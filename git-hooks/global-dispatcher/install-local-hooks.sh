@@ -132,8 +132,10 @@ inject_lefthook() {
 }
 
 # ----------------------------------------------------------------------------------
-# husky: append ONE guarded dispatcher line to .husky/<event>. Husky v9 runs the file
-# directly. We keep the repo's own commands and just add ours at the end.
+# husky: insert ONE guarded dispatcher line into .husky/<event>, right AFTER the shebang
+# (NOT appended). Husky v9 runs the file directly; an existing husky script may end in
+# `exit 0`, which would make a trailing append dead code — so we insert near the top, the
+# same way as raw hooks. The repo's own commands (lint-staged etc.) are preserved below.
 # ----------------------------------------------------------------------------------
 inject_husky() {
   wired_any=0
@@ -144,14 +146,22 @@ inject_husky() {
     if [ -f "$f" ] && grep -q "$MARKER" "$f"; then
       log "husky $ev already wired — no-op"; wired_any=1; continue
     fi
-    if [ ! -f "$f" ]; then
-      printf '%s\n' "#!/bin/sh" > "$f"
-    fi
-    # commit-msg needs the message-file arg ($1); others forward "$@".
+    cmt="# $MARKER — runs every global hook for this event (see agent-tools git-hooks/global-dispatcher)"
     if [ "$ev" = "commit-msg" ]; then
-      printf '\n# %s — runs every global hook for this event (see agent-tools git-hooks/global-dispatcher)\n%s commit-msg "$1" || exit $?\n' "$MARKER" "$DISPATCHER" >> "$f"
+      call="$DISPATCHER commit-msg \"\$1\" || exit \$?"
     else
-      printf '\n# %s — runs every global hook for this event (see agent-tools git-hooks/global-dispatcher)\n%s %s "$@" || exit $?\n' "$MARKER" "$DISPATCHER" "$ev" >> "$f"
+      call="$DISPATCHER $ev \"\$@\" || exit \$?"
+    fi
+    if [ ! -f "$f" ]; then
+      # Fresh husky hook (e.g. a repo that has .husky/ but no commit-msg yet).
+      printf '#!/bin/sh\n%s\n%s\n' "$cmt" "$call" > "$f"
+    else
+      # Insert after the first line (the shebang) so a trailing `exit 0` can't shadow it.
+      # If the file has no shebang, awk still inserts after line 1 — harmless, husky runs
+      # it via sh either way. Pass the two lines as SEPARATE awk vars (no literal newline).
+      tmp="$(mktemp "${TMPDIR:-/tmp}/huskyhook.XXXXXX")"
+      awk -v cmt="$cmt" -v call="$call" 'NR==1{print; print cmt; print call; next} {print}' "$f" > "$tmp"
+      mv "$tmp" "$f"
     fi
     chmod +x "$f"
     log "husky $ev wired ($f)"
