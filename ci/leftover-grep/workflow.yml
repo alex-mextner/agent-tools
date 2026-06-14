@@ -1,0 +1,38 @@
+# Leftover-marker gate: fail the PR on debugging/forbidden leftovers in the ADDED code.
+#
+# Catches the "left it in" class: focused tests (.only/fdescribe/fit), `debugger`, stray
+# console.log/debug, TODO/FIXME without a tracker reference, and merge-conflict markers.
+# Scans only the lines the PR ADDS (vs the base) so it doesn't punish pre-existing debt.
+#
+# INSTALL: copy to .github/workflows/leftover-grep.yml.
+#
+# KNOBS (env on the step): LEFTOVER_INCLUDE / LEFTOVER_EXCLUDE (which files), TICKET_REGEX
+# (what makes a TODO "tracked"), ALLOW_CONSOLE=1 (console.log -> warning not failure).
+#
+# Triggered by `pull_request` (read-only token, no secrets) — running the checked-out
+# script from the PR head is safe; it only greps the diff.
+
+name: leftover-grep
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  leftover-grep:
+    name: leftover-grep
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history so the diff base resolves)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Scan added lines for leftovers
+        env:
+          LEFTOVER_BASE: origin/${{ github.event.pull_request.base.ref }}
+          # TICKET_REGEX: 'ABC-[0-9]+|#[0-9]+'   # your tracker's id format
+          # ALLOW_CONSOLE: '0'
+        run: bash ci/leftover-grep/leftover-grep.sh

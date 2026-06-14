@@ -15,7 +15,7 @@ mechanisms are stack-agnostic (bun/node, python-uv, go).
 | `skills/`      | Advisory rules as markdown skills — `universal/` (any project) and `by-type/{bot,backend,frontend,cli,library,infra,monorepo}/`. Each is one `SKILL.md` with `name` + `description` frontmatter, the portable rule, a rationale, and a generic example. |
 | `agent-hooks/` | Programmatic guards that fire on an agent's tool use (the `agents-hooks/v1` contract). Each is a descriptor + executable + README. They enforce, mid-session, what a skill can only advise. |
 | `git-hooks/`   | Copyable `pre-commit` / `commit-msg` / `pre-push` / `no-secrets-scan` hooks plus a `lefthook.yml`, generalized across three toolchains. |
-| `ci/`          | Drop-in CI building blocks a CI-building agent looks for first. `secret-scan/` = gitleaks as a pinned GitHub Action **and** a generic shell script, with block/warn tier configs. |
+| `ci/`          | Drop-in CI / PR-gate building blocks a CI-building agent looks for first — one slot per concern (workflow + optional shell script + README): secret-scan (gitleaks), CodeQL (incl. a no-GHAS self-gate), semgrep SAST, dependency-review + license, AI-review, Copilot-findings, unresolved-review-thread block, unchecked-checkbox block, mandatory screenshots, conventional-commit PR-title lint, leftover-marker grep, and a green-CI-gated `ship` merge command. See [`ci/README.md`](ci/README.md). |
 | `mcp/`         | Documentation of the multi-model `review` MCP slot (review / quorum / brainstorm / visual) and a code-search MCP slot. |
 | `docs/`        | `carrier-decision-guide.md` — when a rule belongs in a skill vs an agent-hook vs a git-hook. |
 
@@ -69,29 +69,39 @@ team-wide setup. They auto-detect bun/node vs python-uv vs go. See
 
 ## Using the CI tools
 
-`ci/` holds drop-in CI building blocks — the first place a CI-building agent should look for
-"is there a standard way to do this in CI?" Today it has `secret-scan/`: gitleaks as a
-**pinned GitHub Actions workflow** and a **generic shell script** for any other CI, with
-block/warn tier configs. Copy the workflow into `.github/workflows/`, or call the shell
-script from a pipeline step. See [`ci/README.md`](ci/README.md) and the
-[`secret-scanning`](skills/universal/secret-scanning/SKILL.md) skill.
+`ci/` holds drop-in CI / PR-gate building blocks — the first place a CI-building agent
+should look for "is there a standard way to do this in CI?" It covers secret scanning
+(gitleaks), SAST (CodeQL incl. a no-GHAS self-gate, and semgrep), dependency + license
+review, an AI-review step, surfacing Copilot findings, and the "block merge until X" gates
+(unresolved review comments, unchecked PR checkboxes, missing screenshots, non-conventional
+PR titles, debug leftovers in the diff), plus a green-CI-gated `ship` merge command. Each
+slot is a workflow (+ usually a generic shell script for non-GitHub CI) and a README with
+the standard engine, knobs, and escape hatch. Copy the workflow into `.github/workflows/`,
+or call the shell script from a pipeline step. Start at [`ci/README.md`](ci/README.md) and
+the [`ci-gate-suite`](skills/universal/ci-gate-suite/SKILL.md) skill.
 
 ## Inventory
 
-- **Universal skills:** 28 — shell-timeouts, exit-codes-through-pipes, dead-code-
+- **Universal skills:** 29 — shell-timeouts, exit-codes-through-pipes, dead-code-
   investigation, TDD red-first, test discipline, atomic commits, pre-commit gate, secret
-  scanning (gitleaks, hook + CI), comment & naming hygiene, no type escape hatches,
-  systematic debugging, smallest change, shared-util single-source, file-header comments,
-  promise = durable action, worktree-base trap, visual proof cycle, GAN critic loop,
-  completion self-check, semantic code search, and more.
+  scanning (gitleaks, hook + CI), CI gate suite, comment & naming hygiene, no type escape
+  hatches, systematic debugging, smallest change, shared-util single-source, file-header
+  comments, promise = durable action, worktree-base trap, visual proof cycle, GAN critic
+  loop, completion self-check, semantic code search, and more.
 - **By-type skills:** 45 — bot (12), backend (13), frontend (4), cli (7), library (4),
   infra (1), monorepo (4).
 - **Agent-hooks:** 6 — block-no-verify, block-secrets-write, require-review-before-commit,
   enforce-timeout-on-bash, block-raw-process-env, stop-completion-selfcheck.
 - **Git-hooks:** 4 templates — pre-commit, commit-msg, pre-push, no-secrets-scan (+ a
   lefthook.yml).
-- **CI:** 1 slot — secret-scan (gitleaks: pinned GitHub Action + generic shell script +
-  block/warn tier configs).
+- **CI:** 12 slots — secret-scan (gitleaks), codeql (incl. private-repo self-gate), sast
+  (semgrep), dependency-review (+ license + multi-ecosystem audit), ai-review (configurable
+  reviewer), copilot-findings (surface + optional gate), review-threads (unresolved-comment
+  block), pr-checklist (unchecked-checkbox block), screenshots (mandatory image on UI PRs),
+  pr-title-lint (Conventional Commits), leftover-grep (no `.only`/`debugger`/`console`/
+  untracked-TODO), ship (green-CI-gated merge + cleanup). Plus a backlog of net-new ideas in
+  `ci/README.md` (coverage-delta, bundle-size, doc-link-check, CODEOWNERS, stale-PR,
+  size-label).
 - **MCP:** 1 documented slot (review) + a code-search slot.
 
 ## License

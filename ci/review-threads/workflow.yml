@@ -1,0 +1,39 @@
+# Merge gate: block the PR while it has UNRESOLVED review threads.
+#
+# GitHub's native equivalent is the branch-protection toggle "Require conversation
+# resolution before merging" — but that's admin-only and can't be set from inside the repo.
+# This workflow gives you the same gate as a required STATUS CHECK that any maintainer can
+# add to branch protection (Settings -> Branches -> required checks -> "review-threads").
+#
+# INSTALL: copy to .github/workflows/review-threads.yml. To make it a HARD block, add the
+# check "review-threads" to your branch-protection required checks (admin-only, one-time).
+#
+# Re-evaluates when threads are resolved: `pull_request_review` / `…review_comment` events
+# don't carry resolve toggles, so we also re-run on `synchronize` and on a manual dispatch.
+# (Resolving a thread doesn't emit a webhook; push a commit or re-run to refresh, or rely
+# on the ship-time preflight in ci/ship which always re-checks.)
+
+name: review-threads
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  review-threads:
+    name: review-threads
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Fail on unresolved review threads
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: bash ci/review-threads/review-threads.sh

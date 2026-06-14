@@ -1,0 +1,43 @@
+# SAST — semgrep (open-source pattern-based static analysis).
+#
+# Standard OSS engine = semgrep. Fast, rule-based, multi-language. Complements CodeQL
+# (../codeql/): semgrep is quick pattern matching with a huge community ruleset; CodeQL
+# is deep semantic data-flow. Run BOTH for real coverage.
+#
+# INSTALL: copy to .github/workflows/sast.yml.
+#
+# RULESET (knob): `config: auto` (below) pulls the semgrep registry's curated rules for
+# your detected languages. Alternatives: `p/ci`, `p/security-audit`, `p/owasp-top-ten`,
+# `p/secrets`, or a path to your own `.semgrep.yml`. Multiple configs: space-separated.
+# `auto` and registry packs need NO token for OSS rules; SEMGREP_APP_TOKEN is only for
+# Semgrep AppSec Platform (managed policies) and is optional.
+#
+# GATING: semgrep-action exits non-zero on findings → the job fails (block tier, the right
+# CI default). To surface findings WITHOUT failing, add `continue-on-error: true`.
+#
+# PINNED: semgrep/semgrep-action pinned to a commit SHA (a moving tag can be repointed).
+
+name: sast
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    name: semgrep (SAST)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Run semgrep
+        uses: semgrep/semgrep-action@713efdd345f3035192eaa63f56867b88e63e4e5d # v1
+        with:
+          config: auto
+        # env:
+        #   SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}  # optional: managed policies

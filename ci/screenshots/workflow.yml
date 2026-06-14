@@ -1,0 +1,45 @@
+# Merge gate: a UI-touching PR must carry a SCREENSHOT (embedded image) as visual proof.
+#
+# Runs at PR-OPEN/EDIT (so the author is told immediately) AND re-runs on each push. For
+# the SECOND enforcement point the rule wants — "an image must still be present at MERGE
+# time" — wire the same script into your ship/merge preflight (ci/ship runs it). Two
+# enforcement points = harder to merge a UI change that lost its proof mid-review.
+#
+# INSTALL: copy to .github/workflows/screenshots.yml. To HARD-block, add the "screenshots"
+# check to branch protection (admin-only).
+#
+# KNOBS (env on the step):
+#   UI_PATH_REGEX   which changed paths make a PR "UI-touching" (default covers common
+#                   front-end dirs + *.tsx/*.jsx/*.vue/*.svelte). EDIT for your layout.
+#   REQUIRE_ALWAYS  "1" to require a screenshot on every PR regardless of paths.
+#   IMAGE_REGEX     what counts as an embedded image in the PR text.
+#
+# Triggered by `pull_request` (read-only token, no secrets) — running the checked-out
+# script from the PR head is safe (it only reads PR metadata via gh). NOT
+# pull_request_target.
+
+name: screenshots
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  screenshots:
+    name: screenshots
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Require a screenshot on UI-touching PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          # UI_PATH_REGEX: '(^|/)components/|\.(tsx|jsx|vue|svelte)$'   # customize
+          # REQUIRE_ALWAYS: '0'
+        run: bash ci/screenshots/require-screenshots.sh

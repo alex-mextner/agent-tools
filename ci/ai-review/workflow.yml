@@ -1,0 +1,103 @@
+# AI code review on the PR diff — posts findings as a sticky PR comment.
+#
+# Generalizes the "an AI reviewer comments on every PR" pattern. It runs a CONFIGURABLE
+# review CLI (codex / review-cli / claude / gemini / your own) over the PR diff and posts
+# the findings. It is ADVISORY by default — a non-blocking comment, NOT a required gate —
+# because an LLM reviewer has false positives and should inform a human, not auto-block.
+# (Flip `continue-on-error` / set AI_REVIEW_FAIL=1 if you want it to gate.)
+#
+# INSTALL: copy to .github/workflows/ai-review.yml.
+#
+# YOU MUST PROVIDE:
+#   1. A way to install the review CLI (the "Install review CLI" step — edit for your tool).
+#   2. The API key that CLI needs, as a repo/org SECRET, wired into `env:` below. Use a
+#      GENERIC secret name; do not hard-code a provider. Examples: OPENAI_API_KEY,
+#      ANTHROPIC_API_KEY, AI_REVIEW_API_KEY.
+#
+# KNOBS (env on the run step):
+#   AI_REVIEW_TOOL / AI_REVIEW_CMD  — which reviewer + how to invoke it (see ai-review.sh).
+#   AI_REVIEW_BASE                  — diff base (default origin/<base branch>).
+#
+# SECURITY: triggered by `pull_request` (NOT pull_request_target) so a fork PR cannot read
+# secrets. That means this runs with a read-only token and CANNOT post a comment on fork
+# PRs; for same-repo branch PRs the `pull-requests: write` permission lets it comment.
+# Do NOT switch to pull_request_target to "fix" fork commenting unless you fully understand
+# the secret-exfiltration risk of running PR code with a privileged token.
+
+name: ai-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  ai-review:
+    name: AI review (advisory)
+    runs-on: ubuntu-latest
+    # Skip on forks — no secrets available there, the review CLI can't run.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Checkout (full history for an accurate diff)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Install review CLI
+        # EDIT THIS for your reviewer. Examples (uncomment/replace one):
+        #   npm i -g @your-org/review-cli
+        #   pipx install your-reviewer
+        #   curl -fsSL https://example.com/install.sh | sh
+        run: |
+          echo "::warning::Edit the 'Install review CLI' step to install your reviewer (codex / review-cli / etc.)."
+          # Placeholder no-op so the workflow is valid out of the box; replace it.
+          exit 0
+
+      - name: Run AI review on the PR diff
+        id: review
+        env:
+          AI_REVIEW_TOOL: codex            # built-in default; for others set AI_REVIEW_CMD
+          AI_REVIEW_BASE: origin/${{ github.event.pull_request.base.ref }}
+          AI_REVIEW_OUT: ai-review-raw.md
+          # Wire YOUR provider key here (generic name; set it as a repo secret):
+          # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_REVIEW_API_KEY: ${{ secrets.AI_REVIEW_API_KEY }}
+        run: |
+          bash ci/ai-review/ai-review.sh || echo "_AI review tool unavailable or errored — see logs._" > ai-review-raw.md
+          [ -s ai-review-raw.md ] || echo "_No findings emitted._" > ai-review-raw.md
+          # Build the final comment body in shell (the comment action posts literal text,
+          # it does NOT expand $(...)). Fence the tool output so markdown is preserved.
+          {
+            echo '<!-- ai-review -->'
+            echo '## AI review (advisory)'
+            echo ''
+            echo 'Findings below — verify each; this is peer review, not a gate.'
+            echo ''
+            echo '```'
+            cat ai-review-raw.md
+            echo '```'
+          } > ai-review-comment.md
+
+      - name: Find prior AI-review comment
+        uses: peter-evans/find-comment@b30e6a3c0ed37e7c023ccd3f1db5c6c0b0c23aad # v4.0.0
+        id: fc
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '<!-- ai-review -->'
+
+      - name: Post / update sticky comment
+        uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5.0.0
+        with:
+          comment-id: ${{ steps.fc.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          edit-mode: replace
+          body-path: ai-review-comment.md

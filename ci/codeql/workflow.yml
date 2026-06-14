@@ -1,0 +1,77 @@
+# CodeQL — GitHub's semantic code-analysis engine, as a self-gating workflow.
+#
+# Standard engine = github/codeql-action. This workflow runs CodeQL on push/PR and
+# (on a public repo OR a private repo WITH GitHub Advanced Security) uploads results
+# to the Code Scanning dashboard, where branch protection can gate merges on them.
+#
+# INSTALL: copy to .github/workflows/codeql.yml.
+#
+# LANGUAGES: edit the `language` matrix below. `javascript-typescript` is the COMBINED
+# JS+TS language — do NOT also list `javascript` and `typescript` separately. Supported:
+# javascript-typescript, python, java-kotlin, csharp, cpp, go, ruby, swift, actions.
+# Compiled languages (java, cpp, csharp, go) usually need build-mode: autobuild instead
+# of `none`. See https://docs.github.com/code-security/code-scanning.
+#
+# PINNING: github/codeql-action is a FIRST-PARTY GitHub action; GitHub's own docs pin it
+# by major tag (@v4) because the underlying CodeQL bundle rotates frequently. SHA-pin it
+# if your supply-chain policy requires it (see README), but the major tag is the norm here.
+# actions/checkout (third-party-adjacent) IS SHA-pinned.
+
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly full scan — Mondays 03:00 UTC.
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+# Single-flight per ref: cancel an in-flight run for the same ref before starting a new
+# one. Prevents duplicate analyses leaving orphaned cancelled `Analyze (...)` check-runs
+# that can block PR mergeability.
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+  # Required to upload SARIF to the Code Scanning dashboard. Works on PUBLIC repos and on
+  # private repos WITH GitHub Advanced Security. On a private repo WITHOUT GHAS the upload
+  # 403s ("Advanced Security must be enabled") — use ci/codeql/workflow-selfgate.yml there.
+  security-events: write
+
+jobs:
+  analyze:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: javascript-typescript
+            build-mode: none
+          - language: actions
+            build-mode: none
+          # Add more as needed, e.g.:
+          # - language: python
+          #   build-mode: none
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-extended
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: '/language:${{ matrix.language }}'
