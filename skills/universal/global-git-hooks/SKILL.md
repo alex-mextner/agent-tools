@@ -37,7 +37,8 @@ stdin; commit-msg hooks get the message-file path as `$1`.
 ## Wire a repo
 
 ```sh
-install-local-hooks.sh [REPO_DIR]    # detects lefthook | husky | raw, injects ONE
+install-local-hooks.sh [--commit] [--no-dedup] [REPO_DIR]
+                                     # detects lefthook | husky | raw, injects ONE
                                      # dispatcher call per event, idempotent (marker)
 ```
 
@@ -47,9 +48,40 @@ install-local-hooks.sh [REPO_DIR]    # detects lefthook | husky | raw, injects O
 - **raw**: the dispatcher call is inserted after the shebang in `.git/hooks/<event>`, so it
   runs even if the existing body later `exit`s; the body is preserved.
 - **no override**: nothing to do — the global composer already covers the repo.
+- `--commit`: commit the TRACKED wiring (`lefthook.yml` / `.husky/*` / `.githooks-skip`)
+  so it's a reproducible step, not a working-tree edit to remember. No-op if unchanged.
+- `--no-dedup`: skip the automatic secret-scan detection (see Dedup below).
 
 For a pull-only checkout (e.g. a shared main), inject into the manager's tracked config on
-a **branch**, not the working tree, and commit it there.
+a **branch**, not the working tree, and commit it there (or use `--commit`).
+
+## Dedup — each check runs EXACTLY once (local vs. global)
+
+A repo that already runs a check locally (its own lefthook `gitleaks` command, a raw
+`.git/hooks` secret scan) and is ALSO wired to the dispatcher would run that check twice.
+Fix: every global fragment has a stable **capability id** (a `# global-hook-id: <id>`
+header, else basename minus the `NN-` prefix — `10-secret-scan` → `secret-scan`), and a
+repo opts out of a capability so the dispatcher skips that ONE fragment there only.
+Opt-out sources (any match skips; precedence top-down):
+
+1. `git config --get-all hooks.skipGlobal` (multi-valued; genuinely user-controlled),
+2. env `GLOBAL_HOOKS_SKIP="id1:id2"` (ad-hoc / CI),
+3. tracked `<repo>/.githooks-skip` (one id per line, `#` comments) — committable,
+   reproducible, travels with the repo (must be a regular file, not a symlink).
+
+**Trust:** a fragment can mark itself `# global-hook-protected: true` (the secret scan
+does). For a protected id, only **git config** can skip it: `git config hooks.skipGlobal`
+(always) and the **tracked** file (only if `git config hooks.trustSkipFile true`). **Env
+vars are not trusted** for protected ids (a repo's lefthook `env:` block can inject them);
+otherwise the fragment **still runs** — a cloned repo can't silently disable your secret
+scan, and the skip file must be a regular file (symlinks rejected).
+
+`install-local-hooks.sh` auto-detects a local secret scan in the **active** manager's
+pre-commit (ignoring comments, neutralized `|| true` scans, stale inactive hooks, and
+pre-push-only scans) and writes `.githooks-skip` (reproducible). It does **not** auto-write
+a trusted git config — to dedup the *protected* secret scan you opt in once, explicitly:
+`git config --global hooks.trustSkipFile true` or `git -C <repo> config --add
+hooks.skipGlobal secret-scan`. Prove it: `sh git-hooks/global-dispatcher/selfcheck.sh`.
 
 ## Never forget — three passive layers, NEVER a schedule
 

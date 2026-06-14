@@ -15,8 +15,9 @@ pre-commit:
     # This ONE command wires the repo into ~/.config/git/global-hooks.d/ so any hook
     # dropped there runs here too, with no further per-repo edits. The run: value MUST
     # be a single-quoted YAML scalar. See global-dispatcher/README.md and the
-    # global-git-hooks skill. (Replaces the standalone `no-secrets` command below for
-    # repos wired to the dispatcher — the dispatcher's 10-secret-scan supersedes it.)
+    # global-git-hooks skill. The dispatcher's `10-secret-scan` supersedes the standalone
+    # `no-secrets` command below — keep that one commented to avoid running gitleaks twice
+    # (the dispatcher's DEDUP / `.githooks-skip` is the documented way to reconcile both).
     global-git-hooks-dispatcher:
       run: '"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" pre-commit'
     # ---- bun / node ----------------------------------------------------------------
@@ -56,9 +57,15 @@ pre-commit:
         fi
       fail_text: "type escape hatch found"
     # ---- universal: secret scan -----------------------------------------------------
-    no-secrets:
-      run: ./git-hooks/no-secrets-scan
-      fail_text: "secret detected in staged changes"
+    # The dispatcher's `10-secret-scan` already covers this when the dispatcher line
+    # above is present, so a separate local secret scan is redundant — keeping BOTH runs
+    # gitleaks TWICE. Leave it commented if you use the dispatcher. If you DO want a
+    # local one (e.g. a repo not wired to the dispatcher), uncomment it AND add a tracked
+    # `.githooks-skip` with a `secret-scan` line so the dispatcher skips its global copy
+    # (run-global-hooks DEDUP — install-local-hooks.sh writes that file automatically).
+    # no-secrets:
+    #   run: ./git-hooks/no-secrets-scan
+    #   fail_text: "secret detected in staged changes"
 
 commit-msg:
   commands:

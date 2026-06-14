@@ -22,9 +22,64 @@
 #     and exits with that hook's status. An empty/absent event dir = pass (exit 0).
 #   - Non-executable files and dotfiles (README, .keep) are skipped.
 #
-# CONFIG
-#   GLOBAL_HOOKS_DIR  override the default ~/.config/git/global-hooks.d
-#   GLOBAL_HOOKS_DEBUG=1  trace which hooks run
+# DEDUP (local-vs-global — run each check EXACTLY ONCE)
+#   A repo that ALSO runs a check locally (e.g. its own lefthook `gitleaks` command or
+#   a tracked .git/hooks secret-scan) must NOT run the global copy too, or the same
+#   check fires twice. Each fragment carries a stable CAPABILITY ID; a repo opts out of
+#   a global capability and the dispatcher skips that one fragment in THAT repo only.
+#
+#   Capability id of a fragment: the value of a `# global-hook-id: <id>` header line if
+#   present, else the basename with a leading numeric `NN-` prefix stripped
+#   (10-secret-scan -> secret-scan). Ids are matched literally, case-sensitively.
+#
+#   A repo opts out via any of these (for UNPROTECTED ids, ANY match skips):
+#     1. git config --get-all hooks.skipGlobal (multi-valued; repo-local or global)
+#     2. env  GLOBAL_HOOKS_SKIP="id1:id2"      (colon-separated; ad-hoc / CI override)
+#     3. file  <repo>/.githooks-skip           (one id per line; '#' comments; the
+#        committable, reproducible source that travels with the repo)
+#
+# TRUST (don't let a cloned repo silently disable a SECURITY gate)
+#   A fragment may mark itself PROTECTED with a `# global-hook-protected: true` header
+#   (secret-scan is). For a PROTECTED id, only sources a cloned repo CANNOT forge may skip:
+#     - git config hooks.skipGlobal  — ALWAYS (you set it; a repo can't set your git config).
+#     - the .githooks-skip file      — only when git config hooks.trustSkipFile is true.
+#   BOTH trusted sources are git config, read from YOUR local/global config files — a
+#   cloned tree can't ship .git/config. We do NOT honor the repo-injectable skip ENV vars
+#   (GLOBAL_HOOKS_SKIP, a trust flag) for protected ids, and we read the trusted git config
+#   with the ad-hoc VALUE-injection env channels stripped (GIT_CONFIG_COUNT/KEY/VALUE,
+#   GIT_CONFIG_PARAMETERS) — see trusted_git_config. We do NOT additionally neutralize env
+#   that redirects WHICH config FILE git reads (HOME, GIT_CONFIG_GLOBAL, …): a repo able to
+#   reset YOUR $HOME mid-hook has already escalated to arbitrary code — that's the running-
+#   untrusted-hooks case in THREAT BOUNDARY, not a dedup bypass we can meaningfully close
+#   here. Otherwise the protected fragment STILL RUNS (fail-safe). The retrofit writes ONLY
+#   the .githooks-skip file (reproducible); it does NOT auto-write a trusted git config, so a
+#   protected scan is never silently disabled — you opt in explicitly (git config) to dedup
+#   it. The skip file must be a REGULAR file at the repo root (a symlink is rejected) so a
+#   cloned repo can't point it outside the tree.
+#
+# CONFIG (operator knobs — see THREAT BOUNDARY)
+#   GLOBAL_HOOKS_DIR   override the default ~/.config/git/global-hooks.d
+#   GLOBAL_HOOKS_SKIP  colon-separated capability ids to skip — UNPROTECTED ids only
+#   git config hooks.trustSkipFile true  honor .githooks-skip even for protected ids
+#   GLOBAL_HOOKS_DEBUG=1  trace which hooks run / are skipped
+#
+# THREAT BOUNDARY (what the protected-hook machinery does and does NOT defend against)
+#   The protection above defends a realistic case: you CLONE someone's repo and commit in
+#   it; the repo's TRACKED files (lefthook.yml, .githooks-skip) must not silently turn off
+#   YOUR global secret scan. So tracked-file and env signals are not trusted for protected
+#   ids; only YOUR git config (incl. env-injected ad-hoc config stripped) is.
+#   It does NOT — and cannot — defend against a repo you let RUN ITS OWN hooks: that repo's
+#   `run:` already executes arbitrary code on your machine (it can `curl|sh`). So the
+#   following, all reachable from a lefthook `env:` block, are explicitly OUT OF SCOPE and
+#   not additional exposure beyond that arbitrary-code baseline:
+#     - GLOBAL_HOOKS_DIR pointed at an empty/other dir (the dispatcher then finds no
+#       fragments to run);
+#     - GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM / HOME / XDG_CONFIG_HOME redirected at a
+#       repo-shipped config file (which could set hooks.skipGlobal / hooks.trustSkipFile).
+#   We DO close the cheap value-injection channels (GIT_CONFIG_COUNT/KEY/VALUE,
+#   GIT_CONFIG_PARAMETERS, the skip/trust ENV vars) because those forge config WITHOUT
+#   needing code execution. If you don't trust a repo's hooks, don't run them
+#   (`git commit --no-verify`, or inspect first). The knobs above are for YOU, the operator.
 #
 # This file is the canonical copy. The same script ships in agent-tools at
 # git-hooks/global-dispatcher/run-global-hooks; keep them in sync.
@@ -37,6 +92,129 @@ DIR="${GLOBAL_HOOKS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/git/global-hooks.d}/$
 
 # Empty / absent event dir => nothing to do.
 [ -d "$DIR" ] || exit 0
+
+# --- DEDUP: build the per-repo skip sets (capability ids to NOT run globally) ------
+# We keep TWO sets: SKIP_USER (env + git config, always trusted) and SKIP_FILE (the
+# tracked .githooks-skip, which travels with the repo). Membership is tested with a
+# fixed-string, whole-line grep so partial ids never collide.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+
+# trusted_git_config <args...> — run `git config <args>` with the ad-hoc VALUE-INJECTING
+# config env mechanisms stripped, so a repo's lefthook `env:` block can't FORGE "trusted"
+# config (e.g. spoof hooks.trustSkipFile=true) to bypass a PROTECTED hook. Stripped:
+#   - GIT_CONFIG_COUNT + GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n (ad-hoc entries), and
+#   - GIT_CONFIG_PARAMETERS (the serialized `-c key=val` injection channel).
+# We deliberately do NOT touch GIT_CONFIG_GLOBAL/SYSTEM/NOSYSTEM or HOME/XDG_CONFIG_HOME:
+# those redirect WHICH FILE is read (used for test isolation), and a repo able to set YOUR
+# HOME during hook execution is already running arbitrary code — out of scope per the
+# THREAT BOUNDARY note above (don't run an untrusted repo's hooks).
+trusted_git_config() {
+  _n="${GIT_CONFIG_COUNT:-0}"
+  ( unset GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS 2>/dev/null || true
+    _i=0
+    while [ "$_i" -lt "$_n" ] 2>/dev/null; do
+      unset "GIT_CONFIG_KEY_$_i" "GIT_CONFIG_VALUE_$_i" 2>/dev/null || true
+      _i=$((_i + 1))
+    done
+    git "$@" )
+}
+
+# THREE sets, by trust level for PROTECTED ids:
+#   SKIP_CFG  — git config hooks.skipGlobal. Genuinely user-controlled (a cloned repo
+#               can't set your git config), so it ALWAYS counts, even for protected ids.
+#   SKIP_ENV  — env GLOBAL_HOOKS_SKIP. Convenient for YOU, but a repo's lefthook `env:`
+#               block can inject it, so it does NOT count for PROTECTED ids (only unprotected).
+#   SKIP_FILE — the tracked .githooks-skip. Travels with the repo; for protected ids it
+#               counts only under trust (see is_skipped). Must be a regular file (no symlink).
+SKIP_CFG=""
+SKIP_ENV=""
+SKIP_FILE=""
+# 1. git config (multi-valued; repo-local + global both returned). Read via
+# trusted_git_config so env-injected ad-hoc config can't forge a skip of a protected hook.
+if [ -n "$REPO_ROOT" ]; then
+  cfg="$(trusted_git_config -C "$REPO_ROOT" config --get-all hooks.skipGlobal 2>/dev/null || true)"
+  [ -n "$cfg" ] && SKIP_CFG="$cfg"
+fi
+# 2. env override (colon-separated).
+if [ -n "${GLOBAL_HOOKS_SKIP:-}" ]; then
+  SKIP_ENV="$(printf '%s\n' "$GLOBAL_HOOKS_SKIP" | tr ':' '\n')"
+fi
+# 3. the repo-root .githooks-skip (one id per line; strip comments and blanks).
+# It must be a REGULAR file, NOT a symlink — a cloned repo could otherwise make it point
+# outside the worktree and (with trust on) disable a protected hook from an arbitrary file.
+if [ -n "$REPO_ROOT" ] && [ -f "$REPO_ROOT/.githooks-skip" ] \
+   && [ ! -L "$REPO_ROOT/.githooks-skip" ]; then
+  SKIP_FILE="$(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e 's/^[[:space:]]*//' \
+                   "$REPO_ROOT/.githooks-skip" | grep -v '^$' || true)"
+elif [ -L "$REPO_ROOT/.githooks-skip" ] 2>/dev/null; then
+  echo "run-global-hooks: ignoring .githooks-skip — it is a symlink (must be a regular file)" >&2
+fi
+
+# TRUST flag: do we honor the TRACKED file even for PROTECTED ids? ONLY from git config
+# hooks.trustSkipFile (true/1/yes/on). This is read from the user's local/global git config
+# — NOT settable by a cloned repo (a tree can't ship .git/config). We deliberately do NOT
+# accept an env var here: a repo's lefthook `env:` block could inject it, which would defeat
+# the protection (same threat model that makes us ignore env GLOBAL_HOOKS_SKIP for protected
+# ids). So trust is git-config-only.
+TRUST_SKIPFILE=0
+if [ -n "$REPO_ROOT" ]; then
+  case "$(trusted_git_config -C "$REPO_ROOT" config --get hooks.trustSkipFile 2>/dev/null || true)" in
+    1|true|yes|on) TRUST_SKIPFILE=1 ;;
+  esac
+fi
+
+# hook_id <path> — echo a fragment's capability id (header line or basename sans NN-).
+hook_id() {
+  _id="$(sed -n 's/^#[[:space:]]*global-hook-id:[[:space:]]*//p' "$1" 2>/dev/null | head -n1)"
+  if [ -z "$_id" ]; then
+    _id="$(basename "$1")"
+    _id="$(printf '%s\n' "$_id" | sed 's/^[0-9][0-9]*-//')"
+  fi
+  printf '%s\n' "$_id"
+}
+
+# hook_is_protected <path> — 0 if the fragment carries `# global-hook-protected: true`.
+hook_is_protected() {
+  case "$(sed -n 's/^#[[:space:]]*global-hook-protected:[[:space:]]*//p' "$1" 2>/dev/null \
+            | head -n1)" in
+    1|true|yes|on) return 0 ;;
+  esac
+  return 1
+}
+
+# in_set <id> <set-text> — 0 if id is a whole line in the set.
+in_set() {
+  [ -n "$2" ] || return 1
+  printf '%s\n' "$2" | grep -Fxq -- "$1"
+}
+
+# is_skipped <id> <fragment-path> — return 0 if this capability should be skipped here.
+# For a PROTECTED fragment, only sources a CLONED repo cannot forge may skip it:
+#   - git config hooks.skipGlobal  (always — you set it, a repo can't),
+#   - the tracked .githooks-skip    (only under trust),
+#   and NOT the env var (a repo's lefthook `env:` block can inject GLOBAL_HOOKS_SKIP).
+# For an UNPROTECTED fragment, all three sources skip it (env included).
+is_skipped() {
+  _id="$1"; _path="$2"
+  in_set "$_id" "$SKIP_CFG" && return 0          # git config: always trusted
+  if hook_is_protected "$_path"; then
+    # Protected: env is NOT trusted (repo-injectable); tracked file only under trust.
+    if in_set "$_id" "$SKIP_ENV"; then
+      [ -n "$GLOBAL_HOOKS_DEBUG" ] && \
+        echo "run-global-hooks: IGNORING env GLOBAL_HOOKS_SKIP '$_id' for protected fragment (use git config hooks.skipGlobal)" >&2
+    fi
+    if in_set "$_id" "$SKIP_FILE"; then
+      if [ "$TRUST_SKIPFILE" = 1 ]; then return 0; fi
+      [ -n "$GLOBAL_HOOKS_DEBUG" ] && \
+        echo "run-global-hooks: IGNORING .githooks-skip '$_id' for protected fragment (set hooks.trustSkipFile or use git config hooks.skipGlobal)" >&2
+    fi
+    return 1
+  fi
+  # Unprotected: env and tracked file both skip.
+  in_set "$_id" "$SKIP_ENV"  && return 0
+  in_set "$_id" "$SKIP_FILE" && return 0
+  return 1
+}
 
 # Spool stdin ONCE so every hook in the chain can read the same input (pre-push
 # delivers the pushed refs on stdin; without a spool only the first hook sees it).
@@ -59,6 +237,14 @@ for hook in "$DIR"/*; do
   [ -f "$hook" ] || continue
   [ -x "$hook" ] || continue
   case "$(basename "$hook")" in .*) continue ;; esac
+
+  # DEDUP: skip this fragment if the repo already provides its capability locally.
+  hid="$(hook_id "$hook")"
+  if is_skipped "$hid" "$hook"; then
+    [ -n "$GLOBAL_HOOKS_DEBUG" ] && \
+      echo "run-global-hooks[$event]: SKIP $(basename "$hook") (id '$hid' provided locally)" >&2
+    continue
+  fi
 
   [ -n "$GLOBAL_HOOKS_DEBUG" ] && echo "run-global-hooks[$event]: -> $hook" >&2
 
