@@ -61,13 +61,25 @@ pipes the computed diff in, so it reviews the actual PR. For local pre-commit re
 - `AI_REVIEW_FAIL` — `1` to exit non-zero **only if the tool itself errors** (never on
   findings — advisory).
 
-## Security — why `pull_request`, not `pull_request_target`
+## Security — the secret-exfiltration trap (and how this avoids it)
 
-This triggers on `pull_request`, so a **fork** PR runs with a read-only token and **no
-access to secrets** — your API key cannot be exfiltrated by malicious PR code. The trade-off:
-it can't comment on fork PRs (no write token there), so the job is `if:`-skipped on forks.
-Do **not** switch to `pull_request_target` to enable fork commenting unless you fully grasp
-the secret-exfiltration risk of running PR-controlled code with a privileged token.
+This job holds an API-key secret. The trap most "AI review on PR" workflows fall into: they
+trigger on `pull_request`, **check out the PR head, and run a script the PR can edit** — so
+any contributor who can open a **same-repo branch** PR can rewrite that script and steal the
+key. Skipping *forks* does **not** close that hole (same-repo branches still have it).
+
+This workflow closes it by treating the PR's code as **data, never as code**:
+
+- It uses `pull_request_target` and checks out the **base** branch — the script and install
+  step that run are the **trusted base copies**, never the PR's.
+- It fetches the PR diff (the PR head SHA) and feeds **that** to the reviewer — the diff is
+  **read**, never executed.
+- It runs **no build/test/install of PR code** (that would execute it under the privileged
+  trigger). Keep it diff-only — do not add such a step.
+
+Caveat of any base-run workflow: it does **not** run on the PR that first introduces it.
+The reviewer reviews the diff regardless of fork-vs-branch, and can comment on both (the
+base-context token has `pull-requests: write`).
 
 ## Pinning
 

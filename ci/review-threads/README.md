@@ -49,11 +49,14 @@ the instant you resolve the last thread. Push a commit, re-run the job, or rely 
 ship-time preflight ([`../ship/`](../ship/)) which always re-counts at merge time. The
 workflow re-runs on `synchronize` (new commits) and `workflow_dispatch` (manual).
 
-## Security note
+## Security note — tamper-resistant
 
-Triggered by `pull_request` with a **read-only** token and no secrets, so running the
-checked-out script from the PR head is safe (it only reads thread metadata; there is
-nothing to exfiltrate and nothing to tamper). It does NOT use `pull_request_target`.
+A merge-BLOCKING gate must not run a script the PR can edit (a PR could weaken its own
+gate). So the workflow uses `pull_request_target` and runs the **base-branch (trusted)**
+copy of the script; it reads only the **PR number** from the event payload (data), never
+checks out or executes PR-head code, and keeps a read-only token. The standalone
+`review-threads.sh` is for local / ship-preflight use. `workflow_dispatch` takes a
+`pr_number` input (a manual run has no PR in the event payload).
 
 ## When to use
 

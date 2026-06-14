@@ -31,7 +31,19 @@ sh ci/leftover-grep/leftover-grep.sh
 - `ALLOW_CONSOLE=1` — downgrade `console.log` to a warning (some projects log intentionally;
   scope `LEFTOVER_INCLUDE` to app code if so).
 - `LEFTOVER_BASE` — diff base (default `origin/main` → `main` → full-tree).
+- `LEFTOVER_HEAD` — head ref/SHA to diff against the base (default `HEAD`). The
+  `pull_request_target` workflow sets this to the PR head SHA, fetched as **data** — see
+  below.
 - `LEFTOVER_FULLTREE=1` — scan the whole tree, not just the diff (for a one-off cleanup).
+
+## Tamper-resistant in CI (`pull_request_target`)
+
+A merge-blocking gate must not run a script the PR can edit. This gate also needs the PR's
+*code* — but only to **read** it. The workflow uses `pull_request_target` to run the
+**base-branch (trusted)** script, fetches the PR head commit as **data**, and diffs+greps it
+(`LEFTOVER_HEAD=<pr-head-sha>`). `git diff` never executes the PR code. **Hard rule:** do not
+add a build/test/install step to that workflow — that would execute PR code under the
+privileged trigger.
 
 ## Diff-scoped by default
 

@@ -39,6 +39,10 @@ sh ci/dependency-review/dep-audit.sh
 
 **dep-audit.sh:**
 - `DEP_AUDIT_LEVEL` — `low|moderate|high|critical` (default `high`).
+- `DEP_AUDIT_ALLOW_MISSING` — `1` to fail-OPEN when a manifest is found but its scanner
+  isn't installed. **Default `0` (fail-CLOSED):** a detected ecosystem with no usable scanner
+  is a gate failure, not a silent skip — otherwise "no audit ran" masquerades as "no vulns".
+  Install the named tool in your CI image, or set this to `1` to intentionally skip.
 
 ## Relationship to other slots
 

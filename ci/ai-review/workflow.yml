@@ -4,9 +4,9 @@
 # review CLI (codex / review-cli / claude / gemini / your own) over the PR diff and posts
 # the findings. It is ADVISORY by default — a non-blocking comment, NOT a required gate —
 # because an LLM reviewer has false positives and should inform a human, not auto-block.
-# (Flip `continue-on-error` / set AI_REVIEW_FAIL=1 if you want it to gate.)
 #
-# INSTALL: copy to .github/workflows/ai-review.yml.
+# INSTALL: copy to .github/workflows/ai-review.yml AND keep the script at
+# ci/ai-review/ai-review.sh (vendor the ci/ dir, or copy + adjust the run: path).
 #
 # YOU MUST PROVIDE:
 #   1. A way to install the review CLI (the "Install review CLI" step — edit for your tool).
@@ -14,20 +14,24 @@
 #      GENERIC secret name; do not hard-code a provider. Examples: OPENAI_API_KEY,
 #      ANTHROPIC_API_KEY, AI_REVIEW_API_KEY.
 #
-# KNOBS (env on the run step):
-#   AI_REVIEW_TOOL / AI_REVIEW_CMD  — which reviewer + how to invoke it (see ai-review.sh).
-#   AI_REVIEW_BASE                  — diff base (default origin/<base branch>).
-#
-# SECURITY: triggered by `pull_request` (NOT pull_request_target) so a fork PR cannot read
-# secrets. That means this runs with a read-only token and CANNOT post a comment on fork
-# PRs; for same-repo branch PRs the `pull-requests: write` permission lets it comment.
-# Do NOT switch to pull_request_target to "fix" fork commenting unless you fully understand
-# the secret-exfiltration risk of running PR code with a privileged token.
+# SECURITY — this is the part most "AI review on PR" workflows get WRONG:
+#   The job holds an API-key SECRET. If it ran PR-CONTROLLED code (checked out the PR head
+#   and ran a script the PR can edit), ANY contributor who can open a same-repo branch PR
+#   could rewrite that script and exfiltrate the key. Skipping forks does NOT close that hole
+#   (same-repo branches still have it). So this workflow:
+#     • uses `pull_request_target` and checks out the BASE branch — the SCRIPT that runs is
+#       the trusted base copy, never the PR's;
+#     • fetches the PR diff as DATA (`git diff` of the PR head SHA) and feeds that to the
+#       reviewer — the diff is READ, never executed;
+#     • never runs a build/test/install of PR code (that WOULD execute it under the
+#       privileged trigger). HARD RULE: keep it diff-only.
+#   The reviewer command + its install step come from the trusted base + your config.
+#   Caveat: it does NOT run on the PR that first introduces it (base has no workflow yet).
 
 name: ai-review
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened]
 
 permissions:
@@ -42,22 +46,28 @@ jobs:
   ai-review:
     name: AI review (advisory)
     runs-on: ubuntu-latest
-    # Skip on forks — no secrets available there, the review CLI can't run.
-    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
-      - name: Checkout (full history for an accurate diff)
+      - name: Checkout BASE branch (trusted script) with full history
+        # Default ref under pull_request_target = base. The script + install step that run
+        # are the trusted base copies, not the PR's.
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+
+      - name: Fetch the PR head commit as DATA (not checked out / not executed)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git fetch --no-tags --depth=1 origin "$HEAD_SHA"
 
       - name: Install review CLI
         # EDIT THIS for your reviewer. Examples (uncomment/replace one):
         #   npm i -g @your-org/review-cli
         #   pipx install your-reviewer
         #   curl -fsSL https://example.com/install.sh | sh
+        # This runs from the TRUSTED base checkout — never install/run anything from the PR.
         run: |
           echo "::warning::Edit the 'Install review CLI' step to install your reviewer (codex / review-cli / etc.)."
-          # Placeholder no-op so the workflow is valid out of the box; replace it.
           exit 0
 
       - name: Run AI review on the PR diff
@@ -65,6 +75,7 @@ jobs:
         env:
           AI_REVIEW_TOOL: codex            # built-in default; for others set AI_REVIEW_CMD
           AI_REVIEW_BASE: origin/${{ github.event.pull_request.base.ref }}
+          AI_REVIEW_HEAD: ${{ github.event.pull_request.head.sha }}
           AI_REVIEW_OUT: ai-review-raw.md
           # Wire YOUR provider key here (generic name; set it as a repo secret):
           # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

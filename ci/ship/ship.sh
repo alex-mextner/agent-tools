@@ -159,7 +159,7 @@ upload_png() {
   [ -n "$out" ] || return 1; printf '%s' "$out"
 }
 
-POSTED_IMAGE=0; VALID_SHOTS=0
+POSTED_IMAGE=0   # set only when a screenshot is ACTUALLY uploaded + embedded (a real image)
 if [ "${#SHOT_PATHS[@]}" -gt 0 ]; then
   BODY="### Visual proof"; idx=0
   while [ "$idx" -lt "${#SHOT_PATHS[@]}" ]; do
@@ -168,10 +168,12 @@ if [ "${#SHOT_PATHS[@]}" -gt 0 ]; then
       echo "[ship] WARNING: screenshot not found: $png (does NOT satisfy the gate)." >&2
       BODY="$BODY"$'\n\n'"**$desc**"$'\n'"_Visual proof MISSING — file not found: \`$png\`_"
     elif url=$(upload_png "$png"); then
-      echo "[ship] uploaded '$desc' -> $url"; BODY="$BODY"$'\n\n'"**$desc**"$'\n'"![$desc]($url)"; POSTED_IMAGE=1; VALID_SHOTS=$((VALID_SHOTS+1))
+      echo "[ship] uploaded '$desc' -> $url"; BODY="$BODY"$'\n\n'"**$desc**"$'\n'"![$desc]($url)"; POSTED_IMAGE=1
     else
-      echo "[ship] NOTE: no uploader (SHIP_IMAGE_UPLOAD_CMD) or upload failed for '$desc' — embedding a path note." >&2
-      BODY="$BODY"$'\n\n'"**$desc**"$'\n'"_Local path: \`$png\` — upload manually._"; VALID_SHOTS=$((VALID_SHOTS+1))
+      # No uploader / upload failed: we post a path note, but a path note is NOT an embedded
+      # image, so it must NOT satisfy the UI screenshot gate. Do not bump VALID_SHOTS here.
+      echo "[ship] NOTE: no uploader (SHIP_IMAGE_UPLOAD_CMD) or upload failed for '$desc' — embedding a path note (does NOT satisfy the gate)." >&2
+      BODY="$BODY"$'\n\n'"**$desc**"$'\n'"_Local path: \`$png\` — upload manually._"
     fi
     idx=$((idx+1))
   done
@@ -188,7 +190,9 @@ if [ -n "$UI_PATH_REGEX" ]; then
 fi
 if [ "$UI_TOUCHING" = "1" ]; then
   HAS_IMAGE=0
-  if [ "$VALID_SHOTS" -gt 0 ] || [ "$POSTED_IMAGE" = "1" ]; then HAS_IMAGE=1
+  # Only a really-uploaded image, or an image already embedded in the PR, counts — a failed
+  # upload's path note does NOT satisfy the gate.
+  if [ "$POSTED_IMAGE" = "1" ]; then HAS_IMAGE=1
   else
     PR_TEXT=$(gh pr view "$PR" --json body,comments -q '(.body // "") + "\n" + ([.comments[].body] | join("\n"))' 2>/dev/null || echo "")
     printf '%s' "$PR_TEXT" | grep -qE '!\[[^]]*\]\(https?://|<img |user-attachments/' && HAS_IMAGE=1

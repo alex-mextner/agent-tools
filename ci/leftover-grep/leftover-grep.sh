@@ -19,11 +19,16 @@
 #                        (ABC-123) or (#123) or a URL. Customize for your tracker.
 #   ALLOW_CONSOLE        "1" = console.log is a WARNING, not a failure (default: block).
 #   LEFTOVER_FULLTREE    "1" = always scan the whole tree, ignore the diff.
+#   LEFTOVER_HEAD        head ref/SHA to diff against the base. Default HEAD. Under a
+#                        tamper-resistant pull_request_target setup this is the PR head SHA,
+#                        fetched as DATA — `git diff` + grep only READ those lines, they
+#                        never execute PR code — so the trusted base script still gates.
 #
 # Usage: sh ci/leftover-grep/leftover-grep.sh
 set -euo pipefail
 
 LEFTOVER_BASE="${LEFTOVER_BASE:-origin/main}"
+LEFTOVER_HEAD="${LEFTOVER_HEAD:-HEAD}"
 LEFTOVER_INCLUDE="${LEFTOVER_INCLUDE:-\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|rb|java|kt|c|h|cpp|hpp|cs|php|swift|sh)$}"
 LEFTOVER_EXCLUDE="${LEFTOVER_EXCLUDE:-(^|/)(node_modules|dist|build|out|vendor|\.git|coverage|__snapshots__)/|\.min\.(js|css)$|lock$}"
 TICKET_REGEX="${TICKET_REGEX:-[A-Z]+-[0-9]+|#[0-9]+|https?://}"
@@ -43,7 +48,7 @@ emit_lines() {
   if [ -n "$base" ]; then
     # Parse `git diff` unified output, tracking the new-file line number, emitting only '+'
     # lines (added). Robust enough for a gate without extra deps.
-    git diff --no-color --unified=0 "$base...HEAD" -- . \
+    git diff --no-color --unified=0 "$base...$LEFTOVER_HEAD" -- . \
       | awk '
         /^\+\+\+ /      { f=$2; sub(/^b\//,"",f); next }
         /^@@ /          { match($0, /\+[0-9]+/); ln=substr($0,RSTART+1,RLENGTH-1)+0; next }

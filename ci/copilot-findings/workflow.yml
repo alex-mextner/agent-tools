@@ -22,6 +22,11 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to surface findings for (required — manual runs have no PR in the event payload)'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -39,6 +44,6 @@ jobs:
       - name: Surface Copilot findings
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           # GATE: '1'   # uncomment to FAIL the check when Copilot findings exist
         run: bash ci/copilot-findings/copilot-findings.sh
