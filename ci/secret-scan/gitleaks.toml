@@ -1,0 +1,60 @@
+# Global gitleaks config — BLOCK tier.
+#
+# This is the high-confidence ruleset used by the global pre-commit secret-scan
+# (~/.config/git/hooks/pre-commit). A hit here ABORTS the commit.
+#
+# Precedence (gitleaks --config / -c, see `gitleaks --help`):
+#   1. --config / -c           <- the hook passes this file explicitly
+#   2. env GITLEAKS_CONFIG
+#   3. env GITLEAKS_CONFIG_TOML
+#   4. (target)/.gitleaks.toml  <- a per-repo file, when no -c is given
+#
+# Per-repo override/extend: drop a `.gitleaks.toml` at the repo root. To inherit
+# THIS global config and add repo-specific rules/allowlist, start the repo file with:
+#
+#     title = "my-repo"
+#     [extend]
+#     path = "~/.config/gitleaks/gitleaks.toml"   # extend the global block config
+#     useDefault = true                            # (optional) also the stock ruleset
+#     [[rules]] ...                                # repo-specific custom rules
+#     [allowlist] ...                              # repo-specific allowlist
+#
+# The hook auto-detects a repo `.gitleaks.toml` and uses it INSTEAD of this file
+# (so the repo file is responsible for extending the global one via [extend].path
+# if it wants the global rules — that is the documented, intended override path).
+
+title = "global-block-tier"
+
+# Inherit gitleaks' full built-in provider ruleset (AWS, GCP, Azure, GitHub,
+# Slack, Stripe, private keys, JWTs, etc.). EXTENSIBLE: add high-confidence
+# custom [[rules]] below — each one that fires will BLOCK the commit.
+[extend]
+useDefault = true
+
+# ---- Custom high-confidence rules (BLOCK). Add provider rules the stock set misses. ----
+# Example pattern; extend freely. Keep these HIGH-confidence (specific prefixes /
+# fixed lengths) — anything fuzzy belongs in the warn-tier config, not here.
+[[rules]]
+id = "global-generic-private-key-block"
+description = "Private key block (PEM) — high confidence"
+regex = '''-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----'''
+keywords = ["-----BEGIN"]
+
+# ---- Global allowlist — the false-positive ESCAPE HATCH ----
+# Three ways to silence a false positive (all documented in the block message):
+#   1. inline:   add a `gitleaks:allow` comment on the offending line.
+#   2. global:   add a regex / path / stopword here (applies to every repo).
+#   3. per-repo: a repo .gitleaks.toml [allowlist] (scoped to that repo).
+[allowlist]
+description = "Global allowlist — documented non-secrets and example values."
+# Famous documented example credentials that are NOT real secrets.
+regexes = [
+  '''AKIAIOSFODNN7EXAMPLE''',                                   # AWS docs example access key id
+  '''wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY''',               # AWS docs example secret key
+  '''(?i)(your|example|sample|dummy|placeholder|changeme|xxxx)[-_]?(api[-_]?key|secret|token|password)''',
+]
+# Paths never scanned (lockfiles, fixtures, vendored deps, generated SBOMs).
+paths = [
+  '''(.*?)(go\.sum|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?)$''',
+  '''(.*?)/(testdata|fixtures|__fixtures__|__snapshots__)/''',
+]

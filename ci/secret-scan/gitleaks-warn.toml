@@ -1,0 +1,43 @@
+# Global gitleaks config — WARN tier.
+#
+# Lower-confidence, fuzzy heuristics: high-entropy strings, secret-LOOKING variable
+# names that don't match any known provider rule. A hit here is printed to stderr as
+# a WARNING but the commit is ALLOWED (the hook runs this pass with exit-code 0).
+#
+# Deliberately does NOT [extend] useDefault — the stock provider rules already run in
+# the BLOCK pass. This file holds only the suspicious-but-not-proven heuristics, so the
+# warn pass stays cheap and never double-reports a real provider hit.
+#
+# EXTENSIBLE: add your own fuzzy [[rules]] here to surface more "look at this" cases
+# without ever blocking a commit.
+
+title = "global-warn-tier"
+
+# Suspicious assignment: a secret-ish variable name set to a longish opaque literal,
+# but NOT matching any specific provider format. Often a false positive — hence WARN.
+[[rules]]
+id = "warn-suspicious-secret-assignment"
+description = "Suspicious: secret-like variable assigned an opaque literal (no known provider match)"
+regex = '''(?i)\b(secret|token|passwd|password|api[_-]?key|access[_-]?key|client[_-]?secret|private[_-]?key|auth)\b\s*[:=]\s*['"][A-Za-z0-9_\-+/=]{16,}['"]'''
+keywords = ["secret", "token", "password", "passwd", "apikey", "api_key", "api-key", "accesskey", "access_key", "client_secret", "private_key", "auth"]
+entropy = 3.0
+
+# Generic high-entropy base64-ish blob assigned to a variable. Pure entropy heuristic.
+[[rules]]
+id = "warn-high-entropy-assignment"
+description = "Suspicious: high-entropy opaque blob assigned to a variable"
+regex = '''(?i)\b\w+\s*[:=]\s*['"][A-Za-z0-9+/]{32,}={0,2}['"]'''
+keywords = []
+entropy = 4.3
+
+[allowlist]
+description = "Warn-tier allowlist — keep noise down on obvious non-secrets."
+regexes = [
+  '''(?i)(your|example|sample|dummy|placeholder|changeme|test|mock|fake|redacted|xxxx)''',
+  '''sha(256|512)[-:]''',                      # hash digests, not secrets
+  '''[a-f0-9]{32,64}\b''',                      # hex hashes / git SHAs (entropy < real-secret)
+]
+paths = [
+  '''(.*?)(go\.sum|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?)$''',
+  '''(.*?)/(testdata|fixtures|__fixtures__|__snapshots__)/''',
+]
