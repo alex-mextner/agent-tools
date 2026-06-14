@@ -1,0 +1,9 @@
+{
+  "id": "require-review-before-commit",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/require-review-before-commit/require_review.py",
+  "priority": 20,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "On a `git commit`, checks that an AI code review ran this session (a marker file touched by the review tool). If none ran, blocks with a reminder to run review on the uncommitted diff first. on_error=open: this is a process-discipline gate, not a security gate — a crash should warn, not wedge committing."
+}

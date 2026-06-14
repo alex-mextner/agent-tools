@@ -1,0 +1,66 @@
+#!/bin/sh
+# pre-commit — lint + typecheck + tests gate, zero-warnings.
+#
+# Auto-detects the toolchain (bun/node, python-uv, go) from the repo root and runs the
+# matching gate. A failure aborts the commit. Adjust the command lists to your project's
+# actual scripts. Do NOT bypass this with --no-verify — fix the failing check instead
+# (the block-no-verify agent-hook can enforce that for AI agents).
+#
+# Exit non-zero on the FIRST failing stage so the commit is blocked.
+set -e
+
+repo_root() { git rev-parse --show-toplevel; }
+ROOT="$(repo_root)"
+cd "$ROOT"
+
+run() { echo "pre-commit → $*"; "$@"; }
+
+if [ -f "$ROOT/package.json" ]; then
+  # ---- bun / node ---------------------------------------------------------------
+  # Prefer project-local binaries over npx (deterministic, no network). See the
+  # no-npx-direct-binary skill.
+  if [ -f "$ROOT/bun.lockb" ] || [ -f "$ROOT/bunfig.toml" ]; then
+    PM="bun run"
+  elif [ -f "$ROOT/pnpm-lock.yaml" ]; then
+    PM="pnpm run"
+  else
+    PM="npm run"
+  fi
+  # Run whichever scripts exist; treat a missing script as "not configured", not a pass.
+  $PM lint        2>/dev/null || { echo "FAIL: lint";       exit 1; }
+  $PM typecheck   2>/dev/null \
+    || $PM type-check 2>/dev/null \
+    || ./node_modules/.bin/tsc --noEmit \
+    || { echo "FAIL: typecheck"; exit 1; }
+  $PM test        2>/dev/null || { echo "FAIL: tests";      exit 1; }
+
+elif [ -f "$ROOT/pyproject.toml" ] || [ -f "$ROOT/uv.lock" ]; then
+  # ---- python (uv) --------------------------------------------------------------
+  run uv run ruff check .           || { echo "FAIL: ruff";   exit 1; }
+  run uv run ruff format --check .  || { echo "FAIL: format"; exit 1; }
+  # mypy is optional; only gate on it if it's configured.
+  if uv run python -c "import mypy" 2>/dev/null; then
+    run uv run mypy .               || { echo "FAIL: mypy";   exit 1; }
+  fi
+  run uv run pytest -q              || { echo "FAIL: pytest"; exit 1; }
+
+elif [ -f "$ROOT/go.mod" ]; then
+  # ---- go -----------------------------------------------------------------------
+  run go build ./...                || { echo "FAIL: build"; exit 1; }
+  run go test ./... -count=1        || { echo "FAIL: tests"; exit 1; }
+  if command -v golangci-lint >/dev/null 2>&1; then
+    run golangci-lint run ./...     || { echo "FAIL: lint";  exit 1; }
+  fi
+
+else
+  echo "pre-commit: no recognized toolchain (package.json / pyproject.toml / go.mod) — skipping language gate"
+fi
+
+# Secret scan over the staged diff, regardless of language (see no-secrets-scan).
+if [ -x "$ROOT/.git/hooks/no-secrets-scan" ]; then
+  "$ROOT/.git/hooks/no-secrets-scan" || { echo "FAIL: secret scan"; exit 1; }
+elif command -v no-secrets-scan >/dev/null 2>&1; then
+  no-secrets-scan || { echo "FAIL: secret scan"; exit 1; }
+fi
+
+echo "pre-commit: OK"

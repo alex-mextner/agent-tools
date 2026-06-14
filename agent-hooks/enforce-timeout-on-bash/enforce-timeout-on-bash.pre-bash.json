@@ -1,0 +1,9 @@
+{
+  "id": "enforce-timeout-on-bash",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/enforce-timeout-on-bash/enforce_timeout.py",
+  "priority": 40,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "Warns (or, in strict mode, blocks) when a hangable shell command — build / test / install / network fetch / browser-or-Electron launch — is run without a `timeout` wrapper or an equivalent long tool-timeout. Enforces the shell-timeouts skill. on_error=open: advisory by default; set ENFORCE_TIMEOUT_STRICT=1 to make a missing timeout a hard block."
+}

@@ -1,0 +1,9 @@
+{
+  "id": "block-no-verify",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/block-no-verify/block_no_verify.py",
+  "priority": 10,
+  "timeout_ms": 3000,
+  "on_error": "closed",
+  "description": "Blocks `git commit --no-verify` / `-n` and attempts to disable or skip pre-commit hooks. The pre-commit gate (lint/typecheck/test) only protects the repo if it can't be bypassed; this hook denies the bypass mid-session. on_error=closed: if the check itself fails, deny rather than risk letting a bypass through."
+}

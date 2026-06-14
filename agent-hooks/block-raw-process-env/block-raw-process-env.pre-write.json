@@ -1,0 +1,9 @@
+{
+  "id": "block-raw-process-env",
+  "point": "pre-write",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/block-raw-process-env/block_raw_process_env.py",
+  "priority": 50,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "Flags a write/edit that introduces a raw `process.env.X` (or `os.environ[...]`) access inside configured feature directories, where config should come through a validated loader instead. Enforces the config-loadconfig skill. on_error=open and advisory by default: warns and allows; set BLOCK_PROCESS_ENV_STRICT=1 to hard-block. The watched dirs and the config-loader entry point are exempt via env config."
+}

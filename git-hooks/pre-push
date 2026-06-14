@@ -1,0 +1,30 @@
+#!/bin/sh
+# pre-push — run the full test suite before commits leave the machine.
+#
+# The pre-commit gate runs fast, often-scoped checks; pre-push is the place for the
+# FULL suite (and anything too slow to run on every commit), so you never push red.
+# Auto-detects the toolchain. Do not bypass with --no-verify (see block-no-verify).
+set -e
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+echo "pre-push: running full test suite..."
+
+if [ -f "$ROOT/package.json" ]; then
+  if [ -f "$ROOT/bun.lockb" ] || [ -f "$ROOT/bunfig.toml" ]; then PM="bun run";
+  elif [ -f "$ROOT/pnpm-lock.yaml" ]; then PM="pnpm run";
+  else PM="npm run"; fi
+  $PM test || { echo "FAIL: tests"; exit 1; }
+
+elif [ -f "$ROOT/pyproject.toml" ] || [ -f "$ROOT/uv.lock" ]; then
+  uv run pytest || { echo "FAIL: pytest"; exit 1; }
+
+elif [ -f "$ROOT/go.mod" ]; then
+  go test ./... -count=1 || { echo "FAIL: tests"; exit 1; }
+
+else
+  echo "pre-push: no recognized toolchain — skipping"
+fi
+
+echo "pre-push: OK"

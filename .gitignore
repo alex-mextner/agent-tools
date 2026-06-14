@@ -1,0 +1,7 @@
+# Runtime caches written by the agent-hooks at run time (never committed).
+.cache/
+*.done
+
+# OS / editor noise
+.DS_Store
+*.swp

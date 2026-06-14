@@ -1,0 +1,44 @@
+#!/bin/sh
+# commit-msg — enforce the conventional-commit format.
+#
+# Validates the FIRST line of the commit message against:
+#   <type>(<optional scope>)<optional !>: <summary>
+# where <type> is one of feat|fix|refactor|chore|test|docs|style|perf|build|ci|revert.
+#
+# Allows merge/revert/fixup commits through (they have their own conventions).
+# See the atomic-commits skill.
+#
+# Argument: $1 = path to the file holding the commit message.
+
+msg_file="$1"
+[ -n "$msg_file" ] || { echo "commit-msg: no message file"; exit 1; }
+
+# First non-comment, non-empty line.
+subject="$(grep -v '^#' "$msg_file" | sed '/^[[:space:]]*$/d' | head -n1)"
+
+# Pass-through for git-generated subjects that don't follow conventional commits.
+case "$subject" in
+  "Merge "*|"Revert "*|"fixup! "*|"squash! "*) exit 0 ;;
+esac
+
+# type(scope)!: summary   — scope and ! optional; summary required and non-empty.
+pattern='^(feat|fix|refactor|chore|test|docs|style|perf|build|ci|revert)(\([a-z0-9._/-]+\))?(!)?: .+'
+
+if printf '%s' "$subject" | grep -Eq "$pattern"; then
+  exit 0
+fi
+
+cat >&2 <<EOF
+commit-msg: subject does not match the conventional-commit format.
+
+  got:      $subject
+  expected: <type>(<optional scope>): <summary>
+  types:    feat fix refactor chore test docs style perf build ci revert
+
+  examples:
+    feat(auth): add refresh-token rotation
+    fix(parser): handle empty input without throwing
+    refactor: extract retry logic into withRetry
+
+EOF
+exit 1

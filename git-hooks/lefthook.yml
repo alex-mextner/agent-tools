@@ -1,0 +1,67 @@
+# lefthook.yml — example git-hook config for the lefthook runner.
+#
+# Pick the block matching your stack (bun/node, python-uv, or go) and delete the others,
+# or merge them — lefthook only runs commands whose tools exist. `lefthook install` wires
+# these into the repo's git hooks; the config is committed, so every clone gets the same
+# gates. See README.md.
+#
+# These mirror the standalone hooks in this directory. Run fast/scoped checks on
+# pre-commit and the full suite on pre-push (see the pre-commit-gate skill).
+
+pre-commit:
+  parallel: true
+  commands:
+    # ---- bun / node ----------------------------------------------------------------
+    lint:
+      glob: "*.{ts,tsx,js,jsx}"
+      run: node_modules/.bin/biome check --no-errors-on-unmatched {staged_files}
+      fail_text: "lint failed — fix before committing (no --no-verify)"
+    typecheck:
+      glob: "*.{ts,tsx}"
+      run: node_modules/.bin/tsc --noEmit
+      fail_text: "typecheck failed"
+    # ---- python (uv) ---------------------------------------------------------------
+    # ruff:
+    #   glob: "*.py"
+    #   run: uv run ruff check {staged_files} && uv run ruff format --check {staged_files}
+    # mypy:
+    #   glob: "*.py"
+    #   run: uv run mypy .
+    # ---- go ------------------------------------------------------------------------
+    # gofmt:
+    #   glob: "*.go"
+    #   run: test -z "$(gofmt -l {staged_files})"
+    # golangci:
+    #   glob: "*.go"
+    #   run: golangci-lint run ./...
+    # ---- universal: no type escape hatches (see no-type-escape-hatches skill) -------
+    no-type-escape-hatches:
+      glob: "*.{ts,tsx}"
+      # Flag unjustified casts/ignores in staged TS. A justified @ts-expect-error with
+      # an explanatory comment on the SAME line is allowed; bare ones are not.
+      run: |
+        if grep -nE '\bas any\b|\bas unknown as\b' {staged_files}; then
+          echo "no-type-escape-hatches: remove 'as any' / 'as unknown as' (see the skill)"; exit 1
+        fi
+        if grep -nE '@ts-ignore' {staged_files}; then
+          echo "no-type-escape-hatches: use @ts-expect-error with a justification, not @ts-ignore"; exit 1
+        fi
+      fail_text: "type escape hatch found"
+    # ---- universal: secret scan -----------------------------------------------------
+    no-secrets:
+      run: ./git-hooks/no-secrets-scan
+      fail_text: "secret detected in staged changes"
+
+commit-msg:
+  commands:
+    conventional-commit:
+      run: ./git-hooks/commit-msg {1}
+      fail_text: "commit subject must follow conventional-commit format"
+
+pre-push:
+  parallel: true
+  commands:
+    test:
+      # bun/node — swap for `uv run pytest` or `go test ./...` per stack.
+      run: npm test
+      fail_text: "tests failed — not pushing red"
