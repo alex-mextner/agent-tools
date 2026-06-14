@@ -1,0 +1,78 @@
+#!/bin/sh
+# run-global-hooks — the GLOBAL GIT-HOOK DISPATCHER.
+#
+# ONE entry point that runs an arbitrary, growing set of global git hooks for a
+# given hook event. A "global hook" is just an executable file dropped into
+#   ~/.config/git/global-hooks.d/<event>/
+# Adding a hook later = drop a file there; it then runs in EVERY wired repo
+# automatically, with ZERO per-repo edits. This is the single source of truth:
+# repos reference the dispatcher (one line); the LOGIC lives in global-hooks.d/.
+#
+# USAGE
+#   run-global-hooks <event> [args...]
+#     <event>  : pre-commit | commit-msg | pre-push | <any-hook-name>
+#     args     : forwarded verbatim to each hook (e.g. commit-msg gets $1 = msg file;
+#                pre-push gets <remote> <url> on argv and refs on stdin).
+#
+# SEMANTICS
+#   - Runs every EXECUTABLE file in global-hooks.d/<event>/ in shell `sort` order
+#     (number-prefix to control ordering: 10-secret-scan runs before 20-foo).
+#   - stdin is forwarded to every hook (pre-push needs it) — see the stdin spool.
+#   - ANY non-zero exit BLOCKS: the dispatcher stops, prints which hook blocked,
+#     and exits with that hook's status. An empty/absent event dir = pass (exit 0).
+#   - Non-executable files and dotfiles (README, .keep) are skipped.
+#
+# CONFIG
+#   GLOBAL_HOOKS_DIR  override the default ~/.config/git/global-hooks.d
+#   GLOBAL_HOOKS_DEBUG=1  trace which hooks run
+#
+# This file is the canonical copy. The same script ships in agent-tools at
+# git-hooks/global-dispatcher/run-global-hooks; keep them in sync.
+
+event="$1"
+[ -n "$event" ] || { echo "run-global-hooks: missing <event> argument" >&2; exit 2; }
+shift
+
+DIR="${GLOBAL_HOOKS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/git/global-hooks.d}/$event"
+
+# Empty / absent event dir => nothing to do.
+[ -d "$DIR" ] || exit 0
+
+# Spool stdin ONCE so every hook in the chain can read the same input (pre-push
+# delivers the pushed refs on stdin; without a spool only the first hook sees it).
+# Only spool if stdin is not a tty — otherwise we'd block waiting for input.
+stdin_spool=""
+if [ ! -t 0 ]; then
+  stdin_spool="$(mktemp "${TMPDIR:-/tmp}/global-hooks-stdin.XXXXXX")" || stdin_spool=""
+  if [ -n "$stdin_spool" ]; then
+    cat > "$stdin_spool"
+  fi
+fi
+cleanup() { [ -n "$stdin_spool" ] && rm -f "$stdin_spool"; }
+trap cleanup EXIT INT TERM
+
+rc=0
+for hook in "$DIR"/*; do
+  # Glob didn't match anything (literal "*") => empty dir, pass.
+  [ -e "$hook" ] || continue
+  # Skip non-executables, directories, and dotfiles (README/.keep live here too).
+  [ -f "$hook" ] || continue
+  [ -x "$hook" ] || continue
+  case "$(basename "$hook")" in .*) continue ;; esac
+
+  [ -n "$GLOBAL_HOOKS_DEBUG" ] && echo "run-global-hooks[$event]: -> $hook" >&2
+
+  if [ -n "$stdin_spool" ]; then
+    "$hook" "$@" < "$stdin_spool"
+  else
+    "$hook" "$@" < /dev/null
+  fi
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "" >&2
+    echo "run-global-hooks[$event]: BLOCKED by $(basename "$hook") (exit $rc)." >&2
+    exit "$rc"
+  fi
+done
+
+exit 0

@@ -1,0 +1,41 @@
+#!/bin/sh
+# Composing global pre-push hook (core.hooksPath = ~/.config/git/hooks).
+#
+# Runs the repo-local pre-push gate (if any), then the global-hooks dispatcher for
+# the pre-push event. ANY non-zero exit aborts the push.
+#
+# argv: <remote-name> <remote-url>. The pushed refs arrive on STDIN (one line per
+# ref: "<local ref> <local sha> <remote ref> <remote sha>"). Both argv and stdin are
+# forwarded to every stage — the dispatcher spools stdin so each hook can read it.
+#
+# Like the other composers, this only fires for repos that don't override
+# core.hooksPath locally; managed repos call the same dispatcher via injection.
+HOOK_DIR="$(dirname "$0")"
+git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" || exit 0
+[ -n "$git_dir" ] || exit 0
+
+# Spool stdin so BOTH the repo-local hook and the dispatcher see the pushed refs.
+stdin_spool=""
+if [ ! -t 0 ]; then
+  stdin_spool="$(mktemp "${TMPDIR:-/tmp}/global-prepush-stdin.XXXXXX")" || stdin_spool=""
+  [ -n "$stdin_spool" ] && cat > "$stdin_spool"
+fi
+cleanup() { [ -n "$stdin_spool" ] && rm -f "$stdin_spool"; }
+trap cleanup EXIT INT TERM
+
+feed() {
+  if [ -n "$stdin_spool" ]; then "$@" < "$stdin_spool"; else "$@" < /dev/null; fi
+}
+
+# --- 1. repo-local pre-push (shadowed by the global hooksPath; run it explicitly).
+local_hook="$git_dir/hooks/pre-push"
+if [ -x "$local_hook" ] && [ "$local_hook" != "$0" ]; then
+  feed "$local_hook" "$@" || exit $?
+fi
+
+# --- 2. global-hooks dispatcher (pre-push event).
+if [ -x "$HOOK_DIR/../run-global-hooks" ]; then
+  feed "$HOOK_DIR/../run-global-hooks" pre-push "$@" || exit $?
+fi
+
+exit 0

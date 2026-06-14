@@ -1,0 +1,28 @@
+#!/bin/sh
+# Composing global commit-msg hook (core.hooksPath = ~/.config/git/hooks).
+#
+# Runs the repo-local commit-msg gate (if any), then the global-hooks dispatcher
+# for the commit-msg event. ANY non-zero exit blocks the commit.
+#
+# $1 is the path to the file holding the proposed commit message; it is forwarded
+# verbatim to every stage.
+#
+# Like the pre-commit composer, this only fires for repos that don't override
+# core.hooksPath locally. Repos with a local hook manager call the same dispatcher
+# via a one-line injection.
+HOOK_DIR="$(dirname "$0")"
+git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" || exit 0
+[ -n "$git_dir" ] || exit 0
+
+# --- 1. repo-local commit-msg (shadowed by the global hooksPath; run it explicitly).
+local_hook="$git_dir/hooks/commit-msg"
+if [ -x "$local_hook" ] && [ "$local_hook" != "$0" ]; then
+  "$local_hook" "$@" || exit $?
+fi
+
+# --- 2. global-hooks dispatcher (commit-msg event).
+if [ -x "$HOOK_DIR/../run-global-hooks" ]; then
+  "$HOOK_DIR/../run-global-hooks" commit-msg "$@" || exit $?
+fi
+
+exit 0

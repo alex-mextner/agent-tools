@@ -1,0 +1,148 @@
+#!/bin/sh
+# hooks-sweep — find every repo whose LOCAL hook manager shadows the global hooks and
+# wire it into the dispatcher. A MANUAL, run-anytime tool. NO cron, NO launchd, NO
+# scheduled job — you run it when you remember (or never; the passive layers below
+# catch new repos). It is idempotent: re-running only touches repos that aren't wired.
+#
+# WHY THIS EXISTS
+#   `core.hooksPath = ~/.config/git/hooks` covers repos with no local override. Repos
+#   with lefthook/husky/raw .git/hooks bypass it. This sweep retrofits those.
+#
+# PASSIVE LAYERS that make a sweep rarely necessary (set up once, no schedule):
+#   - git config --global init.templateDir ~/.config/git/template  -> new repos get
+#     dispatcher hooks at `git init`/`git clone`.
+#   - lefthook.yml / .husky/pre-commit TEMPLATES (agent-tools) that already include the
+#     dispatcher call -> copy them when starting a managed repo.
+#   This sweep only mops up EXISTING managed repos created before wiring.
+#
+# USAGE
+#   hooks-sweep                 # scan ~/work and ~/xp, wire unwired managed repos
+#   hooks-sweep --dry-run       # report what WOULD be wired; change nothing
+#   hooks-sweep DIR1 DIR2 ...    # scan these roots instead of the defaults
+#   HOOKS_SWEEP_SKIP="path1:path2"  # colon-separated repo paths to skip (active agents)
+#   HOOKS_SWEEP_DEPTH=N         # max dir depth to search (default 4)
+#
+# Repos with NO local hooksPath override are SKIPPED — they're already covered by the
+# global composer, nothing to do.
+
+set -eu
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTALLER="$SELF_DIR/install-local-hooks.sh"
+# Fall back to the installed copy in ~/.config/git if running the shipped one elsewhere.
+[ -x "$INSTALLER" ] || INSTALLER="${XDG_CONFIG_HOME:-$HOME/.config}/git/install-local-hooks.sh"
+[ -x "$INSTALLER" ] || { echo "hooks-sweep: install-local-hooks.sh not found/executable next to me or in ~/.config/git" >&2; exit 2; }
+
+DRY=0
+ROOTS=""
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY=1 ;;
+    -*) echo "hooks-sweep: unknown flag $a" >&2; exit 2 ;;
+    *) ROOTS="$ROOTS $a" ;;
+  esac
+done
+[ -n "$ROOTS" ] || ROOTS="$HOME/work $HOME/xp"
+DEPTH="${HOOKS_SWEEP_DEPTH:-4}"
+SKIP="${HOOKS_SWEEP_SKIP:-}"
+MARKER="global-git-hooks-dispatcher"
+
+is_skipped() {
+  # $1 = repo path. Match against colon-separated HOOKS_SWEEP_SKIP (substring on
+  # normalized path so a parent dir or the exact repo both work).
+  [ -n "$SKIP" ] || return 1
+  _p="$1"
+  _OLDIFS="$IFS"; IFS=':'
+  for s in $SKIP; do
+    [ -n "$s" ] || continue
+    case "$_p" in *"$s"*) IFS="$_OLDIFS"; return 0 ;; esac
+  done
+  IFS="$_OLDIFS"; return 1
+}
+
+manager_of() {
+  # echo lefthook|husky|raw|none for repo $1. "none" => no local override, skip.
+  _r="$1"
+  _hp="$(git -C "$_r" config --local core.hooksPath 2>/dev/null || true)"
+  if [ -f "$_r/lefthook.yml" ] || [ -f "$_r/lefthook.yaml" ] || [ -f "$_r/.lefthook.yml" ]; then echo lefthook; return; fi
+  if [ -d "$_r/.husky" ]; then echo husky; return; fi
+  # raw only counts if it actually overrides hooksPath locally OR ships hook files.
+  if [ -n "$_hp" ] && [ "$_hp" != "$(git -C "$_r" config --global core.hooksPath 2>/dev/null || true)" ]; then echo raw; return; fi
+  echo none
+}
+
+is_wired() {
+  # $1 repo, $2 manager. Return 0 if the dispatcher marker is already present.
+  _r="$1"; _m="$2"
+  case "$_m" in
+    lefthook)
+      for f in "$_r/lefthook.yml" "$_r/lefthook.yaml" "$_r/.lefthook.yml"; do
+        [ -f "$f" ] && grep -q "$MARKER" "$f" && return 0
+      done; return 1 ;;
+    husky)
+      [ -f "$_r/.husky/pre-commit" ] && grep -q "$MARKER" "$_r/.husky/pre-commit" && return 0; return 1 ;;
+    raw)
+      _hp="$(git -C "$_r" config --local core.hooksPath 2>/dev/null || echo "$_r/.git/hooks")"
+      case "$_hp" in /*) : ;; *) _hp="$_r/$_hp" ;; esac
+      [ -f "$_hp/pre-commit" ] && grep -q "$MARKER" "$_hp/pre-commit" && return 0; return 1 ;;
+  esac
+  return 1
+}
+
+echo "hooks-sweep: scanning [$ROOTS] depth<=$DEPTH${DRY:+ (dry-run)}"
+[ "$DRY" = 1 ] && echo "hooks-sweep: DRY RUN — no changes will be made"
+[ -n "$SKIP" ] && echo "hooks-sweep: skip list = $SKIP"
+
+n_wired=0; n_already=0; n_skip=0; n_nooverride=0; n_fail=0
+
+# Find git repos: dirs containing a .git (dir or file). We PRUNE noise that should
+# never be wired independently:
+#   - node_modules / .git internals / caches  : not project roots.
+#   - worktree dirs (.worktrees, *-worktrees, .claude/worktrees) : a linked worktree
+#     SHARES the parent repo's tracked config (lefthook.yml). Wiring it would dirty the
+#     same file in many checkouts. We wire the PARENT once; worktrees inherit it.
+#   - cloned-projects / libs / vendored deps   : third-party, not ours to gate.
+# A repo whose `.git` is a FILE (a linked worktree) is also skipped below for the same
+# reason — its config belongs to the main repo.
+for root in $ROOTS; do
+  [ -d "$root" ] || { echo "  (root not found: $root)"; continue; }
+  # -maxdepth keeps it fast; repos deeper than DEPTH are rare for top-level projects.
+  find "$root" -maxdepth "$DEPTH" \
+       \( -name node_modules -o -name .git -o -name .worktrees -o -name worktrees \
+          -o -name '*-worktrees' -o -name .uv-cache -o -name .cache \
+          -o -name cloned-projects -o -name libs -o -name dist -o -name build \) -prune \
+       -o -type d -print 2>/dev/null \
+    | while IFS= read -r d; do
+        [ -e "$d/.git" ] || continue                      # a git repo root
+        # Skip linked worktrees: .git is a FILE pointing into the main repo's gitdir.
+        # The main repo owns the tracked hook config; don't touch worktree checkouts.
+        if [ -f "$d/.git" ]; then
+          echo "  ok   (worktree)     $(cd "$d" && pwd)"; continue
+        fi
+        repo="$(cd "$d" && pwd)"
+        if is_skipped "$repo"; then
+          echo "  SKIP (skip-list)    $repo"; continue
+        fi
+        m="$(manager_of "$repo")"
+        if [ "$m" = none ]; then
+          echo "  ok   (no override)  $repo"; continue
+        fi
+        if is_wired "$repo" "$m"; then
+          echo "  ok   (already $m)   $repo"; continue
+        fi
+        if [ "$DRY" = 1 ]; then
+          echo "  WOULD WIRE ($m)     $repo"; continue
+        fi
+        if "$INSTALLER" "$repo" >/tmp/.hooks-sweep.$$ 2>&1; then
+          echo "  WIRED ($m)          $repo"
+          sed 's/^/      /' /tmp/.hooks-sweep.$$
+        else
+          echo "  FAIL ($m)           $repo"
+          sed 's/^/      /' /tmp/.hooks-sweep.$$
+        fi
+        rm -f /tmp/.hooks-sweep.$$
+      done
+done
+
+echo "hooks-sweep: done. (counts are per-line above; re-run is idempotent.)"
+echo "hooks-sweep: REMINDER — this is a MANUAL tool. No cron/launchd was installed."
