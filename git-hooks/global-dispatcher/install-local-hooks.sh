@@ -89,30 +89,41 @@ inject_lefthook() {
       else if (ev == "commit-msg") print run_cm
       else if (ev == "pre-push") print run_pp
     }
-    BEGIN { seen["pre-commit"]=0; seen["commit-msg"]=0; seen["pre-push"]=0 }
-    # Track when we are inside a known event block and inject right after its
-    # `commands:` line. A top-level event key is at column 0 and ends with ":".
+    BEGIN {
+      split("pre-commit commit-msg pre-push", order, " ")
+      for (k = 1; k <= 3; k++) { e = order[k]; hdr[e] = 0; cmds[e] = 0 }
+    }
+    # Record, per event: the header line index (hdr) and its `commands:` line index
+    # (cmds, 0 if the block has no commands: key — e.g. a scripts:-only block).
     {
       lines[NR] = $0
       if ($0 ~ /^(pre-commit|commit-msg|pre-push):[ \t]*$/) {
-        ev = $0; sub(/:.*/, "", ev); cur_event = ev
+        ev = $0; sub(/:.*/, "", ev); cur_event = ev; hdr[ev] = NR
       } else if ($0 ~ /^[^ \t#]/) {
         cur_event = ""   # left the block (some other top-level key)
       }
-      if (cur_event != "" && $0 ~ /^[ \t]+commands:[ \t]*$/ && seen[cur_event] == 0) {
-        inject_after[NR] = cur_event; seen[cur_event] = 1
+      if (cur_event != "" && cmds[cur_event] == 0 && $0 ~ /^[ \t]+commands:[ \t]*$/) {
+        cmds[cur_event] = NR
       }
     }
     END {
-      for (i = 1; i <= NR; i++) {
-        print lines[i]
-        if (i in inject_after) emit(inject_after[i])
-      }
-      # For events that had no block at all, append a fresh one.
-      split("pre-commit commit-msg pre-push", order, " ")
+      # Decide the injection point for each present event.
+      #  - has commands:  -> inject right AFTER the commands: line.
+      #  - block but no commands: -> inject right AFTER the header, prefixing a commands: line.
       for (k = 1; k <= 3; k++) {
         e = order[k]
-        if (seen[e] == 0) { print e ":"; print "  commands:"; emit(e) }
+        if (cmds[e] > 0)      { after_cmds[cmds[e]] = e }
+        else if (hdr[e] > 0)  { after_hdr[hdr[e]]  = e }
+      }
+      for (i = 1; i <= NR; i++) {
+        print lines[i]
+        if (i in after_cmds) emit(after_cmds[i])
+        if (i in after_hdr)  { print "  commands:"; emit(after_hdr[i]) }
+      }
+      # Events with no block at all -> append a fresh one.
+      for (k = 1; k <= 3; k++) {
+        e = order[k]
+        if (hdr[e] == 0) { print e ":"; print "  commands:"; emit(e) }
       }
     }
   ' "$cfg" > "$tmp"
