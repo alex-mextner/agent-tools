@@ -1,0 +1,6 @@
+#!/bin/sh
+# Template commit-msg hook (see hooks/pre-commit for the rationale).
+# $1 = path to the proposed commit-message file; forwarded to the dispatcher.
+DISP="${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks"
+[ -x "$DISP" ] && { "$DISP" commit-msg "$@" || exit $?; }
+exit 0

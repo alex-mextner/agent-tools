@@ -5,6 +5,14 @@ Copyable git hooks plus a `lefthook.yml` example, generalized across three toolc
 the repo root and runs the matching gate, so the same file drops into any of the three
 kinds of project.
 
+> **Want a hook to run in EVERY repo on the machine — even ones with lefthook/husky that
+> override `core.hooksPath`?** Use the **global dispatcher** in
+> [`global-dispatcher/`](global-dispatcher/README.md): one entry point + a drop-in
+> `~/.config/git/global-hooks.d/` directory, plus `install-local-hooks.sh` and a manual
+> `hooks-sweep` to retrofit existing repos. The standalone hooks below are the per-repo
+> building blocks; the dispatcher is how you make them universal. See the
+> `global-git-hooks` skill.
+
 ## What's here
 
 | File              | Hook point   | Does                                                              |

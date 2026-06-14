@@ -1,0 +1,78 @@
+---
+name: global-git-hooks
+description: Use when you want a git hook to run in EVERY repo on the machine — not just the one in front of you — or when a repo with a local hook manager (lefthook/husky) or raw .git/hooks is bypassing the global core.hooksPath. Explains the dispatcher model (one entry point, a drop-in global-hooks.d/ directory), how to add a hook once and have it run everywhere, how to wire a single repo, and the passive layers (templateDir + manager templates + a MANUAL sweep, never cron) that keep new repos covered.
+---
+
+# Global git hooks: one dispatcher, runs everywhere
+
+A global `core.hooksPath` covers repos that don't override it. But a repo with a local
+hook manager (lefthook → `.git/hooks`, husky → `.husky/_`) or its own raw `.git/hooks`
+**overrides `core.hooksPath` and silently shadows every global hook**. The result: your
+secret-scan (and anything else you put in the global path) does NOT run in exactly the
+repos most likely to need it. The fix is a dispatcher, not N copies of N hooks.
+
+## The model
+
+- **One entry point**: `~/.config/git/run-global-hooks <event>`.
+- **One drop-in directory**: `~/.config/git/global-hooks.d/<event>/`. A global hook is
+  just an executable file there. The dispatcher runs them all in sort order; any non-zero
+  blocks; an empty dir passes.
+- **Every repo calls the dispatcher once per event.** Adding a new global hook later is a
+  single-file drop — it then runs in every wired repo with ZERO per-repo edits.
+
+Do NOT inject individual hooks into repos. Inject the **dispatcher** (one line per event).
+That's what makes "add a hook once, it runs everywhere" true.
+
+## Add a hook (the entire workflow)
+
+```sh
+printf '#!/bin/sh\n<your check; non-zero to block>\nexit 0\n' \
+  > ~/.config/git/global-hooks.d/pre-commit/20-my-check
+chmod +x ~/.config/git/global-hooks.d/pre-commit/20-my-check
+```
+
+Number prefixes order them (`10-` before `20-`). pre-push hooks get the pushed refs on
+stdin; commit-msg hooks get the message-file path as `$1`.
+
+## Wire a repo
+
+```sh
+install-local-hooks.sh [REPO_DIR]    # detects lefthook | husky | raw, injects ONE
+                                     # dispatcher call per event, idempotent (marker)
+```
+
+- **lefthook**: a `global-git-hooks-dispatcher` command is MERGED under each event (never
+  clobbers your lint/test commands). The `run:` value MUST be a single-quoted YAML scalar.
+- **husky**: a guarded dispatcher line is appended to `.husky/<event>`.
+- **raw**: the dispatcher call is inserted after the shebang in `.git/hooks/<event>`, so it
+  runs even if the existing body later `exit`s; the body is preserved.
+- **no override**: nothing to do — the global composer already covers the repo.
+
+For a pull-only checkout (e.g. a shared main), inject into the manager's tracked config on
+a **branch**, not the working tree, and commit it there.
+
+## Never forget — three passive layers, NEVER a schedule
+
+1. `git config --global init.templateDir ~/.config/git/template` — new `git init`/`clone`
+   repos get dispatcher hooks automatically.
+2. Manager templates (`templates/lefthook.yml`, `templates/husky/*`) preseeded with the
+   dispatcher call — copy one when starting a new managed repo.
+3. `hooks-sweep` — a MANUAL, run-anytime scan of `~/work`+`~/xp` that retrofits existing
+   unwired managed repos (idempotent). **Do not** install a cron/launchd job for it; the
+   passive layers catch new repos and the sweep is there for the occasional mop-up.
+
+```sh
+hooks-sweep --dry-run        # see what would be wired
+hooks-sweep                  # wire them (idempotent)
+```
+
+## Don't
+
+- Don't copy each hook into each repo — that's the N×M trap this replaces.
+- Don't unquote the lefthook `run:` value — `run: "..." pre-commit` is invalid YAML.
+- Don't schedule the sweep. It's a tool, not a daemon.
+- Don't put bypass-resistant or mid-session rules here — a git hook can't block its own
+  `--no-verify`. Those belong in an agent hook (`agent-tools/agent-hooks/`).
+
+Reference implementation + the shipped script twins:
+`agent-tools/git-hooks/global-dispatcher/` (README there has the full file map).

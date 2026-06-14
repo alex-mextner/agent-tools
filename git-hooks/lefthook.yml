@@ -11,6 +11,14 @@
 pre-commit:
   parallel: true
   commands:
+    # ---- global git-hook dispatcher (runs secret-scan + every future global hook) ---
+    # This ONE command wires the repo into ~/.config/git/global-hooks.d/ so any hook
+    # dropped there runs here too, with no further per-repo edits. The run: value MUST
+    # be a single-quoted YAML scalar. See global-dispatcher/README.md and the
+    # global-git-hooks skill. (Replaces the standalone `no-secrets` command below for
+    # repos wired to the dispatcher — the dispatcher's 10-secret-scan supersedes it.)
+    global-git-hooks-dispatcher:
+      run: '"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" pre-commit'
     # ---- bun / node ----------------------------------------------------------------
     lint:
       glob: "*.{ts,tsx,js,jsx}"
@@ -54,6 +62,8 @@ pre-commit:
 
 commit-msg:
   commands:
+    global-git-hooks-dispatcher:
+      run: '"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" commit-msg {1}'
     conventional-commit:
       run: ./git-hooks/commit-msg {1}
       fail_text: "commit subject must follow conventional-commit format"
@@ -61,6 +71,8 @@ commit-msg:
 pre-push:
   parallel: true
   commands:
+    global-git-hooks-dispatcher:
+      run: '"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" pre-push'
     test:
       # bun/node — swap for `uv run pytest` or `go test ./...` per stack.
       run: npm test

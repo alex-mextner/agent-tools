@@ -1,0 +1,6 @@
+#!/bin/sh
+# Template pre-push hook (see hooks/pre-commit for the rationale).
+# argv = <remote> <url>; pushed refs arrive on stdin and are forwarded.
+DISP="${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks"
+[ -x "$DISP" ] && { "$DISP" pre-push "$@" || exit $?; }
+exit 0

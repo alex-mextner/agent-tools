@@ -1,0 +1,14 @@
+#!/bin/sh
+# .husky/pre-commit TEMPLATE — preseeded with the global git-hook dispatcher.
+#
+# Copy this into a NEW husky-managed repo's .husky/ dir so it's wired into the global
+# hooks from day one. Put your repo's own commands ABOVE the dispatcher line (e.g.
+# `npx lint-staged`). The guarded line runs every global hook for this event via
+# ~/.config/git/run-global-hooks; do not remove the marker comment (it's what makes
+# install-local-hooks.sh / hooks-sweep treat this file as already wired).
+
+# ---- your repo's own pre-commit commands go here (example) ----
+# npx lint-staged
+
+# global-git-hooks-dispatcher — runs every global hook for this event (see agent-tools git-hooks/global-dispatcher)
+"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" pre-commit "$@" || exit $?

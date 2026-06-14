@@ -1,0 +1,37 @@
+# lefthook.yml TEMPLATE — preseeded with the global git-hook dispatcher.
+#
+# Copy this into a NEW lefthook-managed repo so it's wired into the global hooks from
+# day one (no `hooks-sweep` needed later). The `global-git-hooks-dispatcher` command in
+# each event runs ~/.config/git/run-global-hooks <event>, which executes every hook in
+# ~/.config/git/global-hooks.d/<event>/ (secret-scan today, more later) with ZERO further
+# per-repo edits. Add your repo's own lint/typecheck/test commands alongside it.
+#
+# The dispatcher `run:` value is a SINGLE-QUOTED YAML scalar on purpose — the embedded
+# double-quotes and ${...} default are literal in YAML and expanded by the shell lefthook
+# hands the string to. Do NOT unquote it (that's invalid YAML).
+
+pre-commit:
+  parallel: true
+  commands:
+    global-git-hooks-dispatcher:
+      run: '"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" pre-commit'
+    # ---- add your repo's own pre-commit gates below (examples) ----------------------
+    # lint:
+    #   glob: "*.{ts,tsx,js,jsx}"
+    #   run: node_modules/.bin/biome check --no-errors-on-unmatched {staged_files}
+    # typecheck:
+    #   glob: "*.{ts,tsx}"
+    #   run: node_modules/.bin/tsc --noEmit
+
+commit-msg:
+  commands:
+    global-git-hooks-dispatcher:
+      run: '"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" commit-msg {1}'
+
+pre-push:
+  parallel: true
+  commands:
+    global-git-hooks-dispatcher:
+      run: '"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" pre-push'
+    # tests:
+    #   run: npm test

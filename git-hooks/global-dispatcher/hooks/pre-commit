@@ -1,0 +1,49 @@
+#!/bin/sh
+# Composing global pre-commit hook (core.hooksPath = ~/.config/git/hooks).
+#
+# Runs three gates IN ORDER and blocks the commit if ANY of them blocks:
+#
+#   1. repo-local pre-commit  ($REPO/.git/hooks/pre-commit, if executable)
+#        — the repo's own quality gate (lint/types/tests). Run FIRST because a
+#          global hooksPath shadows it, and it must still fire.
+#   2. global-hooks dispatcher  (../run-global-hooks pre-commit)
+#        — runs EVERY executable in ~/.config/git/global-hooks.d/pre-commit/ in
+#          order (10-secret-scan, …). Adding a global hook = drop a file there;
+#          no edit to this composer is ever needed again. ANY hook non-zero => BLOCK.
+#   3. review-gate            (./review-gate)
+#        — review-before-commit gate (staged diff must have been reviewed).
+#
+# This composer only fires for repos that DON'T override core.hooksPath locally
+# (review-cli, conloca). Repos with a local hook manager (lefthook/husky/raw)
+# bypass it — they invoke the SAME dispatcher via a one-line injection instead
+# (see agent-tools git-hooks/global-dispatcher/install-local-hooks.sh).
+#
+# Bypass EVERYTHING (last resort): REVIEW_SKIP=1 git commit ... | git commit --no-verify
+HOOK_DIR="$(dirname "$0")"
+# Bail out cleanly if we're somehow not inside a git repo (also our git-dir lookup).
+git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" || exit 0
+[ -n "$git_dir" ] || exit 0
+
+# --- 1. repo-local pre-commit (run once, here; downstream stages must NOT re-run it).
+# A global core.hooksPath SHADOWS the repo's own pre-commit, so run it explicitly.
+# NOTE: `git rev-parse --git-path hooks/pre-commit` is WRONG under a global hooksPath —
+# it returns the global path (this very file), so the hook would skip itself and the
+# repo-local gate would never fire. Resolve against the absolute git dir instead, which
+# is correct for normal repos, worktrees, and submodules (where .git is a file).
+local_hook="$git_dir/hooks/pre-commit"
+# Guard: don't recurse into ourselves if hooksPath happens to point at the git dir.
+if [ -x "$local_hook" ] && [ "$local_hook" != "$0" ]; then
+  "$local_hook" "$@" || exit $?
+fi
+
+# --- 2. global-hooks dispatcher (the extensible set; secret-scan + future hooks).
+if [ -x "$HOOK_DIR/../run-global-hooks" ]; then
+  "$HOOK_DIR/../run-global-hooks" pre-commit "$@" || exit $?
+fi
+
+# --- 3. review-before-commit gate.
+if [ -x "$HOOK_DIR/review-gate" ]; then
+  "$HOOK_DIR/review-gate" "$@" || exit $?
+fi
+
+exit 0

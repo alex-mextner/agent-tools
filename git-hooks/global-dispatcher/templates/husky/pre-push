@@ -1,0 +1,7 @@
+#!/bin/sh
+# .husky/pre-push TEMPLATE — preseeded with the global git-hook dispatcher.
+# argv = <remote> <url>; pushed refs arrive on stdin and are forwarded.
+# Put your repo's own pre-push checks above the dispatcher line.
+
+# global-git-hooks-dispatcher — runs every global hook for this event (see agent-tools git-hooks/global-dispatcher)
+"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" pre-push "$@" || exit $?
