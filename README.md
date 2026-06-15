@@ -43,8 +43,21 @@ when-to-use trigger; the body is the rule. They have no runtime and no dependenc
 
 ```
 skills/universal/shell-timeouts/SKILL.md
+skills/universal/web-page-reading-agent-browser/SKILL.md
 skills/by-type/backend/atomic-db-transactions/SKILL.md
 ```
+
+> **Reading a web page, API doc, or reference?** Reach for the
+> [`web-page-reading-agent-browser`](skills/universal/web-page-reading-agent-browser/SKILL.md)
+> skill: drive the [`agent-browser`](https://github.com/vercel-labs/agent-browser) CLI
+> (`open` + `get text body` / `eval`) instead of a fetch-and-summarize tool that
+> **truncates long pages and silently drops content**. It loads the full JS-rendered page
+> and lets you extract just the section you need — for very long pages, extract a bounded
+> slice (scoped selector / `eval`) or save to a file, so your own tool's output limit
+> doesn't re-truncate it. `agent-browser` is a standalone
+> third-party CLI (`npm i -g agent-browser && agent-browser install`, or `cargo install
+> agent-browser && agent-browser install`) — not bundled here; the skill is the advisory
+> "reach for it, and how."
 
 ## Installing the agent-hooks
 
@@ -86,12 +99,14 @@ the [`ci-gate-suite`](skills/universal/ci-gate-suite/SKILL.md) skill.
 
 ## Inventory
 
-- **Universal skills:** 30 — shell-timeouts, exit-codes-through-pipes, dead-code-
+- **Universal skills:** 31 — shell-timeouts, exit-codes-through-pipes, dead-code-
   investigation, TDD red-first, test discipline, atomic commits, pre-commit gate, secret
   scanning (gitleaks, hook + CI), CI gate suite, global git-hooks dispatcher, comment &
   naming hygiene, no type escape hatches, systematic debugging, smallest change, shared-util
   single-source, file-header comments, promise = durable action, worktree-base trap, visual
-  proof cycle, GAN critic loop, completion self-check, semantic code search, and more.
+  proof cycle, GAN critic loop, completion self-check, semantic code search, **web-page
+  reading via agent-browser** (read full pages/docs with the `agent-browser` CLI instead of
+  a truncating fetch tool), and more.
 - **By-type skills:** 45 — bot (12), backend (13), frontend (4), cli (7), library (4),
   infra (1), monorepo (4).
 - **Agent-hooks:** 6 — block-no-verify, block-secrets-write, require-review-before-commit,
