@@ -147,9 +147,20 @@ tool migrates to import from the lib.
   in PR #4, merged.)
 
 ### 5. rig
-- **Enable repo security settings at init/apply** (#3696/#85): `gh api` enable Dependency Graph +
-  vuln-alerts (+ secret-scanning) so the CI gates run instead of skipping. (Done manually on wave-1.)
-  (alex-mextner/rig-cli#5)
+- **rig provisions REPOSITORY SETTINGS at init/apply** (config-driven, sensible defaults ON) (#3696/#85,
+  CTO 2026-06-15): rig.yaml declares the repo's GitHub settings and `rig init`/`rig apply` reconciles them,
+  the same way it does skills/hooks/CI. **Two backends, auto-selected per setting:**
+  - **`gh api`** for everything the GitHub API exposes: **branch protection / rulesets** (require-PR,
+    required status checks + reviews, linear history, block force-push — the `…/settings/rules/` the CTO
+    just enabled by hand), **GHAS** (Dependency Graph + vuln-alerts + secret-scanning + code-scanning),
+    merge-button policy (squash-only, auto-delete head branch, auto-merge), Actions permissions, etc.
+  - **`agent-browser`** for settings the API does NOT expose — drive the GitHub settings UI headlessly to
+    flip the switches `gh api` can't reach. A first-class rig backend invoked INSIDE init/apply, not a
+    manual step.
+  Everything maps onto rig.yaml (a `repo:`/`github:` block) with the **secure/sensible set enabled by
+  default**, so a fresh `rig init` lands the guardrails (branch protection + GHAS + squash-merge + ship gate)
+  with zero hand-toggling. `rig status` reports drift on these like any other managed artifact. (Supersedes
+  the narrow "gh api enable Dependency Graph" scope.) (alex-mextner/rig-cli#5)
 - **Auto-mode is COMMITTED** (decision REVERSED 2026-06-15, CTO): `.claude/settings.json` is Claude
   Code's SHARED/committed slot — committing it (`defaultMode: bypassPermissions`) is what makes auto-mode
   turn on by itself on every checkout. The personal per-machine slot is `.claude/settings.local.json`
