@@ -188,9 +188,13 @@ tool migrates to import from the lib.
 
 ### 8. agent-tools harvest (one centralized pass, from rollout reports)
 Tracking issue: alex-mextner/agent-tools#14.
-- Candidate skills: **worktree-via-project-CLI** (dep provisioning, distinct from worktree-base-trap),
-  **subagent-delegation contract**, **"diagnostic image ≠ proof"** acceptance bar, **queued-report
-  durability** (channel-unavailable → don't fake delivery). (Sources: 3d-cli AGENTS.)
+- Candidate skills (Sources: 3d-cli AGENTS):
+  - ✅ **worktree-via-project-cli** (dep provisioning, distinct from worktree-base-trap) — authored
+    (`skills/universal/`), GREEN-verified per writing-skills.
+  - ✅ **queued-report-durability** (channel-unavailable → don't fake delivery) — authored, GREEN-verified.
+  - ⏭️ **subagent-delegation contract** — SKIPPED: already covered by `subagent-handoff-contract` (dupe).
+  - ⏭️ **"diagnostic image ≠ proof" acceptance bar** — SKIPPED: overlaps `visual-proof-cycle`; fold a
+    proof-claim acceptance-bar note into that skill rather than ship a near-duplicate.
 - `strict-ticket-discipline` skill + `require-ticket-before-commit` guard (with task-cli).
 
 ### 9. Misc / cleanup
