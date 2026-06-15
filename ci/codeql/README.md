@@ -38,9 +38,18 @@ Then edit the `language` matrix for your stack.
   even more (adds maintainability), or drop the line for the default suite.
 - **Severity floor** (self-gate only) — `GATE_LEVELS` env. `"error warning"` (default,
   recommended) gates on error+warning; `error` gates only the highest severity.
-- **Suppression** (self-gate only) — `// codeql[<rule-id>]` on the flagged line or the one
-  above it suppresses a single justified false positive. Greppable and reviewable — not a
-  silent baseline.
+- **Suppression** (self-gate only) — a `codeql[<rule-id>]` marker on the flagged line, or
+  anywhere in the contiguous comment block directly above it, suppresses a single justified
+  false positive (so a multi-line justification block works; the scan stops at the first
+  blank/non-comment line so a marker can't leak across statements). Both comment styles work:
+  `// codeql[<rule-id>]` (JS/TS) and `# codeql[<rule-id>]` (YAML for the `actions` language,
+  Python, shell). Greppable and reviewable — not a silent baseline.
+- **Language not in the repo** (self-gate only) — the matrix ships a broad default
+  (`javascript-typescript` + `actions`). A preflight step checks whether the repo actually
+  contains source for each matrix language; if not (e.g. a Python-only repo has zero JS/TS),
+  that language is **skipped cleanly** with a notice instead of hard-failing on CodeQL's
+  "No source code seen" error. Trim the matrix to your real stack to drop the notice. Where
+  source IS present nothing changes — the gate runs and blocks on findings as before.
 
 ## Pinning / supply-chain
 
