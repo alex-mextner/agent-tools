@@ -14,7 +14,5 @@ build/
 dist/
 .pytest_cache/
 
-# Per-machine harness settings written by `rig apply` (defaultMode=bypassPermissions).
-# Not reproducible across machines — keep untracked. See rig.yaml header note (rig-cli#6).
-.claude/settings.json
+# Claude Code personal settings slot (per-machine overrides) — never committed.
 .claude/settings.local.json

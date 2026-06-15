@@ -40,10 +40,41 @@ Status snapshot: **2026-06-15**. This is the handoff/roadmap for the agent-nativ
 - ✅ New agent-hook `block-raw-pr-merge` (forces `gh ship`, escape-hatch) — PR #8 merged.
 - ✅ Shared-lib architecture **design doc** at `docs/specs/2026-06-15-shared-lib-architecture.md`
   (NOTE: its `lib/ts`/contracts-twinning part is SUPERSEDED — Python-only).
-- ✅ **Auto-mode provisioned (self-dogfood)** — committed `rig.yaml` (`harness.auto_mode: true`) +
-  gitignored local `.claude/settings.json` (`bypassPermissions`). agent-tools was a pending wave-2
-  target that had never been run through rig (no rig.yaml at all); now done. Installed `rig` still
-  doesn't gitignore the settings file (rig-cli#6 unfixed), so the `.gitignore` lines were added by hand.
+- ✅ **Auto-mode provisioned + made AUTOMATIC (self-dogfood)** — committed `rig.yaml`
+  (`harness.auto_mode: true`) AND committed `.claude/settings.json` (`bypassPermissions`). Reversed an
+  earlier wrong call: `.claude/settings.json` is Claude Code's SHARED/committed slot, so committing it is
+  what makes auto-mode turn on by itself on a fresh checkout (gitignoring it was the reason it "didn't
+  turn on" — CTO caught this). Only `.claude/settings.local.json` (the personal slot) stays gitignored.
+  Matches the rig-cli reference. ⚠️ Safety caveat: the "safe because agent-hooks intercept" rationale is
+  bridge-pending — CC-level guards are INERT until the #18 hook-bridge lands + is live-verified.
+- ✅ **CI gates de-GHAS'd (PR #23 merged)** — the rig-shipped gates depended on PAID GitHub features and
+  hard-failed on the hyper org/private repo. Dropped them for free OSS engines (CTO call, tg#3774):
+  `secret-scan.yml` → gitleaks **OSS binary** (`gitleaks dir`; same engine+ruleset, no org license, vs the
+  `gitleaks-action` that demands a paid `GITLEAKS_LICENSE`); `dependency-review.yml` → scripted
+  `dep-audit.sh` (whole-tree bun/npm/pip/cargo/go audit, no GHAS, vs `dependency-review-action` that needs
+  GHAS on private repos). READMEs corrected (the old "GHAS only for the dashboard" claim was wrong). Verified
+  parity (tg#3777): secrets 1:1, vulns equal-or-better; **one gap = license-policy → #21**. CodeQL
+  actions-suppressions in the leftover-grep/review-threads templates were already correct (untouched).
+
+### hyper #463 (rig-rollout PR) — how it goes green
+- The 3 red checks on #463 were all from the GHAS/licensed gates above; **PR #23 fixes them at the source**.
+  #463 goes green when the **rig agent re-applies `rig apply`** (pulls the #23 templates + commits auto-mode in
+  one pass) — owned by the parallel rig agent, NOT hand-edited on the #463 branch (two agents, one branch =
+  collision). The CodeQL-actions red on #463 is a stale rollout copy → the re-apply replaces it.
+- ⚠️ **Separate REAL finding (pre-existing, not the rollout):** hyper's OWN `security-scan.yml` "Dependency
+  Audit" flags a genuine high vuln — **esbuild `^0.25` (GHSA-gv7w-rqvm-qjhr**, RCE via Deno install path; not
+  exploitable on Node/bun). Bump or waive with justification — tracked as **HYP-743** (Linear).
+
+### ➡️ DELEGATED to the rig agent — finish the hyper rollout (CTO tg#3783/#3784)
+The parallel rig agent owns completing hyper's rollout; this session hands it off:
+1. **`rig apply` re-run on hyper** → pulls the #23 templates (de-GHAS'd gates) + commits auto-mode → greens #463
+   (replaces the stale CodeQL-actions copy too).
+2. **Remove hyper's bespoke `security-scan.yml`** (CTO: common gates belong in agent-tools, not per-repo).
+   Coverage parity BEFORE deleting — its three jobs: **Semgrep** ✅ covered by agent-tools `ci/sast/`;
+   **bun audit** ✅ covered by `ci/dependency-review/dep-audit.sh` (#23); **Trivy** ❌ **NO agent-tools
+   equivalent yet** → either add a `ci/trivy/` (or fs-scan) gate to agent-tools and provision via rig, or
+   keep hyper's Trivy step. Don't silently drop Trivy. Tracked: **agent-tools #24**.
+3. **esbuild HYP-743** must be bumped/waived for any whole-tree dep-audit (rig's or hyper's) to pass green.
 
 ### ecosystem hygiene
 - ✅ ralphex/quorex removed everywhere + `alex-mextner/quorex` **archived** with a "superseded by
@@ -119,20 +150,27 @@ tool migrates to import from the lib.
 - **Enable repo security settings at init/apply** (#3696/#85): `gh api` enable Dependency Graph +
   vuln-alerts (+ secret-scanning) so the CI gates run instead of skipping. (Done manually on wave-1.)
   (alex-mextner/rig-cli#5)
-- **Auto-mode is LOCAL**: `.claude/settings.json` must be **gitignored** (per-machine via apply);
-  `rig.yaml` `harness.auto_mode` is the committed declaration. Fix rig to gitignore it on apply.
-  (Manually corrected on wave-1 PRs; rig-cli `.claude/settings.json` committed in d87257a needs un-commit.)
-  (alex-mextner/rig-cli#6)
+- **Auto-mode is COMMITTED** (decision REVERSED 2026-06-15, CTO): `.claude/settings.json` is Claude
+  Code's SHARED/committed slot — committing it (`defaultMode: bypassPermissions`) is what makes auto-mode
+  turn on by itself on every checkout. The personal per-machine slot is `.claude/settings.local.json`
+  (that one stays gitignored). rig-cli#6 ("gitignore settings.json") is REVERSED/wontfix — the opposite is
+  correct. ⚠️ The footgun every reviewer flagged: committed `bypassPermissions` auto-accepts every tool
+  call on any LOCAL CLI checkout (web sessions ignore it), and the agent-hooks that would gate it are
+  INERT in CC until the #18 bridge lands + is live-verified. So the "safe" pillar is bridge-pending —
+  #18 is now a HARD blocker for blessing auto-mode, not a nicety. (alex-mextner/rig-cli#6 — reverse it.)
 - **Rollout (#3686)**: wave-1 tool repos = PRs open (draw/3d green, tg pending TS fix). **Wave-2 =
   bots** (ExpenseSyncBot, garage-band, summary-bot, esphome-ir, claude-p, diploma, sme-archiving-gc,
   talks, upwork) + review-cli/rig-cli/agent-tools themselves. Each: `rig init --yes` + conservative
   AGENTS/CLAUDE slim (drop now-self-advertised generic rules, keep project specifics) + harvest report.
   (alex-mextner/rig-cli#7)
-  - **Auto-mode provisioning status (verified on `origin/main`, 2026-06-15):** rig-cli ✅, draw-cli ✅,
-    3d-cli ✅, agent-tools ✅. Still missing: **review-cli** (in-sync local, no `rig.yaml`), **task-cli**
-    (foundation in-flight). **tg-cli** is Bun/TS → migrates to Python last; provision auto-mode after
-    that migration. (Earlier "draw/3d unprovisioned" reads were stale local checkouts — both carry
-    `rig.yaml` on origin.)
+  - **Auto-mode COMMITTED-settings.json status (on `origin/main`, 2026-06-15):** rig-cli ✅, agent-tools ✅,
+    review-cli ✅, task-cli ✅, draw-cli ✅, 3d-cli ✅ — all six Python tool repos now COMMIT
+    `.claude/settings.json`. draw/3d had `.claude/` blanket-gitignored (the old "keep local" call) — that
+    was the ecosystem-wide cause of "auto didn't turn on"; reversed (narrowed to `settings.local.json`).
+    **tg-cli** is Bun/TS → migrates to Python last; provision then. ⚠️ The rig.yaml
+    `mcp.review.command: "review --mcp"` is STALE (the `--mcp` flag was dropped in the review subcommand
+    refactor; the global `~/.claude/mcp/mcp.json` registration is broken too) — fix-or-remove before any
+    `rig apply` registers a dead MCP server (tracked in §9 misc).
 
 ### 6. research-cli (after lib `providers`)
 - Separate Python CLI on the shared lib's panel engine (NOT a review mode). Reuses providers verbatim.
@@ -150,9 +188,13 @@ tool migrates to import from the lib.
 
 ### 8. agent-tools harvest (one centralized pass, from rollout reports)
 Tracking issue: alex-mextner/agent-tools#14.
-- Candidate skills: **worktree-via-project-CLI** (dep provisioning, distinct from worktree-base-trap),
-  **subagent-delegation contract**, **"diagnostic image ≠ proof"** acceptance bar, **queued-report
-  durability** (channel-unavailable → don't fake delivery). (Sources: 3d-cli AGENTS.)
+- Candidate skills (Sources: 3d-cli AGENTS):
+  - ✅ **worktree-via-project-cli** (dep provisioning, distinct from worktree-base-trap) — authored
+    (`skills/universal/`), GREEN-verified per writing-skills.
+  - ✅ **queued-report-durability** (channel-unavailable → don't fake delivery) — authored, GREEN-verified.
+  - ⏭️ **subagent-delegation contract** — SKIPPED: already covered by `subagent-handoff-contract` (dupe).
+  - ⏭️ **"diagnostic image ≠ proof" acceptance bar** — SKIPPED: overlaps `visual-proof-cycle`; fold a
+    proof-claim acceptance-bar note into that skill rather than ship a near-duplicate.
 - `strict-ticket-discipline` skill + `require-ticket-before-commit` guard (with task-cli).
 
 ### 9. Misc / cleanup
@@ -170,21 +212,17 @@ Tracking issue: alex-mextner/agent-tools#14.
   gemini → `~/.gemini/GEMINI.md`; commandcode (cmd) → has its own agent CLI (CONFIRMED by CTO) — provision its global instruction dir;
   pi → **earendil-works/pi** (github.com/earendil-works/pi, the minimal extensible coding-agent harness; loads AGENTS.md, multi-provider) → AGENTS.md-style provisioning like codex/oc (confirm its global dir at impl). The **supported-harness list must be in the README** (agent-tools + rig).
 - **⚠️ agent-hooks don't FIRE in Claude Code — need an agents-hooks/v1 → CC bridge** (agent-tools#18): CC runs settings.json hooks (PreToolUse/PostToolUse), NOT the ~/.claude/hooks/*.json `agents-hooks/v1` descriptors rig installs → block-raw-pr-merge / block-secrets / format-on-write / etc. are ALL INERT in CC (files nothing invokes). The 'safe because guards intercept' pillar is FALSE until a bridge runner is wired into settings.json (rig-installed, harness-keyed) + verified by the clean-room e2e. Same class as the skill-loading gap. DO NOT claim any guard 'works' in CC until this lands.
-  **✅ DISPATCHER LANDED (2026-06-15):** `lib/cc_hook_bridge` is the bridge — a stdlib-only
-  dispatcher CC's settings.json calls per event that runs the installed `~/.claude/hooks/*.json`
-  descriptors and translates exit-10 BLOCK into CC's confirmed block signal. CONFIRMED contract
-  (code.claude.com/docs/en/hooks, CC 2.1.177, NOT assumed): PreToolUse blocks via exit 0 +
-  `hookSpecificOutput.permissionDecision="deny"` (chosen over exit 2 — the docs are explicit
-  that exit 2 discards any JSON, so the structured deny carries the full reason); Stop via
-  `decision="block"`. PostToolUse is intentionally NOT wired (the tool already ran → cannot
-  block). Fail-OPEN at the dispatcher (a broken bridge never wedges a tool call); per-hook
-  `on_error` honored (closed→deny on hook error, open→allow). **Clean-room proof
-  (tests/test_cc_hook_bridge.py, 14 tests, full suite green):** the REAL block-raw-pr-merge
-  guard, installed in an isolated $HOME and driven through the dispatcher as a subprocess,
-  DENIES `gh pr merge --admin` and PASSES `gh ship 42`. rig wiring = a separate rig-cli PR
-  (`register_hook_bridge` action; PreToolUse Bash + Edit|Write|MultiEdit|NotebookEdit + Stop,
-  idempotent, preserves the user's other hooks). End-to-end smoke confirms rig writes the
-  dispatcher command at the real lib path and that exact command blocks.
+  **✅ BUILT (2026-06-15) — NOT merged:** **agent-tools PR #20** (dispatcher `lib/cc_hook_bridge`: reads CC's
+  tool-call JSON, maps `(event,tool)`→v1 point, runs the `~/.claude/hooks/*.json` descriptors, translates
+  exit-10 BLOCK → CC's `permissionDecision: deny` on exit 0 — contract confirmed against installed CC 2.1.177)
+  + **rig-cli PR #12** (`register_hook_bridge` wires it into settings.json PreToolUse/PostToolUse on `rig apply`).
+  Clean-room test PROVES it: raw `gh pr merge` → DENY, `gh ship` → pass.
+  **➡️ NEXT ACTION (DO THIS before merging): live-CC round-trip verification.** The clean-room proof drives the
+  dispatcher exactly as CC invokes it, but it was NOT run inside a live CC session. To close the loop: in a
+  real CC session run `rig apply` (so `register_hook_bridge` writes the settings.json hooks), then trigger a
+  guarded action (a raw `gh pr merge`) and confirm **CC itself refuses the tool call**; confirm a benign
+  action passes. THEN merge **#20 first, then #12** (interdependent). Until that live round-trip passes, the
+  "safe because guards intercept" pillar stays UNPROVEN — do not claim any guard "works" in CC, do not merge.
 - **Clean-room / Docker e2e for rig** (tg#3745, rig-cli#10): the manual symlink fixed THIS machine; only a
   fresh-environment e2e (Docker container or throwaway `$HOME`) running `rig init` as a brand-new user
   proves it works for ANYONE on ANY machine — assert skills discoverable by the harness (~/.claude/skills
@@ -225,6 +263,12 @@ Tracking issue: alex-mextner/agent-tools#14.
   (No tracking issue — hyper-saas is a product repo, not a tool repo, and this is CTO-gated.)
 - Billing: Fireworks/Fire Pass (`glide` account) suspended — only that provider is down; rest work.
   (No issue — account-status note; the dead-provider dependency is removed by alex-mextner/review-cli#25.)
+- **`review --mcp` is broken ecosystem-wide** (no tracking issue yet — surfaced by the auto-mode rollout
+  reviewers): the review subcommand refactor dropped the `--mcp` flag, but `~/.claude/mcp/mcp.json` AND
+  every rig.yaml `mcp.review.command` still invoke `review --mcp` → `rig apply` registers a dead MCP
+  server (and the global review MCP is currently inert). Fix-or-remove: implement a real review MCP
+  entrypoint, or drop `mcp.review` from the rig.yaml template + the global registration. Affects all
+  six provisioned tool repos' rig.yaml.
 
 ### 10. Third-party skill/tool ecosystem: enable · harmonize · delineate (RESEARCH) (tg#3754)
 **Problem (CTO observation):** parse a month of hyper sessions and **most installed third-party skills/tools
@@ -268,14 +312,65 @@ count tool/skill invocations by name, surface the never-fired and rarely-fired. 
 + concrete enable/prune/route actions (likely a rig provisioning concern + a routing skill).
 Tracking issue: **alex-mextner/agent-tools#19**.
 
+**✅ Evidence DONE (2026-06-15) — hypothesis confirmed:** only **9/204 hyper sessions (4.4%)** invoked any
+third-party tool; serena + claude-in-chrome = literal zero. Root cause: those tools are **deferred** (need a
+ToolSearch first) so the agent stays on the zero-friction Bash+grep path. Full table + script in **#19**.
+
+---
+
+## 📇 Open-ticket ledger — every open issue/PR (keep in sync; nothing dropped)
+*Snapshot 2026-06-15. The prose sections above carry the context/detail; THIS list is the completeness index —
+if a ticket exists it must appear here. Details live in the tickets, not here.*
+
+- **agent-tools** — #12 shared-lib (Python) · #13 research-cli · #14 harvest skills · #15 slim ~/.claude/CLAUDE.md ·
+  #18 agent-hooks→CC bridge *(✅ built: PR #20 + rig-cli #12, clean-room-proven; live-CC round-trip pending)* ·
+  #19 third-party tool triage · #21 OSS license-policy gate · #22 self-hosted security dashboard ·
+  #24 Trivy CI gate · **PR #17** format-on-write hook · **PR #20** hook-bridge dispatcher
+  *(merge AFTER live-CC verify; before rig-cli #12)*.
+- **rig-cli** — #5 enable repo security settings · #6 auto-mode = gitignored local · #7 rollout wave-2 (bots +
+  self) · #8 model-currency manifest+cron · #9 multi-harness skill provisioning (codex/oc/gemini/cmd/pi) ·
+  #10 clean-room/Docker e2e · **PR #12** hook-bridge provisioning *(depends agent-tools #20)*.
+  *(#11 skill-harness-link ✅ MERGED 2026-06-15.)*
+- **review-cli** — #24 all board models agentic via opencode · #25 stale `DEFAULT_MODELS` → manifest ·
+  #26 propagate canonical ecosystem one-liner to other repos.
+- **tg-cli** — #26 `/tasks` · #27 `/new` · #28 `tg#<id>` ref+autolink · #29 file-excerpt attachment ·
+  #30 decisions-as-buttons + inject-collision · #31 CodeQL 8 TS findings · #32 stale test count (578→997).
+- **3d-cli** — **PR #1** slim AGENTS.md (rollout).
+- **task-cli** — #1 Phase-2 deps+Gantt · #2 daemon+webhooks · #3 completion/due notify · #4 integrations.
+  *(foundation in-flight, agent a9cef4ca — check for its branch/PR.)*
+- **draw-cli** — none open.
+
+> Bridge subagent (agent-tools#18) will likely open NEW PRs (agent-tools + maybe rig-cli) — add them here when it reports.
+
 ---
 
 ## Key constraints / lessons (read before continuing)
 - **Python-only ecosystem; tg migrates last; lib is plain Python.** (Decided twice — don't re-ask.)
 - **Every provider/harness write-up should be GENERAL, not special-cased** (no "opencode does X" when
   every harness does X). Models marked by **capabilities**, not just version.
-- **auto-mode `bypassPermissions` = local (gitignored), not committed.**
+- **auto-mode `bypassPermissions` = COMMITTED `.claude/settings.json`** (CC's shared slot → turns on by
+  itself; `.claude/settings.local.json` is the gitignored personal slot). [Reversed 2026-06-15.] Its
+  "safe because guards fire" rationale is bridge-pending — see #18.
 - **Use `gh ship`, not raw `gh pr merge`** (the `block-raw-pr-merge` guard enforces it).
 - Tool repos work directly on `main` (push often); hyper-saas via PR + `gh ship`.
 - This roadmap lives in `agent-tools` because ecosystem work should run from a tool repo / agent-tools,
   not from an unrelated product repo.
+
+---
+
+## 🆕 From the GHAS-parity analysis (2026-06-15, tg#3777/#3779/#3780)
+
+We dropped every GHAS / licensed-action gate for free OSS equivalents (gitleaks OSS **binary** instead of the
+licensed `gitleaks-action`; scripted `dep-audit.sh` instead of `dependency-review-action`). Verified parity:
+secret-scan is **identical** (same engine + `useDefault` ruleset), dep-audit is **equal-or-better** for vulns
+(whole-tree vs PR-diff). Two follow-ups the parity check surfaced:
+
+- **OSS license-policy gate — agent-tools #21.** The one real gap: `dependency-review-action` also enforced a
+  license allow/deny policy, which `dep-audit.sh` does not. Fill with an OSS license checker
+  (`license-checker` / `cargo-deny` / `pip-licenses`), rig-provisioned as a CI gate, default-deny copyleft
+  (AGPL/GPL) to match the old template. Lives in `ci/license-policy/`.
+- **Self-hosted security findings dashboard — agent-tools #22.** The one thing GHAS uniquely offered that we
+  don't replicate is its hosted code-scanning dashboard. Aggregate the OSS scanners' SARIF/JSON (CodeQL-CLI,
+  Semgrep, gitleaks, dep-audit) into one Tailscale-served dashboard — likely **extending review-cli's existing
+  dashboard** (SARIF is the common format). CTO: copy GitHub's code-scanning UI and improve it (cross-repo
+  view, our own triage state, link to the suppressing `// codeql[...]` line).
