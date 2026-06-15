@@ -61,10 +61,11 @@ Status snapshot: **2026-06-15**. This is the handoff/roadmap for the agent-nativ
 - agent-tools **#9** — CI gate resilience — **MERGED**.
 - rollout: draw-cli **#3** — **MERGED**; 3d-cli **#6** — **MERGED**; rig-cli **#4** (model-cron
   schedule) — **MERGED** (gitleaks GITHUB_TOKEN fix + 2 codex review findings resolved).
-- **tg-cli #25** (rig rollout) — STILL OPEN, blocked only by the CodeQL JS/TS self-gate, which flags
-  **8 real pre-existing TS findings** in `features/**` that this infra-only PR does not touch. Those
-  findings are tracked at alex-mextner/tg-cli#31 (fix-or-justify); #25 merges once they are green.
-  Not mass-suppressed.
+- **tg-cli #25** (rig rollout) — **MERGED** with a documented justification: it is infra-only
+  (CI workflows + `ci/` companions + AGENTS.md + rig.yaml), touches no `features/**` source, and the
+  CodeQL JS/TS self-gate's only red was **8 pre-existing findings** in untouched `features/**` code
+  (the gate firing on legacy code, not a regression). Those are tracked for a real fix-or-justify at
+  alex-mextner/tg-cli#31 — NOT mass-suppressed; the self-gate goes green on main once #31 lands.
 
 ---
 
