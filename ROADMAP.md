@@ -163,6 +163,11 @@ Tracking issue: alex-mextner/agent-tools#14.
   FALSE. Manual fix done (39 skills symlinked; harness lists them live). Durable fix: rig symlinks skills
   into the harness dir on apply (rig-cli#9, branch `skill-harness-link`). DO NOT merge any AGENTS/CLAUDE
   slim until this lands + is verified, or the rules silently vanish on other machines.
+- **Clean-room / Docker e2e for rig** (tg#3745, rig-cli#10): the manual symlink fixed THIS machine; only a
+  fresh-environment e2e (Docker container or throwaway `$HOME`) running `rig init` as a brand-new user
+  proves it works for ANYONE on ANY machine — assert skills discoverable by the harness (~/.claude/skills
+  resolve + in the Skill-tool list), hooks/dispatcher/CI/auto-mode installed, idempotent re-apply,
+  `rig status` clean. (Current rig tests use a tmp-$HOME unit sandbox; this is the full clean-room integration.)
 - **Slim `~/.claude/CLAUDE.md` to PERSONAL-ONLY** (#3704): it should hold only user-specific content
   (identity / "address me as Alex" / preferences / dictionary / Telegram report style). ALL universal
   tool + process docs (how to use `review`/`tg`/`draw`, the no-short-timeout rule, etc.) must
