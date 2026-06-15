@@ -1,0 +1,5 @@
+# Generated model-freshness reports (the gh-absent fallback). The checker writes a dated
+# report here when `gh`/auth is unavailable. These are run artifacts, not source — keep the
+# directory (this file), ignore the reports.
+*
+!.gitignore

@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/alex-mextner/agent-tools/lib/contracts/models.schema.json",
+  "title": "agent-tools model manifest",
+  "description": "Shape of lib/contracts/models.yaml — the ecosystem's single source of truth for the current-best concrete model per provider, each tagged with capabilities (esp. `vision`), plus a symbolic roles/aliases map. The `vision` role/alias resolving only to vision-capable entries is a CROSS-REFERENCE the JSON-Schema cannot express; the checker's --validate enforces it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "models"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Manifest schema version. Only v1 is defined."
+    },
+    "models": {
+      "type": "array",
+      "minItems": 1,
+      "description": "The concrete model pins. Within a provider, strongest/preferred first.",
+      "items": { "$ref": "#/$defs/modelEntry" }
+    },
+    "roles": {
+      "type": "object",
+      "description": "Symbolic lens (architect/fast/code/reasoning/vision/...) -> a concrete model id present in `models`. `vision` MUST resolve to a vision-capable entry (checker --validate enforces).",
+      "additionalProperties": { "type": "string", "minLength": 1 }
+    },
+    "aliases": {
+      "type": "object",
+      "description": "Convenience names + the `<provider>:latest` pointers -> a concrete model id present in `models`.",
+      "additionalProperties": { "type": "string", "minLength": 1 }
+    }
+  },
+  "$defs": {
+    "capability": {
+      "type": "string",
+      "description": "Closed capability set. `vision` is load-bearing for the image-review filter (#3681).",
+      "enum": ["vision", "code", "reasoning", "tools", "embeddings", "audio"]
+    },
+    "modelEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "provider", "capabilities"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Concrete, provider-resolvable model string. Never a symbolic alias."
+        },
+        "provider": {
+          "type": "string",
+          "description": "Transport provider the checker can poll for a model list.",
+          "enum": ["anthropic", "openai", "gemini", "commandcode", "zai", "fireworks"]
+        },
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/capability" },
+          "description": "What the model can do. Omit `vision` for models without real image input (e.g. Kimi-K2.7-Code)."
+        },
+        "context": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Advertised input context window in tokens (optional)."
+        },
+        "notes": {
+          "type": "string",
+          "description": "Free-form provenance / rationale (optional)."
+        }
+      }
+    }
+  }
+}
