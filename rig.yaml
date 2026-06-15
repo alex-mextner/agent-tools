@@ -1,0 +1,76 @@
+# rig.yaml — agent-tools dogfoods the catalog it ships.
+# COMMITTED BY DEFAULT: this file is the reproducible source of truth for this repo.
+# Global defaults live at ~/.config/rig/config.yaml; this file overrides them.
+# agent_tools_source is intentionally omitted → auto-detected (RIG_AGENT_TOOLS_SOURCE,
+# then ~/xp/agent-tools / ~/work/agent-tools / ~/agent-tools) so the file stays portable.
+# Apply with: rig apply   ·   Check drift with: rig status   ·   Schema: docs/config-schema.md
+#
+# NOTE (rig-cli#6, unfixed in installed rig 0.1.0): `rig apply` writes
+# .claude/settings.json (permissions.defaultMode=bypassPermissions, per-machine) but does
+# NOT gitignore it. After applying, add these to .gitignore BY HAND and commit them:
+#     .claude/settings.json
+#     .claude/settings.local.json
+
+version: 1
+scope: both
+
+defaults:
+  skills_target: ~/.agents/skills
+  hooks_target: ~/.claude/hooks
+  ci_target: .github/workflows
+  mcp_target: ~/.claude/mcp
+  on_conflict: backup
+
+# ── Skills — all universal + the cli by-type bundle (agent-tools is a Python tooling repo) ─
+skills:
+  enabled: true
+  target: ~/.agents/skills
+  universal:
+    all: true
+    disable: []
+  by_type:
+    enable: [cli]
+
+# ── Agent-hooks — the full discipline+security set (these make auto-mode safe) ─────────────
+agent_hooks:
+  enabled: true
+  target: ~/.claude/hooks
+  target_kind: claude-code
+  all: true
+
+# ── Git-hooks — the global dispatcher (secret-scan runs in every repo) ─────────────────────
+git_hooks:
+  dispatcher:
+    enabled: true
+    dir: ~/.config/git/global-hooks.d
+    runner: ~/.config/git/run-global-hooks
+    set_global_hooks_path: true
+    install_local_retrofit_script: true
+    fragments:
+      secret-scan: { enabled: true }
+
+# ── CI gates — DEFERRED to wave-2 (ROADMAP). agent-tools has no .github/workflows yet; we do
+#    not introduce committed CI in this change. enabled:false cleanly short-circuits the whole
+#    block (rig writes no workflow files). Keep bare — no items: — until wave-2 turns it on. ──
+ci:
+  enabled: false
+
+# ── MCP — review is the recommended default for AI review-before-commit ────────────────────
+mcp:
+  enabled: true
+  target: ~/.claude/mcp
+  items:
+    review:
+      enabled: true
+      command: "review --mcp"
+
+# ── Harness — auto-mode ON. The agent runs autonomously (the harness auto-accepts tool calls)
+#    with minimum babysitting. SAFE because the agent-hooks above are installed (all: true) —
+#    they block secret writes, --no-verify bypasses, un-timed shell, raw process.env, and a raw
+#    `gh pr merge` that skips ship gates. rig writes permissions.defaultMode=bypassPermissions
+#    into .claude/settings.json (per-machine — gitignore it by hand, see header note).
+#    Set auto_mode: false for interactive permission prompts. ──────────────────────────────
+harness:
+  enabled: true
+  kind: claude-code
+  auto_mode: true
