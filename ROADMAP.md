@@ -63,8 +63,18 @@ Status snapshot: **2026-06-15**. This is the handoff/roadmap for the agent-nativ
   collision). The CodeQL-actions red on #463 is a stale rollout copy → the re-apply replaces it.
 - ⚠️ **Separate REAL finding (pre-existing, not the rollout):** hyper's OWN `security-scan.yml` "Dependency
   Audit" flags a genuine high vuln — **esbuild `^0.25` (GHSA-gv7w-rqvm-qjhr**, RCE via Deno install path; not
-  exploitable on Node/bun). Bump esbuild or waive with justification — **needs a hyper/Linear ticket**, not
-  blocked on the rollout.
+  exploitable on Node/bun). Bump or waive with justification — tracked as **HYP-743** (Linear).
+
+### ➡️ DELEGATED to the rig agent — finish the hyper rollout (CTO tg#3783/#3784)
+The parallel rig agent owns completing hyper's rollout; this session hands it off:
+1. **`rig apply` re-run on hyper** → pulls the #23 templates (de-GHAS'd gates) + commits auto-mode → greens #463
+   (replaces the stale CodeQL-actions copy too).
+2. **Remove hyper's bespoke `security-scan.yml`** (CTO: common gates belong in agent-tools, not per-repo).
+   Coverage parity BEFORE deleting — its three jobs: **Semgrep** ✅ covered by agent-tools `ci/sast/`;
+   **bun audit** ✅ covered by `ci/dependency-review/dep-audit.sh` (#23); **Trivy** ❌ **NO agent-tools
+   equivalent yet** → either add a `ci/trivy/` (or fs-scan) gate to agent-tools and provision via rig, or
+   keep hyper's Trivy step. Don't silently drop Trivy.
+3. **esbuild HYP-743** must be bumped/waived for any whole-tree dep-audit (rig's or hyper's) to pass green.
 
 ### ecosystem hygiene
 - ✅ ralphex/quorex removed everywhere + `alex-mextner/quorex` **archived** with a "superseded by
