@@ -170,10 +170,21 @@ Tracking issue: alex-mextner/agent-tools#14.
   gemini → `~/.gemini/GEMINI.md`; commandcode (cmd) → has its own agent CLI (CONFIRMED by CTO) — provision its global instruction dir;
   pi → **earendil-works/pi** (github.com/earendil-works/pi, the minimal extensible coding-agent harness; loads AGENTS.md, multi-provider) → AGENTS.md-style provisioning like codex/oc (confirm its global dir at impl). The **supported-harness list must be in the README** (agent-tools + rig).
 - **⚠️ agent-hooks don't FIRE in Claude Code — need an agents-hooks/v1 → CC bridge** (agent-tools#18): CC runs settings.json hooks (PreToolUse/PostToolUse), NOT the ~/.claude/hooks/*.json `agents-hooks/v1` descriptors rig installs → block-raw-pr-merge / block-secrets / format-on-write / etc. are ALL INERT in CC (files nothing invokes). The 'safe because guards intercept' pillar is FALSE until a bridge runner is wired into settings.json (rig-installed, harness-keyed) + verified by the clean-room e2e. Same class as the skill-loading gap. DO NOT claim any guard 'works' in CC until this lands.
-  **🚧 IN-FLIGHT (2026-06-15):** dispatched a subagent (worktree) to build the dispatcher (verify CC's
-  actual block contract: exit 2 vs JSON deny → map from `agents-hooks/v1` exit-10), wire it via rig into
-  settings.json PreToolUse/PostToolUse, and prove a real block with a clean-room test (guard BLOCKS / benign
-  PASSES). PRs pending; will NOT be claimed "works" without the clean-room proof.
+  **✅ DISPATCHER LANDED (2026-06-15):** `lib/cc_hook_bridge` is the bridge — a stdlib-only
+  dispatcher CC's settings.json calls per event that runs the installed `~/.claude/hooks/*.json`
+  descriptors and translates exit-10 BLOCK into CC's confirmed block signal. CONFIRMED contract
+  (code.claude.com/docs/en/hooks, CC 2.1.177, NOT assumed): PreToolUse blocks via exit 0 +
+  `hookSpecificOutput.permissionDecision="deny"` (chosen over exit 2 — the docs are explicit
+  that exit 2 discards any JSON, so the structured deny carries the full reason); Stop via
+  `decision="block"`. PostToolUse is intentionally NOT wired (the tool already ran → cannot
+  block). Fail-OPEN at the dispatcher (a broken bridge never wedges a tool call); per-hook
+  `on_error` honored (closed→deny on hook error, open→allow). **Clean-room proof
+  (tests/test_cc_hook_bridge.py, 14 tests, full suite green):** the REAL block-raw-pr-merge
+  guard, installed in an isolated $HOME and driven through the dispatcher as a subprocess,
+  DENIES `gh pr merge --admin` and PASSES `gh ship 42`. rig wiring = a separate rig-cli PR
+  (`register_hook_bridge` action; PreToolUse Bash + Edit|Write|MultiEdit|NotebookEdit + Stop,
+  idempotent, preserves the user's other hooks). End-to-end smoke confirms rig writes the
+  dispatcher command at the real lib path and that exact command blocks.
 - **Clean-room / Docker e2e for rig** (tg#3745, rig-cli#10): the manual symlink fixed THIS machine; only a
   fresh-environment e2e (Docker container or throwaway `$HOME`) running `rig init` as a brand-new user
   proves it works for ANYONE on ANY machine — assert skills discoverable by the harness (~/.claude/skills
