@@ -257,26 +257,32 @@ count tool/skill invocations by name, surface the never-fired and rarely-fired. 
 + concrete enable/prune/route actions (likely a rig provisioning concern + a routing skill).
 Tracking issue: **alex-mextner/agent-tools#19**.
 
-**✅ Evidence DONE (2026-06-15) — hypothesis confirmed hard.** Parsed **204 hyper sessions / 30d** (main +
-worktrees + ralphex tmp), streaming tool_use extraction. Adoption of third-party tools:
+**✅ Evidence DONE (2026-06-15) — hypothesis confirmed:** only **9/204 hyper sessions (4.4%)** invoked any
+third-party tool; serena + claude-in-chrome = literal zero. Root cause: those tools are **deferred** (need a
+ToolSearch first) so the agent stays on the zero-friction Bash+grep path. Full table + script in **#19**.
 
-| tool | sessions | % of 204 | calls |
-|---|---|---|---|
-| agent-browser (cli) | 5 | 2.5% | 50 |
-| haft (mcp) | 2 | 1.0% | 18 |
-| context7 (mcp) | 2 | 1.0% | 4 |
-| computer-use (mcp) | 2 | 1.0% | 12 |
-| sverklo (mcp) | 1 | 0.5% | 4 |
-| **serena (mcp)** | **0** | **0%** | **0** |
-| **claude-in-chrome (mcp)** | **0** | **0%** | **0** |
+---
 
-**Only 9/204 sessions (4.4%) invoked ANY third-party tool; serena + claude-in-chrome = literal zero.**
-Baseline for contrast: Bash **16727**, Read 3192, Edit 1827, Agent 639, Grep 114 — agents do ~everything via
-Bash+Read+Edit. Skill-tool side IS adopted (55 calls / 20 distinct: superpowers brainstorming/debugging, ext,
-commit, h-reason) — i.e. the *self-advertising* mechanism works, the *deferred-tool* mechanism doesn't.
-**Root cause (enable axis is the lever):** serena/sverklo/haft/context7/computer-use are all **deferred** (need
-a ToolSearch to load a schema before use) → the agent takes the zero-friction Bash+grep path. A deferred tool
-nobody searches for is functionally uninstalled. Full table + script (`/tmp/tool_usage_audit.py`) in #19.
+## 📇 Open-ticket ledger — every open issue/PR (keep in sync; nothing dropped)
+*Snapshot 2026-06-15. The prose sections above carry the context/detail; THIS list is the completeness index —
+if a ticket exists it must appear here. Details live in the tickets, not here.*
+
+- **agent-tools** — #12 shared-lib (Python) · #13 research-cli · #14 harvest skills · #15 slim ~/.claude/CLAUDE.md ·
+  #18 agent-hooks→CC bridge *(🚧 in-flight subagent)* · #19 third-party tool enable/harmonize/delineate ·
+  **PR #17** format-on-write hook *(held until #18 bridge fires)*.
+- **rig-cli** — #5 enable repo security settings · #6 auto-mode = gitignored local · #7 rollout wave-2 (bots +
+  self) · #8 model-currency manifest+cron · #9 multi-harness skill provisioning (codex/oc/gemini/cmd/pi) ·
+  #10 clean-room/Docker e2e.  *(#11 skill-harness-link ✅ MERGED 2026-06-15.)*
+- **review-cli** — #24 all board models agentic via opencode · #25 stale `DEFAULT_MODELS` → manifest ·
+  #26 propagate canonical ecosystem one-liner to other repos.
+- **tg-cli** — #26 `/tasks` · #27 `/new` · #28 `tg#<id>` ref+autolink · #29 file-excerpt attachment ·
+  #30 decisions-as-buttons + inject-collision · #31 CodeQL 8 TS findings · #32 stale test count (578→997).
+- **3d-cli** — **PR #1** slim AGENTS.md (rollout).
+- **task-cli** — #1 Phase-2 deps+Gantt · #2 daemon+webhooks · #3 completion/due notify · #4 integrations.
+  *(foundation in-flight, agent a9cef4ca — check for its branch/PR.)*
+- **draw-cli** — none open.
+
+> Bridge subagent (agent-tools#18) will likely open NEW PRs (agent-tools + maybe rig-cli) — add them here when it reports.
 
 ---
 
