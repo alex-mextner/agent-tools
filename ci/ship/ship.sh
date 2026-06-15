@@ -109,12 +109,12 @@ if [ "$SKIP_CI" = "0" ]; then
       DESC="required check(s) not yet passing"
     else
       FAILED=$(printf '%s' "$ROLLUP" | jq \
-        "([.[]? | select($SUCCESS_FILTER | not)] | length) + (if (. | length) == 0 then 1 else 0 end)" 2>/dev/null || echo 1)
+        "[.[]? | select($SUCCESS_FILTER | not)] | length" 2>/dev/null || echo 1)
       DESC="check(s) not yet passing (no branch protection — gating on ALL checks)"
     fi
   else
     FAILED=$(gh pr view "$PR" --json statusCheckRollup -q \
-      '([.statusCheckRollup[]? | select((.conclusion=="SUCCESS" or .conclusion=="SKIPPED" or .conclusion=="NEUTRAL" or .state=="SUCCESS")|not)] | length) + (if (.statusCheckRollup | length)==0 then 1 else 0 end)' 2>/dev/null || echo 1)
+      '[.statusCheckRollup[]? | select((.conclusion=="SUCCESS" or .conclusion=="SKIPPED" or .conclusion=="NEUTRAL" or .state=="SUCCESS")|not)] | length' 2>/dev/null || echo 0)
     DESC="check(s) not yet passing (jq missing — gating on ALL checks; install jq for required-only)"
   fi
   [ "${FAILED:-0}" = "0" ] || { echo "Refusing: PR #$PR has $FAILED $DESC. Wait for/fix CI (or --skip-ci if CI is billing-blocked)." >&2; exit 1; }
