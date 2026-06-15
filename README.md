@@ -125,6 +125,47 @@ the [`ci-gate-suite`](skills/universal/ci-gate-suite/SKILL.md) skill.
   size-label).
 - **MCP:** 1 documented slot (review) + a code-search slot.
 
+## How agent-tools compares
+
+The closest neighbours each cover *one* carrier. **Git-hook managers** (pre-commit,
+lefthook, husky) install commit/push-time checks — and nothing fires earlier or later than
+that. **Curated skill lists** (awesome-claude-code and the many `everything-claude-code` /
+`.claude-templates` collections) are link directories of prompts and configs, almost always
+Claude-Code-specific, with no enforcement at all.
+
+`agent-tools` spans all three carriers — **skills** (judgment rules an agent reads),
+**agent-hooks** (block a tool call *mid-session*, before the side effect), and **git-hooks**
+(mechanical backstop at commit/push) — plus **CI gates** and **MCP slots**, and a shared
+`agenttools_log` lib. Everything is **harness-agnostic** (not tied to one agent) and
+**generic** (no project assumptions; the rationale travels).
+
+| Project | Git hooks | Agent-hooks (mid-session block) | Advisory skills | CI gates | MCP slots | Harness-agnostic | Generic / portable |
+|---|---|---|---|---|---|---|---|
+| **agent-tools** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| pre-commit | ✓ | — | — | ~ (CI action) | — | n/a | ✓ |
+| lefthook | ✓ | — | — | ~ | — | n/a | ✓ |
+| husky | ✓ | — | — | — | — | n/a | ~ (Node-centric) |
+| awesome-claude-code (+ similar lists) | ~ (links) | ~ (links) | ✓ (links) | — | ~ (links) | — (Claude-only) | ~ (curated, not generalized) |
+
+`~` = partial, `n/a` = not an agent tool. Hook managers are excellent at the commit gate
+but cannot stop a `--no-verify` bypass or a secret being written *mid-session* — that needs
+an agent-hook. Skill lists supply ideas but no mechanism. `agent-tools` is the only one here
+that carries advice, mid-session enforcement, and the commit/CI backstop together, and is
+consumed declaratively by [`rig`](https://github.com/alex-mextner/rig-cli).
+
+## Ecosystem
+
+Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
+
+- **[tg-cli](https://github.com/alex-mextner/tg-cli)** — Telegram bridge for agents: push reports, two-way control, Q→buttons
+- **[review-cli](https://github.com/alex-mextner/review-cli)** — multi-model read-only code review
+- **[rig-cli](https://github.com/alex-mextner/rig-cli)** — umbrella dev-env driver: sets up a repo from config — skills, hooks, CI, dep-bootstrap; reconciles drift
+- **[draw-cli](https://github.com/alex-mextner/draw-cli)** — text-to-image via Hugging Face
+- **[3d-cli](https://github.com/alex-mextner/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
+- **[hyperide.ai](https://hyperide.ai)** — Figma replacement inside VS Code. Edit React components directly through AST/LSP without AI hallucinations, token waste, or context-window limits. Works for indie vibe-coding and for enterprise teams with split design/dev roles.
+
+Each CLI registers a skill into your agent harnesses (`<tool> install-skill`) so agents know it exists — see Install.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
