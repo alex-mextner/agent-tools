@@ -1,0 +1,140 @@
+# agenttools-log
+
+Shared **structured JSONL logging** for the agent-tools ecosystem — one JSON object per
+line, **stdlib only** (no `pino`, no `structlog`, no `python-json-logger`). It is a thin,
+generalized wrapper over the stdlib `logging` module so `review-cli`, `rig-cli`, and any
+future Python CLI emit logs in the same shape.
+
+## Record shape
+
+Every line is a JSON object with at least these keys, plus any structured fields you pass:
+
+```json
+{"ts":"2026-06-15T09:00:00.123456+00:00","level":"INFO","logger":"myapp.server","msg":"server started","port":8080,"pid":1234}
+```
+
+| Key      | Meaning                                              |
+| -------- | ---------------------------------------------------- |
+| `ts`     | ISO-8601 timestamp, **UTC**                          |
+| `level`  | `DEBUG` / `INFO` / `WARNING` / `ERROR`               |
+| `logger` | module name (`agenttools.<name>`)                    |
+| `msg`    | the log message                                      |
+| `exc`    | formatted traceback (only when `exc_info` is passed) |
+| `stack`  | formatted stack (only when `stack_info` is passed)   |
+| *…*      | any structured fields you pass as kwargs             |
+
+## Usage
+
+```python
+from agenttools_log import get_logger
+
+log = get_logger(__name__)
+
+log.debug("cache lookup", key="user:42", hit=False)
+log.info("server started", port=8080, pid=1234)
+log.warn("retry", attempt=2, url="https://api.example.com")
+
+# stdlib-style lazy %-formatting also works (positional args after the message):
+log.info("user %s connected from %s", user_id, ip)
+
+try:
+    risky()
+except Exception:
+    log.error("request failed", request_id="abc", exc_info=True)
+    # or, equivalently, inside an except block:
+    log.exception("request failed", request_id="abc")
+```
+
+Positional arguments after the message feed stdlib's lazy `%`-formatting (so migrating
+existing `log.info("x=%s", x)` call sites Just Works). Arbitrary keyword arguments become
+top-level JSON fields. `exc_info`, `stack_info`, and
+`stacklevel` are passed through to stdlib instead of being logged as fields (`exc_info`
+adds an `exc` field, `stack_info` adds a `stack` field). Reserved keys
+(`ts`/`level`/`logger`/`msg`) can never be clobbered by a stray field — the message
+parameter is positional-only, so even a field literally named `msg` is safe.
+
+## Configuration
+
+`get_logger` auto-configures the shared `agenttools` logger tree **once** from the
+environment on first use. Override from code with `configure(...)` (e.g. a `--log-file`
+flag) — explicitly-passed arguments win over the environment. An explicit `stream=`
+suppresses `AGENTTOOLS_LOG_FILE`; pass `log_file=None` explicitly to force a stream sink
+even when that env var is set.
+
+| Env var                 | Values                          | Default | Effect                                  |
+| ----------------------- | ------------------------------- | ------- | --------------------------------------- |
+| `AGENTTOOLS_LOG_LEVEL`  | `debug`/`info`/`warn`/`error`   | `info`  | minimum level emitted                   |
+| `AGENTTOOLS_LOG_FILE`   | a path                          | *(unset)* | append JSONL to this file (created `0600`); otherwise stderr |
+| `AGENTTOOLS_LOG_FORMAT` | `json` / `pretty`               | `json`  | `pretty` = human-readable dev mode      |
+
+```python
+from agenttools_log import configure, get_logger
+
+# Explicit override (e.g. driven by CLI flags):
+configure(level="debug", fmt="pretty", log_file="/tmp/run.jsonl")
+log = get_logger("mytool")
+```
+
+`pretty` mode renders a compact human line instead of JSON, for local development:
+
+```
+09:00:00 INFO  agenttools.myapp.server: server started  port=8080 pid=1234
+```
+
+## Safety posture
+
+- **Never crashes the caller.** The formatter, every log call, and `configure` swallow
+  their own errors — a logging failure degrades output, it does not raise.
+- **`0600` file perms.** A file sink is `chmod`-ed to `0600` on every open, even for a
+  pre-existing file, mirroring `review-cli`'s `stats.py` privacy posture. If the file
+  can't be opened (or `chmod`-ed), it falls back to stderr rather than leave a
+  world-readable log behind.
+- **No automatic redaction.** Nothing is scrubbed for you — but structured fields make it
+  trivial to log exactly what you intend and nothing more.
+
+## Public API
+
+| Symbol                                   | Purpose                                          |
+| ---------------------------------------- | ------------------------------------------------ |
+| `get_logger(name=None) -> StructuredLogger` | per-module logger; auto-configures from env   |
+| `configure(*, level, fmt, stream, log_file, force=True)` | explicit (re)configuration       |
+| `StructuredLogger`                       | the per-module facade (`.debug/.info/.warn/.error/.exception`) |
+| `reset()`                                | tear down configuration (mainly for tests)       |
+| `DEBUG` / `INFO` / `WARNING` / `ERROR`   | re-exported stdlib level ints                    |
+
+`StructuredLogger.stdlib` exposes the underlying `logging.Logger` for callers that need
+native access; `StructuredLogger.isEnabledFor(level)` mirrors the stdlib guard.
+
+## Installing / importing as a consumer
+
+The package lives under `lib/` in the umbrella repo and builds as the `agenttools-log`
+distribution. A consumer (e.g. `review-cli`, `rig-cli`) depends on it like any package:
+
+```toml
+# pyproject.toml of the consumer
+[project]
+dependencies = ["agenttools-log"]
+```
+
+For local/dev installs from the umbrella checkout:
+
+```sh
+pip install -e /path/to/agent-tools/lib      # editable install of agenttools-log
+# or, ad-hoc, with uv:
+uv run --with /path/to/agent-tools/lib python -c "from agenttools_log import get_logger"
+```
+
+Then in code:
+
+```python
+from agenttools_log import get_logger
+log = get_logger(__name__)
+```
+
+### Migration seam for existing consumers
+
+`rig-cli`'s `riglib.logging` already emits this exact shape by hand; it can become a thin
+re-export once this lands (`from agenttools_log import get_logger, configure`), keeping its
+`RIG_LOG*` env names as aliases if desired. `review-cli` currently prints to stderr with no
+log dependency; it can adopt `agenttools_log` incrementally for its structured channels.
+**Wiring those CLIs is a deliberate follow-up — this package ships standalone.**
