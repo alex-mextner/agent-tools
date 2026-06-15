@@ -10,7 +10,9 @@ that isn't actually ready even with a one-liner.
 | Refusal | Why |
 | ------- | --- |
 | PR not OPEN / CONFLICTING / BEHIND base | Not mergeable / ruleset wants up-to-date branch. |
-| Required status checks not all green | The green-CI gate (required-checks-only when branch protection + `jq` are present; else all checks). |
+| **No CI checks at all** | "No CI" is a *failed* gate, not a pass — ship refuses and tells you to set CI up first (`rig apply` provisions the gates, or add workflows). Override only with `--skip-ci`. |
+| Any CI check failing | The green-CI gate (gates on ALL checks). |
+| CI still running | Ship **watches** pending checks to completion (polls every `SHIP_CI_POLL`s up to `SHIP_CI_WAIT`s) instead of refusing — you don't babysit. |
 | Unresolved review threads | Same check as [`../review-threads/`](../review-threads/). |
 | UI-touching PR with no screenshot | Same check as [`../screenshots/`](../screenshots/); override with `--no-screenshot-ok`. |
 | Local branch has unpushed/diverged commits, or dirty worktree | Avoids merging stale/uncommitted local state. |
@@ -42,6 +44,9 @@ Nothing org-/tracker-/layout-specific is hard-coded. Configure via env:
 | --- | ------- | ------- |
 | `SHIP_DEFAULT_BRANCH` | `main` | Base branch. |
 | `SHIP_MERGE_METHOD` | `squash` | `squash` / `merge` / `rebase`. |
+| `SHIP_CI_WAIT` | `900` | Max seconds to WATCH pending CI to completion before giving up. |
+| `SHIP_CI_POLL` | `20` | Poll interval (seconds) while watching pending CI. |
+| `SHIP_CI_GRACE` | `45` | Grace window for checks to *register* on a fresh PR before concluding "no CI" (an empty rollup is briefly normal right after opening a PR). |
 | `SHIP_MAIN_CHECKOUT` | first worktree | Where to fast-forward after merge. |
 | `SHIP_UI_PATH_REGEX` | common FE paths | What makes a PR "UI-touching". **Set empty to disable the screenshot gate.** |
 | `SHIP_IMAGE_UPLOAD_CMD` | (unset) | Optional uploader for `--screenshot`: a command that takes the image (`{FILE}` token or `$1`) and prints a public URL. Without it, `--screenshot` just embeds a local-path note. |
