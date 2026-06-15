@@ -257,6 +257,27 @@ count tool/skill invocations by name, surface the never-fired and rarely-fired. 
 + concrete enable/prune/route actions (likely a rig provisioning concern + a routing skill).
 Tracking issue: **alex-mextner/agent-tools#19**.
 
+**✅ Evidence DONE (2026-06-15) — hypothesis confirmed hard.** Parsed **204 hyper sessions / 30d** (main +
+worktrees + ralphex tmp), streaming tool_use extraction. Adoption of third-party tools:
+
+| tool | sessions | % of 204 | calls |
+|---|---|---|---|
+| agent-browser (cli) | 5 | 2.5% | 50 |
+| haft (mcp) | 2 | 1.0% | 18 |
+| context7 (mcp) | 2 | 1.0% | 4 |
+| computer-use (mcp) | 2 | 1.0% | 12 |
+| sverklo (mcp) | 1 | 0.5% | 4 |
+| **serena (mcp)** | **0** | **0%** | **0** |
+| **claude-in-chrome (mcp)** | **0** | **0%** | **0** |
+
+**Only 9/204 sessions (4.4%) invoked ANY third-party tool; serena + claude-in-chrome = literal zero.**
+Baseline for contrast: Bash **16727**, Read 3192, Edit 1827, Agent 639, Grep 114 — agents do ~everything via
+Bash+Read+Edit. Skill-tool side IS adopted (55 calls / 20 distinct: superpowers brainstorming/debugging, ext,
+commit, h-reason) — i.e. the *self-advertising* mechanism works, the *deferred-tool* mechanism doesn't.
+**Root cause (enable axis is the lever):** serena/sverklo/haft/context7/computer-use are all **deferred** (need
+a ToolSearch to load a schema before use) → the agent takes the zero-friction Bash+grep path. A deferred tool
+nobody searches for is functionally uninstalled. Full table + script (`/tmp/tool_usage_audit.py`) in #19.
+
 ---
 
 ## Key constraints / lessons (read before continuing)
