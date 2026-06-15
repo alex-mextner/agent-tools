@@ -47,6 +47,24 @@ Status snapshot: **2026-06-15**. This is the handoff/roadmap for the agent-nativ
   turn on" — CTO caught this). Only `.claude/settings.local.json` (the personal slot) stays gitignored.
   Matches the rig-cli reference. ⚠️ Safety caveat: the "safe because agent-hooks intercept" rationale is
   bridge-pending — CC-level guards are INERT until the #18 hook-bridge lands + is live-verified.
+- ✅ **CI gates de-GHAS'd (PR #23 merged)** — the rig-shipped gates depended on PAID GitHub features and
+  hard-failed on the hyper org/private repo. Dropped them for free OSS engines (CTO call, tg#3774):
+  `secret-scan.yml` → gitleaks **OSS binary** (`gitleaks dir`; same engine+ruleset, no org license, vs the
+  `gitleaks-action` that demands a paid `GITLEAKS_LICENSE`); `dependency-review.yml` → scripted
+  `dep-audit.sh` (whole-tree bun/npm/pip/cargo/go audit, no GHAS, vs `dependency-review-action` that needs
+  GHAS on private repos). READMEs corrected (the old "GHAS only for the dashboard" claim was wrong). Verified
+  parity (tg#3777): secrets 1:1, vulns equal-or-better; **one gap = license-policy → #21**. CodeQL
+  actions-suppressions in the leftover-grep/review-threads templates were already correct (untouched).
+
+### hyper #463 (rig-rollout PR) — how it goes green
+- The 3 red checks on #463 were all from the GHAS/licensed gates above; **PR #23 fixes them at the source**.
+  #463 goes green when the **rig agent re-applies `rig apply`** (pulls the #23 templates + commits auto-mode in
+  one pass) — owned by the parallel rig agent, NOT hand-edited on the #463 branch (two agents, one branch =
+  collision). The CodeQL-actions red on #463 is a stale rollout copy → the re-apply replaces it.
+- ⚠️ **Separate REAL finding (pre-existing, not the rollout):** hyper's OWN `security-scan.yml` "Dependency
+  Audit" flags a genuine high vuln — **esbuild `^0.25` (GHSA-gv7w-rqvm-qjhr**, RCE via Deno install path; not
+  exploitable on Node/bun). Bump esbuild or waive with justification — **needs a hyper/Linear ticket**, not
+  blocked on the rollout.
 
 ### ecosystem hygiene
 - ✅ ralphex/quorex removed everywhere + `alex-mextner/quorex` **archived** with a "superseded by
