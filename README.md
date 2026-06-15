@@ -17,6 +17,7 @@ mechanisms are stack-agnostic (bun/node, python-uv, go).
 | `git-hooks/`   | Copyable `pre-commit` / `commit-msg` / `pre-push` / `no-secrets-scan` hooks plus a `lefthook.yml`, generalized across three toolchains — and a **global dispatcher** (`global-dispatcher/`) that runs every hook in `~/.config/git/global-hooks.d/` in **every** repo, even ones whose lefthook/husky override `core.hooksPath`. |
 | `ci/`          | Drop-in CI / PR-gate building blocks a CI-building agent looks for first — one slot per concern (workflow + optional shell script + README): secret-scan (gitleaks), CodeQL (incl. a no-GHAS self-gate), semgrep SAST, dependency-review + license, AI-review, Copilot-findings, unresolved-review-thread block, unchecked-checkbox block, mandatory screenshots, conventional-commit PR-title lint, leftover-marker grep, and a green-CI-gated `ship` merge command. See [`ci/README.md`](ci/README.md). |
 | `mcp/`         | Documentation of the multi-model `review` MCP slot (review / quorum / brainstorm / visual) and a code-search MCP slot. |
+| `lib/`         | Reusable, importable library code the ecosystem CLIs depend on. Currently `agenttools_log` — shared **structured JSONL logging** (stdlib-only) so `review-cli`, `rig-cli`, and future Python CLIs log in one shape. See [`lib/README.md`](lib/README.md). |
 | `docs/`        | `carrier-decision-guide.md` — when a rule belongs in a skill vs an agent-hook vs a git-hook. |
 
 ## The three carriers (and why there are three)

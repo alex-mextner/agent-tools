@@ -5,3 +5,11 @@
 # OS / editor noise
 .DS_Store
 *.swp
+
+# Python build / test artifacts (lib/agenttools_log packaging)
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
