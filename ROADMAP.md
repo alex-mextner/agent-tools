@@ -165,8 +165,8 @@ Tracking issue: alex-mextner/agent-tools#14.
   slim until this lands + is verified, or the rules silently vanish on other machines.
   **Must work for ALL supported harnesses** (tg#3747), each with its own discovery mechanism:
   cc → `~/.claude/skills` (dir-skills); codex → `~/.codex/AGENTS.md`; opencode (oc) → `~/.config/opencode/AGENTS.md`;
-  gemini → `~/.gemini/GEMINI.md`; commandcode (cmd) → CONFIRM (provider today, not a CLI harness — has an agent CLI?);
-  pi → CONFIRM full name + dir. The **supported-harness list must be in the README** (agent-tools + rig).
+  gemini → `~/.gemini/GEMINI.md`; commandcode (cmd) → has its own agent CLI (CONFIRMED by CTO) — provision its global instruction dir;
+  pi → **earendil-works/pi** (github.com/earendil-works/pi, the minimal extensible coding-agent harness; loads AGENTS.md, multi-provider) → AGENTS.md-style provisioning like codex/oc (confirm its global dir at impl). The **supported-harness list must be in the README** (agent-tools + rig).
 - **Clean-room / Docker e2e for rig** (tg#3745, rig-cli#10): the manual symlink fixed THIS machine; only a
   fresh-environment e2e (Docker container or throwaway `$HOME`) running `rig init` as a brand-new user
   proves it works for ANYONE on ANY machine — assert skills discoverable by the harness (~/.claude/skills
