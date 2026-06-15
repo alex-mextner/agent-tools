@@ -22,11 +22,12 @@ test = ["pytest"]
 [project.urls]
 Homepage = "https://github.com/alex-mextner/agent-tools"
 
-# The package lives directly under lib/ (this file's directory). Scope discovery to it so
-# setuptools never wanders into the umbrella repo's non-Python content (skills/, ci/, …).
+# The packages live directly under lib/ (this file's directory). Scope discovery to the
+# Python packages so setuptools never wanders into the umbrella repo's non-Python content
+# (skills/, ci/, …). `advertise` is the shared install-skill core; both ship in this dist.
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agenttools_log*"]
+include = ["agenttools_log*", "advertise*"]
 
 [tool.pytest.ini_options]
 testpaths = ["../tests"]
