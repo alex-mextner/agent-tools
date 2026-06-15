@@ -139,6 +139,13 @@ Per the design doc; phased, lowest-churn first. Each tool migrates to import fro
   duplicates the `review` skill → remove it; audit the rest the same way. (My in-place "migrate CLAUDE.md
   review docs to subcommands" was wrong — those docs shouldn't live in CLAUDE.md at all.) Careful pass,
   it's the global config.
+- **Decisions-as-buttons + the hanging-question DANGER** (#3706): verify the agent
+  question-with-options flow (tg inline tappable buttons) actually works end-to-end. **Critical
+  bug risk:** `tg-ctl` injects inbound messages into the agent's tmux pane via `send-keys`; if an
+  interactive prompt/question is open in that pane, the injected text is typed INTO the prompt and
+  LOST/corrupts it. Fix: answers must come through a SEPARATE channel (tg inline buttons → routed
+  reply), and while a question is pending tg-ctl must DEFER/queue inbound text injection (detect the
+  pending-question state) rather than blast it into the pane. Test + fix.
 - tg-cli #25: fix-or-justify the 8 CodeQL TS findings (length-counting helpers + install TOCTOU).
 - tg-cli AGENTS stale "~578 tests" → 997.
 - hyper-saas AGENTS.md "further-trim candidates" (Systematic Debugging / Dead-code / On-Task-Completion
