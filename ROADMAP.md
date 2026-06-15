@@ -153,6 +153,10 @@ Per the design doc; phased, lowest-churn first. Each tool migrates to import fro
 - **tg-cli file-excerpt attachment** (tg#3715): when a message gives a file **path + line / line-range**
   (in any of the common formats — `path:42`, `path:10-20`, `path#L10-L20`, etc.), attach the actual
   excerpt (the referenced lines) as a quote below. Currently broken — fix.
+- **tg-cli `/new` command** (tg#3717): `/new [<model>] [<dir>] name [<task description>]` — spawn a new
+  agent session. **Omitted options are chosen interactively via inline buttons.** Directory options =
+  the dirs already in use + their `..` parents, all normalized + uniq + ranked LRU/MRU. `name` validated
+  with a **uniqueness warning**. (Pairs with the decisions-as-buttons work.)
 - tg-cli #25: fix-or-justify the 8 CodeQL TS findings (length-counting helpers + install TOCTOU).
 - tg-cli AGENTS stale "~578 tests" → 997.
 - hyper-saas AGENTS.md "further-trim candidates" (Systematic Debugging / Dead-code / On-Task-Completion
