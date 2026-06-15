@@ -268,11 +268,13 @@ ToolSearch first) so the agent stays on the zero-friction Bash+grep path. Full t
 if a ticket exists it must appear here. Details live in the tickets, not here.*
 
 - **agent-tools** — #12 shared-lib (Python) · #13 research-cli · #14 harvest skills · #15 slim ~/.claude/CLAUDE.md ·
-  #18 agent-hooks→CC bridge *(🚧 in-flight subagent)* · #19 third-party tool enable/harmonize/delineate ·
-  **PR #17** format-on-write hook *(held until #18 bridge fires)*.
+  #18 agent-hooks→CC bridge *(✅ built: PR #20 + rig-cli #12, clean-room-proven; live-CC round-trip pending)* ·
+  #19 third-party tool triage · #21 OSS license-policy gate · #22 self-hosted security dashboard ·
+  **PR #17** format-on-write hook · **PR #20** hook-bridge dispatcher *(merge before rig-cli #12)*.
 - **rig-cli** — #5 enable repo security settings · #6 auto-mode = gitignored local · #7 rollout wave-2 (bots +
   self) · #8 model-currency manifest+cron · #9 multi-harness skill provisioning (codex/oc/gemini/cmd/pi) ·
-  #10 clean-room/Docker e2e.  *(#11 skill-harness-link ✅ MERGED 2026-06-15.)*
+  #10 clean-room/Docker e2e · **PR #12** hook-bridge provisioning *(depends agent-tools #20)*.
+  *(#11 skill-harness-link ✅ MERGED 2026-06-15.)*
 - **review-cli** — #24 all board models agentic via opencode · #25 stale `DEFAULT_MODELS` → manifest ·
   #26 propagate canonical ecosystem one-liner to other repos.
 - **tg-cli** — #26 `/tasks` · #27 `/new` · #28 `tg#<id>` ref+autolink · #29 file-excerpt attachment ·
@@ -295,3 +297,22 @@ if a ticket exists it must appear here. Details live in the tickets, not here.*
 - Tool repos work directly on `main` (push often); hyper-saas via PR + `gh ship`.
 - This roadmap lives in `agent-tools` because ecosystem work should run from a tool repo / agent-tools,
   not from an unrelated product repo.
+
+---
+
+## 🆕 From the GHAS-parity analysis (2026-06-15, tg#3777/#3779/#3780)
+
+We dropped every GHAS / licensed-action gate for free OSS equivalents (gitleaks OSS **binary** instead of the
+licensed `gitleaks-action`; scripted `dep-audit.sh` instead of `dependency-review-action`). Verified parity:
+secret-scan is **identical** (same engine + `useDefault` ruleset), dep-audit is **equal-or-better** for vulns
+(whole-tree vs PR-diff). Two follow-ups the parity check surfaced:
+
+- **OSS license-policy gate — agent-tools #21.** The one real gap: `dependency-review-action` also enforced a
+  license allow/deny policy, which `dep-audit.sh` does not. Fill with an OSS license checker
+  (`license-checker` / `cargo-deny` / `pip-licenses`), rig-provisioned as a CI gate, default-deny copyleft
+  (AGPL/GPL) to match the old template. Lives in `ci/license-policy/`.
+- **Self-hosted security findings dashboard — agent-tools #22.** The one thing GHAS uniquely offered that we
+  don't replicate is its hosted code-scanning dashboard. Aggregate the OSS scanners' SARIF/JSON (CodeQL-CLI,
+  Semgrep, gitleaks, dep-audit) into one Tailscale-served dashboard — likely **extending review-cli's existing
+  dashboard** (SARIF is the common format). CTO: copy GitHub's code-scanning UI and improve it (cross-repo
+  view, our own triage state, link to the suppressing `// codeql[...]` line).
