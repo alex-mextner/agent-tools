@@ -156,6 +156,13 @@ Tracking issue: alex-mextner/agent-tools#14.
 - `strict-ticket-discipline` skill + `require-ticket-before-commit` guard (with task-cli).
 
 ### 9. Misc / cleanup
+- **⚠️ PREREQUISITE for ALL AGENTS.md/CLAUDE.md slimming — skills must actually LOAD** (tg#3736/3740,
+  rig-cli#9): the harness discovers Skill-tool skills from `~/.claude/skills/` (symlinks → ~/.agents/skills),
+  NOT from ~/.agents/skills directly. rig installed to ~/.agents/skills but never symlinked into
+  ~/.claude/skills → rig-installed universal skills were NOT loaded → "self-advertised via skill" was
+  FALSE. Manual fix done (39 skills symlinked; harness lists them live). Durable fix: rig symlinks skills
+  into the harness dir on apply (rig-cli#9, branch `skill-harness-link`). DO NOT merge any AGENTS/CLAUDE
+  slim until this lands + is verified, or the rules silently vanish on other machines.
 - **Slim `~/.claude/CLAUDE.md` to PERSONAL-ONLY** (#3704): it should hold only user-specific content
   (identity / "address me as Alex" / preferences / dictionary / Telegram report style). ALL universal
   tool + process docs (how to use `review`/`tg`/`draw`, the no-short-timeout rule, etc.) must
