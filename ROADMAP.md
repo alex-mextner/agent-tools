@@ -58,9 +58,13 @@ Status snapshot: **2026-06-15**. This is the handoff/roadmap for the agent-nativ
   rollout PRs patched green except tg-cli #25 CodeQL.
 
 ## 📋 Open PRs ready to land
-- agent-tools **#9** — CI gate resilience (green).
-- rollout: draw-cli **#3** (green), 3d-cli **#6** (green), tg-cli **#25** (CodeQL JS/TS flags **8 real
-  pre-existing TS findings** — fix-or-justify by owner before merge).
+- agent-tools **#9** — CI gate resilience — **MERGED**.
+- rollout: draw-cli **#3** — **MERGED**; 3d-cli **#6** — **MERGED**; rig-cli **#4** (model-cron
+  schedule) — **MERGED** (gitleaks GITHUB_TOKEN fix + 2 codex review findings resolved).
+- **tg-cli #25** (rig rollout) — STILL OPEN, blocked only by the CodeQL JS/TS self-gate, which flags
+  **8 real pre-existing TS findings** in `features/**` that this infra-only PR does not touch. Those
+  findings are tracked at alex-mextner/tg-cli#31 (fix-or-justify); #25 merges once they are green.
+  Not mass-suppressed.
 
 ---
 
@@ -72,21 +76,23 @@ Status snapshot: **2026-06-15**. This is the handoff/roadmap for the agent-nativ
   `change|justAsk` via `review just-ask` per-provider fallback chain (haiku head); enforcement gates
   (acceptance criteria / motivation / user-impact / cost-of-inaction / screenshots / formatting, each
   with `--skip-<gate> "<reason>"` escape hatch); `list` defaults to this-session tickets.
-- **Phase 2** (#3695): task **dependency system** + **Gantt** rendering; a **daemon service** (like
-  tg-ctl: first call brings it up, survives restarts/kills, subscribes to gh-issues/Linear **webhooks**,
-  **adapter-based** for future trackers); on completion → inject "done, X unblocked" into the agent's
-  tmux pane (via shared-lib tmux-inject); **due-date** reminders to the agent; task-cli self-hook.
-- **Integrations**: tg-cli classify inbound hook (#3645); agent-tools `strict-ticket-discipline`
-  skill + `require-ticket-before-commit` guard (+ optional `ci/ticket-required`); rig provisioning
-  (installs linear-cli when backend=linear, for auth only). Needs a NEW `on-inbound` hook point in
-  `agents-hooks/v1`.
+- **Phase 2** (#3695): task **dependency system** + **Gantt** rendering (alex-mextner/task-cli#1); a
+  **daemon service** (like tg-ctl: first call brings it up, survives restarts/kills, subscribes to
+  gh-issues/Linear **webhooks**, **adapter-based** for future trackers) (alex-mextner/task-cli#2); on
+  completion → inject "done, X unblocked" into the agent's tmux pane (via shared-lib tmux-inject);
+  **due-date** reminders to the agent (alex-mextner/task-cli#3); task-cli self-hook.
+- **Integrations** (alex-mextner/task-cli#4): tg-cli classify inbound hook (#3645); agent-tools
+  `strict-ticket-discipline` skill + `require-ticket-before-commit` guard (+ optional
+  `ci/ticket-required`); rig provisioning (installs linear-cli when backend=linear, for auth only).
+  Needs a NEW `on-inbound` hook point in `agents-hooks/v1`.
 
 ### 2. tg-cli `/tasks` (after task-cli)
 - `/tasks` → table + Gantt + agent summary for the session's tasks; show external-to-session deps;
-  diagram sent **HD inline** (not as a file, uncompressed-quality).
+  diagram sent **HD inline** (not as a file, uncompressed-quality). (alex-mextner/tg-cli#26)
 
 ### 3. Shared lib extraction (Python-only) — `agent-tools/lib/<module>`
-Per the design doc; phased, lowest-churn first. Each tool migrates to import from the lib.
+Tracking issue: alex-mextner/agent-tools#12. Per the design doc; phased, lowest-churn first. Each
+tool migrates to import from the lib.
 1. **`advertise`** (install-skill — 4 copies today) — first extraction, stands up the skeleton.
 2. **`hooks`** (`agents-hooks/v1` dispatcher; tg vendored it — de-dupe).
 3. **`providers`** (the biggest asset: board, failover, transports, `oc:` routing, key cascade,
@@ -101,30 +107,39 @@ Per the design doc; phased, lowest-churn first. Each tool migrates to import fro
 - `models.yaml` manifest: per-provider current model + **capability tags** (vision/code/reasoning) +
   role aliases (role `vision` resolves only to vision-capable). Daily-noon **cron checker** that polls
   provider `/models` and opens a bump PR (semi-auto). rig provisions the schedule (launchd/cron),
-  check-and-install-if-missing at init/apply.
+  check-and-install-if-missing at init/apply. (alex-mextner/rig-cli#8 — rig cron provisioning landed
+  in PR #4, merged.)
 
 ### 5. rig
 - **Enable repo security settings at init/apply** (#3696/#85): `gh api` enable Dependency Graph +
   vuln-alerts (+ secret-scanning) so the CI gates run instead of skipping. (Done manually on wave-1.)
+  (alex-mextner/rig-cli#5)
 - **Auto-mode is LOCAL**: `.claude/settings.json` must be **gitignored** (per-machine via apply);
   `rig.yaml` `harness.auto_mode` is the committed declaration. Fix rig to gitignore it on apply.
   (Manually corrected on wave-1 PRs; rig-cli `.claude/settings.json` committed in d87257a needs un-commit.)
+  (alex-mextner/rig-cli#6)
 - **Rollout (#3686)**: wave-1 tool repos = PRs open (draw/3d green, tg pending TS fix). **Wave-2 =
   bots** (ExpenseSyncBot, garage-band, summary-bot, esphome-ir, claude-p, diploma, sme-archiving-gc,
   talks, upwork) + review-cli/rig-cli/agent-tools themselves. Each: `rig init --yes` + conservative
   AGENTS/CLAUDE slim (drop now-self-advertised generic rules, keep project specifics) + harvest report.
+  (alex-mextner/rig-cli#7)
 
 ### 6. research-cli (after lib `providers`)
 - Separate Python CLI on the shared lib's panel engine (NOT a review mode). Reuses providers verbatim.
+  (alex-mextner/agent-tools#13)
 
 ### 7. review-cli follow-ups
 - #75: make ALL board models agentic via opencode (re-investigate commandcode + GLM custom provider).
+  (alex-mextner/review-cli#24)
 - Fix flat `DEFAULT_MODELS` stale `kimi-k2p6-turbo` via Fireworks (dead `glide` account) → manifest.
+  (alex-mextner/review-cli#25)
 - Propagate canonical ecosystem one-liner to other repos' ecosystem tables (after their rollout PRs):
   *"multi-model read-only code review from one command: diff review, cited quorum, brainstorm, visual
   review, and interactive spec-review tooling. Read-only, CLI-first, harness-agnostic."*
+  (alex-mextner/review-cli#26)
 
 ### 8. agent-tools harvest (one centralized pass, from rollout reports)
+Tracking issue: alex-mextner/agent-tools#14.
 - Candidate skills: **worktree-via-project-CLI** (dep provisioning, distinct from worktree-base-trap),
   **subagent-delegation contract**, **"diagnostic image ≠ proof"** acceptance bar, **queued-report
   durability** (channel-unavailable → don't fake delivery). (Sources: 3d-cli AGENTS.)
@@ -138,30 +153,34 @@ Per the design doc; phased, lowest-churn first. Each tool migrates to import fro
   blurbs are the self-advertising mechanism. The hand-written "## Review and sanity checks" section
   duplicates the `review` skill → remove it; audit the rest the same way. (My in-place "migrate CLAUDE.md
   review docs to subcommands" was wrong — those docs shouldn't live in CLAUDE.md at all.) Careful pass,
-  it's the global config.
+  it's the global config. (alex-mextner/agent-tools#15)
 - **Decisions-as-buttons + the hanging-question DANGER** (#3706): verify the agent
   question-with-options flow (tg inline tappable buttons) actually works end-to-end. **Critical
   bug risk:** `tg-ctl` injects inbound messages into the agent's tmux pane via `send-keys`; if an
   interactive prompt/question is open in that pane, the injected text is typed INTO the prompt and
   LOST/corrupts it. Fix: answers must come through a SEPARATE channel (tg inline buttons → routed
   reply), and while a question is pending tg-ctl must DEFER/queue inbound text injection (detect the
-  pending-question state) rather than blast it into the pane. Test + fix.
+  pending-question state) rather than blast it into the pane. Test + fix. (alex-mextner/tg-cli#30)
 - **tg-cli `tg#<id>` message-ref convention** (tg#3715): reference inbound TG messages as `tg#3715`
   (NOT bare `#3715` — collides with PR/issue refs). The inbound inject wrap should render the id as
   `tg#<id>`; the autolink layer must recognize `tg#\d+` as a message reference and link it, **before**
   the PR/issue `#\d+` detection runs. ("— reply via tg" suffix already removed, tg-cli main 83ac5db.)
+  (alex-mextner/tg-cli#28)
 - **tg-cli file-excerpt attachment** (tg#3715): when a message gives a file **path + line / line-range**
   (in any of the common formats — `path:42`, `path:10-20`, `path#L10-L20`, etc.), attach the actual
-  excerpt (the referenced lines) as a quote below. Currently broken — fix.
+  excerpt (the referenced lines) as a quote below. Currently broken — fix. (alex-mextner/tg-cli#29)
 - **tg-cli `/new` command** (tg#3717): `/new [<model>] [<dir>] name [<task description>]` — spawn a new
   agent session. **Omitted options are chosen interactively via inline buttons.** Directory options =
   the dirs already in use + their `..` parents, all normalized + uniq + ranked LRU/MRU. `name` validated
-  with a **uniqueness warning**. (Pairs with the decisions-as-buttons work.)
+  with a **uniqueness warning**. (Pairs with the decisions-as-buttons work.) (alex-mextner/tg-cli#27)
 - tg-cli #25: fix-or-justify the 8 CodeQL TS findings (length-counting helpers + install TOCTOU).
-- tg-cli AGENTS stale "~578 tests" → 997.
+  (alex-mextner/tg-cli#31)
+- tg-cli AGENTS stale "~578 tests" → 997. (alex-mextner/tg-cli#32)
 - hyper-saas AGENTS.md "further-trim candidates" (Systematic Debugging / Dead-code / On-Task-Completion
   / Naming / Codex-Specific) — CTO to confirm before trimming (generic blocks now covered by skills).
+  (No tracking issue — hyper-saas is a product repo, not a tool repo, and this is CTO-gated.)
 - Billing: Fireworks/Fire Pass (`glide` account) suspended — only that provider is down; rest work.
+  (No issue — account-status note; the dead-provider dependency is removed by alex-mextner/review-cli#25.)
 
 ---
 
