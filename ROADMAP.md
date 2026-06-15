@@ -146,6 +146,13 @@ Per the design doc; phased, lowest-churn first. Each tool migrates to import fro
   LOST/corrupts it. Fix: answers must come through a SEPARATE channel (tg inline buttons → routed
   reply), and while a question is pending tg-ctl must DEFER/queue inbound text injection (detect the
   pending-question state) rather than blast it into the pane. Test + fix.
+- **tg-cli `tg#<id>` message-ref convention** (tg#3715): reference inbound TG messages as `tg#3715`
+  (NOT bare `#3715` — collides with PR/issue refs). The inbound inject wrap should render the id as
+  `tg#<id>`; the autolink layer must recognize `tg#\d+` as a message reference and link it, **before**
+  the PR/issue `#\d+` detection runs. ("— reply via tg" suffix already removed, tg-cli main 83ac5db.)
+- **tg-cli file-excerpt attachment** (tg#3715): when a message gives a file **path + line / line-range**
+  (in any of the common formats — `path:42`, `path:10-20`, `path#L10-L20`, etc.), attach the actual
+  excerpt (the referenced lines) as a quote below. Currently broken — fix.
 - tg-cli #25: fix-or-justify the 8 CodeQL TS findings (length-counting helpers + install TOCTOU).
 - tg-cli AGENTS stale "~578 tests" → 997.
 - hyper-saas AGENTS.md "further-trim candidates" (Systematic Debugging / Dead-code / On-Task-Completion
