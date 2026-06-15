@@ -3,7 +3,7 @@
 `agent-tools` is the portable **rule/guard catalog** for AI-assisted development — skills,
 agent-hooks, git-hooks, CI gates, and MCP slots, distilled from practice and generalized so
 they apply to **any** project, language, or team. It is a *library*, not an installer: you
-don't cherry-pick 31 skills, 7 hooks, and 12 CI gates by hand. You install the whole catalog
+don't cherry-pick 36 skills, 8 hooks, and 12 CI gates by hand. You install the whole catalog
 through one front door — [`rig`](https://github.com/alex-mextner/rig-cli) — which reads a
 committed `rig.yaml` and wires it in. agent-tools is the **what**; rig is the **how**.
 
