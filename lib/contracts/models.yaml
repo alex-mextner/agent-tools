@@ -1,0 +1,115 @@
+# models.yaml — the single source of truth for the ecosystem's model board.
+#
+# Accessed via: lib/checker/model_freshness.py (the daily currency checker) reads it to
+#   know what each provider is currently PINNED to, then proposes a bump when a newer
+#   version appears. review-cli / task-cli / a future research-cli read the `roles:` /
+#   `aliases:` map to resolve a SYMBOLIC name ("architect", "vision", …) to a concrete id.
+# Validated by: lib/contracts/models.schema.json (run the checker's --validate, or any
+#   JSON-Schema validator). Keep this file and that schema in lockstep.
+#
+# Assumptions (architectural invariants — do not break silently):
+#   - Every `id` is a concrete, provider-resolvable model string (byte-exact against the
+#     provider catalog), NEVER a symbolic alias. Aliases live ONLY in roles:/aliases:.
+#   - `capabilities` is a CLOSED set (see schema enum). `vision` is load-bearing: the
+#     image-review path (#3681) filters the board to vision-capable entries, so a model
+#     WITHOUT real image input MUST NOT carry the `vision` tag. Kimi-K2.7-Code is
+#     code-specialized and has NO vision; kimi-k2p6-turbo HAS vision — get this right.
+#   - The `vision` role/alias MUST resolve only to an entry whose capabilities include
+#     `vision`. The schema cannot enforce that cross-reference; the checker --validate does.
+#   - `provider` is one of the known transport providers the checker can poll. A provider
+#     with no model-list endpoint (or no key on this machine) is skipped, never crashed.
+#
+# This is DATA, not code: review-cli's DEFAULT_BOARD seeds it, but a tool overrides via its
+# own config. Bumps are SEMI-automatic — the checker PROPOSES (a PR or a dated report); a
+# human confirms, because a newer model can regress.
+
+version: 1
+
+# ── models: per-provider current-best concrete pins ────────────────────────────────────
+# Ordered, within a provider, strongest/preferred first. `context` is the advertised input
+# window in tokens. `notes` is free-form provenance.
+models:
+  # ── Anthropic (claude) — native /v1/models, all current Claude models accept images ──
+  - id: claude-fable-5
+    provider: anthropic
+    capabilities: [vision, reasoning, code]
+    context: 200000
+    notes: "Anthropic flagship (Fable 5). review board priority 1; often paywalled."
+  - id: claude-opus-4-8
+    provider: anthropic
+    capabilities: [vision, reasoning, code]
+    context: 200000
+    notes: "Opus 4.8 — review board priority 2 + default moderator."
+
+  # ── OpenAI (codex / GPT) — native /v1/models. GPT-5.5 is the codex agentic route. ──
+  - id: gpt-5.5
+    provider: openai
+    capabilities: [vision, reasoning, code]
+    context: 400000
+    notes: "GPT-5.5. review uses the agentic `codex` CLI route over the diff-only HTTP one."
+
+  # ── Google (gemini) — native model-list (generativelanguage). Multimodal. ──
+  - id: gemini-2.5-flash
+    provider: gemini
+    capabilities: [vision, reasoning, code]
+    context: 1000000
+    notes: "Gemini 2.5 Flash — review board priority 8 (contracts lens). Multimodal."
+
+  # ── commandcode gateway (OpenAI-compatible /models) — many upstream model families ──
+  - id: moonshotai/Kimi-K2.7-Code
+    provider: commandcode
+    capabilities: [code, reasoning]
+    context: 256000
+    notes: "Kimi K2.7 CODE — code-specialized, NO vision (#3681). Do not tag vision."
+  - id: deepseek/deepseek-v4-pro
+    provider: commandcode
+    capabilities: [reasoning, code]
+    context: 128000
+    notes: "DeepSeek V4 Pro via commandcode — review board priority 7 (tests lens)."
+  - id: Qwen/Qwen3.7-Max
+    provider: commandcode
+    capabilities: [reasoning, code]
+    context: 256000
+    notes: "Qwen3.7-Max via commandcode — review board priority 6 (security lens)."
+
+  # ── Moonshot turbo (vision) — reached via commandcode/fireworks routers ──
+  - id: kimi-k2p6-turbo
+    provider: commandcode
+    capabilities: [vision, code, reasoning]
+    context: 256000
+    notes: "Kimi K2.6 turbo — HAS vision (#3681). The vision-capable Kimi seat."
+
+  # ── z.ai (Zhipu / GLM) — OpenAI-compatible /models on the Coding-Plan endpoint ──
+  - id: glm-5.2
+    provider: zai
+    capabilities: [reasoning, code]
+    context: 200000
+    notes: "GLM-5.2 — newest GLM on the z.ai Coding-Plan endpoint. review board priority 5."
+
+  # ── Fireworks / glide — OpenAI-compatible. Currently down per ops; pinned for record. ──
+  - id: accounts/fireworks/models/fable-5
+    provider: fireworks
+    capabilities: [vision, reasoning, code]
+    context: 200000
+    notes: "Fable 5 via Fireworks router. Provider currently down (glide/Fireworks ops)."
+
+# ── roles: symbolic → concrete. The lens a TOOL asks for, resolved to a real id. ────────
+# A role MUST point at an `id` that exists in `models:` above. `vision` MUST resolve to an
+# entry whose capabilities include `vision` (the checker --validate enforces this).
+roles:
+  architect: claude-fable-5          # strongest holistic reviewer
+  fast: gemini-2.5-flash             # cheap, large-context, quick
+  code: moonshotai/Kimi-K2.7-Code    # code-specialized (no vision — that's fine for code)
+  reasoning: claude-opus-4-8         # deep correctness pass
+  vision: kimi-k2p6-turbo            # MUST be vision-capable (#3681 image-review filter)
+
+# ── aliases: convenience + the <provider>:latest pointers ───────────────────────────────
+# `<provider>:latest` resolves to that provider's current-best (first) pin — the thing the
+# checker compares the live endpoint against. Same constraint: each value is a concrete id.
+aliases:
+  anthropic:latest: claude-fable-5
+  openai:latest: gpt-5.5
+  gemini:latest: gemini-2.5-flash
+  commandcode:latest: moonshotai/Kimi-K2.7-Code
+  zai:latest: glm-5.2
+  fireworks:latest: accounts/fireworks/models/fable-5

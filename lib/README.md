@@ -1,3 +1,15 @@
+# agent-tools `lib/`
+
+Reusable library code + language-agnostic **contracts** the ecosystem CLIs depend on.
+
+| Path | What it is |
+| --- | --- |
+| `agenttools_log/` | Shared **structured JSONL logging** (stdlib-only) — documented below. |
+| `contracts/models.yaml` | The **model board**: the current-best concrete model per provider, each tagged with capabilities (esp. `vision`), plus a symbolic `roles:`/`aliases:` map. Single source of truth for `review-cli`/`task-cli`/future tools. Validated by `contracts/models.schema.json` (JSON-Schema) + the checker's cross-reference `--validate`. |
+| `checker/` | The **model-freshness checker** (`model_freshness.py`) — a daily job that polls provider model-list endpoints and PROPOSES version bumps for `contracts/models.yaml` (a PR via `gh`, else a dated report). Semi-automatic: it proposes, a human confirms. rig provisions it as a daily noon cron. See [`checker/README.md`](checker/README.md). |
+
+---
+
 # agenttools-log
 
 Shared **structured JSONL logging** for the agent-tools ecosystem — one JSON object per
