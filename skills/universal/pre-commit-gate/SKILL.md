@@ -14,7 +14,9 @@ to CI and don't push red.
 Before each commit, all of these must pass with **zero warnings**:
 
 1. **Lint / format** — formatter clean, linter clean. Warnings count as failures;
-   a "zero-warnings" policy is the only one that stays at zero.
+   a "zero-warnings" policy is the only one that stays at zero. Don't hand-format files
+   to satisfy this — let the `format-on-write` agent-hook format each write automatically
+   (it runs the project's configured formatter), and this gate just verifies the result.
 2. **Typecheck** — the type checker reports no errors.
 3. **Tests** — the relevant test suite is green.
 

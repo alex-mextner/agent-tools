@@ -122,7 +122,7 @@ exit `10` = block, other = error → `on_error` policy). To install one:
 2. Set the descriptor's `cmd` to the script's **absolute path** (the runner rejects
    relative/bare commands).
 3. Drop the descriptor into your harness's hook directory for the matching point
-   (`pre-bash`, `pre-write`, `stop` — map to your harness's real event names).
+   (`pre-bash`, `pre-write`, `post-write`, `stop` — map to your harness's real event names).
 
 `rig apply` does all three for you (it rewrites the `cmd` placeholder to the script's
 absolute path in your agent-tools checkout). See [`agent-hooks/README.md`](agent-hooks/README.md)
@@ -164,9 +164,11 @@ the [`ci-gate-suite`](skills/universal/ci-gate-suite/SKILL.md) skill.
   a truncating fetch tool), and more.
 - **By-type skills:** 45 — bot (12), backend (13), frontend (4), cli (7), library (4),
   infra (1), monorepo (4).
-- **Agent-hooks:** 7 — block-no-verify, block-raw-pr-merge, block-secrets-write,
+- **Agent-hooks:** 8 — block-no-verify, block-raw-pr-merge, block-secrets-write,
   require-review-before-commit, enforce-timeout-on-bash, block-raw-process-env,
-  stop-completion-selfcheck.
+  stop-completion-selfcheck, **format-on-write** (runs the project's configured formatter
+  on each file the agent writes — oxfmt/prettier/biome/ruff/black/gofmt/rustfmt; never
+  blocks).
 - **Git-hooks:** 4 templates — pre-commit, commit-msg, pre-push, no-secrets-scan (+ a
   lefthook.yml) — plus a global dispatcher (`global-dispatcher/`: `run-global-hooks`,
   `install-local-hooks.sh`, `hooks-sweep`, and a `global-hooks.d/` drop-in tree) that runs

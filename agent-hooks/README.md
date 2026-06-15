@@ -74,7 +74,21 @@ These are the *logical* points; map them to your harness's actual tool-use event
 | -------------- | -------------------------------------------- | --------------------------------------- |
 | `pre-bash`     | before a shell command runs                  | block-no-verify, block-raw-pr-merge, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash |
 | `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env |
+| `post-write`   | after a file write/edit has landed on disk   | format-on-write                         |
 | `stop`         | when the agent is about to end its turn      | stop-completion-selfcheck               |
+
+### `post-write` — react to a *completed* write
+
+`pre-write` is a **gate**: it sees the *proposed* bytes and can `block` before they touch
+disk. `post-write` is the complement — it fires **after** the file has been written/edited,
+when the file actually exists, so a hook can *react to* (not veto) the change. It's the
+right point for anything that must operate on the real file: reformatting it, regenerating
+a sibling, re-indexing it. The event payload still carries the written path (`args.path` /
+`args.file_path`) plus `event.cwd`; there is no "proposed content" to inspect because the
+content is already on disk. Hooks on this point should be `on_error: open` and treat the
+work as advisory — the write already happened, so blocking after the fact is meaningless.
+Map it to your harness's "file was written" event (e.g. a `PostToolUse` matcher on the
+Write/Edit tools).
 
 ## Installing
 
