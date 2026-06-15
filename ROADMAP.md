@@ -84,7 +84,32 @@ The parallel rig agent owns completing hyper's rollout; this session hands it of
 ---
 
 ## 🚧 In-flight at handoff (background agents — verify state, resume if incomplete)
-- **task-cli foundation** (agent a9cef4ca) — building the Python tool in the new `alex-mextner/task-cli`
+
+### ➡️ rig-tooling session (2026-06-15) — RESUME HERE
+- **hook-bridge #18 LIVE-CC VERIFIED** ✅ — fresh `claude -p` under `bypassPermissions`: a raw
+  `gh pr merge` → CC `permissionDecision: deny` (bridge → block-raw-pr-merge), a benign cmd → pass.
+  The "live-CC round-trip" the bridge section flags as pending is **done**. #20's conflict with main is
+  resolved + pushed (branch `cc-hooks-bridge`). **Land #20 then #12.**
+- **Auto-mode finding: `auto` > `bypassPermissions`, and `auto` is USER-level ONLY** — CC silently ignores
+  `defaultMode:auto` in a repo's project/local `.claude/settings.json` (since v2.1.142; confirmed empirically
+  on 2.1.177), honoring it only from `~/.claude/settings.json`. `auto` (research preview) auto-approves WITH a
+  safety classifier; bypass skips everything. So the committed-per-repo bypass rollout is the inferior model
+  AND project-bypass overrides user-auto. Redesign: `docs/specs/2026-06-15-harness-layer-redesign.md` (PR #25)
+  — CC → user-level `auto`, migrate the 6 tool repos off committed project bypass, per-harness branch-on-kind.
+- **Open PRs:** **#25** (harness-redesign spec), **#26** (this rig-config-UX capture: config get/set, schema,
+  symlinks, repo-settings), **#20** + **rig-cli #12** (the verified bridge). agent-tools `main` is now
+  branch-protected → PRs only (the `gh ship` script `.claude/scripts/pr-ship.sh` was missing here — fix it).
+- **Pending impl:** delete `rig setup` alias (CTO); implement the #26-captured rig features; verify tg
+  `PermissionRequest` passthrough fires in `auto` mode (tg-ctl already installs the hook).
+- **⚠️ `/Users/ultra/work/hyper-canvas-draft` auto-mode STILL DOES NOT WORK (CTO confirmed 2026-06-15).**
+  Diagnosed: its committed `.claude/settings.json` + `.claude/settings.local.json` set **no `defaultMode` at
+  all** (the huge `permissions.allow` list is auto-accumulated "always allow", not auto-mode). And `auto`
+  can't be project-committed (user-level only), so the real fix is **user-level `auto`** (or the rig harness
+  migration), provisioned by **rig** — NOT a hand-edit (a manual settings.local.json edit was made then
+  reverted per "fix tooling, not manual"). Close it via the rig harness redesign + the hyper rollout
+  (delegated to the rig agent). It's a TEAM product repo → user-level auto for Alex, don't commit bypass to
+  the org repo.
+- task-cli foundation (agent a9cef4ca) — building the Python tool in the new `alex-mextner/task-cli`
   repo per `task-cli/docs/2026-06-15-task-cli-spec.md`. Check the repo for the pushed branch/PR.
 - **model-currency** (agent a48e44ab) — building `lib/contracts/models.yaml` (→ relocate to a
   Python `lib/` path, no contracts dir needed) + `lib/checker/model_freshness.py` + rig daily-noon
