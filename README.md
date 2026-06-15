@@ -153,9 +153,10 @@ the [`ci-gate-suite`](skills/universal/ci-gate-suite/SKILL.md) skill.
 
 ## Inventory
 
-- **Universal skills:** 31 — shell-timeouts, exit-codes-through-pipes, dead-code-
+- **Universal skills:** 35 — shell-timeouts, exit-codes-through-pipes, dead-code-
   investigation, TDD red-first, test discipline, atomic commits, pre-commit gate, secret
-  scanning (gitleaks, hook + CI), CI gate suite, global git-hooks dispatcher, comment &
+  scanning (gitleaks, hook + CI), CI gate suite, global git-hooks dispatcher, git-workflow
+  safety (reset/fixup/partial-staging/worktree-removal), comment &
   naming hygiene, no type escape hatches, systematic debugging, smallest change, shared-util
   single-source, file-header comments, promise = durable action, worktree-base trap, visual
   proof cycle, GAN critic loop, completion self-check, semantic code search, **web-page
