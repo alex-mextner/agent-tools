@@ -40,10 +40,13 @@ Status snapshot: **2026-06-15**. This is the handoff/roadmap for the agent-nativ
 - ✅ New agent-hook `block-raw-pr-merge` (forces `gh ship`, escape-hatch) — PR #8 merged.
 - ✅ Shared-lib architecture **design doc** at `docs/specs/2026-06-15-shared-lib-architecture.md`
   (NOTE: its `lib/ts`/contracts-twinning part is SUPERSEDED — Python-only).
-- ✅ **Auto-mode provisioned (self-dogfood)** — committed `rig.yaml` (`harness.auto_mode: true`) +
-  gitignored local `.claude/settings.json` (`bypassPermissions`). agent-tools was a pending wave-2
-  target that had never been run through rig (no rig.yaml at all); now done. Installed `rig` still
-  doesn't gitignore the settings file (rig-cli#6 unfixed), so the `.gitignore` lines were added by hand.
+- ✅ **Auto-mode provisioned + made AUTOMATIC (self-dogfood)** — committed `rig.yaml`
+  (`harness.auto_mode: true`) AND committed `.claude/settings.json` (`bypassPermissions`). Reversed an
+  earlier wrong call: `.claude/settings.json` is Claude Code's SHARED/committed slot, so committing it is
+  what makes auto-mode turn on by itself on a fresh checkout (gitignoring it was the reason it "didn't
+  turn on" — CTO caught this). Only `.claude/settings.local.json` (the personal slot) stays gitignored.
+  Matches the rig-cli reference. ⚠️ Safety caveat: the "safe because agent-hooks intercept" rationale is
+  bridge-pending — CC-level guards are INERT until the #18 hook-bridge lands + is live-verified.
 
 ### ecosystem hygiene
 - ✅ ralphex/quorex removed everywhere + `alex-mextner/quorex` **archived** with a "superseded by
@@ -119,20 +122,27 @@ tool migrates to import from the lib.
 - **Enable repo security settings at init/apply** (#3696/#85): `gh api` enable Dependency Graph +
   vuln-alerts (+ secret-scanning) so the CI gates run instead of skipping. (Done manually on wave-1.)
   (alex-mextner/rig-cli#5)
-- **Auto-mode is LOCAL**: `.claude/settings.json` must be **gitignored** (per-machine via apply);
-  `rig.yaml` `harness.auto_mode` is the committed declaration. Fix rig to gitignore it on apply.
-  (Manually corrected on wave-1 PRs; rig-cli `.claude/settings.json` committed in d87257a needs un-commit.)
-  (alex-mextner/rig-cli#6)
+- **Auto-mode is COMMITTED** (decision REVERSED 2026-06-15, CTO): `.claude/settings.json` is Claude
+  Code's SHARED/committed slot — committing it (`defaultMode: bypassPermissions`) is what makes auto-mode
+  turn on by itself on every checkout. The personal per-machine slot is `.claude/settings.local.json`
+  (that one stays gitignored). rig-cli#6 ("gitignore settings.json") is REVERSED/wontfix — the opposite is
+  correct. ⚠️ The footgun every reviewer flagged: committed `bypassPermissions` auto-accepts every tool
+  call on any LOCAL CLI checkout (web sessions ignore it), and the agent-hooks that would gate it are
+  INERT in CC until the #18 bridge lands + is live-verified. So the "safe" pillar is bridge-pending —
+  #18 is now a HARD blocker for blessing auto-mode, not a nicety. (alex-mextner/rig-cli#6 — reverse it.)
 - **Rollout (#3686)**: wave-1 tool repos = PRs open (draw/3d green, tg pending TS fix). **Wave-2 =
   bots** (ExpenseSyncBot, garage-band, summary-bot, esphome-ir, claude-p, diploma, sme-archiving-gc,
   talks, upwork) + review-cli/rig-cli/agent-tools themselves. Each: `rig init --yes` + conservative
   AGENTS/CLAUDE slim (drop now-self-advertised generic rules, keep project specifics) + harvest report.
   (alex-mextner/rig-cli#7)
-  - **Auto-mode provisioning status (verified on `origin/main`, 2026-06-15):** rig-cli ✅, draw-cli ✅,
-    3d-cli ✅, agent-tools ✅. Still missing: **review-cli** (in-sync local, no `rig.yaml`), **task-cli**
-    (foundation in-flight). **tg-cli** is Bun/TS → migrates to Python last; provision auto-mode after
-    that migration. (Earlier "draw/3d unprovisioned" reads were stale local checkouts — both carry
-    `rig.yaml` on origin.)
+  - **Auto-mode COMMITTED-settings.json status (on `origin/main`, 2026-06-15):** rig-cli ✅, agent-tools ✅,
+    review-cli ✅, task-cli ✅, draw-cli ✅, 3d-cli ✅ — all six Python tool repos now COMMIT
+    `.claude/settings.json`. draw/3d had `.claude/` blanket-gitignored (the old "keep local" call) — that
+    was the ecosystem-wide cause of "auto didn't turn on"; reversed (narrowed to `settings.local.json`).
+    **tg-cli** is Bun/TS → migrates to Python last; provision then. ⚠️ The rig.yaml
+    `mcp.review.command: "review --mcp"` is STALE (the `--mcp` flag was dropped in the review subcommand
+    refactor; the global `~/.claude/mcp/mcp.json` registration is broken too) — fix-or-remove before any
+    `rig apply` registers a dead MCP server (tracked in §9 misc).
 
 ### 6. research-cli (after lib `providers`)
 - Separate Python CLI on the shared lib's panel engine (NOT a review mode). Reuses providers verbatim.
@@ -214,6 +224,12 @@ Tracking issue: alex-mextner/agent-tools#14.
   (No tracking issue — hyper-saas is a product repo, not a tool repo, and this is CTO-gated.)
 - Billing: Fireworks/Fire Pass (`glide` account) suspended — only that provider is down; rest work.
   (No issue — account-status note; the dead-provider dependency is removed by alex-mextner/review-cli#25.)
+- **`review --mcp` is broken ecosystem-wide** (no tracking issue yet — surfaced by the auto-mode rollout
+  reviewers): the review subcommand refactor dropped the `--mcp` flag, but `~/.claude/mcp/mcp.json` AND
+  every rig.yaml `mcp.review.command` still invoke `review --mcp` → `rig apply` registers a dead MCP
+  server (and the global review MCP is currently inert). Fix-or-remove: implement a real review MCP
+  entrypoint, or drop `mcp.review` from the rig.yaml template + the global registration. Affects all
+  six provisioned tool repos' rig.yaml.
 
 ### 10. Third-party skill/tool ecosystem: enable · harmonize · delineate (RESEARCH) (tg#3754)
 **Problem (CTO observation):** parse a month of hyper sessions and **most installed third-party skills/tools
@@ -292,7 +308,9 @@ if a ticket exists it must appear here. Details live in the tickets, not here.*
 - **Python-only ecosystem; tg migrates last; lib is plain Python.** (Decided twice — don't re-ask.)
 - **Every provider/harness write-up should be GENERAL, not special-cased** (no "opencode does X" when
   every harness does X). Models marked by **capabilities**, not just version.
-- **auto-mode `bypassPermissions` = local (gitignored), not committed.**
+- **auto-mode `bypassPermissions` = COMMITTED `.claude/settings.json`** (CC's shared slot → turns on by
+  itself; `.claude/settings.local.json` is the gitignored personal slot). [Reversed 2026-06-15.] Its
+  "safe because guards fire" rationale is bridge-pending — see #18.
 - **Use `gh ship`, not raw `gh pr merge`** (the `block-raw-pr-merge` guard enforces it).
 - Tool repos work directly on `main` (push often); hyper-saas via PR + `gh ship`.
 - This roadmap lives in `agent-tools` because ecosystem work should run from a tool repo / agent-tools,
