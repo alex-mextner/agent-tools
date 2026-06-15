@@ -156,18 +156,24 @@ Tracking issue: alex-mextner/agent-tools#14.
 - `strict-ticket-discipline` skill + `require-ticket-before-commit` guard (with task-cli).
 
 ### 9. Misc / cleanup
-- **⚠️ PREREQUISITE for ALL AGENTS.md/CLAUDE.md slimming — skills must actually LOAD** (tg#3736/3740,
+- **PREREQUISITE for ALL AGENTS.md/CLAUDE.md slimming — skills must actually LOAD** (tg#3736/3740,
   rig-cli#9): the harness discovers Skill-tool skills from `~/.claude/skills/` (symlinks → ~/.agents/skills),
   NOT from ~/.agents/skills directly. rig installed to ~/.agents/skills but never symlinked into
   ~/.claude/skills → rig-installed universal skills were NOT loaded → "self-advertised via skill" was
-  FALSE. Manual fix done (39 skills symlinked; harness lists them live). Durable fix: rig symlinks skills
-  into the harness dir on apply (rig-cli#9, branch `skill-harness-link`). DO NOT merge any AGENTS/CLAUDE
-  slim until this lands + is verified, or the rules silently vanish on other machines.
-  **Must work for ALL supported harnesses** (tg#3747), each with its own discovery mechanism:
+  FALSE. **✅ DURABLE FIX LANDED (2026-06-15): rig-cli PR #11 (`link_skill_harness`) MERGED** — `rig apply`
+  idempotently symlinks each enabled skill into the harness discovery dir (claude-code → ~/.claude/skills),
+  harness-keyed via `harness.kind`, never clobbers real non-symlink dirs, `rig status` reports link drift.
+  **Verified post-merge: 56 entries in ~/.claude/skills, 53 symlinks all resolve (0 broken SKILL.md), 3
+  real hand-authored dirs untouched.** So the **cc** harness is DONE + reproducible for any machine.
+  **STILL OPEN — must work for ALL supported harnesses** (tg#3747), each with its own discovery mechanism:
   cc → `~/.claude/skills` (dir-skills); codex → `~/.codex/AGENTS.md`; opencode (oc) → `~/.config/opencode/AGENTS.md`;
   gemini → `~/.gemini/GEMINI.md`; commandcode (cmd) → has its own agent CLI (CONFIRMED by CTO) — provision its global instruction dir;
   pi → **earendil-works/pi** (github.com/earendil-works/pi, the minimal extensible coding-agent harness; loads AGENTS.md, multi-provider) → AGENTS.md-style provisioning like codex/oc (confirm its global dir at impl). The **supported-harness list must be in the README** (agent-tools + rig).
 - **⚠️ agent-hooks don't FIRE in Claude Code — need an agents-hooks/v1 → CC bridge** (agent-tools#18): CC runs settings.json hooks (PreToolUse/PostToolUse), NOT the ~/.claude/hooks/*.json `agents-hooks/v1` descriptors rig installs → block-raw-pr-merge / block-secrets / format-on-write / etc. are ALL INERT in CC (files nothing invokes). The 'safe because guards intercept' pillar is FALSE until a bridge runner is wired into settings.json (rig-installed, harness-keyed) + verified by the clean-room e2e. Same class as the skill-loading gap. DO NOT claim any guard 'works' in CC until this lands.
+  **🚧 IN-FLIGHT (2026-06-15):** dispatched a subagent (worktree) to build the dispatcher (verify CC's
+  actual block contract: exit 2 vs JSON deny → map from `agents-hooks/v1` exit-10), wire it via rig into
+  settings.json PreToolUse/PostToolUse, and prove a real block with a clean-room test (guard BLOCKS / benign
+  PASSES). PRs pending; will NOT be claimed "works" without the clean-room proof.
 - **Clean-room / Docker e2e for rig** (tg#3745, rig-cli#10): the manual symlink fixed THIS machine; only a
   fresh-environment e2e (Docker container or throwaway `$HOME`) running `rig init` as a brand-new user
   proves it works for ANYONE on ANY machine — assert skills discoverable by the harness (~/.claude/skills
@@ -208,6 +214,48 @@ Tracking issue: alex-mextner/agent-tools#14.
   (No tracking issue — hyper-saas is a product repo, not a tool repo, and this is CTO-gated.)
 - Billing: Fireworks/Fire Pass (`glide` account) suspended — only that provider is down; rest work.
   (No issue — account-status note; the dead-provider dependency is removed by alex-mextner/review-cli#25.)
+
+### 10. Third-party skill/tool ecosystem: enable · harmonize · delineate (RESEARCH) (tg#3754)
+**Problem (CTO observation):** parse a month of hyper sessions and **most installed third-party skills/tools
+were never invoked.** Same root cause as the skill-loading + hook-firing gaps — *installed ≠ discovered ≠
+applied.* We've accreted overlapping tool systems with no routing doctrine → agents default to grep/Read and
+ignore the specialized tools, or burn tokens choosing between redundant ones. Need a data-driven triage:
+which to enable, which to harmonize, which to delineate, which to prune.
+
+**Full inventory of third-party / external systems to triage (NOT our own ecosystem):**
+- **MCP servers (tool providers):**
+  - **Haft** (`h-reason`) — structured engineering reasoning, decision artifacts, FPF patterns. Heavy ceremony.
+    Overlaps superpowers brainstorming + the `h-reason` skill dir.
+  - **superpowers** — skill-discovery framework + workflow skills (using-superpowers, brainstorming, debugging,
+    TDD…). Self-asserts at SessionStart.
+  - **sverklo** — multi-repo code intelligence: semantic search, concepts/clusters, memories, impact/deps,
+    review-diff. Overlaps serena + grep + the `semantic-code-search` skill.
+  - **serena** — LSP-backed semantic code: symbol find/edit, references, onboarding, project memories.
+    Overlaps sverklo + grep.
+  - **context7** — live library/framework docs. Overlaps WebFetch + agent-browser.
+  - **computer-use** — desktop control (native apps, cross-app).
+  - **claude-in-chrome** — browser automation (DOM-aware). Overlaps computer-use browser tier + agent-browser.
+- **CLI-backed external skills:** **agent-browser** — read web pages as markdown (replaces WebFetch for long
+  pages). Overlaps context7 + WebFetch + claude-in-chrome.
+- **Hand-authored skill dirs (non-rule):** **h-reason**, **debate-swarm**, **moshi-best-practices**.
+- *(Boundary, NOT the subject: our own — tg, review, draw, 3d, rig, task-cli, rtk, linear, + 50 agent-tools
+  rule-skills. The research delineates the third-party tools AGAINST these.)*
+
+**Three axes:**
+1. **Enable (заэнейблить)** — audit each: actually installed + discoverable in EVERY harness we support?
+   (Likely many are configured-but-inert or cc-only — same failure class as skill-loading/hook-firing.)
+2. **Harmonize (подружить)** — make overlapping systems compose, not collide: Haft-vs-superpowers reasoning;
+   serena-vs-sverklo memories (two stores + agent-tools MEMORY.md = THREE memory systems); two
+   "think-before-build" frameworks; agent-browser-vs-context7-vs-WebFetch doc reading.
+3. **Delineate (разграничить)** — a written routing doctrine / decision table so an agent picks right without
+   burning tokens: code search → serena (symbol-precise) | sverklo (cross-repo concept) | grep (literal);
+   docs → context7 (libraries) | agent-browser (arbitrary web); reasoning → Haft (irreversible/decision-record)
+   | superpowers brainstorming (divergence).
+
+**Evidence step (the killer):** parse ~1 month of hyper session transcripts (`~/.claude/projects/**/**.jsonl`),
+count tool/skill invocations by name, surface the never-fired and rarely-fired. Output = a routing-doctrine doc
++ concrete enable/prune/route actions (likely a rig provisioning concern + a routing skill).
+Tracking issue: **alex-mextner/agent-tools#19**.
 
 ---
 
