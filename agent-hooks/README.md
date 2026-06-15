@@ -66,7 +66,7 @@ These are the *logical* points; map them to your harness's actual tool-use event
 
 | point          | fires when…                                  | hooks                                   |
 | -------------- | -------------------------------------------- | --------------------------------------- |
-| `pre-bash`     | before a shell command runs                  | block-no-verify, require-review-before-commit, enforce-timeout-on-bash |
+| `pre-bash`     | before a shell command runs                  | block-no-verify, block-raw-pr-merge, require-review-before-commit, enforce-timeout-on-bash |
 | `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env |
 | `stop`         | when the agent is about to end its turn      | stop-completion-selfcheck               |
 

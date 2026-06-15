@@ -1,11 +1,63 @@
 # agent-tools
 
-Portable, reusable rules and guards for AI-assisted software development — distilled from
-practice across bots, backends, frontends, CLIs, libraries, and multi-agent orchestration,
-and generalized so they apply to **any** project, language, or team.
+`agent-tools` is the portable **rule/guard catalog** for AI-assisted development — skills,
+agent-hooks, git-hooks, CI gates, and MCP slots, distilled from practice and generalized so
+they apply to **any** project, language, or team. It is a *library*, not an installer: you
+don't cherry-pick 31 skills, 7 hooks, and 12 CI gates by hand. You install the whole catalog
+through one front door — [`rig`](https://github.com/alex-mextner/rig-cli) — which reads a
+committed `rig.yaml` and wires it in. agent-tools is the **what**; rig is the **how**.
 
-Nothing here is project-specific. Every skill, hook, and template is written to be useful
-to a reader with no prior context: the rationale travels, the examples are generic, and the
+## Quick start — the single front door (`rig init`)
+
+You enter agent-tools through `rig`. One command, run once, scaffolds a `rig.yaml`, wires in
+the catalog, and recommends auto-mode by default:
+
+```bash
+rig init          # first-run onboarding: scaffold rig.yaml + wire the catalog in
+rig apply         # steady state: re-apply on every machine, identically (idempotent, backs up on conflict)
+rig status        # later: has the repo drifted from rig.yaml?
+```
+
+`rig init` and `rig apply` are two distinct commands: `init` is first-run onboarding (no
+config yet → scaffold one and walk you through the catalog); `apply` is the steady-state
+reconcile (converge the disk to an existing `rig.yaml`). Interactivity (full TUI / semi /
+non-interactive `--yes`) is orthogonal — both run in any mode. (`rig setup` is a back-compat
+alias of `rig init`.) rig scans this catalog live and installs what `rig.yaml` enables
+— skills to your harness's skills dir, agent-hooks to its hook dir, the global git-hook
+dispatcher, CI workflows, MCP registrations. Update agent-tools, re-run `rig apply`, and the
+new items flow in with no code change in rig. See
+[rig-cli](https://github.com/alex-mextner/rig-cli) for install and the full `rig.yaml`
+schema.
+
+## Why this exists: autonomous, observable, controllable — and safe
+
+The point of wiring the whole catalog in one shot is to let an agent **work autonomously
+with minimum babysitting** after a single front-door command. That is only sane because of
+the guards. The spine:
+
+> **The guards make auto-mode safe; the logging makes it observable; the config makes it
+> controllable.**
+
+| Pillar | Mechanism in agent-tools |
+| --- | --- |
+| **Autonomous** | **Auto-mode** — the harness auto-accepts tool calls, so the agent runs without a permission prompt on every step. rig provisions this (`harness.auto_mode`) and **recommends it on by default** — *because the guards below are installed.* |
+| **Safe** | **Agent-hooks** intercept the dangerous call *before* the side effect: block a secret write, block a `--no-verify` gate bypass, enforce shell timeouts, block a raw `process.env` read, and **block a raw `gh pr merge` that skips the green-CI + screenshot ship gates** (`block-raw-pr-merge`). The guards are what *buy* the autonomy — auto-mode is only safe because the irreversible actions are caught mid-session. |
+| **Observable** | **Structured JSONL logging** (`lib/agenttools_log`) — one log shape across the ecosystem CLIs, plus tg reporting — so you can see what the agent actually did. |
+| **Controllable** | **Config** (`rig.yaml`) is the steering wheel: enable/disable any item, pin targets, set escape hatches. Paired with decisions-as-buttons / `tg ask`, you steer the agent without sitting on it. |
+
+Every guard ships an **escape hatch** (an env var or an inline sentinel), so safety is a
+controllable gate, not a hard wall — you can override a guard *with an explicit, logged
+reason* when you genuinely need to.
+
+---
+
+# Reference
+
+Everything below is the catalog reference — the carriers, the per-directory map, install
+instructions, and the inventory.
+
+Nothing here is project-specific. Every skill, hook, and template is written to be useful to
+a reader with no prior context: the rationale travels, the examples are generic, and the
 mechanisms are stack-agnostic (bun/node, python-uv, go).
 
 ## What's in here
@@ -27,8 +79,9 @@ A rule is enforced at a different moment depending on its carrier:
 - **Skill** — advice the agent/human reads. The only honest carrier for *judgment* rules
   (naming, design, "investigate before deleting") that no regex captures.
 - **Agent-hook** — intercepts a tool call *mid-session* and can block it *before* the side
-  effect (block a `--no-verify` bypass; stop a secret being written; prompt the completion
-  self-check at end of turn). A git-hook can't do these — it fires too late.
+  effect (block a `--no-verify` bypass; stop a secret being written; block a raw `gh pr
+  merge` that skips the ship gates; prompt the completion self-check at end of turn). A
+  git-hook can't do these — it fires too late.
 - **Git-hook** — aborts a commit/push for *mechanical* checks (format, types, tests, no
   secrets) — for every committer, human or agent, no harness required.
 
@@ -71,8 +124,9 @@ exit `10` = block, other = error → `on_error` policy). To install one:
 3. Drop the descriptor into your harness's hook directory for the matching point
    (`pre-bash`, `pre-write`, `stop` — map to your harness's real event names).
 
-See [`agent-hooks/README.md`](agent-hooks/README.md) for the full contract and each hook's
-README for test commands.
+`rig apply` does all three for you (it rewrites the `cmd` placeholder to the script's
+absolute path in your agent-tools checkout). See [`agent-hooks/README.md`](agent-hooks/README.md)
+for the full contract and each hook's README for test commands.
 
 ## Installing the git-hooks
 
@@ -109,8 +163,9 @@ the [`ci-gate-suite`](skills/universal/ci-gate-suite/SKILL.md) skill.
   a truncating fetch tool), and more.
 - **By-type skills:** 45 — bot (12), backend (13), frontend (4), cli (7), library (4),
   infra (1), monorepo (4).
-- **Agent-hooks:** 6 — block-no-verify, block-secrets-write, require-review-before-commit,
-  enforce-timeout-on-bash, block-raw-process-env, stop-completion-selfcheck.
+- **Agent-hooks:** 7 — block-no-verify, block-raw-pr-merge, block-secrets-write,
+  require-review-before-commit, enforce-timeout-on-bash, block-raw-process-env,
+  stop-completion-selfcheck.
 - **Git-hooks:** 4 templates — pre-commit, commit-msg, pre-push, no-secrets-scan (+ a
   lefthook.yml) — plus a global dispatcher (`global-dispatcher/`: `run-global-hooks`,
   `install-local-hooks.sh`, `hooks-sweep`, and a `global-hooks.d/` drop-in tree) that runs

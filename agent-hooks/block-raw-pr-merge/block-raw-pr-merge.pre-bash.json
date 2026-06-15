@@ -1,0 +1,9 @@
+{
+  "id": "block-raw-pr-merge",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/block-raw-pr-merge/block_raw_pr_merge.py",
+  "priority": 10,
+  "timeout_ms": 3000,
+  "on_error": "closed",
+  "description": "Blocks a raw `gh pr merge` (incl. `--admin`) that bypasses the ship gate. `gh ship <PR>` merges only on green CI + required screenshots; a raw merge skips both. Allows `gh ship`/`pr-ship.sh` and non-merge `gh pr` subcommands. Escape hatch: ALLOW_RAW_PR_MERGE=1 + ALLOW_RAW_PR_MERGE_REASON='why', or an inline `# no-ship-guard: why` sentinel. on_error=closed: if the check itself fails, deny rather than let a raw merge through."
+}
