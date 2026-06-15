@@ -40,6 +40,10 @@ Status snapshot: **2026-06-15**. This is the handoff/roadmap for the agent-nativ
 - ✅ New agent-hook `block-raw-pr-merge` (forces `gh ship`, escape-hatch) — PR #8 merged.
 - ✅ Shared-lib architecture **design doc** at `docs/specs/2026-06-15-shared-lib-architecture.md`
   (NOTE: its `lib/ts`/contracts-twinning part is SUPERSEDED — Python-only).
+- ✅ **Auto-mode provisioned (self-dogfood)** — committed `rig.yaml` (`harness.auto_mode: true`) +
+  gitignored local `.claude/settings.json` (`bypassPermissions`). agent-tools was a pending wave-2
+  target that had never been run through rig (no rig.yaml at all); now done. Installed `rig` still
+  doesn't gitignore the settings file (rig-cli#6 unfixed), so the `.gitignore` lines were added by hand.
 
 ### ecosystem hygiene
 - ✅ ralphex/quorex removed everywhere + `alex-mextner/quorex` **archived** with a "superseded by
@@ -124,6 +128,11 @@ tool migrates to import from the lib.
   talks, upwork) + review-cli/rig-cli/agent-tools themselves. Each: `rig init --yes` + conservative
   AGENTS/CLAUDE slim (drop now-self-advertised generic rules, keep project specifics) + harvest report.
   (alex-mextner/rig-cli#7)
+  - **Auto-mode provisioning status (verified on `origin/main`, 2026-06-15):** rig-cli ✅, draw-cli ✅,
+    3d-cli ✅, agent-tools ✅. Still missing: **review-cli** (in-sync local, no `rig.yaml`), **task-cli**
+    (foundation in-flight). **tg-cli** is Bun/TS → migrates to Python last; provision auto-mode after
+    that migration. (Earlier "draw/3d unprovisioned" reads were stale local checkouts — both carry
+    `rig.yaml` on origin.)
 
 ### 6. research-cli (after lib `providers`)
 - Separate Python CLI on the shared lib's panel engine (NOT a review mode). Reuses providers verbatim.
