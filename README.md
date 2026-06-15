@@ -13,13 +13,16 @@ You enter agent-tools through `rig`. One command, run once, scaffolds a `rig.yam
 the catalog, and recommends auto-mode by default:
 
 ```bash
-rig init          # first-run front door: scaffold rig.yaml → apply the catalog (alias of `rig setup`)
-rig apply         # re-apply on every machine, identically (idempotent, backs up on conflict)
+rig init          # first-run onboarding: scaffold rig.yaml + wire the catalog in
+rig apply         # steady state: re-apply on every machine, identically (idempotent, backs up on conflict)
 rig status        # later: has the repo drifted from rig.yaml?
 ```
 
-`rig init` is the canonical entry; `rig setup` is its synonym (wizard or headless
-`--config rig.yaml --yes`). rig scans this catalog live and installs what `rig.yaml` enables
+`rig init` and `rig apply` are two distinct commands: `init` is first-run onboarding (no
+config yet → scaffold one and walk you through the catalog); `apply` is the steady-state
+reconcile (converge the disk to an existing `rig.yaml`). Interactivity (full TUI / semi /
+non-interactive `--yes`) is orthogonal — both run in any mode. (`rig setup` is a back-compat
+alias of `rig init`.) rig scans this catalog live and installs what `rig.yaml` enables
 — skills to your harness's skills dir, agent-hooks to its hook dir, the global git-hook
 dispatcher, CI workflows, MCP registrations. Update agent-tools, re-run `rig apply`, and the
 new items flow in with no code change in rig. See
