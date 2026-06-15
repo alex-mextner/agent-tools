@@ -428,3 +428,5 @@ secret-scan is **identical** (same engine + `useDefault` ruleset), dep-audit is 
   Semgrep, gitleaks, dep-audit) into one Tailscale-served dashboard — likely **extending review-cli's existing
   dashboard** (SARIF is the common format). CTO: copy GitHub's code-scanning UI and improve it (cross-repo
   view, our own triage state, link to the suppressing `// codeql[...]` line).
+
+<!-- merge-probe ad04a9d -->
