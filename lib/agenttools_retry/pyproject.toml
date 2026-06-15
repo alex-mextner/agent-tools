@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenttools-retry"
+version = "0.1.0"
+description = "Shared, dependency-free retry helper for the agent-tools ecosystem (stdlib-only)."
+readme = "README.md"
+# 3.9 to match the lowest floor in the ecosystem (review-cli is >=3.9; rig-cli >=3.10),
+# the same floor agenttools-log targets.
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alex Mextner" }]
+keywords = ["retry", "backoff", "jitter", "resilience", "agent-tools"]
+# Intentionally ZERO runtime dependencies — stdlib only (functools + random + time).
+# See lib/agenttools_retry/__init__.py for the dependency rationale.
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/alex-mextner/agent-tools"
+
+# The package source lives one directory up (lib/agenttools_retry, this file's directory is
+# the package itself). Point discovery at the parent so setuptools finds the package and
+# never wanders into the umbrella repo's non-Python content (skills/, ci/, …).
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["agenttools_retry*"]
+
+[tool.pytest.ini_options]
+testpaths = ["../../tests"]
