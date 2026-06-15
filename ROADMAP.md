@@ -73,7 +73,7 @@ The parallel rig agent owns completing hyper's rollout; this session hands it of
    Coverage parity BEFORE deleting — its three jobs: **Semgrep** ✅ covered by agent-tools `ci/sast/`;
    **bun audit** ✅ covered by `ci/dependency-review/dep-audit.sh` (#23); **Trivy** ❌ **NO agent-tools
    equivalent yet** → either add a `ci/trivy/` (or fs-scan) gate to agent-tools and provision via rig, or
-   keep hyper's Trivy step. Don't silently drop Trivy.
+   keep hyper's Trivy step. Don't silently drop Trivy. Tracked: **agent-tools #24**.
 3. **esbuild HYP-743** must be bumped/waived for any whole-tree dep-audit (rig's or hyper's) to pass green.
 
 ### ecosystem hygiene
@@ -208,10 +208,17 @@ Tracking issue: alex-mextner/agent-tools#14.
   gemini → `~/.gemini/GEMINI.md`; commandcode (cmd) → has its own agent CLI (CONFIRMED by CTO) — provision its global instruction dir;
   pi → **earendil-works/pi** (github.com/earendil-works/pi, the minimal extensible coding-agent harness; loads AGENTS.md, multi-provider) → AGENTS.md-style provisioning like codex/oc (confirm its global dir at impl). The **supported-harness list must be in the README** (agent-tools + rig).
 - **⚠️ agent-hooks don't FIRE in Claude Code — need an agents-hooks/v1 → CC bridge** (agent-tools#18): CC runs settings.json hooks (PreToolUse/PostToolUse), NOT the ~/.claude/hooks/*.json `agents-hooks/v1` descriptors rig installs → block-raw-pr-merge / block-secrets / format-on-write / etc. are ALL INERT in CC (files nothing invokes). The 'safe because guards intercept' pillar is FALSE until a bridge runner is wired into settings.json (rig-installed, harness-keyed) + verified by the clean-room e2e. Same class as the skill-loading gap. DO NOT claim any guard 'works' in CC until this lands.
-  **🚧 IN-FLIGHT (2026-06-15):** dispatched a subagent (worktree) to build the dispatcher (verify CC's
-  actual block contract: exit 2 vs JSON deny → map from `agents-hooks/v1` exit-10), wire it via rig into
-  settings.json PreToolUse/PostToolUse, and prove a real block with a clean-room test (guard BLOCKS / benign
-  PASSES). PRs pending; will NOT be claimed "works" without the clean-room proof.
+  **✅ BUILT (2026-06-15) — NOT merged:** **agent-tools PR #20** (dispatcher `lib/cc_hook_bridge`: reads CC's
+  tool-call JSON, maps `(event,tool)`→v1 point, runs the `~/.claude/hooks/*.json` descriptors, translates
+  exit-10 BLOCK → CC's `permissionDecision: deny` on exit 0 — contract confirmed against installed CC 2.1.177)
+  + **rig-cli PR #12** (`register_hook_bridge` wires it into settings.json PreToolUse/PostToolUse on `rig apply`).
+  Clean-room test PROVES it: raw `gh pr merge` → DENY, `gh ship` → pass.
+  **➡️ NEXT ACTION (DO THIS before merging): live-CC round-trip verification.** The clean-room proof drives the
+  dispatcher exactly as CC invokes it, but it was NOT run inside a live CC session. To close the loop: in a
+  real CC session run `rig apply` (so `register_hook_bridge` writes the settings.json hooks), then trigger a
+  guarded action (a raw `gh pr merge`) and confirm **CC itself refuses the tool call**; confirm a benign
+  action passes. THEN merge **#20 first, then #12** (interdependent). Until that live round-trip passes, the
+  "safe because guards intercept" pillar stays UNPROVEN — do not claim any guard "works" in CC, do not merge.
 - **Clean-room / Docker e2e for rig** (tg#3745, rig-cli#10): the manual symlink fixed THIS machine; only a
   fresh-environment e2e (Docker container or throwaway `$HOME`) running `rig init` as a brand-new user
   proves it works for ANYONE on ANY machine — assert skills discoverable by the harness (~/.claude/skills
@@ -314,7 +321,8 @@ if a ticket exists it must appear here. Details live in the tickets, not here.*
 - **agent-tools** — #12 shared-lib (Python) · #13 research-cli · #14 harvest skills · #15 slim ~/.claude/CLAUDE.md ·
   #18 agent-hooks→CC bridge *(✅ built: PR #20 + rig-cli #12, clean-room-proven; live-CC round-trip pending)* ·
   #19 third-party tool triage · #21 OSS license-policy gate · #22 self-hosted security dashboard ·
-  **PR #17** format-on-write hook · **PR #20** hook-bridge dispatcher *(merge before rig-cli #12)*.
+  #24 Trivy CI gate · **PR #17** format-on-write hook · **PR #20** hook-bridge dispatcher
+  *(merge AFTER live-CC verify; before rig-cli #12)*.
 - **rig-cli** — #5 enable repo security settings · #6 auto-mode = gitignored local · #7 rollout wave-2 (bots +
   self) · #8 model-currency manifest+cron · #9 multi-harness skill provisioning (codex/oc/gemini/cmd/pi) ·
   #10 clean-room/Docker e2e · **PR #12** hook-bridge provisioning *(depends agent-tools #20)*.
