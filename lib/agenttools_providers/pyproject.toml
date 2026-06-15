@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenttools-providers"
+version = "0.1.0"
+description = "Tool-agnostic CORE of the multi-model provider abstraction for the agent-tools ecosystem: a capability-tagged model registry, role->model resolution, a failover board, and a key cascade (stdlib-only at import)."
+readme = "README.md"
+# 3.9 to match the lowest floor in the ecosystem (review-cli is >=3.9; rig-cli >=3.10),
+# the same floor agenttools-log / agenttools-retry target.
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alex Mextner" }]
+keywords = ["llm", "providers", "model-registry", "capability-tags", "failover", "agent-tools"]
+# Intentionally ZERO required runtime dependencies — stdlib only at import. PyYAML is the
+# ONE optional dep, needed only to parse a manifest FILE (load_registry); it is imported
+# lazily, so a consumer that builds a Registry from in-memory data never needs it. See
+# lib/agenttools_providers/__init__.py for the deferred-transports rationale.
+dependencies = []
+
+[project.optional-dependencies]
+# yaml: only if you call load_registry() on a models.yaml file. test: the suite (which
+# exercises the YAML path, so it pulls yaml in too).
+yaml = ["pyyaml"]
+test = ["pytest", "pyyaml"]
+
+[project.urls]
+Homepage = "https://github.com/alex-mextner/agent-tools"
+
+# The package source lives one directory up (lib/agenttools_providers, this file's
+# directory IS the package). Point discovery at the parent so setuptools finds the package
+# and never wanders into the umbrella repo's non-Python content (skills/, ci/, …).
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["agenttools_providers*"]
+
+[tool.pytest.ini_options]
+testpaths = ["../../tests"]
