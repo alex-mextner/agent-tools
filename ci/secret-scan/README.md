@@ -12,7 +12,7 @@ local git-hook (`../../git-hooks/no-secrets-scan`) so the same guard runs in two
 
 | File                 | For                          | Does                                                          |
 | -------------------- | ---------------------------- | ------------------------------------------------------------ |
-| `secret-scan.yml`    | **GitHub Actions**           | Reusable workflow using `gitleaks/gitleaks-action`, **pinned to a commit SHA**. Drop into `.github/workflows/`. |
+| `secret-scan.yml`    | **GitHub Actions**           | Installs the **gitleaks OSS binary** (pinned version) and scans the tree — NO `gitleaks-action`, NO org license. Drop into `.github/workflows/`. |
 | `secret-scan.sh`     | **Any other CI** (GitLab/Jenkins/Buildkite/cron) | POSIX-sh gitleaks runner; installs gitleaks if missing; block + optional warn tier. |
 | `gitleaks.toml`      | **Block-tier config**        | High-confidence ruleset (extends gitleaks defaults) + allowlist. Copy as repo `.gitleaks.toml`, or point `GITLEAKS_CONFIG`/`SECRET_SCAN_CONFIG` at it. |
 | `gitleaks-warn.toml` | **Warn-tier config**         | Fuzzy heuristics (entropy, suspicious var names). Warn-only — never blocks. |
@@ -82,11 +82,19 @@ paths   = ['''(.*?)/fixtures/''']
 3. Never delete the CI step or `--no-verify` past the local hook to "fix it later" — that's
    how a credential reaches history (effectively permanent once pushed).
 
+## Why the binary, not `gitleaks/gitleaks-action`
+
+The gitleaks **Action** requires a paid `GITLEAKS_LICENSE` on GitHub **organizations** (it
+refuses to run without one — `"[org] is an organization. License key is required."`). The
+gitleaks **binary** is MIT/open and is the *same engine with the same ruleset* — the Action
+is just a wrapper around it. So `secret-scan.yml` downloads the pinned binary and runs
+`gitleaks dir` directly: identical detection, zero license, works on org repos. `secret-scan.sh`
+does the same for non-GitHub CI.
+
 ## Pinning / supply-chain
 
-`secret-scan.yml` pins `gitleaks/gitleaks-action` to a **commit SHA** (`# v3.0.0` in the
-comment), not a moving tag — a tag like `@v3` can be repointed at malicious code. Bump the
-SHA deliberately when you upgrade. Same for `actions/checkout`.
+`secret-scan.yml` pins the **gitleaks release version** (`GITLEAKS_VERSION`) and downloads
+that exact tarball; `actions/checkout` is pinned to a commit SHA. Bump deliberately.
 
 See the [`secret-scanning`](../../skills/universal/secret-scanning/SKILL.md) skill for the
 full local-hook + CI + tiers + extension story.
