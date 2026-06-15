@@ -22,9 +22,11 @@ ls path/to/expected/new/dir     # does a directory/file from the stack exist?
 ```
 
 If the base is wrong and you have **not yet made any commits** on the new branch,
-re-seat it onto the top of your stack:
+re-seat it onto the top of your stack — but check `git status` first; a hard reset
+destroys uncommitted changes irrecoverably (see `git-workflow`):
 
 ```bash
+git status                      # clean? (a hard reset wipes anything dirty)
 git reset --hard <top-of-stack-ref>
 ```
 
