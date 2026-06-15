@@ -161,6 +161,24 @@ tool migrates to import from the lib.
   default**, so a fresh `rig init` lands the guardrails (branch protection + GHAS + squash-merge + ship gate)
   with zero hand-toggling. `rig status` reports drift on these like any other managed artifact. (Supersedes
   the narrow "gh api enable Dependency Graph" scope.) (alex-mextner/rig-cli#5)
+- **`rig config get|set [--global] <path> [val]` — the recommended way to change config** (CTO 2026-06-15):
+  read/write a single nested key in `rig.yaml` (or `~/.config/rig/config.yaml` with `--global`) WITHOUT
+  hand-editing YAML, and **reconcile immediately** — `set` runs `rig apply` so the change takes effect on the
+  spot. `<path>` is dot-notation into the YAML tree (`harness.mode`, `ci.items.secret-scan.tier`,
+  `github.branch_protection.required_reviews`). The tooling-driven config-change UX: agents and the CTO change
+  rig config through `rig config set`, never by hand-patching the file. (Pairs with the repo-settings
+  provisioning above + the harness-layer redesign + the "fix tooling, not manual" rule.)
+- **rig.yaml has a real, ENFORCED JSON schema + config docs in the rig repo** (CTO 2026-06-15): ship a JSON
+  Schema for `rig.yaml` + the global config and actually VALIDATE against it (not just prose) — `rig apply` /
+  `rig config set` reject an unknown key or bad value with a clear error + the schema path, and editors get
+  completion/validation. The human-readable config reference (`docs/config-schema.md`, already cited from the
+  rig.yaml header) must EXIST in rig-cli and stay in sync with the schema (one source of truth, every key
+  documented). "It should work" = a malformed config fails loudly, not silently.
+- **rig always provisions `AGENTS.md` + `CLAUDE.md` as symlinks** (CTO 2026-06-15): a repo should carry BOTH
+  files so every harness finds its expected name (codex/opencode/gemini read `AGENTS.md`, Claude Code reads
+  `CLAUDE.md`), pointing at ONE source of truth via a symlink (e.g. `CLAUDE.md` → `AGENTS.md`) so the two can
+  never drift. `rig init`/`rig apply` create/repair the symlink (never clobber a real file without backup);
+  `rig status` flags a missing or broken link.
 - **Auto-mode is COMMITTED** (decision REVERSED 2026-06-15, CTO): `.claude/settings.json` is Claude
   Code's SHARED/committed slot — committing it (`defaultMode: bypassPermissions`) is what makes auto-mode
   turn on by itself on every checkout. The personal per-machine slot is `.claude/settings.local.json`
