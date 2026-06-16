@@ -889,3 +889,14 @@ Generalize across the ecosystem; tie into rig.yaml repo config + the error-syste
   open a task or do basic ops (e.g. "↳ `task show <id>` to view · `task done <id>` to close"). Informative,
   proactive, friendly (the pillars) without breaking machine-readability (hint on stderr or clearly dimmed).
 Folds into the task-cli list work (grouping, --all, session-vs-all messaging, pager). task-cli.
+
+## task current: map a CURRENT task to the session/dir (CTO 2026-06-16)
+A CURRENT task can be mapped to the agent session / working directory:
+- **`task current get|set|unlink|change|link`** — manage the mapping. `get` shows the current task;
+  `link`/`set` binds a task as current; `change` swaps it; `unlink` clears it. (Use consistent verbs;
+  `link`+`change`+`unlink`, with `get` to read.)
+- The current task is HIGHLIGHTED in `task list` (distinct from the session-created marking) and SURFACED
+  prominently (e.g. a header line "current: HYP-xxx …" / shown on a bare `task current`).
+- Persisted per session/dir (alongside the team-key / rig.yaml mapping or session state). Informative when
+  set/changed (what it points at now). Pairs with the TUI selection + session-task marking + grouping.
+task-cli.
