@@ -927,3 +927,16 @@ Refinement of "review must be resilient": classify backend errors and act per cl
 Implement in panel.py/backends.py (the run_panel/failover path) — surface "retry seat X (n/3)" / "seat X
 fatal → promoting reserve Y". Tests: mock 500 → 3 retries then success; mock auth-fail → immediate reserve
 swap; mock all-fail → loud error + exit code. CTO verifies with mocked backend errors.
+
+## On a killed/crashed review → RESUME via `review sessions -s`, not from scratch (CTO 2026-06-16)
+review-cli already ships resumable sessions (PR #31): `review sessions -a` lists sessions incl. interrupted
+ones, `review sessions -s <id>` CONTINUES from where it stopped. USE IT. When a long review/brainstorm is
+killed or crashes (Anthropic storm, timeout), the continuation must `review sessions -s <id>` instead of
+restarting from round 1 — for the orchestrator AND for any subagent that runs review/brainstorm.
+- Process rule: before launching a fresh brainstorm/panel, check `review sessions -a` for an INTERRUPTED
+  session of the same topic and resume it.
+- Pairs with review-resilience (retry/reserve-replace handles transient errors WITHIN a run; sessions-resume
+  recovers a run that was killed entirely). Together: a review never has to start over.
+- Caveat: a run that died BEFORE writing its discussion log (the classifier brainstorm hit 0 bytes — backends
+  never produced a round) has nothing to resume; that's the resilience layer's job (retry/fallback so a round
+  is actually produced + logged), after which resume works.
