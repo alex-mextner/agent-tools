@@ -1,0 +1,9 @@
+{
+  "id": "require-ticket-before-commit",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/require-ticket-before-commit/require_ticket_before_commit.py",
+  "priority": 25,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "On a `git commit`, checks the commit message and branch name for a ticket reference (task-cli id, GitHub issue #123, Linear ABC-123). If none is found and the commit isn't an exempt chore/WIP/merge, it warns (default) — or blocks in strict mode (REQUIRE_TICKET_STRICT=1) — that non-trivial changes should start from a ticket with acceptance criteria + motivation + user-impact. Enforces the strict-ticket-discipline skill; pairs with task-cli. on_error=open and default warn-only: process discipline, not a security gate, so a crash or a missed reference must never wedge committing."
+}
