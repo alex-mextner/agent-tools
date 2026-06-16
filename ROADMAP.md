@@ -15,6 +15,7 @@ Status snapshot: **2026-06-16**. This is the handoff/roadmap for the agent-nativ
 ## ✅ Done (this session, 2026-06-15)
 
 ### review-cli
+
 - ✅ **Modes → first-class SUBCOMMANDS** (`review review` default, `brainstorm`, `just-ask`,
   `quorum`; mode-registry plugin-dirs; `--brainstorm/--quorum/--just-ask` flags removed; bare
   `review -C <repo>` still defaults to diff-review; `--visual` stays a composable flag) — PR #23 **merged**.
@@ -25,17 +26,20 @@ Status snapshot: **2026-06-16**. This is the handoff/roadmap for the agent-nativ
 - ✅ Ecosystem doc migration: `~/.claude/CLAUDE.md` + `review install-skill` regenerated to subcommand syntax.
 
 ### tg-cli
+
 - ✅ `tg replies [user|agent|all] [list|find]` — recall session messages (history.jsonl) — PR #24 merged.
 - ✅ Inbound media download retry-with-backoff — PR #22 merged.
 - ✅ README orthogonality: branding-follows-model (not opencode-specific), detection precedence,
   3-axis comparison — PR #23 merged.
 
 ### rig-cli
+
 - ✅ `rig init` onboarding front door + `rig apply` reconcile + auto-mode harness provisioning
   (writes `permissions.defaultMode`) — PR #3 merged. Installed + verified (doctor green).
 - ✅ Global layer applied machine-wide (47 skills → ~/.agents/skills, 7 agent-hooks, git-dispatcher, ship, mcp).
 
 ### agent-tools
+
 - ✅ README reframed around rig front door + 4 pillars (autonomous/observable/controllable/safe).
 - ✅ New agent-hook `block-raw-pr-merge` (forces `gh ship`, escape-hatch) — PR #8 merged.
 - ✅ Shared-lib architecture **design doc** at `docs/specs/2026-06-15-shared-lib-architecture.md`
@@ -57,6 +61,7 @@ Status snapshot: **2026-06-16**. This is the handoff/roadmap for the agent-nativ
   actions-suppressions in the leftover-grep/review-threads templates were already correct (untouched).
 
 ### hyper #463 (rig-rollout PR) — how it goes green
+
 - The 3 red checks on #463 were all from the GHAS/licensed gates above; **PR #23 fixes them at the source**.
   #463 goes green when the **rig agent re-applies `rig apply`** (pulls the #23 templates + commits auto-mode in
   one pass) — owned by the parallel rig agent, NOT hand-edited on the #463 branch (two agents, one branch =
@@ -66,7 +71,9 @@ Status snapshot: **2026-06-16**. This is the handoff/roadmap for the agent-nativ
   exploitable on Node/bun). Bump or waive with justification — tracked as **HYP-743** (Linear).
 
 ### ➡️ DELEGATED to the rig agent — finish the hyper rollout (CTO tg#3783/#3784)
+
 The parallel rig agent owns completing hyper's rollout; this session hands it off:
+
 1. **`rig apply` re-run on hyper** → pulls the #23 templates (de-GHAS'd gates) + commits auto-mode → greens #463
    (replaces the stale CodeQL-actions copy too).
 2. **Remove hyper's bespoke `security-scan.yml`** (CTO: common gates belong in agent-tools, not per-repo).
@@ -77,6 +84,7 @@ The parallel rig agent owns completing hyper's rollout; this session hands it of
 3. **esbuild HYP-743** must be bumped/waived for any whole-tree dep-audit (rig's or hyper's) to pass green.
 
 ### ecosystem hygiene
+
 - ✅ ralphex/quorex removed everywhere + `alex-mextner/quorex` **archived** with a "superseded by
   review-cli" banner; 3d-cli docs purged; hyper-saas AGENTS.md ralphex workflow removed (PR #461 merged).
 - ✅ hyperide.ai homepage URL cleared on all 6 tool repos.
@@ -84,10 +92,12 @@ The parallel rig agent owns completing hyper's rollout; this session hands it of
 ---
 
 ## ✅ Done (2026-06-16) — auto-mode SAFETY BLOCKER CLOSED + 17 PRs landed
+
 *(The detail below lists the first 9; the §3 lib stack #30/#33/#17, this roadmap #40, rig-cli #18, and the
 3 cross-repo doc PRs (review #27, draw #4, 3d #7) landed later the same session — see "Next actions".)*
 
 ### 🎯 Auto-mode guard — RESOLVED (the central "bridge-pending safety" blocker is CLOSED)
+
 - **#20 hook-bridge MERGED** (`d4ff40f`) + hardened (timeout_ms null/bool/0/neg; non-UTF-8 decode
   pinned `errors=replace`/`encoding=utf-8`; NotebookEdit path normalized so pre-write guards scope it).
 - **`rig apply` wired `cc_hook_bridge` into `~/.claude/settings.json`** (3 dispatcher hooks:
@@ -98,6 +108,7 @@ The parallel rig agent owns completing hyper's rollout; this session hands it of
 - Provisioned via rig (dogfood), not hand-edits.
 
 ### Merged this session (gh ship, gated — green CI + resolved codex threads)
+
 - **agent-tools #38** — NEW `ci/tests` slot (pytest via uv, secretless) + rig provisions it. agent-tools had
   12 governance CI slots but none that RAN the repo's tests → `gh ship` refused no-CI PRs. This unblocked the
   whole backlog. Keystone.
@@ -112,29 +123,34 @@ The parallel rig agent owns completing hyper's rollout; this session hands it of
   agent's subset-test run missed — `--spec` in `_VALUE_TAKING_OPTS` broke a guard test.)
 
 ### Durable / infra
+
 - Global `~/.gitignore` now ignores `.serena/` + `.claude/worktrees/` (machine artifacts were tripping
   `gh ship`'s clean-worktree check — not a ship bug; ship works fine from clean worktrees, verified).
 - `gh ship` (ci/ship/ship.sh) confirmed repo-agnostic: ran it against rig-cli/review-cli via `bash
   <agent-tools>/ci/ship/ship.sh <PR>` from each repo's worktree.
 
 ### Still-open in §3 (Shared lib extraction) — handed off with documented threads
+
 - **#30 lib-config** (§3 "config") — rebased onto main, conflict resolved, 30 tests pass (with pyyaml). **2
   open P2:** (1) `core.py` "global-only" mode still loads the repo layer (no suppress) — needs an API knob +
   test; (2) ⚠️ **SYSTEMIC:** umbrella `lib/pyproject.toml` builds only `agenttools_log`
   (`include=["agenttools_log*"]`), so NO new lib module installs — fix ONCE for all (`#29 lib-retry` already
-  merged with this latent gap). 
+  merged with this latent gap).
 - **#33 lib-advertise** (§3 "advertise") + **#17 format-hook** — CONFLICTING; need rebase (lib/README.md row
   conflict, same as #30) + thread resolution.
 - **Uncommitted lib modules** in `.claude/worktrees/wf_9d942e4d-*`: `tmux_inject` (§3 "tmux-inject"),
   `daemon` (§3 "daemon-supervisor"), `registry` (§3 "registry"); `gantt`/`providers` committed → need push+PR.
 
 ### New tickets opened (add to ledger)
+
 - **agent-tools #39** — surface advisory (exit-0) v1 hook messages as CC `additionalContext` (bridge follow-up).
 - **review-cli #30** — spec-web draft autosave race → server-side ordering token/tombstone.
 
 ## 🎯 Next actions — audit-reconciled 2026-06-16 (ordered; drives the loop)
+
 *Live cross-repo audit of all 7 tool repos (roadmap-state-audit workflow). Re-audit (or `gh pr view`)
 before acting — items 1–4 + 6's #18 LANDED later in this same 2026-06-16 session.*
+
 1. ✅ **DONE — Easy wins:** review-cli **#27**, draw-cli **#4**, 3d-cli **#7** MERGED; review-cli **#26**
    closed. PENDING: tg-cli **#33** (no local checkout — clone tg-cli first), 3d-cli **#1** (blocked on a
    required check — re-check).
@@ -168,6 +184,7 @@ before acting — items 1–4 + 6's #18 LANDED later in this same 2026-06-16 ses
 > a different repo, not the bridge.
 
 ### ➡️ rig-tooling session (2026-06-15) — RESUME HERE
+
 - **hook-bridge #18 LIVE-CC VERIFIED** ✅ — fresh `claude -p` under `bypassPermissions`: a raw
   `gh pr merge` → CC `permissionDecision: deny` (bridge → block-raw-pr-merge), a benign cmd → pass.
   The "live-CC round-trip" the bridge section flags as pending is **done**. #20's conflict with main is
@@ -200,6 +217,7 @@ before acting — items 1–4 + 6's #18 LANDED later in this same 2026-06-16 ses
   rollout PRs patched green except tg-cli #25 CodeQL.
 
 ## 📋 Open PRs ready to land
+
 - agent-tools **#9** — CI gate resilience — **MERGED**.
 - rollout: draw-cli **#3** — **MERGED**; 3d-cli **#6** — **MERGED**; rig-cli **#4** (model-cron
   schedule) — **MERGED** (gitleaks GITHUB_TOKEN fix + 2 codex review findings resolved).
@@ -214,6 +232,7 @@ before acting — items 1–4 + 6's #18 LANDED later in this same 2026-06-16 ses
 ## 🗺️ Remaining work (prioritized)
 
 ### 1. task-cli (after foundation lands)
+
 - **Phase 1** (foundation, in-flight): Python CLI — backends (GitHub Issues default, Linear per-repo)
   call the provider **API directly** with creds harvested from `gh`/`linear` configs; classification
   `change|justAsk` via `review just-ask` per-provider fallback chain (haiku head); enforcement gates
@@ -230,12 +249,15 @@ before acting — items 1–4 + 6's #18 LANDED later in this same 2026-06-16 ses
   Needs a NEW `on-inbound` hook point in `agents-hooks/v1`.
 
 ### 2. tg-cli `/tasks` (after task-cli)
+
 - `/tasks` → table + Gantt + agent summary for the session's tasks; show external-to-session deps;
   diagram sent **HD inline** (not as a file, uncompressed-quality). (alex-mextner/tg-cli#26)
 
 ### 3. Shared lib extraction (Python-only) — `agent-tools/lib/<module>`
+
 Tracking issue: alex-mextner/agent-tools#12. Per the design doc; phased, lowest-churn first. Each
 tool migrates to import from the lib.
+
 1. **`advertise`** (install-skill — 4 copies today) — first extraction, stands up the skeleton.
 2. **`hooks`** (`agents-hooks/v1` dispatcher; tg vendored it — de-dupe).
 3. **`providers`** (the biggest asset: board, failover, transports, `oc:` routing, key cascade,
@@ -247,6 +269,7 @@ tool migrates to import from the lib.
    (survives kills — shared by task-cli + tg-ctl), **Gantt-render**, `agenttools_log` (exists).
 
 ### 4. model-currency (in-flight → finish)
+
 - `models.yaml` manifest: per-provider current model + **capability tags** (vision/code/reasoning) +
   role aliases (role `vision` resolves only to vision-capable). Daily-noon **cron checker** that polls
   provider `/models` and opens a bump PR (semi-auto). rig provisions the schedule (launchd/cron),
@@ -254,6 +277,7 @@ tool migrates to import from the lib.
   in PR #4, merged.)
 
 ### 5. rig
+
 - **rig provisions REPOSITORY SETTINGS at init/apply** (config-driven, sensible defaults ON) (#3696/#85,
   CTO 2026-06-15): rig.yaml declares the repo's GitHub settings and `rig init`/`rig apply` reconciles them,
   the same way it does skills/hooks/CI. **Two backends, auto-selected per setting:**
@@ -309,9 +333,11 @@ tool migrates to import from the lib.
     `rig apply` registers a dead MCP server (tracked in §9 misc).
 
 ### 5b. rig manages tmux configuration (CTO 2026-06-16)
+
 `.tmux.conf` + plugin setup (tpm/resurrect/continuum) become rig-managed artifacts, reconciled like
 skills/hooks/CI — not hand-edited dotfiles that drift. Requirements surfaced while fixing a stale-session
 reboot (continuum's last save was 3 weeks old):
+
 - **Apply mechanism = import-preferred, managed-block fallback (CTO 2026-06-16).** rig must MIGRATE an
   existing hand-written `~/.tmux.conf`, not clobber it. Preferred: rig owns a generated file (e.g.
   `~/.config/rig/tmux/rig.tmux.conf`) built declaratively from rig.yaml, and `~/.tmux.conf` carries a
@@ -342,10 +368,12 @@ reboot (continuum's last save was 3 weeks old):
   the canonical one so they don't fight.
 
 ### 6. research-cli (after lib `providers`)
+
 - Separate Python CLI on the shared lib's panel engine (NOT a review mode). Reuses providers verbatim.
   (alex-mextner/agent-tools#13)
 
 ### 7. review-cli follow-ups
+
 - #75: make ALL board models agentic via opencode (re-investigate commandcode + GLM custom provider).
   (alex-mextner/review-cli#24)
 - Fix flat `DEFAULT_MODELS` stale `kimi-k2p6-turbo` via Fireworks (dead `glide` account) → manifest.
@@ -356,7 +384,9 @@ reboot (continuum's last save was 3 weeks old):
   (alex-mextner/review-cli#26)
 
 ### 8. agent-tools harvest (one centralized pass, from rollout reports)
+
 Tracking issue: alex-mextner/agent-tools#14.
+
 - Candidate skills (Sources: 3d-cli AGENTS):
   - ✅ **worktree-via-project-cli** (dep provisioning, distinct from worktree-base-trap) — authored
     (`skills/universal/`), GREEN-verified per writing-skills.
@@ -367,6 +397,7 @@ Tracking issue: alex-mextner/agent-tools#14.
 - `strict-ticket-discipline` skill + `require-ticket-before-commit` guard (with task-cli).
 
 ### 9. Misc / cleanup
+
 - **PREREQUISITE for ALL AGENTS.md/CLAUDE.md slimming — skills must actually LOAD** (tg#3736/3740,
   rig-cli#9): the harness discovers Skill-tool skills from `~/.claude/skills/` (symlinks → ~/.agents/skills),
   NOT from ~/.agents/skills directly. rig installed to ~/.agents/skills but never symlinked into
@@ -384,7 +415,7 @@ Tracking issue: alex-mextner/agent-tools#14.
   **✅ BUILT (2026-06-15) — NOT merged:** **agent-tools PR #20** (dispatcher `lib/cc_hook_bridge`: reads CC's
   tool-call JSON, maps `(event,tool)`→v1 point, runs the `~/.claude/hooks/*.json` descriptors, translates
   exit-10 BLOCK → CC's `permissionDecision: deny` on exit 0 — contract confirmed against installed CC 2.1.177)
-  + **rig-cli PR #12** (`register_hook_bridge` wires it into settings.json PreToolUse/PostToolUse on `rig apply`).
+  - **rig-cli PR #12** (`register_hook_bridge` wires it into settings.json PreToolUse/PostToolUse on `rig apply`).
   Clean-room test PROVES it: raw `gh pr merge` → DENY, `gh ship` → pass.
   **➡️ NEXT ACTION (DO THIS before merging): live-CC round-trip verification.** The clean-room proof drives the
   dispatcher exactly as CC invokes it, but it was NOT run inside a live CC session. To close the loop: in a
@@ -463,6 +494,7 @@ Tracking issue: alex-mextner/agent-tools#14.
   six provisioned tool repos' rig.yaml.
 
 ### 10. Third-party skill/tool ecosystem: enable · harmonize · delineate (RESEARCH) (tg#3754)
+
 **Problem (CTO observation):** parse a month of hyper sessions and **most installed third-party skills/tools
 were never invoked.** Same root cause as the skill-loading + hook-firing gaps — *installed ≠ discovered ≠
 applied.* We've accreted overlapping tool systems with no routing doctrine → agents default to grep/Read and
@@ -470,6 +502,7 @@ ignore the specialized tools, or burn tokens choosing between redundant ones. Ne
 which to enable, which to harmonize, which to delineate, which to prune.
 
 **Full inventory of third-party / external systems to triage (NOT our own ecosystem):**
+
 - **MCP servers (tool providers):**
   - **Haft** (`h-reason`) — structured engineering reasoning, decision artifacts, FPF patterns. Heavy ceremony.
     Overlaps superpowers brainstorming + the `h-reason` skill dir.
@@ -489,6 +522,7 @@ which to enable, which to harmonize, which to delineate, which to prune.
   rule-skills. The research delineates the third-party tools AGAINST these.)*
 
 **Three axes:**
+
 1. **Enable (заэнейблить)** — audit each: actually installed + discoverable in EVERY harness we support?
    (Likely many are configured-but-inert or cc-only — same failure class as skill-loading/hook-firing.)
 2. **Harmonize (подружить)** — make overlapping systems compose, not collide: Haft-vs-superpowers reasoning;
@@ -501,7 +535,8 @@ which to enable, which to harmonize, which to delineate, which to prune.
 
 **Evidence step (the killer):** parse ~1 month of hyper session transcripts (`~/.claude/projects/**/**.jsonl`),
 count tool/skill invocations by name, surface the never-fired and rarely-fired. Output = a routing-doctrine doc
-+ concrete enable/prune/route actions (likely a rig provisioning concern + a routing skill).
+
+- concrete enable/prune/route actions (likely a rig provisioning concern + a routing skill).
 Tracking issue: **alex-mextner/agent-tools#19**.
 
 **✅ Evidence DONE (2026-06-15) — hypothesis confirmed:** only **9/204 hyper sessions (4.4%)** invoked any
@@ -511,11 +546,14 @@ ToolSearch first) so the agent stays on the zero-friction Bash+grep path. Full t
 ---
 
 ## 📇 Open-ticket ledger — every open issue/PR (keep in sync; nothing dropped)
+
 *Snapshot 2026-06-15. The prose sections above carry the context/detail; THIS list is the completeness index —
 if a ticket exists it must appear here. Details live in the tickets, not here.*
 
 **2026-06-16 delta:** MERGED → agent-tools #20 (bridge, +wired+live-proven), #29 (lib-retry), #32 (mcp-policy),
-#34 (=#19 triage), #35 (strict-ticket), **#38** (ci/tests gate, NEW); rig-cli **#21** (rig stats, NEW);
+
+# 34 (=#19 triage), #35 (strict-ticket), **#38** (ci/tests gate, NEW); rig-cli **#21** (rig stats, NEW)
+
 review-cli **#28**+**#29** (spec-web). OPENED → agent-tools **#39** (bridge advisory-msg), review-cli **#30**
 (spec-web autosave race). STILL OPEN → agent-tools #17 (format-hook), #30 (lib-config, 2 P2 incl. umbrella-
 packaging systemic), #33 (lib-advertise). SYSTEMIC TODO → `lib/pyproject.toml` packages only agenttools_log.
@@ -543,6 +581,7 @@ packaging systemic), #33 (lib-advertise). SYSTEMIC TODO → `lib/pyproject.toml`
 ---
 
 ## Key constraints / lessons (read before continuing)
+
 - **Python-only ecosystem; tg migrates last; lib is plain Python.** (Decided twice — don't re-ask.)
 - **Every provider/harness write-up should be GENERAL, not special-cased** (no "opencode does X" when
   every harness does X). Models marked by **capabilities**, not just version.
@@ -575,9 +614,11 @@ secret-scan is **identical** (same engine + `useDefault` ruleset), dep-audit is 
   view, our own triage state, link to the suppressing `// codeql[...]` line).
 
 ## ⚠️ rig tmux v2 — REAL reboot cycle broke (CTO 2026-06-16, post-reboot)
+
 The #24/#26 tmux provisioning passed unit (456) + tmux parse-check but I never ran a REAL
 e2e (apply→save→REBOOT→restore) on a live machine. A reboot exposed multiple defects — fix
 so a CLEAN-machine `rig init` does EVERYTHING with NO manual steps:
+
 1. **boot**: launchd ran `tmux start-server` = an EMPTY server (config/plugins load only on the
    first session, so continuum-restore never fired). Use a boot script that `tmux new-session -d`
    (loads conf) THEN restores; and `rig` must `launchctl load` the agent itself (it didn't).
@@ -595,14 +636,17 @@ so a CLEAN-machine `rig init` does EVERYTHING with NO manual steps:
 restored session, cc resumes by session-id, panes are login shells. Verify on THIS machine too.
 
 ## ⚠️ rig MUST gate smoke.sh on pre-commit + always run smoke, not just pytest (CTO 2026-06-16)
+
 Two failures the same day traced to the SAME root: I shipped rig changes after green PYTEST
 (456/460) but NEVER ran `bash tests/smoke.sh` — the real `rig init/apply/status` flow.
+
 - `rig status` errored `unknown mcp item(s): review (known: none)` — a STALE `mcp.items.review`
   (the `review --mcp` slot was removed in #32) lingered in `~/.config/rig/config.yaml`. smoke
   (which runs `rig status` against a sample config) would have caught it. (FIXED on this machine
   by removing the block; the rig-cli template is already clean — verify `rig init` never re-adds it.)
 - the tmux reboot-cycle defects (see "rig tmux v2") — unit-only, no real e2e.
 REQUIREMENTS:
+
 1. **rig provisions a pre-commit hook (via its own git-hooks dispatcher / lefthook) that runs
    `bash tests/smoke.sh`** for the rig-cli repo (and offers it to any repo that has a smoke target),
    so a commit that breaks the real CLI flow is blocked locally — not just in CI.
@@ -612,9 +656,11 @@ REQUIREMENTS:
 3. CI already runs smoke (`tests/smoke.sh`) — keep it; the gap was LOCAL pre-commit + my discipline.
 
 ## ⚠️ rig (+ ecosystem) error system v2 — every error says what/why/how-to-fix, with heuristics (CTO 2026-06-16)
+
 Today's failures were hard to diagnose because the errors were thin: `unknown mcp item(s): review
 (known: none)` (no hint it was a removed slot or how to remove it); a dead rtk hook surfaced only as
 a generic CC "PreToolUse error"; tmux defects were SILENT (no error at all). Build a real error layer:
+
 - **Every rig error = 3 parts**: WHAT happened, WHY (root cause / context), HOW to fix (a concrete
   command or edit). Pattern from the `structured-exit-codes` skill. Stable, per-class EXIT CODES.
 - **Heuristics**:
@@ -634,9 +680,11 @@ a generic CC "PreToolUse error"; tmux defects were SILENT (no error at all). Bui
 Build as a background subagent; do NOT merge without the CTO's verify (real `rig status`/smoke proof).
 
 ## rig status — separate GLOBAL vs REPO layers + clearer drift (CTO 2026-06-16, part of error-system v2)
+
 `rig status` in a repo (e.g. hyperide) mixes machine-wide GLOBAL drift (skills in ~/.agents, harness
 links, agent-hooks — owned by `~/.config/rig/config.yaml`) with REPO drift (this repo's `.github/`
 CI, AGENTS/CLAUDE symlinks, rig.yaml). Group the output by LAYER:
+
 - **GLOBAL** (from ~/.config/rig/config.yaml): skills/hooks/harness/mcp on this machine.
 - **REPO** (from ./rig.yaml): CI workflows, repo symlinks, repo settings.
 Each item should show WHICH layer/config FILE declares it (or "not declared in any layer").
@@ -647,14 +695,17 @@ fix (`run rig init to create one`), not just a one-line warning buried above a 4
 Ties into the did-you-mean / 3-part-error work.
 
 ## rig status: non-git dir must NOT claim "no rig.yaml, should be committed" (CTO 2026-06-16)
+
 `rig status` run in `~` (no `.git/`) prints "warning: no rig.yaml in this repo (it should be committed)"
 — but `~` is NOT a repo at all. Detect non-git dirs: show ONLY the global layer + "(not a git
 repository — repo layer/rig.yaml N/A here)". The "commit a rig.yaml" advice only applies inside an
 actual git repo. Part of the error-system/status-clarity work.
 
 ## review-cli must not crash outside a git repo (CTO 2026-06-16)
+
 Running bare `review` outside a `.git` repo throws a raw RuntimeError + Python traceback
 (`_git_diff` → `git diff` failed) — a user just trying the tool gets a stack trace. Fix:
+
 - git is needed ONLY by the diff modes (`review`/`review review`, `--diff`, `--staged`).
   `just-ask`, `quorum`, `brainstorm` do NOT need git and must work anywhere.
 - Outside a git repo, the diff path must fail GRACEFULLY (no traceback): a clear 3-part message —
@@ -667,7 +718,9 @@ Running bare `review` outside a `.git` repo throws a raw RuntimeError + Python t
 Fix as a background subagent (review-cli), no merge without CTO verify.
 
 ## review-cli: rename `review review` → `review diff`; bare `review` = HELP (CTO 2026-06-16)
+
 `review review …` is bad UX (stutter). Two changes:
+
 - The diff-review SUBCOMMAND is renamed `review` → **`review diff`**. (The "review review" stutter and
   the "bare review defaults to a diff review" behavior were a mistake — never do that.)
 - **Bare `review` (no subcommand/args) prints the HELP/usage**, it does NOT silently run a diff review
@@ -681,6 +734,7 @@ SEQUENCING: do this in review-cli AFTER the "non-git graceful" PR merges (same c
 one review-cli agent at a time to avoid collisions. CTO verifies, no blind merge.
 
 ## install-* commands must show INSTALLED state (✓ + "already configured") (CTO 2026-06-16)
+
 The `install-skill` / `install-commit-hook` / `register-module` (review-cli) and rig's `install-*`
 surfaces should INDICATE current state, not just offer the action. When the thing is already set up,
 show a green ✓ + "already configured — nothing to do" (idempotent, like `rig doctor`'s dependency
@@ -689,7 +743,9 @@ review-cli install subcommands and any rig install/provision listing (status/doc
 the ecosystem error-system / clarity work — implement alongside it (subagents), CTO verifies.
 
 ## Topic-based help across the ecosystem (CTO 2026-06-16)
+
 Tools need DEEP help topics, advertised from the main help:
+
 - **review**: `review help config` (or `review --help config`) — a real config reference: the reviewer
   board, model/backend selection, config file paths + cascade (`~/.config/review-cli/…` + repo), env
   vars, how to add/override a seat. The MAIN `review --help` must POINT at it ("see `review help config`
@@ -702,8 +758,10 @@ Tools need DEEP help topics, advertised from the main help:
 Implement via subagents (per tool), CTO verifies. Start with `review help config` since that's the ask.
 
 ## Help must show ACTUAL defaults — esp. --model (CTO 2026-06-16)
+
 In `review --help` (and across tools) every configurable option must show its EFFECTIVE default value,
 not a vague description:
+
 - **`--model`**: today it says only "model/backend to run; repeat or comma-separate" — it must show the
   ACTUAL default (the reviewer board / models that run when you DON'T pass --model). E.g. "(default: the
   active board — see `review help config` / `--show-board`)" or the concrete default model id(s).
@@ -715,8 +773,10 @@ not a vague description:
 Implement with the review-cli UX subagent (queued after non-git), CTO verifies.
 
 ## Subcommand-only options belong in the subcommand help, not the global list (CTO 2026-06-16)
+
 `review --help` dumps options that apply only to specific modes/features into the GLOBAL option list,
 cluttering it. Scope them:
+
 - **Visual-only opts** (`--visual` and its companions `--before`, `--intent`, `--expect`, `--check`,
   `--json`, `--strict`, `--no-ai`, `--no-local-model`, `--vision-timeout`, `--project`) belong in the
   visual section / `review --visual --help`, NOT the global list.
@@ -730,7 +790,9 @@ cluttering it. Scope them:
 Part of the review-cli UX subagent (queued after non-git). Generalize the principle to other tools' CLIs.
 
 ## review dashboard as a managed service (run/start/status/stop/enable/disable) (CTO 2026-06-16)
+
 `review dashboard` gets service-style subcommands:
+
 - **run** — run in the foreground (this shell), blocking; for `disable`d / ad-hoc use.
 - **start** — start in the BACKGROUND (detached daemon), return immediately.
 - **status** — is it running? pid/port/url.
@@ -742,11 +804,14 @@ Part of the review-cli UX subagent (queued after non-git). Generalize the princi
   not launch anything.
 - On `start`/`run`, HINT how to enable autostart ("run `review dashboard enable` to start at login").
 Idempotent, removable; supported-OS matrix in agent-tools. SHARE the run/start/status/stop/enable/disable
-+ OS-autostart machinery with tg-ctl autostart and the daemon-supervisor (§3) — one service-management
+
+- OS-autostart machinery with tg-ctl autostart and the daemon-supervisor (§3) — one service-management
 helper, not per-tool copies. review-cli UX subagent (queued), CTO verifies.
 
 ## review-cli dashboard is under-tested — fix data + tabs, real visual QA (CTO 2026-06-16)
+
 A live look at `review dashboard` shows it was never properly tested:
+
 - **literal "topic"** is rendered for every brainstorm session instead of the REAL brainstorm topic
   (a placeholder/parse bug — pull the actual topic from the discussion-log header `# Brainstorm: <topic>`).
 - **missing data everywhere**: panel sessions show no prompt/title; many fields blank.
@@ -760,9 +825,11 @@ This is the same failure mode as the tmux/smoke gaps today: looked done, wasn't 
 subagent, CTO verifies with a screenshot.
 
 ## ONE shared help-formatter in agent-tools/lib — reuse across ALL tools (CTO 2026-06-16)
+
 tg-cli's `--help` is NOT colorized like review/rig/draw — inconsistent. ROOT PRINCIPLE (CTO, repeated):
 extract EVERYTHING reusable into `agent-tools/lib` and share it; do not re-implement per tool. Help is a
 prime candidate — build ONE shared help layer (Python lib module, §3) and have every CLI use it:
+
 - colors/styling, section layout, usage line, subcommands list;
 - the help-clarity rules from today all live HERE so a fix lands everywhere: show ACTUAL defaults
   (esp. --model), SCOPE subcommand-only options to their subcommand, topic-help (`<tool> help <topic>`)
@@ -774,6 +841,7 @@ migration it imports the shared lib like the rest. Tracking: agent-tools#12 (sha
 shared help/errors modules, then refit each CLI (subagents), CTO verifies parity (same look across tools).
 
 ## tg --tag: lowercase-english only (CTO 2026-06-16)
+
 `tg --tag` currently accepts Russian (ОТВЕТ/РЕШЕНИЕ/...) and uppercase. Restrict to LOWERCASE ENGLISH
 words only: `answer` / `decision` / `problem` / `report` (and any other defined tags) — lowercase. Reject
 anything else with a clear 3-part error ("tag must be a lowercase english word, e.g. answer/decision/
@@ -782,6 +850,7 @@ tg-cli is Bun/TS (no local checkout — clone first); pairs with tg help-colorin
 shared help/errors lib (after the Python migration). Subagent, CTO verifies.
 
 ## tg help specifics (CTO 2026-06-16) — apply with the tg-cli help work
+
 - **Don't repeat `[--format text|html]` many times** in the help. It's a global option — show it ONCE
   (in the global options), not duplicated per command/usage line.
 - **Replace the `--format-help` flag with standard topic-help**: `tg help format` (and `tg help <topic>`
@@ -793,6 +862,7 @@ shared help/errors lib (after the Python migration). Subagent, CTO verifies.
 These extend the already-queued tg-cli help work (--tag + coloring + shared help lib). CTO verifies.
 
 ## rig status must cover ALL reconciled areas, not mostly skills (CTO 2026-06-16)
+
 `rig status` is skill-heavy, but rig reconciles MANY areas — all must show, grouped by area (and by the
 GLOBAL vs REPO layer split): skills, agent-hooks (v1 descriptors), git-hooks dispatcher, CI gates,
 MCP servers, AGENTS.md/CLAUDE.md symlinks, repo settings (branch protection / GHAS / merge policy),
@@ -802,8 +872,10 @@ manages and where it's out of sync — not a wall of skill lines with everything
 error-system/status-clarity agent (global/repo separation + which config file declares each).
 
 ## Commands should work OUTSIDE a repo; task list groups by repo/project (CTO 2026-06-16)
+
 General principle (same spirit as review-non-git): a tool's read/list/global operations should NOT require
 being inside a git repo. Specifically:
+
 - **`task list` outside any repo** → show ALL tasks across repos/projects, GROUPED by repo/project (a
   heading per project, tasks under it). Inside a repo → scope to that repo (current) but offer `--all` for
   the cross-repo grouped view.
@@ -814,7 +886,9 @@ being inside a git repo. Specifically:
 task-cli is in-flight (foundation agent a9cef4ca) — fold this into it. CTO verifies.
 
 ## task list: fallback to all-tasks + pagination + session-vs-all messaging (CTO 2026-06-16)
+
 `task list` defaults to THIS-agent-SESSION's tasks. But:
+
 - In a repo, run OUTSIDE an agent session → FALL BACK to showing ALL tasks (grouped by repo/project).
 - In a session but NO session tasks → same fallback (show all tasks).
 - In BOTH fallback cases, the output must SAY SO: "showing all project tasks (`task list` defaults to
@@ -824,6 +898,7 @@ task-cli is in-flight (foundation agent a9cef4ca) — fold this into it. CTO ver
 Fold into task-cli (foundation agent a9cef4ca). Pairs with "commands work outside repo / group by project".
 
 ## task list pager: interactive-only + higher limit there (CTO 2026-06-16)
+
 Refinement of the task-list pagination: the PAGER (less) is used ONLY in interactive mode (stdout is a
 tty). In non-interactive (piped/scripted) output → NO pager, plain text (scriptable). In interactive
 mode the display LIMIT is HIGHER (e.g. 100 tasks) since the pager handles scrolling; non-interactive
@@ -831,8 +906,10 @@ keeps a small default (or `--all`/all, machine-readable). Respect `NO_PAGER`/`--
 git convention. Fold into the task-cli list work.
 
 ## Universal zsh tab-completion: shared generator + auto-installer in agent-tools/lib (CTO 2026-06-16)
+
 ONE shared module in `agent-tools/lib` that GENERATES and AUTO-INSTALLS zsh tab-completion for every tool
 (review, rig, tg, draw, 3d, task) — not per-tool copies (the "extract everything reusable" principle).
+
 - **Generator**: derive completions from each tool's CLI structure — subcommands, options, topic-help
   topics, choice values (argparse introspection for the Python tools). Keeps completion in sync with the
   CLI automatically (no hand-written, drift-prone _tool files).
@@ -843,8 +920,10 @@ ONE shared module in `agent-tools/lib` that GENERATES and AUTO-INSTALLS zsh tab-
 Build as a subagent on agent-tools/lib + wire each tool, CTO verifies (tab-complete actually works in zsh).
 
 ## task-cli classifier (change vs justAsk) — make it accurate, fast, reliable (CTO 2026-06-16)
+
 `task classify 'когда началась сессия?'` → `change` — WRONG (it's a justAsk question). The change/justAsk
 classifier is inaccurate. Improve it properly:
+
 - **Brainstorm a fast + reliable design** (done as a real review brainstorm — see launch). Likely: cheap
   deterministic heuristics first (interrogative words/`?` → justAsk; imperative verbs/file refs → change)
   to short-circuit obvious cases with ZERO LLM latency, then a small local-model head (haiku) with a
@@ -860,6 +939,7 @@ classifier is inaccurate. Improve it properly:
 task-cli (foundation agent a9cef4ca). CTO verifies with the benchmark numbers.
 
 ## task list --all shows nothing on hyperide (CTO 2026-06-16)
+
 `task list --all` returns NOTHING in the hyperide repo — it should show ALL tasks across all known
 projects/repos (grouped by project, per the outside-repo/grouping item). Bug in the `--all` cross-repo
 aggregation (backend query scope, or it only looks at the current repo). Fix + test: `--all` returns tasks
@@ -867,10 +947,12 @@ from every configured/known project (GitHub Issues + Linear backends), grouped, 
 messaging. Pairs with the task-list grouping/fallback items. task-cli.
 
 ## First-run mapping for external per-repo config → persist to rig.yaml; informative/proactive/friendly (CTO 2026-06-16)
+
 PILLARS of our tooling: informative, proactive, friendly. The `linear` CLI fails cryptically when it can't
 infer the team key from the dir name ("Could not determine team key from directory name or team flag") —
 the user must manually `linear team list` then `--team HYP`. Our tooling (task-cli with the Linear backend,
 and any tool wrapping an external command that needs per-repo config) must instead:
+
 - **First-run mapping flow**: when a needed per-repo value (Linear team key, project, etc.) is missing,
   DETECT it (e.g. fetch `linear team list`; if exactly one team → auto-pick) or ASK, then PERSIST it to the
   LOCAL `rig.yaml` (repo config) so it's remembered — no re-asking, no cryptic failures next time.
@@ -882,8 +964,9 @@ and any tool wrapping an external command that needs per-repo config) must inste
 Generalize across the ecosystem; tie into rig.yaml repo config + the error-system. task-cli/rig subagents.
 
 ## task list: interactive TUI + non-interactive hints (CTO 2026-06-16)
+
 - **Interactive mode (tty)**: `task list` is a TUI — a SCROLLABLE list, tasks are SELECTABLE (arrow keys
-  + enter to open/act), and tasks CREATED IN THIS SESSION are visually MARKED/highlighted. Take inspiration
+  - enter to open/act), and tasks CREATED IN THIS SESSION are visually MARKED/highlighted. Take inspiration
   from the linear CLI's TUI (key/state columns, navigation). Pairs with the interactive pager + higher limit.
 - **Non-interactive mode (piped/script)**: no TUI — plain list, and print a DIMMED/grey HINT showing how to
   open a task or do basic ops (e.g. "↳ `task show <id>` to view · `task done <id>` to close"). Informative,
@@ -891,7 +974,9 @@ Generalize across the ecosystem; tie into rig.yaml repo config + the error-syste
 Folds into the task-cli list work (grouping, --all, session-vs-all messaging, pager). task-cli.
 
 ## task current: map a CURRENT task to the session/dir (CTO 2026-06-16)
+
 A CURRENT task can be mapped to the agent session / working directory:
+
 - **`task current get|set|unlink|change|link`** — manage the mapping. `get` shows the current task;
   `link`/`set` binds a task as current; `change` swaps it; `unlink` clears it. (Use consistent verbs;
   `link`+`change`+`unlink`, with `get` to read.)
@@ -902,8 +987,10 @@ A CURRENT task can be mapped to the agent session / working directory:
 task-cli.
 
 ## review CLI must be RESILIENT to backend 500 / rate-limit (CTO 2026-06-16)
+
 Today review brainstorm/panel returned SILENT-EMPTY (0 bytes) when Anthropic backends threw 500 /
 "Server temporarily limiting requests" / model-unavailable. review must HANDLE this, not give up:
+
 - **Retry with exponential backoff + jitter** per backend on transient errors (HTTP 500/502/503/429,
   "rate limited", "temporarily unavailable") — a few attempts before declaring a seat failed.
 - **Fall back to other available board seats** (the failover pool already exists for unavailability —
@@ -915,7 +1002,9 @@ review-cli subagent. CTO verifies by simulating backend 500s (mock) — retries 
 silent-empty.
 
 ## review resilience — concrete retry vs reserve-replace policy (CTO 2026-06-16)
+
 Refinement of "review must be resilient": classify backend errors and act per class:
+
 - **Retryable (transient)** — HTTP 500/502/503/429, "rate limited", "temporarily limiting", timeouts:
   RETRY the SAME seat up to ~3 times with exponential backoff + jitter before giving up on it. (3 is the
   default where retrying makes sense; tunable.)
@@ -929,10 +1018,12 @@ fatal → promoting reserve Y". Tests: mock 500 → 3 retries then success; mock
 swap; mock all-fail → loud error + exit code. CTO verifies with mocked backend errors.
 
 ## On a killed/crashed review → RESUME via `review sessions -s`, not from scratch (CTO 2026-06-16)
+
 review-cli already ships resumable sessions (PR #31): `review sessions -a` lists sessions incl. interrupted
 ones, `review sessions -s <id>` CONTINUES from where it stopped. USE IT. When a long review/brainstorm is
 killed or crashes (Anthropic storm, timeout), the continuation must `review sessions -s <id>` instead of
 restarting from round 1 — for the orchestrator AND for any subagent that runs review/brainstorm.
+
 - Process rule: before launching a fresh brainstorm/panel, check `review sessions -a` for an INTERRUPTED
   session of the same topic and resume it.
 - Pairs with review-resilience (retry/reserve-replace handles transient errors WITHIN a run; sessions-resume
@@ -942,11 +1033,16 @@ restarting from round 1 — for the orchestrator AND for any subagent that runs 
   is actually produced + logged), after which resume works.
 
 ## review retry count must be CONFIGURABLE (CTO 2026-06-16)
+
 The ~3 retries (and backoff/timeout budgets) must be CONFIGURABLE — via review-cli config file, env var
 (e.g. REVIEW_RETRIES), and/or a flag — not hardcoded. Sensible default (3), overridable per env/run.
+
 ## (reserve-replace failover already exists — verify it actually fires in the logs; see check below)
+
 ## reserve-replace failover IS firing, but the promotion event is NOT durably logged (CTO 2026-06-16, VERIFIED)
+
 Verified via `~/.config/review-cli/run-stats.jsonl`: the failover fires on nearly EVERY review run.
+
 - Steady state: `pool_size:4, ok:4, fail:1`, recorded `models=[fable5,opus,codex,glm]`. The planned
   top-4 by board priority (config.py:181-196) is `[fable5,opus,codex,KIMI]`. Kimi (commandcode) dies at
   runtime (timeouts `EXIT 124` / empty `output_tokens=0` in commandcode-r0 logs) and GLM (first reserve)
