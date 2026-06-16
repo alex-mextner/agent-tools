@@ -215,6 +215,10 @@ def _as_dirs(harness_dirs: Union[PathLike, Sequence[PathLike]]) -> Sequence[Path
 
 def _write_skill_md(skill_dir: Path, skill_md: str) -> Literal["written", "current"]:
     target = skill_dir / "SKILL.md"
+    # Never write THROUGH a symlink (write_text would follow it and clobber the link's
+    # target, somewhere outside the skill dir). Replace a symlinked SKILL.md with a real file.
+    if target.is_symlink():
+        target.unlink()
     if target.is_file() and target.read_text(encoding="utf-8") == skill_md:
         return "current"
     target.write_text(skill_md, encoding="utf-8")
@@ -245,6 +249,13 @@ def _sync_source_dir(source: Path, skill_dir: Path) -> Literal["written", "curre
         dst.parent.mkdir(parents=True, exist_ok=True)
         if _same_file(src, dst):
             continue
+        # A symlink or a real dir sitting where this file goes would make copy2 write THROUGH
+        # the link (clobbering its target) or copy INTO the dir (wrong name). Replace it with
+        # the regular file we intend.
+        if dst.is_symlink() or dst.is_file():
+            dst.unlink()
+        elif dst.is_dir():
+            shutil.rmtree(dst)
         shutil.copy2(src, dst)  # copies content + mode + mtime
         changed = True
     return "written" if changed else "current"

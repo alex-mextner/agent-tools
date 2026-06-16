@@ -377,6 +377,50 @@ def test_source_dir_resyncs_when_only_mode_changes(tmp_path):
     assert (skills / "demo" / "run.sh").stat().st_mode & stat.S_IXUSR
 
 
+# ----------------------------------------------------------------- file-safety edge cases
+
+
+def test_skill_md_symlink_is_replaced_not_written_through(dirs):
+    # A SKILL.md that is a SYMLINK must be replaced with a real file — never written THROUGH
+    # (that would clobber the link's target, somewhere outside the skill dir).
+    skills, harness = dirs
+    skill_dir = skills / "demo"
+    skill_dir.mkdir(parents=True)
+    outside = skills.parent / "outside.txt"
+    outside.write_text("DO NOT CLOBBER\n")
+    (skill_dir / "SKILL.md").symlink_to(outside)
+
+    _install(skills, harness)
+
+    md = skill_dir / "SKILL.md"
+    assert md.is_file() and not md.is_symlink()
+    assert md.read_text() == SKILL_MD
+    assert outside.read_text() == "DO NOT CLOBBER\n", "the symlink target was clobbered"
+
+
+def test_source_asset_symlink_dest_is_replaced(tmp_path):
+    # A source-dir asset whose destination is a SYMLINK must be replaced with the real file,
+    # not copied THROUGH the link.
+    skills = tmp_path / "agents"
+    src = tmp_path / "src-skill"
+    (src / "scripts").mkdir(parents=True)
+    (src / "SKILL.md").write_text(SKILL_MD)
+    (src / "scripts" / "run.sh").write_text("#!/bin/sh\necho new\n")
+    # pre-create the dest asset as a symlink to an external file
+    dest_scripts = skills / "demo" / "scripts"
+    dest_scripts.mkdir(parents=True)
+    outside = tmp_path / "outside.sh"
+    outside.write_text("echo DO NOT CLOBBER\n")
+    (dest_scripts / "run.sh").symlink_to(outside)
+
+    install_skill("demo", source_dir=src, skills_dir=skills, harness_dirs=[tmp_path / "claude"])
+
+    landed = dest_scripts / "run.sh"
+    assert landed.is_file() and not landed.is_symlink()
+    assert landed.read_text() == "#!/bin/sh\necho new\n"
+    assert outside.read_text() == "echo DO NOT CLOBBER\n", "the symlink target was clobbered"
+
+
 # --------------------------------------------------------------------------- CLI (_main)
 
 
