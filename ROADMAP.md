@@ -1056,3 +1056,22 @@ written to **stderr only**, never to the per-backend `~/Library/Logs/review-cli/
 failover is invisible "by the logs" — only inferrable from run-stats + EXIT codes. Fix: also append the
 FailoverOutcome (each promotion: failed seat, promoted reserve, round) to a durable run log so a kill/
 post-mortem can SEE the replacements, not just the final usable set.
+
+## rig must ignore .claude/worktrees globally via core.excludesfile (CTO 2026-06-17, DECIDED)
+The harness (Claude Code / Workflow tool) creates throwaway worktrees under each repo's
+`.claude/worktrees/`; they pollute `git status` in every repo and even got accidentally
+committed into agent-tools as 160000 gitlinks (commit 6d9b5ac, cleaned up forward by
+untracking them). CTO DECISION (chosen over PR #23's per-repo `.gitignore` block): rig
+provisions a single rig-managed marker block in the GLOBAL git excludes file
+(`core.excludesfile`), so it covers EVERY repo on the machine with zero per-repo commits.
+- Target resolution: respect an already-set `core.excludesfile` (this machine: `~/.gitignore`);
+  else set it to `~/.config/git/ignore` and write the block there. Clean machine: `rig init`
+  does both (set the git config + write block).
+- Block: `# >>> rig-managed (do not edit) >>>` … `# <<< … <<<`, default entry `**/.claude/worktrees/`.
+- STRICT idempotency required: evidence of a prior non-idempotent appender — `~/.config/git/ignore`
+  had ~280 duplicated `**/.claude/settings.local.json` lines (and that file is currently DEAD because
+  core.excludesfile points elsewhere). rig's reconcile must never duplicate; collapse the managed
+  region only, never touch user lines.
+- Immediate relief already applied by hand on this machine: rig-marker block with `**/.claude/worktrees/`
+  appended to `~/.gitignore`; all repos now ignore it. Reworked rig feature (branch
+  `rig-global-excludesfile`, supersedes #23) makes it durable / clean-machine.
