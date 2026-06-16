@@ -1,6 +1,6 @@
 # Agent CLI Ecosystem — Roadmap
 
-Status snapshot: **2026-06-15**. This is the handoff/roadmap for the agent-native CLI ecosystem
+Status snapshot: **2026-06-16**. This is the handoff/roadmap for the agent-native CLI ecosystem
 (`tg-cli`, `review-cli`, `rig-cli`, `draw-cli`, `3d-cli`, `task-cli`) + the `agent-tools` umbrella.
 
 > **North-star architecture (DECIDED — do not re-litigate):** the whole CLI ecosystem is
@@ -83,7 +83,82 @@ The parallel rig agent owns completing hyper's rollout; this session hands it of
 
 ---
 
+## ✅ Done (2026-06-16) — auto-mode SAFETY BLOCKER CLOSED + 9 PRs landed
+
+### 🎯 Auto-mode guard — RESOLVED (the central "bridge-pending safety" blocker is CLOSED)
+- **#20 hook-bridge MERGED** (`d4ff40f`) + hardened (timeout_ms null/bool/0/neg; non-UTF-8 decode
+  pinned `errors=replace`/`encoding=utf-8`; NotebookEdit path normalized so pre-write guards scope it).
+- **`rig apply` wired `cc_hook_bridge` into `~/.claude/settings.json`** (3 dispatcher hooks:
+  PreToolUse×2 + Stop). **Live-proven THIS machine:** a blockable cmd → `permissionDecision: deny`,
+  benign → allow. So `defaultMode: auto` is now GUARDED — the installed agent-hooks (block-secrets-write,
+  enforce-timeout-on-bash, require-review-before-commit, block-no-verify, block-raw-pr-merge, …) actually
+  FIRE under auto-mode. The roadmap's "safe pillar is bridge-pending" caveat is now satisfied.
+- Provisioned via rig (dogfood), not hand-edits.
+
+### Merged this session (gh ship, gated — green CI + resolved codex threads)
+- **agent-tools #38** — NEW `ci/tests` slot (pytest via uv, secretless) + rig provisions it. agent-tools had
+  12 governance CI slots but none that RAN the repo's tests → `gh ship` refused no-CI PRs. This unblocked the
+  whole backlog. Keystone.
+- **agent-tools #29** — `lib/agenttools_retry` (§3 "retry"). **agent-tools #32** — mcp-policy (review is a
+  CLI+skill, NOT an MCP; removed the dead `mcp/review` slot + repointed 6 dangling refs). **agent-tools #34**
+  — third-party tool triage (#19). **agent-tools #35** — strict-ticket-discipline skill + require-ticket
+  hook (task-cli integration piece; fixed 2 real hook bugs: honor `git -C`, don't exempt on flags in the msg).
+- **rig-cli #21** — NEW `rig stats show`: tool-adoption analytics across agent harnesses (sources/aggregate/
+  render pipeline, json/tui/web). Fixed 2 P2 (parse_iso non-string; inverted --since/--until).
+- **review-cli #28 + #29** — spec-web phase-1 (mobile UX) + phase-2 (submit→agent handoff, debounced disk
+  drafts, `review spec-web reply` → UI+tg). §7 review-cli follow-ups. (Caught a CI regression the building
+  agent's subset-test run missed — `--spec` in `_VALUE_TAKING_OPTS` broke a guard test.)
+
+### Durable / infra
+- Global `~/.gitignore` now ignores `.serena/` + `.claude/worktrees/` (machine artifacts were tripping
+  `gh ship`'s clean-worktree check — not a ship bug; ship works fine from clean worktrees, verified).
+- `gh ship` (ci/ship/ship.sh) confirmed repo-agnostic: ran it against rig-cli/review-cli via `bash
+  <agent-tools>/ci/ship/ship.sh <PR>` from each repo's worktree.
+
+### Still-open in §3 (Shared lib extraction) — handed off with documented threads
+- **#30 lib-config** (§3 "config") — rebased onto main, conflict resolved, 30 tests pass (with pyyaml). **2
+  open P2:** (1) `core.py` "global-only" mode still loads the repo layer (no suppress) — needs an API knob +
+  test; (2) ⚠️ **SYSTEMIC:** umbrella `lib/pyproject.toml` builds only `agenttools_log`
+  (`include=["agenttools_log*"]`), so NO new lib module installs — fix ONCE for all (`#29 lib-retry` already
+  merged with this latent gap). 
+- **#33 lib-advertise** (§3 "advertise") + **#17 format-hook** — CONFLICTING; need rebase (lib/README.md row
+  conflict, same as #30) + thread resolution.
+- **Uncommitted lib modules** in `.claude/worktrees/wf_9d942e4d-*`: `tmux_inject` (§3 "tmux-inject"),
+  `daemon` (§3 "daemon-supervisor"), `registry` (§3 "registry"); `gantt`/`providers` committed → need push+PR.
+
+### New tickets opened (add to ledger)
+- **agent-tools #39** — surface advisory (exit-0) v1 hook messages as CC `additionalContext` (bridge follow-up).
+- **review-cli #30** — spec-web draft autosave race → server-side ordering token/tombstone.
+
+## 🎯 Next actions — audit-reconciled 2026-06-16 (ordered; drives the loop)
+*Live cross-repo audit of all 7 tool repos (roadmap-state-audit workflow). Do in this order.*
+1. **Easy wins (S):** ship the cross-repo ecosystem-table doc PRs — review-cli **#27**, draw-cli **#4**,
+   3d-cli **#7**, tg-cli **#33** (all CI-green, 0 threads, MERGEABLE) → then close review-cli **#26**
+   (the propagation tracking issue). Also 3d-cli **#1** (slim AGENTS.md, 0 threads).
+2. **Cleanup stale-open (S):** close agent-tools issue **#18** (bridge done — point at `d4ff40f` + the wiring)
+   and rig-cli **#12** (provisioning done) — they re-surface as "pending" in every audit otherwise.
+3. **§3 SYSTEMIC UNBLOCKER (M):** fix the umbrella `lib/pyproject.toml` (`include=["agenttools_log*"]`) to
+   package ALL `agenttools_*` modules — today NO new lib module installs, so `agenttools_retry` (#29, merged)
+   ImportErrors and green CI is misleading. Fix ONCE, then the lib PRs.
+4. **§3 lib PRs (M):** land **#30** lib-config (fix its 2 P2: global-only suppress + the packaging above),
+   then rebase **#33** lib-advertise and **#17** format-hook onto it (they stack-conflict on `lib/README.md`),
+   clear threads, ship. Then **commit+push the uncommitted** lib modules (tmux_inject/daemon/registry) +
+   PR gantt/providers — BEFORE any worktree cleanup (single point of loss).
+5. **tg-cli (S):** ship #34 (autolink → tg#28) and #35 (defer-while-waiting → tg#30) after clearing 1 thread each.
+6. **rig-cli (S):** ship #20 (`rig config get|set`, §5 piece) and #18 (readme) after clearing 1 thread each.
+7. **rig-cli §5 (L):** repo-settings provisioning via `gh api` + `agent-browser` (current branch
+   `roadmap-rig-repo-settings`). Guard with capability detection (org/private repos can hard-fail on
+   ruleset/GHAS endpoints — same class that forced the GHAS→OSS retreat); default-on only where the API permits.
+
 ## 🚧 In-flight at handoff (background agents — verify state, resume if incomplete)
+
+> ⚠️ **SUPERSEDED (2026-06-16):** every "hook-bridge / auto-mode-guard is bridge-pending / live-verify
+> pending / land #20 / #18 is a hard blocker" item in THIS section and below is **DONE** — see
+> "✅ Done (2026-06-16)" above. #20 is merged (`d4ff40f`), `cc_hook_bridge` is wired into
+> `~/.claude/settings.json` and **live-proven** (deny/allow). Do NOT re-verify or re-merge the bridge.
+> The `.claude/scripts/pr-ship.sh` shim is present and CI exists (#36/#37/#38). Follow the "🎯 Next
+> actions" block. The ONLY still-open auto-mode item is the **hyper product repo** rollout (below) —
+> a different repo, not the bridge.
 
 ### ➡️ rig-tooling session (2026-06-15) — RESUME HERE
 - **hook-bridge #18 LIVE-CC VERIFIED** ✅ — fresh `claude -p` under `bypassPermissions`: a raw
@@ -376,6 +451,12 @@ ToolSearch first) so the agent stays on the zero-friction Bash+grep path. Full t
 *Snapshot 2026-06-15. The prose sections above carry the context/detail; THIS list is the completeness index —
 if a ticket exists it must appear here. Details live in the tickets, not here.*
 
+**2026-06-16 delta:** MERGED → agent-tools #20 (bridge, +wired+live-proven), #29 (lib-retry), #32 (mcp-policy),
+#34 (=#19 triage), #35 (strict-ticket), **#38** (ci/tests gate, NEW); rig-cli **#21** (rig stats, NEW);
+review-cli **#28**+**#29** (spec-web). OPENED → agent-tools **#39** (bridge advisory-msg), review-cli **#30**
+(spec-web autosave race). STILL OPEN → agent-tools #17 (format-hook), #30 (lib-config, 2 P2 incl. umbrella-
+packaging systemic), #33 (lib-advertise). SYSTEMIC TODO → `lib/pyproject.toml` packages only agenttools_log.
+
 - **agent-tools** — #12 shared-lib (Python) · #13 research-cli · #14 harvest skills · #15 slim ~/.claude/CLAUDE.md ·
   #18 agent-hooks→CC bridge *(✅ built: PR #20 + rig-cli #12, clean-room-proven; live-CC round-trip pending)* ·
   #19 third-party tool triage · #21 OSS license-policy gate · #22 self-hosted security dashboard ·
@@ -404,8 +485,9 @@ if a ticket exists it must appear here. Details live in the tickets, not here.*
   every harness does X). Models marked by **capabilities**, not just version.
 - **auto-mode `bypassPermissions` = COMMITTED `.claude/settings.json`** (CC's shared slot → turns on by
   itself; `.claude/settings.local.json` is the gitignored personal slot). [Reversed 2026-06-15.] Its
-  "safe because guards fire" rationale is bridge-pending — see #18.
-- **Use `gh ship`, not raw `gh pr merge`** (the `block-raw-pr-merge` guard enforces it).
+  "safe because guards fire" rationale is **RESOLVED 2026-06-16** (#18/#20 bridge merged + wired into
+  `~/.claude/settings.json` + live-proven; guards fire under auto-mode). No longer bridge-pending.
+- **Use `gh ship`, not raw `gh pr merge`** (the `block-raw-pr-merge` guard enforces it — now LIVE via the bridge).
 - Tool repos work directly on `main` (push often); hyper-saas via PR + `gh ship`.
 - This roadmap lives in `agent-tools` because ecosystem work should run from a tool repo / agent-tools,
   not from an unrelated product repo.
