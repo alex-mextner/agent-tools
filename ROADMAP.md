@@ -83,7 +83,9 @@ The parallel rig agent owns completing hyper's rollout; this session hands it of
 
 ---
 
-## ✅ Done (2026-06-16) — auto-mode SAFETY BLOCKER CLOSED + 9 PRs landed
+## ✅ Done (2026-06-16) — auto-mode SAFETY BLOCKER CLOSED + 17 PRs landed
+*(The detail below lists the first 9; the §3 lib stack #30/#33/#17, this roadmap #40, rig-cli #18, and the
+3 cross-repo doc PRs (review #27, draw #4, 3d #7) landed later the same session — see "Next actions".)*
 
 ### 🎯 Auto-mode guard — RESOLVED (the central "bridge-pending safety" blocker is CLOSED)
 - **#20 hook-bridge MERGED** (`d4ff40f`) + hardened (timeout_ms null/bool/0/neg; non-UTF-8 decode
@@ -131,21 +133,26 @@ The parallel rig agent owns completing hyper's rollout; this session hands it of
 - **review-cli #30** — spec-web draft autosave race → server-side ordering token/tombstone.
 
 ## 🎯 Next actions — audit-reconciled 2026-06-16 (ordered; drives the loop)
-*Live cross-repo audit of all 7 tool repos (roadmap-state-audit workflow). Do in this order.*
-1. **Easy wins (S):** ship the cross-repo ecosystem-table doc PRs — review-cli **#27**, draw-cli **#4**,
-   3d-cli **#7**, tg-cli **#33** (all CI-green, 0 threads, MERGEABLE) → then close review-cli **#26**
-   (the propagation tracking issue). Also 3d-cli **#1** (slim AGENTS.md, 0 threads).
-2. **Cleanup stale-open (S):** close agent-tools issue **#18** (bridge done — point at `d4ff40f` + the wiring)
-   and rig-cli **#12** (provisioning done) — they re-surface as "pending" in every audit otherwise.
-3. **§3 SYSTEMIC UNBLOCKER (M):** fix the umbrella `lib/pyproject.toml` (`include=["agenttools_log*"]`) to
-   package ALL `agenttools_*` modules — today NO new lib module installs, so `agenttools_retry` (#29, merged)
-   ImportErrors and green CI is misleading. Fix ONCE, then the lib PRs.
-4. **§3 lib PRs (M):** land **#30** lib-config (fix its 2 P2: global-only suppress + the packaging above),
-   then rebase **#33** lib-advertise and **#17** format-hook onto it (they stack-conflict on `lib/README.md`),
-   clear threads, ship. Then **commit+push the uncommitted** lib modules (tmux_inject/daemon/registry) +
-   PR gantt/providers — BEFORE any worktree cleanup (single point of loss).
-5. **tg-cli (S):** ship #34 (autolink → tg#28) and #35 (defer-while-waiting → tg#30) after clearing 1 thread each.
-6. **rig-cli (S):** ship #20 (`rig config get|set`, §5 piece) and #18 (readme) after clearing 1 thread each.
+*Live cross-repo audit of all 7 tool repos (roadmap-state-audit workflow). Re-audit (or `gh pr view`)
+before acting — items 1–4 + 6's #18 LANDED later in this same 2026-06-16 session.*
+1. ✅ **DONE — Easy wins:** review-cli **#27**, draw-cli **#4**, 3d-cli **#7** MERGED; review-cli **#26**
+   closed. PENDING: tg-cli **#33** (no local checkout — clone tg-cli first), 3d-cli **#1** (blocked on a
+   required check — re-check).
+2. ✅ **DONE — Cleanup:** agent-tools **#18** closed (bridge done, pointed at `d4ff40f`); rig-cli **#12**
+   was already merged.
+3. ✅ **INVESTIGATED — not a hard blocker:** the lib modules DO install via their NESTED pyproject
+   (`uv --with .../lib/agenttools_config` — verified). The umbrella `lib/pyproject.toml` is just
+   agenttools_log's own dist; the real fix is per-module README install paths (done in #30). No packaging
+   refactor needed. (Optional polish: clarify the misleadingly-named root pyproject.)
+4. ✅ **DONE (PRs) — §3 lib stack:** **#30** lib-config, **#33** lib-advertise, **#17** format-hook ALL
+   MERGED (each had REAL codex P2s — global-only, symlink-write-through, ruff-in-Black-repo — fixed+tested).
+   ⏳ STILL TODO: **proper commit+push+PR** the 3 uncommitted modules (tmux_inject/daemon/registry) — they are
+   **backed up** at `~/xp/agent-tools-lib-modules-backup-2026-06-16/` (loss risk gone) but NOT yet in git;
+   plus PR the committed gantt/providers. Do BEFORE any `git worktree prune` of `wf_9d942e4d-*`.
+5. **tg-cli (S):** ship #34 (autolink → tg#28) and #35 (defer-while-waiting → tg#30) after clearing 1 thread each. (No local tg-cli checkout — clone first.)
+6. **rig-cli:** ✅ **#18** (readme) MERGED. ⏳ **#20** (`rig config get|set`, §5 piece) — has a real P2 (validate
+   the GLOBAL layer in isolation so a repo overlay can't mask a bad `--global` write; fix verified-viable: an
+   empty-cwd `_load_plan` sees only the global layer) + a `docs/gen_svgs.py` rebase conflict to resolve.
 7. **rig-cli §5 (L):** repo-settings provisioning via `gh api` + `agent-browser` (current branch
    `roadmap-rig-repo-settings`). Guard with capability detection (org/private repos can hard-fail on
    ruleset/GHAS endpoints — same class that forced the GHAS→OSS retreat); default-on only where the API permits.
