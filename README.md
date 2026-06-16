@@ -112,6 +112,25 @@ skills/by-type/backend/atomic-db-transactions/SKILL.md
 > agent-browser && agent-browser install`) — not bundled here; the skill is the advisory
 > "reach for it, and how."
 
+### Universal skills vs. a project's `AGENTS.md`
+
+There are two different homes for agent guidance, and they must not be confused:
+
+- **A project's `AGENTS.md` (or a repo-level `CLAUDE.md`) is for project-specific guidance
+  only** — how *this* repo builds, its layout, its local conventions. Nothing in it should
+  apply to every other repo.
+- **Cross-project, always-apply MANDATORY skills** (for example `visual-proof-cycle` or
+  `task-completion-selfcheck`) live here in `skills/universal/`. They are provisioned by
+  **rig's universal skill layer** and meant to reach **every project and every user** through
+  the SessionStart blurb, the rig-installed skills, and each skill's own trigger
+  `description`. That layer is their single source of truth.
+
+**Never copy a universal mandatory skill into an individual `AGENTS.md`.** Duplicating it
+there pins a stale copy to one repo, hides the real source, and goes stale the moment the
+skill changes. The universal layer is the one place that carries these mandates across all
+projects and users — let it. `AGENTS.md` stays project-specific; universal mandates stay
+universal.
+
 ## Installing the agent-hooks
 
 Each hook directory has a JSON **descriptor**, an executable **script**, and a **README**.
