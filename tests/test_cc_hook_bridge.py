@@ -126,6 +126,19 @@ def test_to_v1_event_normalizes_notebook_new_source():
           "tool_input": {"notebook_path": "/n.ipynb", "new_source": "SECRET=abc123"}}
     v1 = dispatch.to_v1_event(cc, point="pre-write")
     assert "SECRET=abc123" in v1["args"]["content"]
+    # The NotebookEdit `notebook_path` must alias onto the standard path fields the shipped
+    # pre-write hooks scope on — else path-scoped raw-env/secret-scan checks see an empty path
+    # and wave the write through (guard bypass).
+    assert v1["args"]["file_path"] == "/n.ipynb"
+    assert v1["args"]["path"] == "/n.ipynb"
+
+
+def test_to_v1_event_does_not_clobber_explicit_path():
+    """A tool that already provides file_path keeps it; the notebook alias only FILLS a gap."""
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Write",
+          "tool_input": {"file_path": "/real.py", "notebook_path": "/wrong.ipynb", "content": "x"}}
+    v1 = dispatch.to_v1_event(cc, point="pre-write")
+    assert v1["args"]["file_path"] == "/real.py"
 
 
 def test_to_v1_event_preserves_explicit_content_over_normalization():

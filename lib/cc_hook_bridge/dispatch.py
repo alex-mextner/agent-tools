@@ -81,6 +81,14 @@ def to_v1_event(cc_event: dict, *, point: str) -> dict:
         proposed = _proposed_write_text(tool_input)
         if proposed and not isinstance(args.get("content"), str):
             args["content"] = proposed
+        # Normalize the target PATH too: NotebookEdit carries `notebook_path`, not the
+        # `file_path` the shipped pre-write hooks scope on. Without this a NotebookEdit
+        # presents an empty path, so path-scoped raw-env checks and secret-scan allowlists
+        # wave the write through — the same bypass the content-normalization above prevents.
+        path = _proposed_write_path(tool_input)
+        if path:
+            args.setdefault("file_path", path)
+            args.setdefault("path", path)
     # stop has no tool_input; carry the CC session id so a stop hook can key its marker.
     if "session_id" not in args and cc_event.get("session_id"):
         args["session_id"] = cc_event["session_id"]
@@ -117,6 +125,20 @@ def _proposed_write_text(tool_input: dict) -> str:
             if isinstance(edit, dict) and isinstance(edit.get("new_string"), str):
                 parts.append(edit["new_string"])
     return "\n".join(parts)
+
+
+def _proposed_write_path(tool_input: dict) -> str:
+    """The on-disk path a write/edit tool targets, normalized across CC's tool payloads.
+
+    Write/Edit/MultiEdit use ``file_path``; NotebookEdit uses ``notebook_path``. The shipped
+    pre-write hooks scope on ``args.file_path``/``args.path``, so a NotebookEdit would otherwise
+    present an EMPTY path and slip past path-scoped checks. Returns "" when there's no path.
+    """
+    for key in ("file_path", "path", "notebook_path"):
+        val = tool_input.get(key)
+        if isinstance(val, str) and val:
+            return val
+    return ""
 
 
 def cc_block_output(hook_event_name: str, reason: str) -> dict:
