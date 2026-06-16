@@ -841,3 +841,27 @@ ONE shared module in `agent-tools/lib` that GENERATES and AUTO-INSTALLS zsh tab-
   (✓ installed / how to enable). Removable (`completion uninstall`). No clobber, idempotent.
 - Bash later if needed, but zsh first. Ties into the shared help/errors lib (one lib stack, §3).
 Build as a subagent on agent-tools/lib + wire each tool, CTO verifies (tab-complete actually works in zsh).
+
+## task-cli classifier (change vs justAsk) — make it accurate, fast, reliable (CTO 2026-06-16)
+`task classify 'когда началась сессия?'` → `change` — WRONG (it's a justAsk question). The change/justAsk
+classifier is inaccurate. Improve it properly:
+- **Brainstorm a fast + reliable design** (done as a real review brainstorm — see launch). Likely: cheap
+  deterministic heuristics first (interrogative words/`?` → justAsk; imperative verbs/file refs → change)
+  to short-circuit obvious cases with ZERO LLM latency, then a small local-model head (haiku) with a
+  provider fallback chain only for the ambiguous middle; cache by normalized text.
+- **Metrics + benchmarks + tests**: a LABELED dataset (change vs justAsk, RU+EN, incl. tricky cases like
+  "когда началась сессия?"). Report accuracy / precision / recall per class + p50/p95 latency. CI test
+  asserts accuracy ≥ threshold and latency budget. Track regressions.
+- **Deliberate small BIAS toward `change`**: a false-`change` is cheaper than a false-`justAsk` (better to
+  over-propose a task than to silently drop a real change). Tune the threshold accordingly + document it.
+- **The task-FORMING agent must be told the classification MAY BE A FALSE POSITIVE**: when it turns a
+  `change` into a ticket, instruct it to sanity-check ("this was auto-classified as a change and may be
+  wrong — if it's actually a question, don't create a ticket") so the bias doesn't create noise.
+task-cli (foundation agent a9cef4ca). CTO verifies with the benchmark numbers.
+
+## task list --all shows nothing on hyperide (CTO 2026-06-16)
+`task list --all` returns NOTHING in the hyperide repo — it should show ALL tasks across all known
+projects/repos (grouped by project, per the outside-repo/grouping item). Bug in the `--all` cross-repo
+aggregation (backend query scope, or it only looks at the current repo). Fix + test: `--all` returns tasks
+from every configured/known project (GitHub Issues + Linear backends), grouped, with the session-vs-all
+messaging. Pairs with the task-list grouping/fallback items. task-cli.
