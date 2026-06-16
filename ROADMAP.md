@@ -812,3 +812,20 @@ being inside a git repo. Specifically:
 - Generalize: every ecosystem CLI's non-repo-bound commands run anywhere; only diff/repo-scoped ops need a
   repo, failing gracefully (3-part error) when missing. Pairs with review-non-git + rig-status-non-git.
 task-cli is in-flight (foundation agent a9cef4ca) — fold this into it. CTO verifies.
+
+## task list: fallback to all-tasks + pagination + session-vs-all messaging (CTO 2026-06-16)
+`task list` defaults to THIS-agent-SESSION's tasks. But:
+- In a repo, run OUTSIDE an agent session → FALL BACK to showing ALL tasks (grouped by repo/project).
+- In a session but NO session tasks → same fallback (show all tasks).
+- In BOTH fallback cases, the output must SAY SO: "showing all project tasks (`task list` defaults to
+  tasks created in the agent session)" — so the user understands why they see everything.
+- **Pagination**: default through a pager (less, like git), with `NO_PAGER`/`--no-pager` support and the
+  git convention (no pager when output fits / not a tty). Respect `$PAGER`.
+Fold into task-cli (foundation agent a9cef4ca). Pairs with "commands work outside repo / group by project".
+
+## task list pager: interactive-only + higher limit there (CTO 2026-06-16)
+Refinement of the task-list pagination: the PAGER (less) is used ONLY in interactive mode (stdout is a
+tty). In non-interactive (piped/scripted) output → NO pager, plain text (scriptable). In interactive
+mode the display LIMIT is HIGHER (e.g. 100 tasks) since the pager handles scrolling; non-interactive
+keeps a small default (or `--all`/all, machine-readable). Respect `NO_PAGER`/`--no-pager`/`$PAGER` and the
+git convention. Fold into the task-cli list work.
