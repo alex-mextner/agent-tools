@@ -94,6 +94,16 @@ Skills are plain markdown — drop them where your agent harness discovers skill
 skills directory it scans), or just read them. The frontmatter `description` is a
 when-to-use trigger; the body is the rule. They have no runtime and no dependencies.
 
+> **Two of these are always-apply — not opt-in, every task, every agent:**
+> [`delegate-work-to-subagents`](skills/universal/delegate-work-to-subagents/SKILL.md) (the
+> main thread is an orchestrator — plan, decompose, dispatch to subagents or a dynamic
+> workflow, and verify; it does **not** do non-trivial work inline) and
+> [`visual-proof-cycle`](skills/universal/visual-proof-cycle/SKILL.md) (capture and **look
+> at** any user-visible change before claiming it works). Both are universal skills, so rig
+> installs them by default (`skills.universal.all`), and their strong frontmatter triggers
+> surface them on any matching task. See the **Always-apply skills** section of
+> [`AGENTS.md`](AGENTS.md) for the mandate.
+
 ```
 skills/universal/shell-timeouts/SKILL.md
 skills/universal/web-page-reading-agent-browser/SKILL.md
@@ -153,15 +163,18 @@ the [`ci-gate-suite`](skills/universal/ci-gate-suite/SKILL.md) skill.
 
 ## Inventory
 
-- **Universal skills:** 35 — shell-timeouts, exit-codes-through-pipes, dead-code-
+- **Universal skills:** 37 — shell-timeouts, exit-codes-through-pipes, dead-code-
   investigation, TDD red-first, test discipline, atomic commits, pre-commit gate, secret
   scanning (gitleaks, hook + CI), CI gate suite, global git-hooks dispatcher, git-workflow
   safety (reset/fixup/partial-staging/worktree-removal), comment &
   naming hygiene, no type escape hatches, systematic debugging, smallest change, shared-util
-  single-source, file-header comments, promise = durable action, worktree-base trap, visual
-  proof cycle, GAN critic loop, completion self-check, semantic code search, **web-page
-  reading via agent-browser** (read full pages/docs with the `agent-browser` CLI instead of
-  a truncating fetch tool), and more.
+  single-source, file-header comments, promise = durable action, worktree-base trap,
+  **delegate-work-to-subagents** (the main thread orchestrates — plan, dispatch to
+  subagents, verify — never does non-trivial work inline) and **visual proof cycle** (look
+  at any user-visible change before claiming it works) — the two **always-apply** skills
+  (see [`AGENTS.md`](AGENTS.md)) — GAN critic loop, completion self-check, semantic code
+  search, **web-page reading via agent-browser** (read full pages/docs with the
+  `agent-browser` CLI instead of a truncating fetch tool), and more.
 - **By-type skills:** 45 — bot (12), backend (13), frontend (4), cli (7), library (4),
   infra (1), monorepo (4).
 - **Agent-hooks:** 8 — block-no-verify, block-raw-pr-merge, block-secrets-write,
