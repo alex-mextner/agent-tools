@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenttools-registry"
+version = "0.1.0"
+description = "Shared trust kernel + trust-gated registry for the agent-tools ecosystem (stdlib-only)."
+readme = "README.md"
+# 3.9 to match the lowest floor in the ecosystem (review-cli is >=3.9; rig-cli >=3.10),
+# mirroring lib/agenttools_log.
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alex Mextner" }]
+keywords = ["trust", "registry", "trust-kernel", "sha256", "allowlist", "provenance", "agent-tools"]
+# Intentionally ZERO runtime dependencies — stdlib only (hashlib + json + importlib, the
+# last lazy-imported inside load_python_entry). See agenttools_registry/core.py for the
+# dependency rationale.
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/alex-mextner/agent-tools"
+
+# This pyproject lives INSIDE the package dir (lib/agenttools_registry/), so the package
+# is discovered from the parent (lib/). The `include` filter scopes discovery strictly to
+# this one package so setuptools never sweeps in sibling lib packages (agenttools_log, …)
+# or the umbrella repo's non-Python content (skills/, ci/, …).
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["agenttools_registry*"]
+# Exclude build artifacts: `python -m build` (run in-place) drops a build/ tree that, with
+# `where=".."`, would otherwise be re-discovered as a nested package on the next build and
+# double-pack the wheel. Excluding it keeps repeat builds deterministic.
+exclude = ["build*", "agenttools_registry.build*"]
+
+[tool.pytest.ini_options]
+testpaths = ["../../tests"]
