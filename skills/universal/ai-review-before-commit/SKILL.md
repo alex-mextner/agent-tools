@@ -34,6 +34,6 @@ Review is the cheapest place to catch a bug — before it's in history, before C
 before a teammate builds on it. An independent reviewer imports a perspective the
 author structurally lacks. Wiring it into your pre-commit habit (see
 `pre-commit-gate`) makes "did anyone else look at this" the default, not the
-exception. The `mcp/review` slot makes such a reviewer callable from any agent, and the
+exception. The `review` CLI (a skill, not an MCP) makes such a reviewer callable from any agent, and the
 `ci/ai-review/` slot runs the same idea automatically on every PR (advisory — it posts
 findings, it does not auto-block). See also the `ci-gate-suite` skill.

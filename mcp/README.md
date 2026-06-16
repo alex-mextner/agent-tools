@@ -1,34 +1,54 @@
-# MCP slots
+# MCP servers — when (not) to add one
 
-This directory documents two MCP (Model Context Protocol) server slots that make the
-"AI review before commit" and "code search over grep" rules *executable from any agent*,
-rather than just advisory text.
+**Default: don't.** Our tools advertise themselves to agents as a **CLI + a skill**
+(`<tool> install-skill` drops a `SKILL.md` that teaches the agent the command); the agent
+reads the skill and runs the binary in a shell. That is the right shape for almost every dev
+tool — ~zero idle context (the skill body loads only on trigger), no second process to drift
+out of sync, and it works in every shell-having host (Claude Code, Codex, Cursor).
 
-These are **documentation of where the servers plug in**, not the servers themselves —
-the review server is a wrapper you point at your own multi-model review CLI, and the
-code-search servers are third-party. Nothing proprietary is vendored here.
+An **MCP server** is the adapter for a system the agent *cannot reach from a shell*. Add one
+here ONLY if you can tick at least one box:
 
-## `review/` — multi-model review as an MCP
+- [ ] **No shell on the host** — a non-CLI agent host (web app, IDE sandbox) that cannot `exec` a binary.
+- [ ] **Stateful / long-lived session** — holds a connection, cursor, REPL, index, or subscription across calls (debugger, DB session, live browser, code index).
+- [ ] **Streaming / incremental results** the agent consumes as they arrive.
+- [ ] **No CLI exists** for the underlying system (a remote API / SaaS / index with no binary entry point).
+- [ ] **Enterprise governance** — centralized OAuth, per-user auth, RBAC, or audit across a multi-tenant boundary.
+- [ ] **Dynamic tool discovery** — the agent must enumerate capabilities at runtime.
 
-A read-only multi-model code-review tool, exposed as an MCP server, turns these rules into
-a callable capability:
+If none apply, ship a **CLI + skill** instead. An MCP wrapper around your own local CLI pays a
+permanent context tax (MCP loads every registered tool's schema up front — easily tens of
+thousands of tokens before the agent acts), adds a process + registration that drifts out of
+sync (the classic dead-`--mcp`-flag failure), and degrades tool-selection accuracy as the tool
+count climbs. It buys nothing the skill does not already give.
 
-- `ai-review-before-commit` — review the uncommitted diff before committing.
-- `gan-critic-loop` — a separate critic (a different model) judging the work.
-- `visual-proof-cycle` — `--visual` verification of a rendered screenshot via a vision
-  model.
+## What belongs here
 
-See `review/README.md` for the tool surface (review / quorum / brainstorm / visual) and
-how it connects to the `require-review-before-commit` agent-hook and the optional photo /
-notification hook.
+### Code search (serena / sverklo / language-server style) — JUSTIFIED ✓
 
-## Code-search MCP (serena / sverklo / language-server style)
+An index-backed code-search server (find-symbol / find-references over a built index) is a
+real MCP case: it is **stateful** (holds the index), there is usually **no shell CLI** for it,
+and the agent benefits from structured symbol results. The `semantic-code-search` skill
+recommends preferring such a server over `grep` + whole-file reads, falling back to grep only
+for literal-string searches or unindexed repos. These servers (serena, sverklo, …) are
+third-party — register them in your harness's MCP config per their own docs.
 
-The `semantic-code-search` skill recommends an index-backed code-search server over
-`grep` + whole-file reads. Those servers (serena, sverklo, and similar) are third-party —
-register them per their own docs. The slot here is just the reminder that an agent's
-default for "find this symbol / its references" should be such a server when one is
-available, falling back to grep only for literal-string searches or unindexed repos.
+## What was removed
 
-Typical registration is an entry in your agent harness's MCP config pointing at the
-server's launch command; consult the specific server's documentation for the exact shape.
+### `review/` — NOT an MCP (it is a CLI + skill)
+
+`review` (multi-model code review) is the textbook CLI+skill case: read-only, stateless,
+run-and-return, prints markdown, already shell-callable, already ships a skill. It ticks
+**zero** boxes above. Its minutes-long runtime is an argument *against* MCP — a long batch job
+wants a backgroundable shell call, not a blocking MCP tool call. So review is a CLI + skill;
+its MCP slot (and the dead `review --mcp` registration) was removed. The "executable rules" it
+backed — `ai-review-before-commit`, `gan-critic-loop`, `visual-proof-cycle` — are delivered by
+the **CLI's exit codes + `--json` + the agent-hooks**, not by MCP transport. If we ever build a
+**shell-less** review consumer (a pure web / IDE-sandbox host with no `exec`), that is the
+moment to add `mcp/review/` back — and only then.
+
+---
+
+Research basis (2025-2026 consensus — CLI + Skills for the local dev inner loop, MCP for
+systems-without-a-shell): Mario Zechner's MCP-vs-CLI benchmark (120 runs), Anthropic
+"Equipping agents for the real world with Agent Skills", Milvus "Is MCP Dead?".

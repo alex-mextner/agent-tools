@@ -25,7 +25,7 @@ critic must be a *different* agent — ideally a different model.
 ## Where this applies
 
 - **Code review before merge** — a separate review model on the diff, not the author
-  re-reading their own work. See the `mcp/review` slot and `pre-commit-gate`.
+  re-reading their own work. See the `review` CLI and `pre-commit-gate`.
 - **Visual verification** — a vision model judging a render the generator produced.
   See `visual-proof-cycle`.
 - **Brainstorming / design** — rotating expert personas critiquing each other beats
