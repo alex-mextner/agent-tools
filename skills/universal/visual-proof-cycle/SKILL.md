@@ -31,6 +31,6 @@ nothing. Make sure the capture shows the thing you changed, in its rendered stat
 ## Why
 
 Visual bugs are invisible to compilers and unit tests by definition. A human (or a
-vision model — see `gan-critic-loop` and the `mcp/review --visual` slot) has to look.
+vision model — see `gan-critic-loop` and `review --visual`) has to look.
 Building the look-review-fix loop into your definition of done is what stops "it
 builds" from being mistaken for "it works".

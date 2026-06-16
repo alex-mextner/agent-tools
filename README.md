@@ -68,7 +68,7 @@ mechanisms are stack-agnostic (bun/node, python-uv, go).
 | `agent-hooks/` | Programmatic guards that fire on an agent's tool use (the `agents-hooks/v1` contract). Each is a descriptor + executable + README. They enforce, mid-session, what a skill can only advise. |
 | `git-hooks/`   | Copyable `pre-commit` / `commit-msg` / `pre-push` / `no-secrets-scan` hooks plus a `lefthook.yml`, generalized across three toolchains — and a **global dispatcher** (`global-dispatcher/`) that runs every hook in `~/.config/git/global-hooks.d/` in **every** repo, even ones whose lefthook/husky override `core.hooksPath`. |
 | `ci/`          | Drop-in CI / PR-gate building blocks a CI-building agent looks for first — one slot per concern (workflow + optional shell script + README): secret-scan (gitleaks), CodeQL (incl. a no-GHAS self-gate), semgrep SAST, dependency-review + license, AI-review, Copilot-findings, unresolved-review-thread block, unchecked-checkbox block, mandatory screenshots, conventional-commit PR-title lint, leftover-marker grep, and a green-CI-gated `ship` merge command. See [`ci/README.md`](ci/README.md). |
-| `mcp/`         | Documentation of the multi-model `review` MCP slot (review / quorum / brainstorm / visual) and a code-search MCP slot. |
+| `mcp/`         | The MCP-vs-CLI+skill policy (why `review` is a CLI+skill, not an MCP) and a code-search MCP slot. |
 | `lib/`         | Reusable, importable library code + shared contracts the ecosystem CLIs depend on. `agenttools_log` — shared **structured JSONL logging** (stdlib-only) so `review-cli`, `rig-cli`, and future Python CLIs log in one shape. `contracts/models.yaml` — the **model board**: the current-best concrete model per provider, each tagged with capabilities (esp. `vision`, for the image-review filter), plus a symbolic roles/aliases map (validated by `contracts/models.schema.json`). `checker/model_freshness.py` — a **daily currency checker** that polls provider model-list endpoints and PROPOSES version bumps (a PR, or a dated report) when a newer model appears (semi-automatic; a human confirms). rig provisions the checker as a daily noon cron. See [`lib/README.md`](lib/README.md), [`lib/checker/README.md`](lib/checker/README.md). |
 | `docs/`        | `carrier-decision-guide.md` — when a rule belongs in a skill vs an agent-hook vs a git-hook. |
 
@@ -179,7 +179,7 @@ the [`ci-gate-suite`](skills/universal/ci-gate-suite/SKILL.md) skill.
   untracked-TODO), ship (green-CI-gated merge + cleanup). Plus a backlog of net-new ideas in
   `ci/README.md` (coverage-delta, bundle-size, doc-link-check, CODEOWNERS, stale-PR,
   size-label).
-- **MCP:** 1 documented slot (review) + a code-search slot.
+- **MCP:** a code-search slot (`review` is a CLI+skill, not an MCP — see [`mcp/README.md`](mcp/README.md)).
 
 ## How agent-tools compares
 

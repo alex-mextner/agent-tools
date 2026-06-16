@@ -37,4 +37,4 @@ shortcut.)
 
 For non-trivial or architectural changes, run an automated multi-model review on
 the diff before committing, and treat a second independent model as a peer review,
-not a rubber stamp. See `gan-critic-loop` and the `mcp/review` slot.
+not a rubber stamp. See `gan-critic-loop` and the `review` CLI.
