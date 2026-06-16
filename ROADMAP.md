@@ -1089,3 +1089,18 @@ Confirmed by isolation: `tg --tag ANSWER "x"` fails, `tg --tag REPORT "x"` → O
 tag VALIDATION (lowercase-english) but may NOT fix this pill-HTML bug — verify #36 actually fixes
 the ANSWER pill render, else open a follow-up. Real-world impact: agent reports tagged ANSWER
 silently never reach Telegram.
+
+## rig-cli worktree hygiene incidents (2026-06-17, found while reconciling agent PRs)
+Two issues surfaced while the parallel rig-cli agents (PRs #27/#28/#29 + tg-ctl-boot) ran:
+1. **Orphaned WIP stash — RECLAIM:** an unrelated `agents_md` symlink-"repair" feature (touches
+   `riglib/actions/runner.py` + `riglib/drift.py`) was found uncommitted in a worktree and stashed
+   by the excludesfile agent as `stash@{0}: pre-existing-agents-md-repair-and-untracked-WIP`
+   (repo-global stash, visible from every rig-cli worktree, NOT lost). This is a real forgotten
+   feature — investigate (git log -S) and either finish or land it; do NOT drop it.
+2. **Main checkout left on a feature branch:** the live `rig` (`~/.local/bin/rig` →
+   `~/xp/rig-cli/bin/rig`, the MAIN checkout) was found on branch `rig-global-excludesfile`, not
+   `main` — a parallel agent's isolation worktree contaminated the shared main checkout. Restored to
+   `main` (tree was clean, branch safe on origin/PR #29). Watch: agents running with isolation:worktree
+   against rig-cli are stepping on the shared checkout / each other (the tmux agent also reported a
+   two-agent same-worktree collision). Must verify ~/xp/rig-cli is on `main` BEFORE running ship.sh
+   (its post-merge pull targets that checkout).
