@@ -791,3 +791,12 @@ shared help/errors lib (after the Python migration). Subagent, CTO verifies.
   yellow ○ when not — the install-* state principle, applied to voice setup. So the user sees what's done
   vs pending without running it blindly.
 These extend the already-queued tg-cli help work (--tag + coloring + shared help lib). CTO verifies.
+
+## rig status must cover ALL reconciled areas, not mostly skills (CTO 2026-06-16)
+`rig status` is skill-heavy, but rig reconciles MANY areas — all must show, grouped by area (and by the
+GLOBAL vs REPO layer split): skills, agent-hooks (v1 descriptors), git-hooks dispatcher, CI gates,
+MCP servers, AGENTS.md/CLAUDE.md symlinks, repo settings (branch protection / GHAS / merge policy),
+harness auto-mode settings, tmux config (the new provisioning), model-freshness cron, ship/`gh ship`.
+Each AREA shows in-sync vs drift (count) under its heading, so the user sees the FULL picture of what rig
+manages and where it's out of sync — not a wall of skill lines with everything else buried. Ties into the
+error-system/status-clarity agent (global/repo separation + which config file declares each).
