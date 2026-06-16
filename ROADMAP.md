@@ -940,3 +940,8 @@ restarting from round 1 — for the orchestrator AND for any subagent that runs 
 - Caveat: a run that died BEFORE writing its discussion log (the classifier brainstorm hit 0 bytes — backends
   never produced a round) has nothing to resume; that's the resilience layer's job (retry/fallback so a round
   is actually produced + logged), after which resume works.
+
+## review retry count must be CONFIGURABLE (CTO 2026-06-16)
+The ~3 retries (and backoff/timeout budgets) must be CONFIGURABLE — via review-cli config file, env var
+(e.g. REVIEW_RETRIES), and/or a flag — not hardcoded. Sensible default (3), overridable per env/run.
+## (reserve-replace failover already exists — verify it actually fires in the logs; see check below)
