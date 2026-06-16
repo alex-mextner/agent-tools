@@ -279,6 +279,91 @@ def test_bad_timeout_ms_on_closed_gate_blocks(tmp_path):
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
 
 
+def test_non_utf8_block_output_on_OPEN_gate_still_blocks(tmp_path):
+    """A hook that emits NON-UTF-8 bytes AND a deliberate block (exit 10) must BLOCK even on a
+    fail-OPEN gate: the decode must not raise (errors='replace') and turn a real block into a
+    hook error → on_error=open → allow. on_error='open' isolates this from the fail-closed
+    path (where any error denies anyway). Regression: #18 / non-UTF-8 fail-open."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    blocker = tmp_path / "binary_blocker.py"
+    blocker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "sys.stdout.buffer.write(b'\\xff\\xfe not utf-8')\n"
+        "sys.stdout.flush()\n"
+        "sys.exit(10)\n"
+    )
+    blocker.chmod(0o755)
+    _install_descriptor(hooks, hook_id="binblk", point="pre-bash", cmd=blocker, on_error="open")
+    cc_event = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                "tool_input": {"command": "echo hi"}, "cwd": str(tmp_path)}
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
+
+
+def test_negative_timeout_ms_on_closed_gate_blocks(tmp_path):
+    """A NEGATIVE timeout_ms is a descriptor typo (not 'unset') → a fail-closed gate must DENY,
+    consistent with how a non-numeric timeout_ms is handled."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    hooks.mkdir(parents=True)
+    spec = {"id": "neg-timeout", "point": "pre-bash", "cmd": str(BLOCK_RAW_PR_MERGE),
+            "priority": 10, "timeout_ms": -100, "on_error": "closed"}
+    (hooks / "neg-timeout.pre-bash.json").write_text(json.dumps(spec))
+    cc_event = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                "tool_input": {"command": "echo hi"}, "cwd": str(tmp_path)}
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
+
+
+@pytest.mark.parametrize("bad", [True, False])
+def test_bool_timeout_ms_on_closed_gate_blocks(tmp_path, bad):
+    """A BOOLEAN timeout_ms is a descriptor typo, not a number — bool is an int subclass, so
+    int(True)==1 / int(False)==0 would otherwise sneak past as a 1 ms / 'unset' timeout. A
+    fail-closed gate must DENY, like any other bad descriptor field."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    hooks.mkdir(parents=True)
+    spec = {"id": "bool-timeout", "point": "pre-bash", "cmd": str(BLOCK_RAW_PR_MERGE),
+            "priority": 10, "timeout_ms": bad, "on_error": "closed"}
+    (hooks / "bool-timeout.pre-bash.json").write_text(json.dumps(spec))
+    cc_event = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                "tool_input": {"command": "echo hi"}, "cwd": str(tmp_path)}
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
+
+
+def _benign_exit0(tmp_path: Path) -> Path:
+    script = tmp_path / "benign.py"
+    script.write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+    script.chmod(0o755)
+    return script
+
+
+@pytest.mark.parametrize("timeout_ms", [0, None])
+def test_zero_or_null_timeout_ms_uses_default_not_a_spurious_timeout(tmp_path, timeout_ms):
+    """timeout_ms of 0 (or null) means 'unset' → the default, NOT a 1 ms floor that would make
+    every such hook spuriously time out and, on a fail-closed gate, block a benign call."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    hooks.mkdir(parents=True)
+    spec = {"id": "fast", "point": "pre-bash", "cmd": str(_benign_exit0(tmp_path)),
+            "priority": 10, "timeout_ms": timeout_ms, "on_error": "closed"}
+    (hooks / "fast.pre-bash.json").write_text(json.dumps(spec))
+    cc_event = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                "tool_input": {"command": "echo hi"}, "cwd": str(tmp_path)}
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    assert "deny" not in proc.stdout  # benign call allowed, not a spurious timeout-block
+
+
 def test_bad_priority_does_not_crash_dispatch(tmp_path):
     """A non-numeric priority must NOT bubble to the top-level fail-open and skip OTHER hooks
     (including a fail-closed gate that should block)."""

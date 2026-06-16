@@ -183,25 +183,49 @@ def _run_hook(spec: dict, v1_event: dict) -> tuple[str, str]:
         return _on_error_outcome(spec, hook_id, "descriptor cmd is not absolute")
     raw_args = spec.get("args")
     argv = [cmd, *(str(a) for a in raw_args)] if isinstance(raw_args, list) else [cmd]
-    # A PRESENT-but-bad timeout_ms is a DESCRIPTOR error, resolved per-hook (a fail-closed
-    # gate with a typo'd timeout must DENY, not be silently skipped by the dispatcher's
-    # fail-open). A MISSING timeout_ms is fine → the default.
+    # A MISSING or NULL timeout_ms is fine → the default. A PRESENT-but-bad one (non-numeric,
+    # bool, or negative) is a DESCRIPTOR error, resolved per-hook: a fail-closed gate with a
+    # typo'd timeout must DENY, not be silently skipped by the dispatcher's fail-open.
     raw_timeout = spec.get("timeout_ms", DEFAULT_TIMEOUT_MS)
+    if raw_timeout is None:
+        raw_timeout = DEFAULT_TIMEOUT_MS
+    # bool is an int subclass, so int(True)==1 / int(False)==0 would sneak past _safe_int and
+    # be silently mis-read as a 1 ms timeout / "unset". A boolean is a descriptor typo.
+    if isinstance(raw_timeout, bool):
+        return _on_error_outcome(spec, hook_id, f"non-numeric timeout_ms {raw_timeout!r}")
     timeout_ms = _safe_int(raw_timeout, None)
     if timeout_ms is None:
         return _on_error_outcome(spec, hook_id, f"non-numeric timeout_ms {raw_timeout!r}")
-    timeout_s = max(1, timeout_ms) / 1000.0
+    # 0 = unset → the default; a NEGATIVE timeout is a descriptor typo, not "unset", so it is
+    # a descriptor error (a fail-closed gate must DENY, like any other bad descriptor field).
+    # This also avoids the old 1 ms floor that made such hooks spuriously time out.
+    if timeout_ms == 0:
+        timeout_ms = DEFAULT_TIMEOUT_MS
+    elif timeout_ms < 0:
+        return _on_error_outcome(spec, hook_id, f"negative timeout_ms {timeout_ms}")
+    timeout_s = timeout_ms / 1000.0
+    # Serialize OUTSIDE the try: a json.dumps failure here is a DISPATCHER bug (must fail open),
+    # not a hook error — keeping it out of the try keeps the ValueError catch below scoped to
+    # the subprocess launch (embedded-NUL argv), per the fail-policy contract.
+    payload = json.dumps(v1_event)
     try:
         proc = subprocess.run(  # noqa: S603 — cmd comes from a trusted local descriptor dir
             argv,
-            input=json.dumps(v1_event),
+            input=payload,
             capture_output=True,
             text=True,
+            encoding="utf-8",  # pin decode so it's platform-independent, not locale-default
+            errors="replace",  # non-UTF-8 hook output must not raise → it would escape to the
+                               # dispatcher's fail-open and turn a deliberate block into an allow
             timeout=timeout_s,
         )
     except subprocess.TimeoutExpired:
         return _on_error_outcome(spec, hook_id, f"timed out after {timeout_s:.1f}s")
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # OSError: an unrunnable cmd. ValueError: an embedded NUL in cmd/args. Both are
+        # hook/descriptor failures resolved per-hook via on_error. We deliberately do NOT
+        # catch bare Exception: a bug in the DISPATCHER itself must fail OPEN per the contract
+        # (README), not masquerade as a hook error and block on a fail-closed gate.
         return _on_error_outcome(spec, hook_id, f"could not run {cmd}: {exc}")
 
     if proc.stderr:
