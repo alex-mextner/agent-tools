@@ -1079,3 +1079,13 @@ provisions a single rig-managed marker block in the GLOBAL git excludes file
   `**/.claude/settings.local.json` lines and is not even read by git (core.excludesfile points
   to `~/.gitignore`). Harmless now but a latent landmine if rig ever repoints excludesfile there.
   Awaiting CTO go (offered in chat); collapse the dups, leave one canonical line, touch nothing else.
+
+## tg-cli: --tag ANSWER/ОТВЕТ broken in 1.11.0 (CTO-found 2026-06-17, VERIFIED)
+Sending with `--tag ANSWER` (or its Russian alias `ОТВЕТ`) FAILS in deployed tg 1.11.0 (3024b71):
+it emits an invalid Telegram-HTML pill and the CLI prints the MISLEADING error
+"Only those HTML tags are supported. Escape raw <, >, and &…" even on plain-text bodies with no
+markup. `--tag REPORT` / `--title` / no-tag all work — isolated to the answer-pill template.
+Confirmed by isolation: `tg --tag ANSWER "x"` fails, `tg --tag REPORT "x"` → OK. PR #36 reworks
+tag VALIDATION (lowercase-english) but may NOT fix this pill-HTML bug — verify #36 actually fixes
+the ANSWER pill render, else open a follow-up. Real-world impact: agent reports tagged ANSWER
+silently never reach Telegram.
