@@ -101,8 +101,8 @@ when-to-use trigger; the body is the rule. They have no runtime and no dependenc
 > [`visual-proof-cycle`](skills/universal/visual-proof-cycle/SKILL.md) (capture and **look
 > at** any user-visible change before claiming it works). Both are universal skills, so rig
 > installs them by default (`skills.universal.all`), and their strong frontmatter triggers
-> surface them on any matching task. See the **Always-apply skills** section of
-> [`AGENTS.md`](AGENTS.md) for the mandate.
+> surface them on any matching task — that trigger is the mandate's single source of truth,
+> not any per-repo `AGENTS.md` (see "Universal skills vs. a project's `AGENTS.md`" below).
 
 ```
 skills/universal/shell-timeouts/SKILL.md
@@ -190,8 +190,8 @@ the [`ci-gate-suite`](skills/universal/ci-gate-suite/SKILL.md) skill.
   single-source, file-header comments, promise = durable action, worktree-base trap,
   **delegate-work-to-subagents** (the main thread orchestrates — plan, dispatch to
   subagents, verify — never does non-trivial work inline) and **visual proof cycle** (look
-  at any user-visible change before claiming it works) — the two **always-apply** skills
-  (see [`AGENTS.md`](AGENTS.md)) — GAN critic loop, completion self-check, semantic code
+  at any user-visible change before claiming it works) — the two **always-apply** skills —
+  GAN critic loop, completion self-check, semantic code
   search, **web-page reading via agent-browser** (read full pages/docs with the
   `agent-browser` CLI instead of a truncating fetch tool), and more.
 - **By-type skills:** 45 — bot (12), backend (13), frontend (4), cli (7), library (4),

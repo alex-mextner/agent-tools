@@ -7,36 +7,14 @@ wires the catalog into a repo and a dev machine. See `README.md` for the full re
 
 If you are an agent working **in** this repo, read the rules below before you act.
 
-## Always-apply skills (mandatory — every task, every agent)
+> **No always-apply skill list lives here.** Cross-project, mandatory universal skills
+> (e.g. `delegate-work-to-subagents`, `visual-proof-cycle`) are surfaced by **rig's
+> universal skill layer** — installed by default (`skills.universal.all`) and triggered by
+> each skill's own frontmatter `description`. `AGENTS.md` carries **project-specific**
+> guidance only; never duplicate a universal skill here. See the "Universal skills vs. a
+> project's `AGENTS.md`" section of [`README.md`](README.md).
 
-These two skills are **not** opt-in and **not** task-specific. They apply to the main
-orchestrator thread and to every subagent, on every task. They exist because the two most
-common, most expensive agent failures are (a) the main thread doing non-trivial work inline
-instead of delegating, and (b) claiming a user-visible change is "done" without ever looking
-at the rendered result. Internalize both before you touch the work.
-
-| Skill | Trigger — when it applies | The rule, in one line |
-| --- | --- | --- |
-| [`delegate-work-to-subagents`](skills/universal/delegate-work-to-subagents/SKILL.md) | Any task beyond a trivial one-liner — multi-step coding, research, or any repo mutation. | The main thread is an **orchestrator**: plan, decompose, dispatch to subagents (the `Agent` tool) or a dynamic workflow, and **verify** their results. Do not implement inline. |
-| [`visual-proof-cycle`](skills/universal/visual-proof-cycle/SKILL.md) | Any user-visible change — UI, a rendered image, a chart, generated output. | Capture the rendered result, **look at it yourself**, review critically, fix, re-capture. "It builds" is not "it works"; attach the final capture as evidence. |
-
-Two non-negotiable consequences:
-
-- **Do not do non-trivial work inline.** The moment a task grows past a one-liner, it is a
-  subagent or a dynamic workflow — not the orchestrator's own edits. See
-  `delegate-work-to-subagents`.
-- **Do not claim a user-visible change is done without looking at it.** Capture the rendered
-  output, inspect the capture yourself, and attach it. See `visual-proof-cycle`.
-
-Both are **universal** skills, so `rig` installs them by default on every machine: the
-global rig config selects `skills.universal.all: true` (default-on; a skill is included
-unless explicitly disabled), which carries every `skills/universal/*` skill — these two
-included — into the harness's skills dir. Their strong, always-on frontmatter
-`description` (the when-to-use trigger) is what makes the harness surface them on any
-matching task; this AGENTS.md is the per-session backstop that states they are mandatory,
-not optional.
-
-## Other guardrails an agent here must honor
+## Guardrails an agent here must honor
 
 These are the same gates `rig` installs for any repo; they apply here too.
 
