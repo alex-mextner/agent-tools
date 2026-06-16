@@ -900,3 +900,16 @@ A CURRENT task can be mapped to the agent session / working directory:
 - Persisted per session/dir (alongside the team-key / rig.yaml mapping or session state). Informative when
   set/changed (what it points at now). Pairs with the TUI selection + session-task marking + grouping.
 task-cli.
+
+## review CLI must be RESILIENT to backend 500 / rate-limit (CTO 2026-06-16)
+Today review brainstorm/panel returned SILENT-EMPTY (0 bytes) when Anthropic backends threw 500 /
+"Server temporarily limiting requests" / model-unavailable. review must HANDLE this, not give up:
+- **Retry with exponential backoff + jitter** per backend on transient errors (HTTP 500/502/503/429,
+  "rate limited", "temporarily unavailable") — a few attempts before declaring a seat failed.
+- **Fall back to other available board seats** (the failover pool already exists for unavailability —
+  extend it to transient errors: a 500 on one seat promotes a reserve, not a dead round).
+- **NEVER silent-empty**: if a round/all seats fail after retries, FAIL LOUD with a clear error naming
+  which backends failed + why + a retry hint + non-zero exit (ties into brainstorm-fail-loud + error-system).
+- Make timeouts/retry budgets configurable; surface "retrying seat X (attempt n)" so it's not a silent hang.
+review-cli subagent. CTO verifies by simulating backend 500s (mock) — retries fire, fallback works, no
+silent-empty.
