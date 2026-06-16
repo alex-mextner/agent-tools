@@ -1075,3 +1075,7 @@ provisions a single rig-managed marker block in the GLOBAL git excludes file
 - Immediate relief already applied by hand on this machine: rig-marker block with `**/.claude/worktrees/`
   appended to `~/.gitignore`; all repos now ignore it. Reworked rig feature (branch
   `rig-global-excludesfile`, supersedes #23) makes it durable / clean-machine.
+- FOLLOW-UP (tracked): clean the DEAD `~/.config/git/ignore` — it has ~280 duplicated
+  `**/.claude/settings.local.json` lines and is not even read by git (core.excludesfile points
+  to `~/.gitignore`). Harmless now but a latent landmine if rig ever repoints excludesfile there.
+  Awaiting CTO go (offered in chat); collapse the dups, leave one canonical line, touch nothing else.
