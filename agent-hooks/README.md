@@ -64,6 +64,12 @@ tiny JSON-on-stdin / exit-code protocol. No shared runtime between host and hook
 These are the *logical* points; map them to your harness's actual tool-use events
 (e.g. a PreToolUse matcher on the Bash/Write/Edit tool, or a Stop hook).
 
+> **Claude Code:** CC does NOT run these descriptors directly — it only runs hooks declared
+> in `settings.json`. The `lib/cc_hook_bridge` dispatcher is the carrier that makes them
+> fire: rig wires it into `settings.json` (PreToolUse for `pre-bash`/`pre-write`, Stop for
+> `stop`) and translates the exit-10 BLOCK into CC's `permissionDecision: "deny"` /
+> `decision: "block"`. Without that bridge these hooks are inert in CC (agent-tools#18).
+
 | point          | fires when…                                  | hooks                                   |
 | -------------- | -------------------------------------------- | --------------------------------------- |
 | `pre-bash`     | before a shell command runs                  | block-no-verify, block-raw-pr-merge, require-review-before-commit, enforce-timeout-on-bash |

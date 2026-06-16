@@ -5,6 +5,7 @@ Reusable library code + language-agnostic **contracts** the ecosystem CLIs depen
 | Path | What it is |
 | --- | --- |
 | `agenttools_log/` | Shared **structured JSONL logging** (stdlib-only) — documented below. |
+| `cc_hook_bridge/` | The **`agents-hooks/v1` → Claude Code bridge** — a dispatcher CC's `settings.json` PreToolUse/Stop hooks call that runs the installed `~/.claude/hooks/*.json` descriptors and translates exit-10 BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`. Without it, every agent-hook is INERT in CC (agent-tools#18). stdlib-only. See [`cc_hook_bridge/README.md`](cc_hook_bridge/README.md). |
 | `contracts/models.yaml` | The **model board**: the current-best concrete model per provider, each tagged with capabilities (esp. `vision`), plus a symbolic `roles:`/`aliases:` map. Single source of truth for `review-cli`/`task-cli`/future tools. Validated by `contracts/models.schema.json` (JSON-Schema) + the checker's cross-reference `--validate`. |
 | `checker/` | The **model-freshness checker** (`model_freshness.py`) — a daily job that polls provider model-list endpoints and PROPOSES version bumps for `contracts/models.yaml` (a PR via `gh`, else a dated report). Semi-automatic: it proposes, a human confirms. rig provisions it as a daily noon cron. See [`checker/README.md`](checker/README.md). |
 
