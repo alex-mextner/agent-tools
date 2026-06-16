@@ -308,6 +308,39 @@ tool migrates to import from the lib.
     refactor; the global `~/.claude/mcp/mcp.json` registration is broken too) — fix-or-remove before any
     `rig apply` registers a dead MCP server (tracked in §9 misc).
 
+### 5b. rig manages tmux configuration (CTO 2026-06-16)
+`.tmux.conf` + plugin setup (tpm/resurrect/continuum) become rig-managed artifacts, reconciled like
+skills/hooks/CI — not hand-edited dotfiles that drift. Requirements surfaced while fixing a stale-session
+reboot (continuum's last save was 3 weeks old):
+- **Apply mechanism = import-preferred, managed-block fallback (CTO 2026-06-16).** rig must MIGRATE an
+  existing hand-written `~/.tmux.conf`, not clobber it. Preferred: rig owns a generated file (e.g.
+  `~/.config/rig/tmux/rig.tmux.conf`) built declaratively from rig.yaml, and `~/.tmux.conf` carries a
+  single `source-file <that path>` import; rig rewrites its own file wholesale on every `rig apply`
+  (idempotent) and never touches the user's hand-written lines. Fallback (when an import is undesirable):
+  splice a managed block between sentinel markers (`# === rig-managed (tmux) BEGIN ===` / `… END ===`)
+  and replace ONLY between the markers (conda-init style). First apply: detect rig-owned settings already
+  inline (resurrect/continuum/Moshi/etc.), lift them into the import/block, back up the original
+  (`~/.tmux.conf.rig-bak`), leave user-specific lines intact. `rig status` reports drift on the managed
+  region only. Because rig generates the managed region, it can GUARANTEE ordering (continuum's
+  status-right hook last — the root cause of the stale-session bug) instead of relying on hand-ordering.
+- **Moshi-specific tmux tweaks must be SEPARATELY toggled (opt-in), not unconditional.** Current bug:
+  `set -g status-right ''` under `$MOSHI_CLIENT` wipes tmux-continuum's autosave timer (it lives in
+  `status-right`) → continuum silently stops saving → a reboot restores a weeks-stale session. Moshi
+  tweaks must gate behind an explicit enable and must never break continuum/resurrect (use a Moshi-safe
+  status layout that keeps continuum's hook, or move continuum off status-right).
+- **resurrect must restart Claude Code per-window with the right session id.** `@resurrect-processes`
+  has no `claude` today, so cc is not restored at all after a reboot. Need `claude` in the list PLUS a
+  save/restore hook that records each window's cwd→cc session id and relaunches `claude --continue`
+  (most-recent in cwd) or `claude --resume <id>` (exact) after restore.
+- **tmux must auto-come-up after a machine reboot** — verify continuum-boot / a launchd agent actually
+  fires (currently `@continuum-boot on` + `boot-options iterm`, unverified), don't assume.
+- **reconnect must attach to the ONE session, not spawn a new one (anti-sprawl).** Observed: a Moshi/iTerm
+  reconnect created a duplicate session ("3" alongside the working "2", same `ext` window) instead of
+  re-attaching — the user reads this as "tmux crashed again". The login/reconnect entry must do
+  attach-or-create (`tmux attach -t main || tmux new -s main`), single canonical session. Note there are
+  TWO tmux wrappers in play (`tmux` with `.tmux.conf` + `ln` with `.ln.conf`) — reconcile/clarify which is
+  the canonical one so they don't fight.
+
 ### 6. research-cli (after lib `providers`)
 - Separate Python CLI on the shared lib's panel engine (NOT a review mode). Reuses providers verbatim.
   (alex-mextner/agent-tools#13)
@@ -391,6 +424,29 @@ Tracking issue: alex-mextner/agent-tools#14.
   agent session. **Omitted options are chosen interactively via inline buttons.** Directory options =
   the dirs already in use + their `..` parents, all normalized + uniq + ranked LRU/MRU. `name` validated
   with a **uniqueness warning**. (Pairs with the decisions-as-buttons work.) (alex-mextner/tg-cli#27)
+- **tg-ctl must self-register for system autostart on first run** (CTO 2026-06-16): on first launch the
+  tg-ctl daemon installs a boot/login autostart entry so it survives reboots — per-OS, for every OS
+  agent-tools supports: macOS → launchd LaunchAgent (same mechanism as continuum's `Tmux.Start.plist`);
+  Ubuntu/Debian/other Linux → systemd **user** service (`systemctl --user enable`), with a fallback for
+  no-systemd. Idempotent (re-run safe), removable, and the supported-OS matrix lives in agent-tools.
+  Pairs with the task-cli/tg-ctl daemon-supervisor work (§3 daemon-supervisor).
+- **review brainstorm must FAIL LOUD when backends return empty (not silently "converge")** (CTO
+  2026-06-16): observed a brainstorm that ran 5 rounds with every round empty ("(no output)") and the
+  moderator stamping `DECISION: STOP` each time → it printed an empty synthesis and exited as if it
+  worked, wasting ~20 min of "it's still thinking". When all/most panel seats return empty for a round,
+  the run must surface a clear error (dead/credential-less backends) and non-zero exit, not a hollow
+  STOP. Pairs with the dead-provider cleanup (Fireworks suspended) — and with the new `review sessions`
+  resume work (a dead run should be resumable AND diagnosable).
+- **tg-cli rejects messages containing URLs / `--` / colons with a bogus "Only those HTML tags are
+  supported" error** (CTO 2026-06-16): a plain-text message (no `<`/`>`/`&`) that merely contains a
+  `https://…` link or `--flag` or `1: foo` fails to send; stripping the URL/double-dash made the SAME
+  text send fine (`OK`). So tg is defaulting to an HTML/markdown parse_mode and mis-parsing ordinary
+  punctuation as entities. Fix: auto-escape (or send `parse_mode=None` by default and only opt into
+  HTML via `--format html`), so links and CLI snippets in reports just work. Cost us 4 failed sends.
+  PINPOINTED: the trigger is the `://` scheme — `https://github.com/...` fails, bare `github.com/...`
+  sends `OK` (telegram autolinks the domain). Even a correct `<a href="https://…">` tag is rejected by
+  tg's OWN pre-send validation (before telegram sees it), confirming it's tg-cli mis-parsing, not the
+  Bot API. Workaround in use: send links as bare domains (no scheme).
 - tg-cli #25: fix-or-justify the 8 CodeQL TS findings (length-counting helpers + install TOCTOU).
   (alex-mextner/tg-cli#31)
 - tg-cli AGENTS stale "~578 tests" → 997. (alex-mextner/tg-cli#32)
@@ -517,3 +573,221 @@ secret-scan is **identical** (same engine + `useDefault` ruleset), dep-audit is 
   Semgrep, gitleaks, dep-audit) into one Tailscale-served dashboard — likely **extending review-cli's existing
   dashboard** (SARIF is the common format). CTO: copy GitHub's code-scanning UI and improve it (cross-repo
   view, our own triage state, link to the suppressing `// codeql[...]` line).
+
+## ⚠️ rig tmux v2 — REAL reboot cycle broke (CTO 2026-06-16, post-reboot)
+The #24/#26 tmux provisioning passed unit (456) + tmux parse-check but I never ran a REAL
+e2e (apply→save→REBOOT→restore) on a live machine. A reboot exposed multiple defects — fix
+so a CLEAN-machine `rig init` does EVERYTHING with NO manual steps:
+1. **boot**: launchd ran `tmux start-server` = an EMPTY server (config/plugins load only on the
+   first session, so continuum-restore never fired). Use a boot script that `tmux new-session -d`
+   (loads conf) THEN restores; and `rig` must `launchctl load` the agent itself (it didn't).
+2. **cc-save detect**: filtered on `pane_current_command == claude`, but cc shows as its VERSION
+   (`2.1.178`); the real process is a CHILD (`claude --resume`, pid in the pane's tree). Detect via
+   the pane's process tree, not the command string → map was empty → cc never resumed.
+3. **default-command `''`** → resurrect restores a NON-login shell → `.zprofile` not sourced.
+   Set a login shell so restored panes get the full env.
+4. **resurrect dir** `~/.tmux/resurrect` was absent → no snapshot written at all. Ensure it exists.
+5. **old continuum boot not cleaned**: `osx_iterm/terminal_start_tmux.sh` still register in macOS
+   Login Items (competing boot). rig must disable/clean them (continuum `osx_disable.sh` + unload).
+6. **plugins/tpm install + first save**: on a clean machine rig must install tpm + resurrect/
+   continuum (clone) and take a first resurrect save, else there is nothing to restore.
+**Acceptance = a REAL e2e**, not unit-only: fresh HOME → `rig init` → boot brings tmux up with the
+restored session, cc resumes by session-id, panes are login shells. Verify on THIS machine too.
+
+## ⚠️ rig MUST gate smoke.sh on pre-commit + always run smoke, not just pytest (CTO 2026-06-16)
+Two failures the same day traced to the SAME root: I shipped rig changes after green PYTEST
+(456/460) but NEVER ran `bash tests/smoke.sh` — the real `rig init/apply/status` flow.
+- `rig status` errored `unknown mcp item(s): review (known: none)` — a STALE `mcp.items.review`
+  (the `review --mcp` slot was removed in #32) lingered in `~/.config/rig/config.yaml`. smoke
+  (which runs `rig status` against a sample config) would have caught it. (FIXED on this machine
+  by removing the block; the rig-cli template is already clean — verify `rig init` never re-adds it.)
+- the tmux reboot-cycle defects (see "rig tmux v2") — unit-only, no real e2e.
+REQUIREMENTS:
+1. **rig provisions a pre-commit hook (via its own git-hooks dispatcher / lefthook) that runs
+   `bash tests/smoke.sh`** for the rig-cli repo (and offers it to any repo that has a smoke target),
+   so a commit that breaks the real CLI flow is blocked locally — not just in CI.
+2. **Every rig PR runs smoke (real flow), not just pytest.** smoke must exercise `rig status` with a
+   config that includes EVERY catalog area (skills/hooks/CI/mcp/tmux) so an unknown-item / dead-slot
+   regression fails loudly. Add an assertion that `rig status` exits 0 on the sample config.
+3. CI already runs smoke (`tests/smoke.sh`) — keep it; the gap was LOCAL pre-commit + my discipline.
+
+## ⚠️ rig (+ ecosystem) error system v2 — every error says what/why/how-to-fix, with heuristics (CTO 2026-06-16)
+Today's failures were hard to diagnose because the errors were thin: `unknown mcp item(s): review
+(known: none)` (no hint it was a removed slot or how to remove it); a dead rtk hook surfaced only as
+a generic CC "PreToolUse error"; tmux defects were SILENT (no error at all). Build a real error layer:
+- **Every rig error = 3 parts**: WHAT happened, WHY (root cause / context), HOW to fix (a concrete
+  command or edit). Pattern from the `structured-exit-codes` skill. Stable, per-class EXIT CODES.
+- **Heuristics**:
+  - *did-you-mean*: for an unknown item (mcp/skill/hook/ci/tmux key) Levenshtein-match against the
+    catalog and suggest the nearest valid name, OR say "no such slot" + list the known ones.
+  - *deprecated/removed slots*: a registry of removed slots (e.g. `mcp.items.review` removed in #32,
+    `review --ln`/`--mcp` dropped) → the error names the PR and says "remove it from <config path>"
+    (and, when `rig config unset` exists, prints that exact command).
+  - *missing-target*: a config points at a file/binary that doesn't exist (the rtk-hook case:
+    settings.json → a hook path that's gone) → say which file is missing and how to regenerate it.
+  - *silent-success guard*: an apply/provision that did nothing meaningful (empty cc-map, no snapshot,
+    hook installed but inert) must WARN, not look clean — tie into `rig status`/`doctor`.
+- **`rig doctor` / `rig status` surface these proactively** (drift + dead-config + missing-target), so
+  a problem is visible BEFORE it bites at runtime/reboot.
+- Generalize the pattern so review/tg/draw/3d/task CLIs reuse it (shared lib `errors` module candidate,
+  §3). Tests assert the message contains the fix hint + the right exit code per failure class.
+Build as a background subagent; do NOT merge without the CTO's verify (real `rig status`/smoke proof).
+
+## rig status — separate GLOBAL vs REPO layers + clearer drift (CTO 2026-06-16, part of error-system v2)
+`rig status` in a repo (e.g. hyperide) mixes machine-wide GLOBAL drift (skills in ~/.agents, harness
+links, agent-hooks — owned by `~/.config/rig/config.yaml`) with REPO drift (this repo's `.github/`
+CI, AGENTS/CLAUDE symlinks, rig.yaml). Group the output by LAYER:
+- **GLOBAL** (from ~/.config/rig/config.yaml): skills/hooks/harness/mcp on this machine.
+- **REPO** (from ./rig.yaml): CI workflows, repo symlinks, repo settings.
+Each item should show WHICH layer/config FILE declares it (or "not declared in any layer").
+Also make the "extras are left for you to decide" guarantee LOUD (apply NEVER deletes disk-not-declared
+items) so a user isn't scared `rig apply` will nuke their skills — print that reassurance in `status`
+and in `rig apply --help`. And: a repo with NO committed rig.yaml should say so prominently with the
+fix (`run rig init to create one`), not just a one-line warning buried above a 49-line drift dump.
+Ties into the did-you-mean / 3-part-error work.
+
+## rig status: non-git dir must NOT claim "no rig.yaml, should be committed" (CTO 2026-06-16)
+`rig status` run in `~` (no `.git/`) prints "warning: no rig.yaml in this repo (it should be committed)"
+— but `~` is NOT a repo at all. Detect non-git dirs: show ONLY the global layer + "(not a git
+repository — repo layer/rig.yaml N/A here)". The "commit a rig.yaml" advice only applies inside an
+actual git repo. Part of the error-system/status-clarity work.
+
+## review-cli must not crash outside a git repo (CTO 2026-06-16)
+Running bare `review` outside a `.git` repo throws a raw RuntimeError + Python traceback
+(`_git_diff` → `git diff` failed) — a user just trying the tool gets a stack trace. Fix:
+- git is needed ONLY by the diff modes (`review`/`review review`, `--diff`, `--staged`).
+  `just-ask`, `quorum`, `brainstorm` do NOT need git and must work anywhere.
+- Outside a git repo, the diff path must fail GRACEFULLY (no traceback): a clear 3-part message —
+  "not in a git repository; the diff review needs one. Run `review just-ask`/`quorum`/`brainstorm`
+  (no git needed), or cd into a repo" — and a stable non-zero exit code (align with the rig
+  error-system / `structured-exit-codes` work).
+- Bare `review --list-defaults` / `--show-board` / `--help` (meta) must work outside a repo too.
+- Add a smoke/test: run `review` and `review just-ask "x"` in a non-git tmpdir; assert no traceback,
+  helpful message + correct exit on the diff path, and just-ask/meta paths work.
+Fix as a background subagent (review-cli), no merge without CTO verify.
+
+## review-cli: rename `review review` → `review diff`; bare `review` = HELP (CTO 2026-06-16)
+`review review …` is bad UX (stutter). Two changes:
+- The diff-review SUBCOMMAND is renamed `review` → **`review diff`**. (The "review review" stutter and
+  the "bare review defaults to a diff review" behavior were a mistake — never do that.)
+- **Bare `review` (no subcommand/args) prints the HELP/usage**, it does NOT silently run a diff review
+  (today it dumps "No diff to review" or, outside git, crashes). Meta flags still work
+  (`review --list-defaults` etc.).
+- Other subcommands unchanged: `diff`, `brainstorm`, `just-ask`, `quorum`, `dashboard`, `spec-web`, …
+- Update README/AGENTS, the `~/.claude/CLAUDE.md` review-skill blurb, and any docs that say
+  `review review`. Decide migration: a removed-`review`-subcommand should print a one-line
+  "use `review diff`" pointer (like the old removed mode-flags), not error opaquely.
+SEQUENCING: do this in review-cli AFTER the "non-git graceful" PR merges (same cli.py/dispatch area) —
+one review-cli agent at a time to avoid collisions. CTO verifies, no blind merge.
+
+## install-* commands must show INSTALLED state (✓ + "already configured") (CTO 2026-06-16)
+The `install-skill` / `install-commit-hook` / `register-module` (review-cli) and rig's `install-*`
+surfaces should INDICATE current state, not just offer the action. When the thing is already set up,
+show a green ✓ + "already configured — nothing to do" (idempotent, like `rig doctor`'s dependency
+checks). So a user listing/running install-* sees what's done vs pending at a glance. Applies to
+review-cli install subcommands and any rig install/provision listing (status/doctor style). Part of
+the ecosystem error-system / clarity work — implement alongside it (subagents), CTO verifies.
+
+## Topic-based help across the ecosystem (CTO 2026-06-16)
+Tools need DEEP help topics, advertised from the main help:
+- **review**: `review help config` (or `review --help config`) — a real config reference: the reviewer
+  board, model/backend selection, config file paths + cascade (`~/.config/review-cli/…` + repo), env
+  vars, how to add/override a seat. The MAIN `review --help` must POINT at it ("see `review help config`
+  for configuration", plus any other topics).
+- **Generalize**: a `<tool> help <topic>` convention for non-obvious features (config, board/models,
+  auth, output formats, etc.), and the top-level `--help` LISTS the available topics. Apply across the
+  ecosystem — review, tg, draw, 3d, rig, task — each ships the topic helps relevant to it.
+- Keep topic help in sync with behavior (the `help-docs-sync` skill): a flag/behavior change updates its
+  topic help in the same commit. Tests assert main `--help` lists the topics and each topic prints.
+Implement via subagents (per tool), CTO verifies. Start with `review help config` since that's the ask.
+
+## Help must show ACTUAL defaults — esp. --model (CTO 2026-06-16)
+In `review --help` (and across tools) every configurable option must show its EFFECTIVE default value,
+not a vague description:
+- **`--model`**: today it says only "model/backend to run; repeat or comma-separate" — it must show the
+  ACTUAL default (the reviewer board / models that run when you DON'T pass --model). E.g. "(default: the
+  active board — see `review help config` / `--show-board`)" or the concrete default model id(s).
+- Other configurable defaults (`--pool` 4, `--timeout` 1200/240, `--moderator`, `--vision-timeout`, …)
+  already show some defaults — make ALL of them show their CURRENT effective value, respecting the config
+  cascade (if the user set a default in config, the help reflects it, or at least points at where it's set).
+- Generalize to the ecosystem: a flag with a configurable default prints that default in --help. Ties into
+  topic-help (`review help config`) and the help-docs-sync skill (tests assert --help shows defaults).
+Implement with the review-cli UX subagent (queued after non-git), CTO verifies.
+
+## Subcommand-only options belong in the subcommand help, not the global list (CTO 2026-06-16)
+`review --help` dumps options that apply only to specific modes/features into the GLOBAL option list,
+cluttering it. Scope them:
+- **Visual-only opts** (`--visual` and its companions `--before`, `--intent`, `--expect`, `--check`,
+  `--json`, `--strict`, `--no-ai`, `--no-local-model`, `--vision-timeout`, `--project`) belong in the
+  visual section / `review --visual --help`, NOT the global list.
+- Mode-only opts belong on that subcommand's parser (`review brainstorm --help` already owns
+  `--rounds`/`--max-rounds` — do the same for every mode/feature-specific flag).
+- The GLOBAL `review --help` shows only TRULY global opts (`-m/--model`, `-C`, `-o`, `--timeout`,
+  `--list-defaults`, `--show-board`, `--pool`) + the subcommands list + the topic-help pointer.
+- argparse: give each subcommand (and the composable `--visual` feature) its own argument group/parser so
+  `--help` is scoped automatically. Tests assert a visual-only flag does NOT appear in the global help and
+  DOES appear in the visual/subcommand help.
+Part of the review-cli UX subagent (queued after non-git). Generalize the principle to other tools' CLIs.
+
+## review dashboard as a managed service (run/start/status/stop/enable/disable) (CTO 2026-06-16)
+`review dashboard` gets service-style subcommands:
+- **run** — run in the foreground (this shell), blocking; for `disable`d / ad-hoc use.
+- **start** — start in the BACKGROUND (detached daemon), return immediately.
+- **status** — is it running? pid/port/url.
+- **stop** — stop the background instance.
+- **enable** — install OS autostart (launchd LaunchAgent on macOS / systemd user unit on Linux — same
+  mechanism as the tg-ctl autostart item) AND start it in the background now.
+- **disable** — remove autostart (and stop).
+- **bare `review dashboard`** (no subcommand) → print the dashboard HELP (like bare `review` → help),
+  not launch anything.
+- On `start`/`run`, HINT how to enable autostart ("run `review dashboard enable` to start at login").
+Idempotent, removable; supported-OS matrix in agent-tools. SHARE the run/start/status/stop/enable/disable
++ OS-autostart machinery with tg-ctl autostart and the daemon-supervisor (§3) — one service-management
+helper, not per-tool copies. review-cli UX subagent (queued), CTO verifies.
+
+## review-cli dashboard is under-tested — fix data + tabs, real visual QA (CTO 2026-06-16)
+A live look at `review dashboard` shows it was never properly tested:
+- **literal "topic"** is rendered for every brainstorm session instead of the REAL brainstorm topic
+  (a placeholder/parse bug — pull the actual topic from the discussion-log header `# Brainstorm: <topic>`).
+- **missing data everywhere**: panel sessions show no prompt/title; many fields blank.
+- **tabs barely work**: Overview/Chat logs/Stats/Models&roles/Metrics/Overseer feedback/Modes/Errors/
+  Tasks/Prompts/PRs&tickets — several likely empty/broken ("mostly doesn't work").
+Fix: populate REAL data per session (brainstorm topic, panel prompt, models, durations, error details);
+every tab either renders real data or is removed; wire the parser to the actual log/store format.
+ACCEPTANCE = real visual QA (the `visual-proof-cycle` skill): start the dashboard against sample logs,
+SCREENSHOT each tab, READ IT BACK, assert no "topic" placeholder and real data shows — not unit-only.
+This is the same failure mode as the tmux/smoke gaps today: looked done, wasn't exercised. review-cli
+subagent, CTO verifies with a screenshot.
+
+## ONE shared help-formatter in agent-tools/lib — reuse across ALL tools (CTO 2026-06-16)
+tg-cli's `--help` is NOT colorized like review/rig/draw — inconsistent. ROOT PRINCIPLE (CTO, repeated):
+extract EVERYTHING reusable into `agent-tools/lib` and share it; do not re-implement per tool. Help is a
+prime candidate — build ONE shared help layer (Python lib module, §3) and have every CLI use it:
+- colors/styling, section layout, usage line, subcommands list;
+- the help-clarity rules from today all live HERE so a fix lands everywhere: show ACTUAL defaults
+  (esp. --model), SCOPE subcommand-only options to their subcommand, topic-help (`<tool> help <topic>`)
+  advertised in main help, install-* state (✓ already-configured), service subcommands help.
+- the 3-part error/exit-code layer (error-system v2) is the same story — one shared `errors` + `help`
+  module, consumed by review/rig/tg/draw/3d/task.
+tg-cli is Bun/TS (migrates to Python LAST) — until then, at minimum match the color scheme; after
+migration it imports the shared lib like the rest. Tracking: agent-tools#12 (shared lib). Build the
+shared help/errors modules, then refit each CLI (subagents), CTO verifies parity (same look across tools).
+
+## tg --tag: lowercase-english only (CTO 2026-06-16)
+`tg --tag` currently accepts Russian (ОТВЕТ/РЕШЕНИЕ/...) and uppercase. Restrict to LOWERCASE ENGLISH
+words only: `answer` / `decision` / `problem` / `report` (and any other defined tags) — lowercase. Reject
+anything else with a clear 3-part error ("tag must be a lowercase english word, e.g. answer/decision/
+problem/report"). Update tg docs + the ~/.claude/CLAUDE.md tg blurb (it currently shows ОТВЕТ/РЕШЕНИЕ).
+tg-cli is Bun/TS (no local checkout — clone first); pairs with tg help-coloring (match other tools) and the
+shared help/errors lib (after the Python migration). Subagent, CTO verifies.
+
+## tg help specifics (CTO 2026-06-16) — apply with the tg-cli help work
+- **Don't repeat `[--format text|html]` many times** in the help. It's a global option — show it ONCE
+  (in the global options), not duplicated per command/usage line.
+- **Replace the `--format-help` flag with standard topic-help**: `tg help format` (and `tg help <topic>`
+  for other such sections). The MAIN `tg --help` briefly LISTS the available topics ("see `tg help format`
+  …"). Same convention as the ecosystem topic-help item — not a bespoke `--format-help` flag.
+- **`tg voice setup` (and similar setup/install surfaces) show actual STATUS**: green ✓ when configured,
+  yellow ○ when not — the install-* state principle, applied to voice setup. So the user sees what's done
+  vs pending without running it blindly.
+These extend the already-queued tg-cli help work (--tag + coloring + shared help lib). CTO verifies.
