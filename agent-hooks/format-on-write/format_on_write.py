@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -145,10 +146,34 @@ def _tool_detect(tool: str) -> Callable[[Path | None], str | None]:
     return detect
 
 
+def _ruff_configured(root: Path | None) -> bool:
+    """True when the repo CONFIGURES ruff: a ruff.toml/.ruff.toml, or a [tool.ruff] (or
+    [tool.ruff.*]) section in pyproject.toml. Mirrors the biome/prettier "needs a config
+    signal before using a GLOBAL tool" rule."""
+    if not root:
+        return False
+    if (root / "ruff.toml").exists() or (root / ".ruff.toml").exists():
+        return True
+    pp = root / "pyproject.toml"
+    if pp.is_file():
+        try:
+            text = pp.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        return re.search(r"(?m)^\s*\[tool\.ruff(\.[^\]]+)?\]", text) is not None
+    return False
+
+
 def _ruff_detect(root: Path | None) -> str | None:
-    # ruff format only makes sense if ruff is the project's formatter; require ruff present.
+    # A repo-local ruff (.venv/node_modules) is an explicit opt-in — use it. But a GLOBAL ruff
+    # is the project's formatter ONLY if the repo CONFIGURES ruff; else a repo set up for Black
+    # (with ruff merely installed globally) would be silently reformatted by ruff.
     lb = local_bin(root, "ruff")
-    return lb or ("ruff" if has_global("ruff") else None)
+    if lb:
+        return lb
+    if _ruff_configured(root) and has_global("ruff"):
+        return "ruff"
+    return None
 
 
 # argv builders

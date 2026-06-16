@@ -147,6 +147,29 @@ def test_table_python_candidate_order():
     assert second_argv == ["black", "-q", "x.py"]
 
 
+def test_ruff_global_requires_config(tmp_path, monkeypatch):
+    root = _mk_repo(tmp_path)
+    monkeypatch.setattr(fow, "has_global", lambda tool: tool == "ruff")
+    # no ruff config -> a globally-installed ruff is NOT selected (a Black-configured repo must
+    # not be silently reformatted by ruff just because ruff is on PATH).
+    assert fow._ruff_detect(root) is None
+    # a ruff.toml makes ruff the configured formatter -> global ruff is now used.
+    (root / "ruff.toml").write_text("line-length = 100\n")
+    assert fow._ruff_detect(root) == "ruff"
+
+
+def test_ruff_config_via_pyproject_tool_section(tmp_path, monkeypatch):
+    root = _mk_repo(tmp_path)
+    monkeypatch.setattr(fow, "has_global", lambda tool: tool == "ruff")
+    (root / "pyproject.toml").write_text('[tool.ruff.lint]\nselect = ["E"]\n')
+    assert fow._ruff_configured(root) is True
+    assert fow._ruff_detect(root) == "ruff"
+    # a pyproject with only [tool.black] does NOT count as ruff config
+    (root / "pyproject.toml").write_text("[tool.black]\nline-length = 88\n")
+    assert fow._ruff_configured(root) is False
+    assert fow._ruff_detect(root) is None
+
+
 def test_table_go_and_rust():
     assert fow.TABLE[".go"][0][1]("gofmt", "x.go") == ["gofmt", "-w", "x.go"]
     assert fow.TABLE[".rs"][0][1]("rustfmt", "x.rs") == ["rustfmt", "x.rs"]
