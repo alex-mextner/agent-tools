@@ -880,3 +880,12 @@ and any tool wrapping an external command that needs per-repo config) must inste
 - **Informative/proactive/friendly**: tell the user what was detected, what got written to rig.yaml, and
   how to change it — never a bare "could not determine X".
 Generalize across the ecosystem; tie into rig.yaml repo config + the error-system. task-cli/rig subagents.
+
+## task list: interactive TUI + non-interactive hints (CTO 2026-06-16)
+- **Interactive mode (tty)**: `task list` is a TUI — a SCROLLABLE list, tasks are SELECTABLE (arrow keys
+  + enter to open/act), and tasks CREATED IN THIS SESSION are visually MARKED/highlighted. Take inspiration
+  from the linear CLI's TUI (key/state columns, navigation). Pairs with the interactive pager + higher limit.
+- **Non-interactive mode (piped/script)**: no TUI — plain list, and print a DIMMED/grey HINT showing how to
+  open a task or do basic ops (e.g. "↳ `task show <id>` to view · `task done <id>` to close"). Informative,
+  proactive, friendly (the pillars) without breaking machine-readability (hint on stderr or clearly dimmed).
+Folds into the task-cli list work (grouping, --all, session-vs-all messaging, pager). task-cli.
