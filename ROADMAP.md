@@ -945,3 +945,18 @@ restarting from round 1 — for the orchestrator AND for any subagent that runs 
 The ~3 retries (and backoff/timeout budgets) must be CONFIGURABLE — via review-cli config file, env var
 (e.g. REVIEW_RETRIES), and/or a flag — not hardcoded. Sensible default (3), overridable per env/run.
 ## (reserve-replace failover already exists — verify it actually fires in the logs; see check below)
+## reserve-replace failover IS firing, but the promotion event is NOT durably logged (CTO 2026-06-16, VERIFIED)
+Verified via `~/.config/review-cli/run-stats.jsonl`: the failover fires on nearly EVERY review run.
+- Steady state: `pool_size:4, ok:4, fail:1`, recorded `models=[fable5,opus,codex,glm]`. The planned
+  top-4 by board priority (config.py:181-196) is `[fable5,opus,codex,KIMI]`. Kimi (commandcode) dies at
+  runtime (timeouts `EXIT 124` / empty `output_tokens=0` in commandcode-r0 logs) and GLM (first reserve)
+  backfills it — that's the `fail:1`. So replacement is the steady state, not the exception.
+- Heavy cascade 2026-06-16T20:25:40: `models=[fable5,opus,glm,gemini]`, fail=4 — kimi AND codex failed,
+  reserve cascaded down to gemini (priority 8).
+- Live (21:00-21:06): claude-r0 logs show `ClaudeFable5 is currently unavailable` with EXIT 0 — a sentinel
+  body that `result_is_usable` catches → another real-time promotion.
+GAP TO FIX: the promotion line `[review-cli] board: X failed — promoting reserve Y` (panel.py:339) is
+written to **stderr only**, never to the per-backend `~/Library/Logs/review-cli/*.log` files. So the
+failover is invisible "by the logs" — only inferrable from run-stats + EXIT codes. Fix: also append the
+FailoverOutcome (each promotion: failed seat, promoted reserve, round) to a durable run log so a kill/
+post-mortem can SEE the replacements, not just the final usable set.
