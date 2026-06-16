@@ -239,5 +239,27 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(decision, "allow")
 
 
+class GitDashCAndSkipScope(unittest.TestCase):
+    def test_effective_cwd_honors_dash_C(self):
+        # `git -C <repo> commit` acts on <repo> — branch detection must read THAT repo.
+        self.assertEqual(mod.effective_cwd("git -C /srv/repo commit -m x", "/event"), "/srv/repo")
+        self.assertEqual(mod.effective_cwd("git -C/srv/repo commit -m x", "/event"), "/srv/repo")
+        # a relative -C resolves against the event cwd
+        self.assertEqual(mod.effective_cwd("git -C sub commit -m x", "/event"), "/event/sub")
+        # no -C → the event cwd is unchanged
+        self.assertEqual(mod.effective_cwd("git commit -m x", "/event"), "/event")
+
+    def test_argv_without_message_strips_message_values(self):
+        # a flag named only in the MESSAGE is dropped; a real argv flag is kept
+        self.assertNotIn("--amend", mod._argv_without_message('git commit -m "uses --amend"'))
+        self.assertIn("--amend", mod._argv_without_message('git commit --amend -m "x"'))
+
+    def test_skip_flag_in_message_does_not_exempt(self):
+        # `--amend` inside the commit MESSAGE must NOT exempt a real, ticketless commit.
+        code, decision = run_hook('git commit -m "support the --amend flag"', strict=True)
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

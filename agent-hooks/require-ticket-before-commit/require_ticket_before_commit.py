@@ -194,6 +194,58 @@ def current_branch(cwd: str | None) -> str:
         return ""
 
 
+def effective_cwd(command: str, cwd: str | None) -> str | None:
+    """Honor ``git -C <dir>``: a `git -C <repo> commit …` acts on <repo>, not the shell cwd,
+    so branch detection must read THAT repo. Returns the -C target (``-C dir`` or ``-Cdir``,
+    last one wins, resolved against cwd) if present, else cwd. Falls back to cwd when the
+    command can't be tokenized."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return cwd
+    target: str | None = None
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "-C" and i + 1 < len(tokens):
+            target = tokens[i + 1]
+            i += 2
+            continue
+        if tok.startswith("-C") and len(tok) > 2:
+            target = tok[2:]
+        i += 1
+    if target is None:
+        return cwd
+    target = os.path.expanduser(target)
+    if cwd and not os.path.isabs(target):
+        target = os.path.join(cwd, target)
+    return target
+
+
+def _argv_without_message(command: str) -> str:
+    """The command with -m/--message/-F message VALUES stripped, so a flag named in the commit
+    MESSAGE (``-m 'support --amend'``) can't trip SKIP_COMMIT and falsely exempt a real commit.
+    On a tokenization failure, returns "" → SKIP_COMMIT can't match → the commit is GATED
+    (the safe direction: gate rather than wrongly exempt)."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return ""
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in ("-m", "--message", "-F", "--file") and i + 1 < len(tokens):
+            i += 2  # drop the flag AND its value
+            continue
+        if tok.startswith(("--message=", "--file=")) or (tok.startswith("-m") and len(tok) > 2):
+            i += 1  # drop -mMSG / --message=MSG / --file=PATH
+            continue
+        out.append(tok)
+        i += 1
+    return " ".join(out)
+
+
 def main() -> int:
     try:
         event = json.load(sys.stdin)
@@ -206,9 +258,12 @@ def main() -> int:
     command = args.get("command") or args.get("cmd") or event.get("command") or ""
     if not isinstance(command, str):
         command = str(command)
-    cwd = event.get("cwd") or args.get("cwd")
+    # Honor `git -C <repo>`: branch/message checks must target the repo the commit acts on.
+    cwd = effective_cwd(command, event.get("cwd") or args.get("cwd"))
 
-    if not GIT_COMMIT.search(command) or SKIP_COMMIT.search(command):
+    # SKIP_COMMIT is matched against the argv with the MESSAGE removed, so `--amend`/`--continue`
+    # appearing in a commit message can't falsely exempt the commit.
+    if not GIT_COMMIT.search(command) or SKIP_COMMIT.search(_argv_without_message(command)):
         return _allow()  # not a normal authoring commit → nothing to gate
 
     message = commit_message_from_command(command, cwd)
