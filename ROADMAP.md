@@ -913,3 +913,17 @@ Today review brainstorm/panel returned SILENT-EMPTY (0 bytes) when Anthropic bac
 - Make timeouts/retry budgets configurable; surface "retrying seat X (attempt n)" so it's not a silent hang.
 review-cli subagent. CTO verifies by simulating backend 500s (mock) — retries fire, fallback works, no
 silent-empty.
+
+## review resilience — concrete retry vs reserve-replace policy (CTO 2026-06-16)
+Refinement of "review must be resilient": classify backend errors and act per class:
+- **Retryable (transient)** — HTTP 500/502/503/429, "rate limited", "temporarily limiting", timeouts:
+  RETRY the SAME seat up to ~3 times with exponential backoff + jitter before giving up on it. (3 is the
+  default where retrying makes sense; tunable.)
+- **Seat-fatal (not worth retrying)** — model unavailable, auth/credential failure, persistent refusal,
+  unknown-model: immediately REPLACE that seat with the next RESERVE from the board (failover), don't waste
+  retries on a dead seat.
+- After retries+replacement exhaust the pool+reserves, FAIL LOUD (which seats failed, why, retry hint,
+  non-zero exit) — never silent-empty.
+Implement in panel.py/backends.py (the run_panel/failover path) — surface "retry seat X (n/3)" / "seat X
+fatal → promoting reserve Y". Tests: mock 500 → 3 retries then success; mock auth-fail → immediate reserve
+swap; mock all-fail → loud error + exit code. CTO verifies with mocked backend errors.
