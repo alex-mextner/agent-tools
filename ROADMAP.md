@@ -800,3 +800,15 @@ harness auto-mode settings, tmux config (the new provisioning), model-freshness 
 Each AREA shows in-sync vs drift (count) under its heading, so the user sees the FULL picture of what rig
 manages and where it's out of sync — not a wall of skill lines with everything else buried. Ties into the
 error-system/status-clarity agent (global/repo separation + which config file declares each).
+
+## Commands should work OUTSIDE a repo; task list groups by repo/project (CTO 2026-06-16)
+General principle (same spirit as review-non-git): a tool's read/list/global operations should NOT require
+being inside a git repo. Specifically:
+- **`task list` outside any repo** → show ALL tasks across repos/projects, GROUPED by repo/project (a
+  heading per project, tasks under it). Inside a repo → scope to that repo (current) but offer `--all` for
+  the cross-repo grouped view.
+- Other task-cli read commands (status/show) work outside a repo too; only repo-bound actions (create-in-
+  this-repo) need a repo, and then with a clear message if absent.
+- Generalize: every ecosystem CLI's non-repo-bound commands run anywhere; only diff/repo-scoped ops need a
+  repo, failing gracefully (3-part error) when missing. Pairs with review-non-git + rig-status-non-git.
+task-cli is in-flight (foundation agent a9cef4ca) — fold this into it. CTO verifies.
