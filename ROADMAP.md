@@ -865,3 +865,18 @@ projects/repos (grouped by project, per the outside-repo/grouping item). Bug in 
 aggregation (backend query scope, or it only looks at the current repo). Fix + test: `--all` returns tasks
 from every configured/known project (GitHub Issues + Linear backends), grouped, with the session-vs-all
 messaging. Pairs with the task-list grouping/fallback items. task-cli.
+
+## First-run mapping for external per-repo config → persist to rig.yaml; informative/proactive/friendly (CTO 2026-06-16)
+PILLARS of our tooling: informative, proactive, friendly. The `linear` CLI fails cryptically when it can't
+infer the team key from the dir name ("Could not determine team key from directory name or team flag") —
+the user must manually `linear team list` then `--team HYP`. Our tooling (task-cli with the Linear backend,
+and any tool wrapping an external command that needs per-repo config) must instead:
+- **First-run mapping flow**: when a needed per-repo value (Linear team key, project, etc.) is missing,
+  DETECT it (e.g. fetch `linear team list`; if exactly one team → auto-pick) or ASK, then PERSIST it to the
+  LOCAL `rig.yaml` (repo config) so it's remembered — no re-asking, no cryptic failures next time.
+- **Interactive mode**: show the options (the team list) and let the user pick; confirm what was written.
+- **Non-interactive mode**: auto-infer when unambiguous (single team), else take a flag/env, else fail with
+  a clear 3-part error (WHAT/WHY/HOW: "run `<tool> link --team HYP`" or "set X in rig.yaml").
+- **Informative/proactive/friendly**: tell the user what was detected, what got written to rig.yaml, and
+  how to change it — never a bare "could not determine X".
+Generalize across the ecosystem; tie into rig.yaml repo config + the error-system. task-cli/rig subagents.
