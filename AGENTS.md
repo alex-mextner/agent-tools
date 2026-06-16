@@ -1,57 +1,212 @@
 # AGENTS.md — agent-tools
 
-This repo is the portable **rule/guard catalog** for AI-assisted development — skills,
-agent-hooks, git-hooks, CI gates, MCP slots. It is consumed by
-[`rig`](https://github.com/alex-mextner/rig-cli), which reads a committed `rig.yaml` and
-wires the catalog into a repo and a dev machine. See `README.md` for the full reference.
+This repo is the portable **rule/guard catalog** for AI-assisted development — a library of
+skills, agent-hooks, git-hooks, CI gates, and MCP slots, distilled from practice and
+generalized so they apply to *any* project, language, or harness. It is **not** an installer
+and has **no runtime of its own**: the directories here are *content*, consumed through one
+front door — [`rig`](https://github.com/alex-mextner/rig-cli) (the separate `rig-cli` repo) —
+which reads a committed `rig.yaml` and wires the catalog into two distinct targets at once:
 
-If you are an agent working **in** this repo, read the rules below before you act.
+- **a repo** — via committed artifacts: git-hooks (or the global dispatcher), CI workflows in
+  `.github/workflows/`, MCP registrations, and the `rig.yaml` itself.
+- **a dev machine / agent harness** — via the machine layer: skills dropped into the harness's
+  skills dir, agent-hooks installed into its hook dir, the global git-hook dispatcher, the
+  model-freshness cron.
 
-## Always-apply skills (mandatory — every task, every agent)
+The same catalog feeds both. A `skills/universal/*` entry lands in your harness; a `ci/<slot>/`
+workflow lands in a repo's `.github/`. agent-tools is the **what**; `rig` is the **how** — and
+`rig` lives in another repo, so nothing in *this* tree imports or runs `rig`.
 
-These two skills are **not** opt-in and **not** task-specific. They apply to the main
-orchestrator thread and to every subagent, on every task. They exist because the two most
-common, most expensive agent failures are (a) the main thread doing non-trivial work inline
-instead of delegating, and (b) claiming a user-visible change is "done" without ever looking
-at the rendered result. Internalize both before you touch the work.
+The single most important thing for an agent landing here: **you are editing a content
+catalog, not an application.** There is no `main()`, no entry point, no `bin/rig` in this
+repo. The "behavior" is what `rig` does *with* these files elsewhere. Keep that frame and the
+rest of this doc makes sense.
 
-| Skill | Trigger — when it applies | The rule, in one line |
+---
+
+## How the catalog is discovered: directory convention, zero registration
+
+There is no central registry, manifest, or index file you edit to "add" a catalog item.
+`rig` scans this tree live and an item *is* a directory at a known path. **Drop a directory
+in the right place and it becomes a catalog item** — that is the whole registration story.
+
+| Carrier | Convention | What a new directory must contain |
 | --- | --- | --- |
-| [`delegate-work-to-subagents`](skills/universal/delegate-work-to-subagents/SKILL.md) | Any task beyond a trivial one-liner — multi-step coding, research, or any repo mutation. | The main thread is an **orchestrator**: plan, decompose, dispatch to subagents (the `Agent` tool) or a dynamic workflow, and **verify** their results. Do not implement inline. |
-| [`visual-proof-cycle`](skills/universal/visual-proof-cycle/SKILL.md) | Any user-visible change — UI, a rendered image, a chart, generated output. | Capture the rendered result, **look at it yourself**, review critically, fix, re-capture. "It builds" is not "it works"; attach the final capture as evidence. |
+| Skill | `skills/universal/<name>/SKILL.md` or `skills/by-type/<group>/<name>/SKILL.md` | one `SKILL.md` with `name` + `description` frontmatter (the trigger), the portable rule, rationale, a generic example |
+| Agent-hook | `agent-hooks/<name>/` | a `<id>.<point>.json` descriptor + the executable it points at + `README.md` |
+| CI gate | `ci/<slot>/` | a `README.md` + either a `workflow.yml` (most slots) or a shell script (a client-side gate like `ci/ship/ship.sh`, which is a merge command, not a GitHub workflow) |
+| Git-hook | `git-hooks/<hook>` (`pre-commit`, `commit-msg`, `pre-push`, `no-secrets-scan`, `lefthook.yml`, `global-dispatcher/`) | the copyable hook script |
+| MCP slot | `mcp/<name>/` | the slot's config + `README.md` (see the MCP-vs-CLI policy first — the default is *don't add one*) |
+| Lib module | `lib/<module>/` | an importable Python package (often its own `pyproject.toml` — see below) |
 
-Two non-negotiable consequences:
+The `<group>` axis for by-type skills is fixed:
+`bot`, `backend`, `frontend`, `cli`, `library`, `infra`, `monorepo`. A skill that applies to
+*every* project goes in `universal/`; one scoped to a project shape goes under its `by-type/`
+group.
 
-- **Do not do non-trivial work inline.** The moment a task grows past a one-liner, it is a
-  subagent or a dynamic workflow — not the orchestrator's own edits. See
-  `delegate-work-to-subagents`.
-- **Do not claim a user-visible change is done without looking at it.** Capture the rendered
-  output, inspect the capture yourself, and attach it. See `visual-proof-cycle`.
+**Non-obvious:** because discovery is by location, the catalog grows with **no code change in
+`rig`**. You add a directory here, the consumer re-runs `rig apply` in their repo, and the new
+item flows in. Conversely, *moving or renaming* a directory is a breaking change to its
+identity — a skill's path, a hook's `<id>.<point>.json` name, and a CI slot's directory name
+are the stable handles `rig.yaml` and the harness key on.
 
-Both are **universal** skills, so `rig` installs them by default on every machine: the
-global rig config selects `skills.universal.all: true` (default-on; a skill is included
-unless explicitly disabled), which carries every `skills/universal/*` skill — these two
-included — into the harness's skills dir. Their strong, always-on frontmatter
-`description` (the when-to-use trigger) is what makes the harness surface them on any
-matching task; this AGENTS.md is the per-session backstop that states they are mandatory,
-not optional.
+---
 
-## Other guardrails an agent here must honor
+## The declarative / reconcile model (it lives in `rig`, acts on this catalog)
 
-These are the same gates `rig` installs for any repo; they apply here too.
+`rig` treats your repo + machine like Terraform treats infra: `rig status` computes the
+**two-way drift** between what `rig.yaml` declares and what is actually on disk; `rig apply`
+**reconciles** — it builds the set of intended actions, diffs against current state, and
+applies only the delta (idempotent; backs up on conflict). The plan/drift/reconcile *engine*
+(the `_build_*` action emitters and `_do_<kind>` handlers) is **in `rig-cli`, not in this
+repo** — so do not go looking for `plan.py` / `drift.py` / `runner.py` here. What you control
+from *this* repo is the catalog the engine reconciles toward.
 
-- **Review before commit.** Run `review --staged -C <repo>` (or `review -C <repo>`) in a
-  separate step before each commit. Never bypass it for code changes.
-- **Atomic, conventional commits.** One logical change per commit; conventional message.
-  Never `git --no-verify`. End commit messages with the `Co-Authored-By: Claude` line.
-- **Merge ONLY via `gh ship <PR>`.** That is the single sanctioned merge interface (a gh
-  alias → the repo's provisioned `pr-ship.sh`). Do NOT invoke `ship.sh` / `pr-ship.sh` by
-  path, do NOT invent or hand-roll a merge script, do NOT `gh pr merge` — every alternative
-  skips the green-CI + resolved-threads + clean-tree gate. Flags pass straight through:
-  `gh ship 27`, `gh ship 36 --skip-ci`, `gh ship 33 --screenshot ./after.png "badge"`. If
-  `gh ship` is missing in a repo, fix the provisioning (`rig apply`) — never route around it
-  with the raw script.
-- **Work in a fresh worktree** off the origin default branch, never the main checkout
-  (another agent may hold it). Remove your worktree when its branch is merged or pushed.
-- **Docs are English-only.** Every agent-facing doc in this repo — `AGENTS.md`, any repo
-  `CLAUDE.md`, every `SKILL.md` and `README.md` — is English. No Cyrillic.
+Practical consequence for an agent: you never "install" a skill or a hook by hand in a
+consumer repo. You add/edit content here, and the declarative pass in `rig` converges the
+target. If a change isn't showing up, the question is "did `rig apply` run against an enabled
+item in `rig.yaml`?" — not "did I copy the file to the right place?".
+
+---
+
+## Agent-hooks: the agent's OWN mid-session gates
+
+Agent-hooks are the non-obvious bit of this repo. They are **not** git hooks and **not** CI.
+They are out-of-process guards that intercept *the agent's own tool calls* — a Bash command, a
+file write, the end of a turn — **before the side effect happens**, and can deny it. A git hook
+fires too late (at commit); a CI check fires far too late (after push). Only an agent-hook can
+stop a `--no-verify` commit (the very thing being skipped) or stop a secret from being written
+to a file in the first place.
+
+The contract is `agents-hooks/v1`: a descriptor (`{id, point, cmd (ABSOLUTE), priority,
+timeout_ms, on_error}`) names an executable that reads a JSON event on stdin and signals via
+exit code — **`0` allow · `10` BLOCK (canonical even if stdout is malformed) · any other →
+the descriptor's `on_error` policy** (`open` = warn-and-proceed, `closed` = deny on failure).
+`cmd` must be absolute; installers (i.e. `rig`) substitute the real path for the shipped
+`/ABSOLUTE/PATH/TO/...` placeholder.
+
+The shipped hooks and their points:
+
+| Point | Hooks |
+| --- | --- |
+| `pre-bash` | `block-no-verify` (fail-closed), `block-raw-pr-merge`, `require-review-before-commit`, `require-ticket-before-commit`, `enforce-timeout-on-bash` |
+| `pre-write` | `block-secrets-write`, `block-raw-process-env` |
+| `post-write` | `format-on-write` (reacts to the completed write; never blocks — see the bridge note: not carried to CC yet) |
+| `stop` | `stop-completion-selfcheck` |
+
+**The carrier trap (`lib/cc_hook_bridge`).** Claude Code does **not** run these descriptors
+directly — it only runs hooks declared in `settings.json`. `lib/cc_hook_bridge` is the
+dispatcher that makes them fire: `rig` wires it into `settings.json` and it translates the v1
+exit-10 BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`. **Without that
+bridge an agent-hook is inert in CC** (agent-tools#18). The dispatcher itself is fail-**open**
+at the top level (a broken bridge must never wedge every tool call), while an individual
+fail-closed hook still blocks.
+
+**Non-obvious:** the bridge only maps the points CC has a matching event for —
+`PreToolUse` → `pre-bash`/`pre-write` and `Stop` → `stop` (see `point_for_event` in
+`dispatch.py`). It does **not** yet map `PostToolUse` → `post-write`, so `format-on-write` —
+the one `post-write` hook — is not carried to CC through this bridge today; it works on
+harnesses whose own `post-write`/`PostToolUse` event you map it to directly. Don't assume every
+shipped hook is live in CC just because the bridge exists.
+
+**The "runs before the command" trap.** `pre-bash` hooks run *before* the command they gate,
+so the precondition they check must already be satisfied. The clearest example is
+`require-review-before-commit`: it allows `git commit` only if a **review marker file is
+fresh** — it stats `REVIEW_MARKER` (default `~/.cache/agent-tools/last-review`) and passes
+only when its mtime is within `REVIEW_FRESH_WINDOW_S` (3600s) of now. So the workflow is two
+steps: **run the review and refresh the marker first, *then* `git commit`.** Committing first
+and reviewing after does not work — the gate has already fired. (This hook is `on_error: open`
+— a discipline reminder, not a security boundary; contrast `block-no-verify`, fail-closed.)
+
+---
+
+## The ship gate: the only sanctioned merge
+
+A raw `gh pr merge` is **not** how work lands here — `block-raw-pr-merge` exists to stop it
+mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
+[`ci/ship/ship.sh`](ci/ship/ship.sh)). Before it merges, `ship` refuses unless:
+
+- the PR is OPEN, not CONFLICTING, not BEHIND its base;
+- **every reported CI check is green** — it polls the PR's `statusCheckRollup` and treats any
+  check that isn't SUCCESS/SKIPPED/NEUTRAL as a failure, so *all* reported checks gate the merge,
+  not only the branch-ruleset's required ones (an optional/advisory check that goes red still
+  blocks `gh ship`). And *no CI at all is itself a failed gate*, not a free pass — it watches
+  pending checks to completion, then gates on the result;
+- there are **no unresolved review threads**;
+- a UI-touching PR carries an embedded **screenshot** (override with `--no-screenshot-ok
+  <reason>`);
+- the local branch has **no unpushed/diverged commits** and a **clean worktree**.
+
+Then it squash-merges, deletes the remote branch, removes the local worktree + branch (unless
+you're sitting inside that worktree), and fast-forwards the main checkout. It is
+repo-agnostic: nothing about an org/tracker/path layout is hard-coded, and knobs are env-driven
+— most notably **`SHIP_MAIN_CHECKOUT`** (the primary checkout to refresh post-merge; defaults
+to the first `git worktree list` entry), plus `SHIP_DEFAULT_BRANCH`, `SHIP_MERGE_METHOD`,
+`SHIP_UI_PATH_REGEX`, `SHIP_IMAGE_UPLOAD_CMD`. `--skip-ci` admin-merges (CI billing-blocked
+only) and still runs the other preflights.
+
+---
+
+## The universal skills layer: where mandatory behavior lives (don't restate it here)
+
+`skills/universal/*` are the cross-project skills, and the global `rig` config selects them by
+default for every machine via **`skills.universal.all: true`** (default-on: a universal skill
+is included unless explicitly disabled). **This is the single source of truth for universal,
+always-apply mandatory behavior** — e.g. delegating non-trivial work to subagents and the
+visual-proof cycle for any user-visible change. The harness surfaces them through each skill's
+own trigger `description` plus the SessionStart blurb; `rig` installs them.
+
+**Deliberately, this AGENTS.md does not list or restate those universal mandates.** Duplicating
+a universal mandatory skill into a per-repo `AGENTS.md` pins a stale copy to one repo, hides the
+real source, and goes out of date the moment the skill changes. `AGENTS.md` is for
+**project-specific** guidance only; universal mandates stay in the universal layer that carries
+them to *every* project and user. If you want the catalog of always-apply behavior, read
+`skills/universal/` — not this file.
+
+---
+
+## Other things that surprise an agent here
+
+- **`lib/` modules are separate Python distributions, not one package.** `lib/pyproject.toml`,
+  `lib/agenttools_config/`, and `lib/agenttools_retry/` each build/publish independently;
+  `agenttools_log` "builds as the `agenttools-log` distribution" and "ships standalone."
+  Several are **extracted *from* `rig-cli`** to be shared (e.g. `agenttools_config` is
+  generalized from `riglib.config`) — so the dependency direction is `rig-cli` → `lib/`, never
+  the reverse. They are **stdlib-only at import time** (heavy deps like PyYAML are lazy) so
+  importing one never pulls a toolchain.
+- **`rig.yaml` here is REPO-level only.** It declares this repo's own CI gates (currently just
+  `ci.items.tests`, tier `block`). The machine-wide installs (skills, agent-hooks, the
+  git-hook dispatcher, MCP, harness auto-mode) live in the **global** layer
+  (`~/.config/rig/config.yaml`) and are intentionally *not* repeated in the committed file. The
+  cascade is by location: global is global, this committed file is the repo and overrides it.
+- **The repo dogfoods its own gates on itself.** `.github/workflows/tests.yml` *is* the `ci/tests`
+  slot, running `uv run --with pytest pytest tests/` on every PR — and it's the green/red signal
+  `gh ship` and the branch ruleset wait on here. The agent-hooks and git-hooks this catalog ships
+  are the same ones an agent working in this repo is expected to operate under.
+- **The MCP default is "don't add one."** `mcp/` is mostly a *policy*: tools advertise to agents
+  as a **CLI + skill**, not an MCP server (an MCP pays a permanent context tax). Add an MCP slot
+  only when the agent genuinely can't reach the system from a shell. `review` is a CLI+skill for
+  exactly this reason — don't wrap it in MCP.
+
+---
+
+## Working in this repo
+
+- **Docs are English-only.** Every agent-facing doc — this `AGENTS.md`, any repo-level
+  `CLAUDE.md`, every `SKILL.md`, every `README.md` — is English. No Cyrillic, not even in
+  examples. These files are read by all agents/subagents.
+- **Content over code.** Most changes are markdown (a skill, a README) or a small, self-contained
+  hook/CI script. A skill has no runtime; a CI slot is a workflow + README; an agent-hook is a
+  descriptor + a stdlib-only script. Keep examples generic and portable — nothing in the catalog
+  may assume a specific project, since it ships to all of them.
+- **Fresh worktrees, off the origin default branch.** Don't work in the primary checkout (another
+  agent may hold it). A fresh worktree bases on `origin/<default branch>`, not your current HEAD —
+  verify the base before you start if your work is stacked on unmerged branches.
+- **The gates apply to you too.** Atomic, conventional commits (one logical change each); review
+  before each commit (refresh the marker, *then* commit); never `--no-verify`; land only via the
+  ship gate. These are the same guards this catalog installs for any repo — here they're
+  dogfooded.
+
+See [`README.md`](README.md) for the full catalog reference, inventory, and the carrier-decision
+guide ([`docs/carrier-decision-guide.md`](docs/carrier-decision-guide.md): skill vs. agent-hook
+vs. git-hook).
