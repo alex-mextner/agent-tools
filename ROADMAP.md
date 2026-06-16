@@ -829,3 +829,15 @@ tty). In non-interactive (piped/scripted) output → NO pager, plain text (scrip
 mode the display LIMIT is HIGHER (e.g. 100 tasks) since the pager handles scrolling; non-interactive
 keeps a small default (or `--all`/all, machine-readable). Respect `NO_PAGER`/`--no-pager`/`$PAGER` and the
 git convention. Fold into the task-cli list work.
+
+## Universal zsh tab-completion: shared generator + auto-installer in agent-tools/lib (CTO 2026-06-16)
+ONE shared module in `agent-tools/lib` that GENERATES and AUTO-INSTALLS zsh tab-completion for every tool
+(review, rig, tg, draw, 3d, task) — not per-tool copies (the "extract everything reusable" principle).
+- **Generator**: derive completions from each tool's CLI structure — subcommands, options, topic-help
+  topics, choice values (argparse introspection for the Python tools). Keeps completion in sync with the
+  CLI automatically (no hand-written, drift-prone _tool files).
+- **Auto-installer**: on first run (idempotent) and/or `<tool> completion install` — write the completion
+  into an fpath dir (e.g. ~/.zsh/completions) + ensure it's on `fpath` + `compinit`, with clear status
+  (✓ installed / how to enable). Removable (`completion uninstall`). No clobber, idempotent.
+- Bash later if needed, but zsh first. Ties into the shared help/errors lib (one lib stack, §3).
+Build as a subagent on agent-tools/lib + wire each tool, CTO verifies (tab-complete actually works in zsh).
