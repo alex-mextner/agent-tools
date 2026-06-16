@@ -152,6 +152,14 @@ The parallel rig agent owns completing hyper's rollout; this session hands it of
 
 ## 🚧 In-flight at handoff (background agents — verify state, resume if incomplete)
 
+> ⚠️ **SUPERSEDED (2026-06-16):** every "hook-bridge / auto-mode-guard is bridge-pending / live-verify
+> pending / land #20 / #18 is a hard blocker" item in THIS section and below is **DONE** — see
+> "✅ Done (2026-06-16)" above. #20 is merged (`d4ff40f`), `cc_hook_bridge` is wired into
+> `~/.claude/settings.json` and **live-proven** (deny/allow). Do NOT re-verify or re-merge the bridge.
+> The `.claude/scripts/pr-ship.sh` shim is present and CI exists (#36/#37/#38). Follow the "🎯 Next
+> actions" block. The ONLY still-open auto-mode item is the **hyper product repo** rollout (below) —
+> a different repo, not the bridge.
+
 ### ➡️ rig-tooling session (2026-06-15) — RESUME HERE
 - **hook-bridge #18 LIVE-CC VERIFIED** ✅ — fresh `claude -p` under `bypassPermissions`: a raw
   `gh pr merge` → CC `permissionDecision: deny` (bridge → block-raw-pr-merge), a benign cmd → pass.
@@ -477,8 +485,9 @@ packaging systemic), #33 (lib-advertise). SYSTEMIC TODO → `lib/pyproject.toml`
   every harness does X). Models marked by **capabilities**, not just version.
 - **auto-mode `bypassPermissions` = COMMITTED `.claude/settings.json`** (CC's shared slot → turns on by
   itself; `.claude/settings.local.json` is the gitignored personal slot). [Reversed 2026-06-15.] Its
-  "safe because guards fire" rationale is bridge-pending — see #18.
-- **Use `gh ship`, not raw `gh pr merge`** (the `block-raw-pr-merge` guard enforces it).
+  "safe because guards fire" rationale is **RESOLVED 2026-06-16** (#18/#20 bridge merged + wired into
+  `~/.claude/settings.json` + live-proven; guards fire under auto-mode). No longer bridge-pending.
+- **Use `gh ship`, not raw `gh pr merge`** (the `block-raw-pr-merge` guard enforces it — now LIVE via the bridge).
 - Tool repos work directly on `main` (push often); hyper-saas via PR + `gh ship`.
 - This roadmap lives in `agent-tools` because ecosystem work should run from a tool repo / agent-tools,
   not from an unrelated product repo.
