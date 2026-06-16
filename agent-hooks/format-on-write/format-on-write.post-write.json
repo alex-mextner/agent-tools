@@ -1,0 +1,9 @@
+{
+  "id": "format-on-write",
+  "point": "post-write",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/format-on-write/format_on_write.py",
+  "priority": 60,
+  "timeout_ms": 10000,
+  "on_error": "open",
+  "description": "After the agent writes/edits a file, runs the project's CONFIGURED formatter on just that file (oxfmt → prettier → biome for JS/TS; ruff/black for py; gofmt for go; rustfmt for rs; repo-local tool preferred over global). No-op when no formatter is configured/available. Makes formatting a harness concern instead of a per-project manual step. on_error=open and never blocks: a formatting convenience must never wedge the agent. Escape hatch: NO_FORMAT_HOOK=1."
+}
