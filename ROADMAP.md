@@ -84,7 +84,32 @@ The parallel rig agent owns completing hyper's rollout; this session hands it of
 ---
 
 ## 🚧 In-flight at handoff (background agents — verify state, resume if incomplete)
-- **task-cli foundation** (agent a9cef4ca) — building the Python tool in the new `alex-mextner/task-cli`
+
+### ➡️ rig-tooling session (2026-06-15) — RESUME HERE
+- **hook-bridge #18 LIVE-CC VERIFIED** ✅ — fresh `claude -p` under `bypassPermissions`: a raw
+  `gh pr merge` → CC `permissionDecision: deny` (bridge → block-raw-pr-merge), a benign cmd → pass.
+  The "live-CC round-trip" the bridge section flags as pending is **done**. #20's conflict with main is
+  resolved + pushed (branch `cc-hooks-bridge`). **Land #20 then #12.**
+- **Auto-mode finding: `auto` > `bypassPermissions`, and `auto` is USER-level ONLY** — CC silently ignores
+  `defaultMode:auto` in a repo's project/local `.claude/settings.json` (since v2.1.142; confirmed empirically
+  on 2.1.177), honoring it only from `~/.claude/settings.json`. `auto` (research preview) auto-approves WITH a
+  safety classifier; bypass skips everything. So the committed-per-repo bypass rollout is the inferior model
+  AND project-bypass overrides user-auto. Redesign: `docs/specs/2026-06-15-harness-layer-redesign.md` (PR #25)
+  — CC → user-level `auto`, migrate the 6 tool repos off committed project bypass, per-harness branch-on-kind.
+- **Open PRs:** **#25** (harness-redesign spec), **#26** (this rig-config-UX capture: config get/set, schema,
+  symlinks, repo-settings), **#20** + **rig-cli #12** (the verified bridge). agent-tools `main` is now
+  branch-protected → PRs only (the `gh ship` script `.claude/scripts/pr-ship.sh` was missing here — fix it).
+- **Pending impl:** delete `rig setup` alias (CTO); implement the #26-captured rig features; verify tg
+  `PermissionRequest` passthrough fires in `auto` mode (tg-ctl already installs the hook).
+- **⚠️ `/Users/ultra/work/hyper-canvas-draft` auto-mode STILL DOES NOT WORK (CTO confirmed 2026-06-15).**
+  Diagnosed: its committed `.claude/settings.json` + `.claude/settings.local.json` set **no `defaultMode` at
+  all** (the huge `permissions.allow` list is auto-accumulated "always allow", not auto-mode). And `auto`
+  can't be project-committed (user-level only), so the real fix is **user-level `auto`** (or the rig harness
+  migration), provisioned by **rig** — NOT a hand-edit (a manual settings.local.json edit was made then
+  reverted per "fix tooling, not manual"). Close it via the rig harness redesign + the hyper rollout
+  (delegated to the rig agent). It's a TEAM product repo → user-level auto for Alex, don't commit bypass to
+  the org repo.
+- task-cli foundation (agent a9cef4ca) — building the Python tool in the new `alex-mextner/task-cli`
   repo per `task-cli/docs/2026-06-15-task-cli-spec.md`. Check the repo for the pushed branch/PR.
 - **model-currency** (agent a48e44ab) — building `lib/contracts/models.yaml` (→ relocate to a
   Python `lib/` path, no contracts dir needed) + `lib/checker/model_freshness.py` + rig daily-noon
@@ -147,9 +172,38 @@ tool migrates to import from the lib.
   in PR #4, merged.)
 
 ### 5. rig
-- **Enable repo security settings at init/apply** (#3696/#85): `gh api` enable Dependency Graph +
-  vuln-alerts (+ secret-scanning) so the CI gates run instead of skipping. (Done manually on wave-1.)
-  (alex-mextner/rig-cli#5)
+- **rig provisions REPOSITORY SETTINGS at init/apply** (config-driven, sensible defaults ON) (#3696/#85,
+  CTO 2026-06-15): rig.yaml declares the repo's GitHub settings and `rig init`/`rig apply` reconciles them,
+  the same way it does skills/hooks/CI. **Two backends, auto-selected per setting:**
+  - **`gh api`** for everything the GitHub API exposes: **branch protection / rulesets** (require-PR,
+    required status checks + reviews, linear history, block force-push — the `…/settings/rules/` the CTO
+    just enabled by hand), **GHAS** (Dependency Graph + vuln-alerts + secret-scanning + code-scanning),
+    merge-button policy (squash-only, auto-delete head branch, auto-merge), Actions permissions, etc.
+  - **`agent-browser`** for settings the API does NOT expose — drive the GitHub settings UI headlessly to
+    flip the switches `gh api` can't reach. A first-class rig backend invoked INSIDE init/apply, not a
+    manual step.
+  Everything maps onto rig.yaml (a `repo:`/`github:` block) with the **secure/sensible set enabled by
+  default**, so a fresh `rig init` lands the guardrails (branch protection + GHAS + squash-merge + ship gate)
+  with zero hand-toggling. `rig status` reports drift on these like any other managed artifact. (Supersedes
+  the narrow "gh api enable Dependency Graph" scope.) (alex-mextner/rig-cli#5)
+- **`rig config get|set [--global] <path> [val]` — the recommended way to change config** (CTO 2026-06-15):
+  read/write a single nested key in `rig.yaml` (or `~/.config/rig/config.yaml` with `--global`) WITHOUT
+  hand-editing YAML, and **reconcile immediately** — `set` runs `rig apply` so the change takes effect on the
+  spot. `<path>` is dot-notation into the YAML tree (`harness.mode`, `ci.items.secret-scan.tier`,
+  `github.branch_protection.required_reviews`). The tooling-driven config-change UX: agents and the CTO change
+  rig config through `rig config set`, never by hand-patching the file. (Pairs with the repo-settings
+  provisioning above + the harness-layer redesign + the "fix tooling, not manual" rule.)
+- **rig.yaml has a real, ENFORCED JSON schema + config docs in the rig repo** (CTO 2026-06-15): ship a JSON
+  Schema for `rig.yaml` + the global config and actually VALIDATE against it (not just prose) — `rig apply` /
+  `rig config set` reject an unknown key or bad value with a clear error + the schema path, and editors get
+  completion/validation. The human-readable config reference (`docs/config-schema.md`, already cited from the
+  rig.yaml header) must EXIST in rig-cli and stay in sync with the schema (one source of truth, every key
+  documented). "It should work" = a malformed config fails loudly, not silently.
+- **rig always provisions `AGENTS.md` + `CLAUDE.md` as symlinks** (CTO 2026-06-15): a repo should carry BOTH
+  files so every harness finds its expected name (codex/opencode/gemini read `AGENTS.md`, Claude Code reads
+  `CLAUDE.md`), pointing at ONE source of truth via a symlink (e.g. `CLAUDE.md` → `AGENTS.md`) so the two can
+  never drift. `rig init`/`rig apply` create/repair the symlink (never clobber a real file without backup);
+  `rig status` flags a missing or broken link.
 - **Auto-mode is COMMITTED** (decision REVERSED 2026-06-15, CTO): `.claude/settings.json` is Claude
   Code's SHARED/committed slot — committing it (`defaultMode: bypassPermissions`) is what makes auto-mode
   turn on by itself on every checkout. The personal per-machine slot is `.claude/settings.local.json`

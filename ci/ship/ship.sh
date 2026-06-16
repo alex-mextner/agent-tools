@@ -95,29 +95,47 @@ if [ "${MERGE_STATE:-}" = "BEHIND" ]; then
   exit 1
 fi
 
-# --- green-CI gate (required checks only when jq + branch protection are available) ----
+# --- green-CI gate: CI must EXIST + be green; pending CI is WATCHED to completion -------
+# Design (CTO): "no CI" is itself a FAILED gate, not a free pass — refuse with guidance to
+# set CI up. Existing-but-pending checks are WATCHED (polled to completion, up to
+# SHIP_CI_WAIT) so you don't have to babysit; then the merge is gated on the final result of
+# ALL checks. (gh has `gh run watch <run-id>` for a single run; we poll the PR-aggregate.)
 if [ "$SKIP_CI" = "0" ]; then
+  command -v jq >/dev/null 2>&1 || { echo "Refusing: jq is required for the CI gate (install jq — or --skip-ci only if CI is genuinely N/A)." >&2; exit 1; }
   SUCCESS_FILTER='((.conclusion=="SUCCESS" or .conclusion=="SKIPPED" or .conclusion=="NEUTRAL") or .state=="SUCCESS")'
-  if command -v jq >/dev/null 2>&1; then
+  SETTLED_FILTER='(.status=="COMPLETED" or .state=="SUCCESS" or .state=="FAILURE" or .state=="ERROR")'
+  CI_WAIT="${SHIP_CI_WAIT:-900}"; CI_POLL="${SHIP_CI_POLL:-20}"; CI_GRACE="${SHIP_CI_GRACE:-45}"
+  START=$(date +%s); DEADLINE=$(( START + CI_WAIT )); GRACE_DEADLINE=$(( START + CI_GRACE ))
+  while :; do
     ROLLUP=$(gh pr view "$PR" --json statusCheckRollup -q '.statusCheckRollup' 2>/dev/null || echo '[]')
-    PROT=$(gh api "repos/{owner}/{repo}/branches/$DEFAULT_BRANCH/protection/required_status_checks" 2>/dev/null) || PROT=''
-    REQUIRED=$(printf '%s' "$PROT" | jq -c '[.contexts[]?]' 2>/dev/null || echo '[]'); [ -n "$REQUIRED" ] || REQUIRED='[]'
-    if [ "$REQUIRED" != "[]" ]; then
-      FAILED=$(printf '%s' "$ROLLUP" | jq --argjson req "$REQUIRED" \
-        "[.[]? | select($SUCCESS_FILTER) | (.name // .context)] as \$ok
-          | [\$req[] | select((. as \$r | \$ok | index(\$r)) | not)] | length" 2>/dev/null || echo 1)
-      DESC="required check(s) not yet passing"
-    else
-      FAILED=$(printf '%s' "$ROLLUP" | jq \
-        "([.[]? | select($SUCCESS_FILTER | not)] | length) + (if (. | length) == 0 then 1 else 0 end)" 2>/dev/null || echo 1)
-      DESC="check(s) not yet passing (no branch protection — gating on ALL checks)"
+    N=$(printf '%s' "$ROLLUP" | jq 'length' 2>/dev/null || echo 0)
+    if [ "${N:-0}" = "0" ]; then
+      # An empty rollup is ambiguous: either "no CI configured" OR "checks not registered yet"
+      # (GitHub briefly returns [] on a freshly-opened PR before Actions enqueue). Give a grace
+      # window for checks to appear; only after it lapses do we conclude there is genuinely no CI.
+      NOW=$(date +%s)
+      if [ "$NOW" -lt "$GRACE_DEADLINE" ]; then
+        echo "[ship] no checks reported yet on PR #$PR — waiting ${CI_POLL}s for CI to register (grace $(( GRACE_DEADLINE - NOW ))s left) ..."
+        sleep "$CI_POLL"; continue
+      fi
+      { echo "Refusing: PR #$PR has NO CI checks (none registered within ${CI_GRACE}s) — set up CI before merging (an ungated merge is not allowed; 'no CI' is a failed gate, not a pass)."
+        echo "  Provision CI: enable rig's ci block — \`rig apply\` writes secret-scan / codeql / dependency-review into .github/workflows — or add your own workflows."
+        echo "  Override ONLY if CI is genuinely N/A for this repo: --skip-ci."; } >&2
+      exit 1
     fi
-  else
-    FAILED=$(gh pr view "$PR" --json statusCheckRollup -q \
-      '([.statusCheckRollup[]? | select((.conclusion=="SUCCESS" or .conclusion=="SKIPPED" or .conclusion=="NEUTRAL" or .state=="SUCCESS")|not)] | length) + (if (.statusCheckRollup | length)==0 then 1 else 0 end)' 2>/dev/null || echo 1)
-    DESC="check(s) not yet passing (jq missing — gating on ALL checks; install jq for required-only)"
+    PENDING=$(printf '%s' "$ROLLUP" | jq "[.[] | select($SETTLED_FILTER | not)] | length" 2>/dev/null || echo 0)
+    [ "${PENDING:-0}" = "0" ] && break
+    NOW=$(date +%s); [ "$NOW" -ge "$DEADLINE" ] && { echo "Refusing: PR #$PR still has $PENDING pending check(s) after ${CI_WAIT}s. Let CI settle, then re-run." >&2; exit 1; }
+    echo "[ship] $PENDING check(s) still running on PR #$PR — watching (poll ${CI_POLL}s, $(( DEADLINE - NOW ))s left before giving up) ..."
+    sleep "$CI_POLL"
+  done
+  FAILED=$(printf '%s' "$ROLLUP" | jq "[.[] | select($SUCCESS_FILTER | not)] | length" 2>/dev/null || echo 1)
+  if [ "${FAILED:-0}" != "0" ]; then
+    echo "Refusing: PR #$PR has $FAILED check(s) not passing:" >&2
+    printf '%s' "$ROLLUP" | jq -r ".[] | select($SUCCESS_FILTER | not) | \"  x \(.name // .context) -> \(.conclusion // .state)\"" >&2 2>/dev/null || true
+    echo "  Fix CI, then re-run (or --skip-ci if CI is billing-blocked)." >&2
+    exit 1
   fi
-  [ "${FAILED:-0}" = "0" ] || { echo "Refusing: PR #$PR has $FAILED $DESC. Wait for/fix CI (or --skip-ci if CI is billing-blocked)." >&2; exit 1; }
 fi
 
 # --- unresolved review threads (see ci/review-threads/) --------------------------------
