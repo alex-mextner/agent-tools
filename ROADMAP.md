@@ -1151,3 +1151,160 @@ ship blocks. Align them (do X: make the CI review-threads check enforce ship's a
 because Y: green CI currently misrepresents thread state and wasted merge cycles).
 FOLLOW-UP: worktree hygiene — prune the merged-branch + /tmp/wt-* worktrees across rig-cli/review-cli
 and the salvage branches (salvage-readme-agenttools-fix) now that the wave is done.
+
+## Forward harness confirmation / permission prompts to TG as inline buttons (CTO 2026-06-17)
+The agent harness's BLOCKING prompts must MIRROR to Telegram as tappable inline buttons, not only
+render in the tmux pane. Trigger that surfaced it: the dynamic-**workflow launch** confirm dialog
+("Run a dynamic workflow? 1. Yes, run it / 2. View raw script / 3. No") appeared ONLY in the pane —
+a backgrounded/remote run stalls on a prompt the CTO never sees from the phone, or it just auto-runs
+without the chance to say no. Scope: detect the harness prompt state (Claude Code workflow-confirm +
+tool-permission + plan-approval prompts at minimum; generalize to codex/opencode/etc.), push the
+prompt text + its option list to TG as inline buttons, and route the tap back as the selection /
+keystroke into the pane (or via the harness prompt API). This EXTENDS decisions-as-buttons
+(#3706, tg-cli#30): same inline-button + routed-reply infra, and it MUST honor the pending-question
+DEFER (tg-ctl must not blast injected text into a pane that has an open prompt — see tg-cli#30).
+Tracking: extend tg-cli#30 (or a new tg-cli issue).
+
+## INCIDENT 2026-06-17 ~09:52: tmux died (spawn-storm, not reboot/OOM) + restore machinery built-but-not-deployed
+Read-only forensics. The machine did NOT reboot (uptime ~12h45, boot prev-day 21:18) and did NOT OOM
+(~17 GB free, no jetsam on tmux, no `.ips` crash report). The old server (PID 9214) continuum heartbeat
+collapsed during a **`tmux`-command spawn-storm ~09:51-09:53** — hundreds of short-lived one-shot `tmux`
+invocations, consistent with the **185 leftover `rigtest-*`/`ccdbg-*`/`tgctl-test-*` sockets** in
+/private/tmp/tmux-501/. The actual SIGKILL/SIGTERM was not logged, so the exact terminator is unprovable;
+strongest circumstantial read = a rig/test loop's tmux-socket churn starved/killed the server. ACTION:
+find+stop whatever loops `tmux` (the `rigtest-*` socket factory) and clean the 185 stale test sockets; rig
+tests must use throwaway sockets they tear down in a trap.
+Why the manual restart restored NOTHING (all already in §5b / "v2 reboot", DOCUMENTED but NOT DEPLOYED):
+- **cc not resumed**: deployed `~/.config/rig/tmux/cc-save.sh` matches `pane_current_command == claude`, but
+  a live cc pane reports `2.1.179` (cc's versioned node binary name) -> never matches -> `cc-sessions.map`
+  is 0 bytes -> cc-restore has nothing. Fix (in rig's TEMPLATE, not a hand-patch of the provisioned file):
+  detect cc by walking the pane pid-tree for the claude/node process, not by command-string. Highest value.
+- **zsh profile missing in panes**: the heavy profile (zplug, spaceship prompt, gs/gpf aliases, full PATH)
+  lives only in `~/.zprofile` (LOGIN shells); `.zshrc` is 4 lines. tmux `default-command ''` spawns
+  NON-login panes -> only `.zshrc` runs. Fix: `set -g default-command "$SHELL -l"` in rig.tmux.conf.
+- **launchd boot = empty server**: `ai.hyperide.tmux-boot.plist` runs bare `tmux start-server` (no session
+  -> no conf/plugins/continuum-restore). Point it at a script that does `new-session -d` (rig tmux-boot.sh).
+- **duplicate boot agent**: a legacy `~/Library/LaunchAgents/Tmux.Start.plist` (continuum
+  `osx_iterm_start_tmux.sh`) competes with rig's agent. Unload+remove it. This — NOT an `ln`/`.ln.conf`
+  wrapper — is the real "two wrappers"; CORRECT the §5b note: there is NO `ln`/`.ln.conf` on this machine.
+- **session sprawl**: the manual bare `tmux` bypassed `attach -t main || new -s main` -> 4 sessions (2/3/4/main).
+GOOD NEWS: the Moshi `status-right ''` continuum-wipe did NOT bite this time — rig's ordering fix held
+(status-right intact under MOSHI_CLIENT=1). All fixes belong in **rig tmux provisioning** (§5b), not hand-edits.
+**ROOT CAUSE — RESOLVED 2026-06-17 (corrects the "spawn-storm/unprovable" read above):** a killer subagent
+PROVED the mechanism — `tmux kill-server` ends the server process but does NOT unlink the socket file on
+macOS, so test fixtures that `kill-server` without unlinking LEAK one socket inode per run. Two leakers:
+rig-cli `tests/test_tmux_e2e.py` (fixture `tmux_env`, `rigtest-<uuid>` — 157 of the 166) and tg-cli
+`tests/ctl-tmux-integration.test.ts` (`afterAll`, `tgctl-test-<pid>`). The "spawn-storm" I saw WAS these
+fixtures churning sockets. FIX (PRs open, NOT merged): rig-cli **#31** + tg-cli **#37** — teardown now kills
+the server AND unlinks the socket, + a regression test asserting no leak. Tests green (rig-cli 660 + 6 e2e,
+tg-cli 1015 bun); reviews caught+fixed 2 real bugs (env-mismatch socket path, kill-timeout skips unlink).
+166 stale sockets cleaned to 0; live session intact.
+Follow-ups: (a) rig-cli leak regression is gated behind `RIG_TMUX_E2E=1` + GitHub-reachability -> decouple
+into a tmux-only no-network check; (b) `ati-test-*` (14) + `ccdbg-*` (3) debris has NO source in any managed
+repo -> trace which tool makes them so it gets the same kill+unlink fix; (c) prune worktrees after merge
+(`~/xp/rig-cli-worktrees/fix-tmux-socket-leak`, `~/.files/repos/tg-cli-wt-socketleak`).
+
+## require-review-before-commit hook is too broad + ignores the env bypass (found 2026-06-17)
+The `require-review-before-commit` agent-hook blocks a commit when no fresh review marker
+(`~/.cache/agent-tools/last-review`, mtime-windowed) exists — but: (1) it fires on a pure **docs-only**
+change (e.g. a ROADMAP.md edit), where the project rule explicitly allows skipping review; (2) it also
+catches `git stash` (any persisting git op), so you can't even park a docs edit; (3) it does NOT honor
+`REVIEW_SKIP=1` / `REVIEW_MARKER=...` passed as INLINE ENV on the git command — the hook reads the marker
+FILE / its own process env, not the to-be-run command's env, so `REVIEW_MARKER=x git commit` is ignored
+(the error message advertises `REVIEW_MARKER` as if inline would work). Net: a docs commit forces either a
+full multi-model `review` run (heavy, and a crash-risk when other agents are already reviewing) or a touch
+of the GLOBAL marker (which then lets concurrent code agents' commits skip the gate inside the 1h window).
+Fix: (a) detect docs-only diffs (paths match `*.md`/docs globs) and allow them, OR honor a real per-commit
+skip — `git commit -m '... [skip-review: docs]'` trailer, or a `REVIEW_SKIP`/`REVIEW_MARKER` env the hook
+actually reads from the command; (b) don't gate `git stash`/`git worktree` (non-commit ops). Pairs with the
+"docs-only OK to skip review" rule. Tracking: agent-hooks (this repo).
+
+## rig setup — interactive config wizard (CTO 2026-06-17)
+`rig setup` is the INTERACTIVE wizard. It (1) SHOWS what is currently enabled/configured — the live
+state across ALL reconciled areas (skills, agent-hooks, git-hooks, CI, MCP, harness/auto-mode, repo
+settings, tmux, model-cron — the same areas `rig status` covers), and (2) lets you CHANGE anything in
+BOTH the local (`rig.yaml`) and global (`~/.config/rig/config.yaml`) config from inside the wizard, then
+APPLY (`rig apply`) so the change takes effect on the spot. Each option carries an inline HINT explaining
+how it works and why it's needed (the "why" sits next to the toggle, not buried in docs).
+NON-interactive `rig setup` (no TTY / piped / non-interactive run) just prints USAGE help for the core
+commands: `init`, `apply`, `config get|set` — it degrades to a help/pointer, it does NOT run a
+half-wizard. (Pairs with `rig config get|set` and the rig.yaml JSON-schema work in §5 — the wizard reads
+the schema for the option list + hints. This REFINES/REVERSES the earlier "delete the `rig setup` alias"
+item above: `rig setup` is no longer an alias, it IS the wizard; `init` (onboarding front door) and
+`apply` (reconcile) stay distinct commands.)
+
+## MISSING gate: "mandatory/relevant skills were READ before work" (CTO 2026-06-17)
+There is NO hook that verifies an agent actually READ the mandatory + task-relevant skills before it
+starts working. Today skill-loading is purely advisory — the frontmatter `description` triggers + the
+SessionStart blurb SUGGEST skills, but NOTHING enforces that the universal-mandatory skills
+(delegate-work-to-subagents, visual-proof-cycle) or the task-relevant ones were invoked before the agent
+acts/commits. Need a GUARD (a new `agents-hooks/v1` point — e.g. a pre-work / first-substantive-tool gate,
+carried into Claude Code via the `cc_hook_bridge`, same as the other gates) that checks the required
+skills for the context were invoked this session/task and BLOCKS or warns otherwise. Design questions to
+settle: what counts as "read" (Skill-tool invocation this session vs this task), which skills are
+mandatory-always vs relevance-triggered (and how relevance is detected), and warn-vs-block tier. Pairs
+with the skill-loading work (§9 — skills must actually LOAD) and the require-review-before-commit gate
+(same hook-bridge carrier). Tracking: agent-hooks (this repo).
+
+## DOCTRINE: enforce correct agent behavior with PreToolUse hooks (rig-provisioned), not prompts/promises (CTO 2026-06-17)
+**Root lesson from this session:** behavioral rules that live only in prose (CLAUDE.md, AGENTS.md, skills,
+"I'll do better going forward") REGRESS — the agent forgets or rationalizes them within a few turns. The
+CTO repeated the SAME corrections many times in one session (orchestrate-only; subagents in the
+BACKGROUND; no long inline processes) because nothing ENFORCED them. A behavioral rule with no mechanism
+is a promise, and promises regress. The fix is structural: encode each rule as an `agents-hooks/v1`
+**PreToolUse** hook (carried into every harness via `cc_hook_bridge`), provisioned UNIVERSALLY by rig
+(rig.yaml agent-hooks layer, default-on), self-dogfooded here. Build these, each its own descriptor under
+`agent-hooks/<name>/`:
+
+1. **background-subagent gate** (PreToolUse on the Agent/Task dispatch tool). If the ORCHESTRATOR launches
+   a subagent WITHOUT `run_in_background: true` (and it isn't a trivial one-liner), BLOCK (exit 10) with a
+   3-part reminder: "the orchestrator must dispatch subagents in the BACKGROUND — set
+   `run_in_background: true` or use a dynamic Workflow; a foreground subagent blocks the main thread." This
+   is the CTO's specific ask: detect that the main agent is about to launch a subagent NOT in the
+   background and remind/block with the right way. Detect: `tool in {Agent, Task}` and `run_in_background != true`.
+2. **orchestrator-stays-thin gate** (PreToolUse on Edit/Write/Bash, MAIN thread only). When the main thread
+   attempts non-trivial work itself — a code Edit/Write (non-docs), or a multi-step/long Bash — WARN then
+   BLOCK with "delegate to a subagent; the orchestrator plans, dispatches, verifies — it doesn't implement
+   inline." (delegate-work-to-subagents, enforced.)
+3. **no-long-inline-process gate** (PreToolUse on Bash, MAIN thread only). Detect long-running commands in
+   the orchestrator (`review`, `* --watch`, `gh pr checks --watch`, build/test suites, `sleep`) and BLOCK:
+   "run this in a background subagent, not the orchestrator." Pattern-match the command.
+4. **skills-read gate** — the separate "MISSING gate" item above (verify mandatory/relevant skills were
+   invoked before work).
+5. **visual-proof gate** — block a commit / "done" claim on a user-visible change with no attached
+   screenshot the agent actually looked at (visual-proof-cycle, enforced).
+
+**Fighting the RIGIDITY (equally important — a gate that can't be satisfied is as bad as no gate):** the
+require-review-before-commit hook is this session's cautionary tale — its marker was UNSATISFIABLE
+(nothing wrote it) and it gated even docs/`git stash`, so it forced agents to either STALL or "forge" the
+marker. So every enforcement hook MUST be: (a) **satisfiable** by an honest action (and that action must
+exist + be wired — e.g. `review` must actually write its marker); (b) **tiered** — warn before block where
+feasible, so a brittle rule doesn't wedge the whole loop; (c) **scoped** — SUBAGENTS are EXEMPT from
+gates 1-3 (a subagent legitimately does the work + runs review + ships); this needs a reliable
+main-thread-vs-subagent signal (an env var the harness/bridge sets); (d) **honest escape hatch** — a
+real, auditable skip (a commit trailer / documented flag the hook reads), never a silent forge. rig
+provisions all of them via the agent-hooks layer + `cc_hook_bridge`; `rig status` reports drift; they are
+default-ON so a fresh machine inherits the enforcement. Tracking: agent-hooks (this repo) + rig provisioning.
+
+## MISSING universal-mandatory skill: extract lessons from process mistakes + user complaints (CTO 2026-06-17)
+There is NO skill that mandates SELF-LEARNING — turning a process mistake or a user
+complaint/correction into a durably-recorded lesson. Checked: the 38 universal skills include
+`promise-durable-action` (turn a promise into a mechanism — that's the DOWNSTREAM step) and
+`task-completion-selfcheck` (end-of-task reflection), but NOTHING covers the upstream act of NOTICING a
+recurring failure / a user's repeated correction and EXTRACTING + recording the generalizable lesson. The
+proof it's needed is this very session: the CTO had to repeat the same corrections many times
+(orchestrate-only; subagents in the background; no long inline processes) because the lesson was never
+captured — it stayed an apology, not a durable change.
+**Author a new universal-MANDATORY skill** (e.g. `learn-from-feedback` / `capture-lessons-durably`,
+skills/universal/, English-only, follow writing-skills, GREEN-verified). Trigger: ANY user
+complaint/correction, OR a self-noticed process failure (a repeated mistake, a tool that didn't behave as
+the user expected, a workflow that failed the same way twice). Mandate: do NOT just apologize and fix the
+instance — (1) name the ROOT cause, (2) extract the GENERALIZABLE lesson, (3) durably record it in the
+right place: a `MEMORY.md` memory file for cross-session/behavioral lessons, a ROADMAP/ticket entry for a
+project process gap, and — if it's a behavioral rule — escalate it to ENFORCEMENT (a hook/skill/config
+change) per the doctrine above. It is MANDATORY-ALWAYS (every agent, every session), in the same tier as
+`delegate-work-to-subagents` / `visual-proof-cycle`. Pairs with `promise-durable-action` (the mechanism
+step it feeds into), `task-completion-selfcheck`, and the enforcement DOCTRINE above. ENFORCEMENT hook
+(ties into that doctrine): after a user message that reads as a correction/complaint, a PreToolUse/Stop
+nudge "extract + durably record the lesson before moving on" — so self-learning itself isn't just another
+prose promise. Tracking: skills/universal + agent-hooks (this repo).
