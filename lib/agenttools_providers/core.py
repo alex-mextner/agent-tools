@@ -113,6 +113,35 @@ Capability.EMBEDDINGS = Capability("embeddings")
 Capability.AUDIO = Capability("audio")
 
 
+# The ONE capability a role/alias name can imply. Vision is load-bearing — the image-review
+# path (#3681) filters the registry to vision-capable entries — so a `vision` / `*:vision`
+# pointer must resolve to a vision-capable model. The other capabilities (code/reasoning/…)
+# gate no such filter, so a `:code` alias carries no implicit demand. Lifted to a constant
+# so the hardcoding is visible at the call sites and a future second name-constrained
+# capability is a one-line change here, not a hunt through the validators.
+NAME_CONSTRAINED_CAPABILITY = "vision"
+
+
+def _required_capability_of(name: str) -> Optional[str]:
+    """The capability a role/alias NAME requires of its target, or ``None``.
+
+    A bare ``"vision"`` requires vision, and so does a qualified ``"<provider>:vision"``
+    alias (``"commandcode:vision"``). Everything else — a plain role like ``"architect"``,
+    or a ``<provider>:latest`` pointer — requires nothing. This mirrors the manifest
+    checker's ``key == "vision" or key.endswith(":vision")`` test (#3681): the SAME single
+    name-implied capability and the SAME canonical lower-case form models.yaml is written
+    in, so a Registry built in code and one built from a manifest enforce the identical
+    cross-reference. Core normalises the name first where the checker treats keys raw — a
+    deliberately STRICTER superset: core also constrains an upper-cased ``"VISION"`` the
+    checker would miss, never the reverse, so core can only reject MORE, never silently
+    accept a non-vision ``:vision`` the checker would catch.
+    """
+    norm = name.strip().lower()
+    if norm == NAME_CONSTRAINED_CAPABILITY or norm.endswith(f":{NAME_CONSTRAINED_CAPABILITY}"):
+        return NAME_CONSTRAINED_CAPABILITY
+    return None
+
+
 @dataclass(frozen=True)
 class ModelEntry:
     """One concrete model pin: a provider-resolvable id, its provider, and its tags.
@@ -268,26 +297,45 @@ def validate_registry(registry: Registry) -> list:
             return None
         return registry.entry(target)
 
-    for role, target in registry.roles.items():
-        entry = _check_target("role", role, target)
-        # A role NAMED after a capability must resolve to an entry carrying it. The
-        # canonical case is `vision` (the image-review filter), but the rule is general:
-        # any role whose key is a known capability is held to it.
-        norm = role.strip().lower()
-        if (
-            entry is not None
-            and norm in KNOWN_CAPABILITIES
-            and Capability(norm) not in entry.capabilities
-        ):
+    def _check_capability(kind: str, name: str, entry: ModelEntry, target: str) -> None:
+        # A role/alias whose NAME is `vision` or ends in `:vision` (`commandcode:vision`)
+        # must resolve to a vision-capable entry — the image-review filter (#3681) — so a
+        # `*:vision` pointer at a text-only model is rejected, not silently honoured. This
+        # mirrors the manifest checker's `_check_pointer` rule; core additionally lower-cases
+        # the name (see `_required_capability_of`), so it rejects a superset, never less.
+        cap = _required_capability_of(name)
+        if cap is not None and Capability(cap) not in entry.capabilities:
             problems.append(
-                f"role {role!r} resolves to {target!r}, which is not {norm}-capable "
+                f"{kind} {name!r} resolves to {target!r}, which is not {cap}-capable "
                 f"(capabilities: {', '.join(sorted(entry.capabilities)) or 'none'})"
             )
 
+    def _check_no_id_collision(kind: str, name: str) -> None:
+        # A role/alias key that is ALSO a concrete model id is dead: `resolve_role` resolves
+        # an exact id before consulting roles/aliases, so the pointer never fires. Beyond the
+        # general dead-pointer bug, this also lets a `*:vision` alias colliding with a
+        # non-vision id silently return that model and bypass the #3681 guard. Reject the
+        # collision so a validated registry can never hide one.
+        if name in ids:
+            problems.append(
+                f"{kind} {name!r} collides with a concrete model id of the same name, which "
+                f"shadows it at resolve time (a model id always wins over a role/alias)"
+            )
+
+    for role, target in registry.roles.items():
+        _check_no_id_collision("role", role)
+        entry = _check_target("role", role, target)
+        if entry is not None:
+            _check_capability("role", role, entry, target)
+
     for alias, target in registry.aliases.items():
+        _check_no_id_collision("alias", alias)
         entry = _check_target("alias", alias, target)
+        if entry is None:
+            continue
+        _check_capability("alias", alias, entry, target)
         # `<provider>:latest` must point at an entry of that same provider.
-        if entry is not None and alias.endswith(":latest"):
+        if alias.endswith(":latest"):
             want = alias[: -len(":latest")]
             if entry.provider != want:
                 problems.append(
@@ -306,19 +354,25 @@ def resolve_role(
     """Resolve a symbolic ``role`` (then ``aliases``) to a concrete :class:`ModelEntry`.
 
     Lookup order: an exact model id wins first (so a caller may pass a concrete id where
-    a role is expected), then ``roles``, then ``aliases``. A role whose own name is a
-    capability (``vision``) is required to resolve to an entry that carries it — the
-    same guard :func:`validate_registry` applies, enforced again here so a registry built
-    with ``validate=False`` still cannot hand back a text-only model for ``vision``.
-    Pass ``require_capability`` to demand a capability the role name does not imply.
+    a role is expected), then ``roles``, then ``aliases``. A SYMBOLIC name whose own text
+    is ``vision`` or ends in ``:vision`` (e.g. ``commandcode:vision``) is required to
+    resolve to a vision-capable entry — the same guard :func:`validate_registry` applies,
+    enforced again here so a registry built with ``validate=False`` still cannot hand back
+    a text-only model for a vision pointer. The name-implied guard is skipped for a direct
+    concrete-id hit (a model literally named ``foo:vision`` is just that model, returned
+    verbatim). Pass ``require_capability`` to demand a capability the name does not imply.
 
     Raises :class:`ProviderError` when the role/alias is unknown, points at a missing id,
     or resolves to an entry lacking a required capability — never a silent wrong pick.
     """
     direct = registry.entry(role)
     if direct is not None:
+        # An exact concrete id was passed where a role is expected — honour it verbatim.
+        # We do NOT read a capability out of the id's own text (a model literally named
+        # `foo:vision` is just that model), so a direct hit skips the name-implied guard.
         target_id: str = role
         entry: ModelEntry = direct
+        symbolic = False
     else:
         target_id = registry.roles.get(role) or registry.aliases.get(role) or ""
         if not target_id:
@@ -332,11 +386,12 @@ def resolve_role(
                 f"role/alias {role!r} -> {target_id!r}, which is not a model in the registry"
             )
         entry = resolved
+        symbolic = True
 
-    required: list = []
-    norm = role.strip().lower()
-    if norm in KNOWN_CAPABILITIES:
-        required.append(norm)
+    required: list = []  # capability names (str) to enforce on the resolved entry
+    implied = _required_capability_of(role) if symbolic else None
+    if implied is not None:
+        required.append(implied)
     if require_capability is not None:
         required.append(str(Capability(require_capability)))
     for cap in required:

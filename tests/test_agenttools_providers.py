@@ -233,6 +233,103 @@ def test_valid_registry_has_no_problems():
     assert validate_registry(_registry()) == []
 
 
+def test_validate_registry_rejects_qualified_vision_alias_to_text_only_model():
+    # A `<provider>:vision` alias is a vision pointer just like the bare `vision` role:
+    # it MUST resolve to a vision-capable entry (#3681 image-review filter). A non-vision
+    # target must be a loud problem, not silently honoured.
+    reg = Registry(
+        models=(
+            make_entry("kimi-k2.7-code", "commandcode", ["code", "reasoning"]),  # NO vision
+            make_entry("kimi-k2p6-turbo", "commandcode", ["vision", "code"]),
+        ),
+        aliases={"commandcode:vision": "kimi-k2.7-code"},  # non-vision target!
+    )
+    problems = validate_registry(reg)
+    assert any("commandcode:vision" in p and "vision-capable" in p for p in problems)
+
+
+def test_validate_registry_accepts_qualified_vision_alias_to_vision_model():
+    # The same alias name pointed at a vision-capable model is fine.
+    reg = Registry(
+        models=(
+            make_entry("kimi-k2.7-code", "commandcode", ["code", "reasoning"]),
+            make_entry("kimi-k2p6-turbo", "commandcode", ["vision", "code"]),
+        ),
+        aliases={"commandcode:vision": "kimi-k2p6-turbo"},
+    )
+    assert validate_registry(reg) == []
+
+
+def test_validate_registry_qualified_latest_alias_unaffected_by_vision_rule():
+    # `<provider>:latest` is NOT a capability pointer — its suffix is `latest`, not a
+    # known capability — so a non-vision target stays valid; only the provider must match.
+    reg = Registry(
+        models=(make_entry("kimi-k2.7-code", "commandcode", ["code", "reasoning"]),),
+        aliases={"commandcode:latest": "kimi-k2.7-code"},
+    )
+    assert validate_registry(reg) == []
+
+
+def test_validate_registry_rejects_qualified_vision_role_to_text_only_model():
+    # The rule generalises to roles too, mirroring the manifest checker's `:vision` test.
+    reg = Registry(
+        models=(make_entry("kimi-k2.7-code", "commandcode", ["code"]),),
+        roles={"commandcode:vision": "kimi-k2.7-code"},
+    )
+    assert any("commandcode:vision" in p for p in validate_registry(reg))
+
+
+def test_resolve_role_enforces_qualified_vision_alias_even_without_build_validation():
+    # A registry built with validate=False still cannot hand back a text-only model for a
+    # `*:vision` alias — the guard is re-applied at resolve time, same as bare `vision`.
+    reg = build_registry(
+        models=[make_entry("kimi-k2.7-code", "commandcode", ["code"])],
+        aliases={"commandcode:vision": "kimi-k2.7-code"},
+        validate=False,
+    )
+    with pytest.raises(ProviderError):
+        resolve_role(reg, "commandcode:vision")
+
+
+def test_validate_registry_only_vision_is_name_constrained_not_other_caps():
+    # Only `vision` / `*:vision` is name-constrained; a `:code` or `:reasoning` suffix
+    # imposes no implicit capability demand. This matches the manifest checker, so
+    # `load_registry()` never rejects a manifest the checker `--validate` accepts.
+    reg = Registry(
+        models=(make_entry("kimi-k2.7-code", "commandcode", ["code"]),),  # no `reasoning`
+        aliases={"commandcode:reasoning": "kimi-k2.7-code"},
+    )
+    assert validate_registry(reg) == []
+
+
+def test_resolve_role_direct_concrete_id_ending_in_vision_skips_name_guard():
+    # An exact concrete id is honoured verbatim — a model literally named `*:vision` is not
+    # required to be vision-capable, because the caller asked for THAT model, not a role.
+    reg = build_registry(
+        models=[make_entry("vendor:model:vision", "vendor", ["code"])],  # not vision-capable
+        validate=False,
+    )
+    assert resolve_role(reg, "vendor:model:vision").id == "vendor:model:vision"
+
+
+def test_validate_registry_rejects_alias_key_colliding_with_a_model_id():
+    # A `*:vision` alias whose KEY is also a concrete model id is shadowed by the direct-id
+    # lookup and would bypass the vision guard — `resolve_role` returns the non-vision model.
+    # validate_registry must reject the collision so a validated registry can't hide it.
+    reg = Registry(
+        models=(
+            make_entry("commandcode:vision", "commandcode", ["code"]),  # non-vision id
+            make_entry("kimi-k2p6-turbo", "commandcode", ["vision", "code"]),
+        ),
+        aliases={"commandcode:vision": "kimi-k2p6-turbo"},  # vision-capable target, yet dead
+    )
+    problems = validate_registry(reg)
+    assert any("commandcode:vision" in p and "collides" in p for p in problems)
+    # And the danger is real: resolve_role would hand back the non-vision model.
+    assert resolve_role(reg, "commandcode:vision").id == "commandcode:vision"
+    assert not resolve_role(reg, "commandcode:vision").has("vision")
+
+
 # --- Failover ordering ---------------------------------------------------------------
 def _board() -> Board:
     return Board(
