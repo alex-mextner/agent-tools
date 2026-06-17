@@ -371,6 +371,17 @@ reboot (continuum's last save was 3 weeks old):
 
 - Separate Python CLI on the shared lib's panel engine (NOT a review mode). Reuses providers verbatim.
   (alex-mextner/agent-tools#13)
+- ✅ **MVP SCAFFOLDED (`tools/research-cli/`)** — a distinct tool (NOT a review mode) that reuses the
+  merged `agenttools_providers` CORE (#49) verbatim: registry + `resolve_role`, the failover `Board` /
+  pool-reserve split, the key cascade, capability tags, the shared `lib/contracts/models.yaml` manifest.
+  Adds the half the CORE defers — a `Transport` (reachability via the key cascade + a live call, behind a
+  protocol so the engine is network-free in tests) + the single-round panel pass + deterministic synthesis.
+  Self-registering commands (`ask`, `board`), structured exit codes, 24 deterministic tests (green in the
+  umbrella CI gate, pytest-only), README. **Phased rest** (tracked in the tool README): a real transport
+  (`oc:` router / api|cli mode / parsing), multi-round follow-ups, adversarial cross-examination, citation
+  verification, model-driven synthesis. Scaffolded inside the umbrella (next to `lib/`) for trivial reuse;
+  **spin out to `alex-mextner/research-cli` when CTO provisions the repo** (move `tools/research-cli/`, drop
+  the `sys.path` shim, depend on the published `agenttools-providers`).
 
 ### 7. review-cli follow-ups
 
