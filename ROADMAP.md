@@ -1308,3 +1308,30 @@ step it feeds into), `task-completion-selfcheck`, and the enforcement DOCTRINE a
 (ties into that doctrine): after a user message that reads as a correction/complaint, a PreToolUse/Stop
 nudge "extract + durably record the lesson before moving on" — so self-learning itself isn't just another
 prose promise. Tracking: skills/universal + agent-hooks (this repo).
+
+## Model-fallback skill + cross-harness hooks: escalate on repeated main-model errors (CTO 2026-06-17)
+When the MAIN model hits REPEATED errors (rate-limit / overload / API 5xx — e.g. today's transient
+"temporarily limiting requests" throttle), the agent must AUTO-FALL-BACK down a priority chain instead of
+stalling or dying:
+> **`claude:fable` -> `claude:opus` -> `oc:GLM-5.2` -> `codex:gpt5.5`**
+
+Notation `<harness/provider>:<model>`: fable then opus within Claude, then GLM-5.2 via opencode, then
+GPT-5.5 via codex — the chain deliberately CROSSES HARNESSES so a whole-provider outage (like today's
+Anthropic throttle) doesn't wedge the work. Build BOTH:
+- **A skill** (universal-mandatory) defining the chain + the fallback discipline: on the Nth repeated
+  model error, drop to the NEXT entry; surface which model is now active; return to the top when the
+  preferred model recovers. Mandatory so every agent inherits resilient execution.
+- **Supporting hooks** that make it AUTOMATIC, not manual: an error-detection hook (counts repeated model
+  errors per task) that, past a threshold, triggers the switch — within a harness it's a model swap
+  (`claude:fable`->`claude:opus`); across the harness boundary it RE-DISPATCHES the unit of work to the
+  next harness as an executor (shell out to `opencode` / `codex exec` — today's codex-as-executor pattern,
+  generalized + made reliable, since codex exec exit-0 lies about completion).
+- **CROSS-HARNESS — must work in cc AND codex AND oc AND pi**, not only Claude Code. Each harness has its
+  own model-selection + error-surfacing mechanism, so the error-hook + switch mechanism is provisioned PER
+  harness (cc via settings hooks + `cc_hook_bridge`; codex via its hooks/config; opencode + pi likewise),
+  all reconciled by rig from ONE chain definition (in `rig.yaml` / the providers manifest) so every harness
+  reads the same priority order.
+Builds on the shared `providers` lib (§3 — it already owns board/failover/`oc:`-routing/key-cascade; this
+is the agent-facing trigger + the cross-harness wiring on top). Pairs with the transient-rate-limit lesson
+(retry-then-fallback, NOT reduce-fan-out) and the enforcement DOCTRINE (hooks, rig-provisioned,
+cross-harness). Tracking: skills/universal + agent-hooks + lib/providers + rig provisioning.
