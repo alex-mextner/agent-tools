@@ -1138,3 +1138,16 @@ everywhere on a clean machine — AND handle gitignore so the provisioned file d
   already-merged #27-readme (0748b8a). Verify and delete the branch if redundant.
 - **multi-agent restore (#3972) recorded but NOT started** — codex/opencode/commandcode session
   restore in cc-save/cc-restore. Delegate after the merge wave settles.
+
+## DONE 2026-06-17: merge wave — all 9 PRs landed (CTO "лей" #3974/#3975)
+Shipped via `gh ship` (after fixing the alias to work outside agent-tools): review-cli #32/#34/#33,
+rig-cli #28/#27/#29/#30, agent-tools #52, tg-cli #36 (--skip-ci for 8 pre-existing CodeQL findings).
+#23 closed as superseded by #29. rig-cli #27/#29/#30 each needed a serial rebase onto the advancing
+main (all touch the same provisioning files) + codex P2 thread fixes — done by subagents, verified
+green (smoke exit 0 + CI) before each ship.
+FINDING worth fixing: the CI `review-threads` gate reads GREEN while `gh ship` still refuses for
+unresolved codex threads — the two gates use different criteria, so a PR looks merge-ready in CI but
+ship blocks. Align them (do X: make the CI review-threads check enforce ship's all-resolved rule,
+because Y: green CI currently misrepresents thread state and wasted merge cycles).
+FOLLOW-UP: worktree hygiene — prune the merged-branch + /tmp/wt-* worktrees across rig-cli/review-cli
+and the salvage branches (salvage-readme-agenttools-fix) now that the wave is done.
