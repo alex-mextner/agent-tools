@@ -1080,15 +1080,16 @@ provisions a single rig-managed marker block in the GLOBAL git excludes file
   to `~/.gitignore`). Harmless now but a latent landmine if rig ever repoints excludesfile there.
   Awaiting CTO go (offered in chat); collapse the dups, leave one canonical line, touch nothing else.
 
-## tg-cli: --tag ANSWER/ОТВЕТ broken in 1.11.0 (CTO-found 2026-06-17, VERIFIED)
-Sending with `--tag ANSWER` (or its Russian alias `ОТВЕТ`) FAILS in deployed tg 1.11.0 (3024b71):
-it emits an invalid Telegram-HTML pill and the CLI prints the MISLEADING error
-"Only those HTML tags are supported. Escape raw <, >, and &…" even on plain-text bodies with no
-markup. `--tag REPORT` / `--title` / no-tag all work — isolated to the answer-pill template.
-Confirmed by isolation: `tg --tag ANSWER "x"` fails, `tg --tag REPORT "x"` → OK. PR #36 reworks
-tag VALIDATION (lowercase-english) but may NOT fix this pill-HTML bug — verify #36 actually fixes
-the ANSWER pill render, else open a follow-up. Real-world impact: agent reports tagged ANSWER
-silently never reach Telegram.
+## CORRECTION: --tag ANSWER/ОТВЕТ is NOT a bug — it requires --reply-to (by design)
+My earlier entry here claimed `--tag ANSWER` emits an "invalid HTML pill" and marked it VERIFIED.
+That was WRONG — I saw the error text and GUESSED the cause instead of reading the source. The CTO
+corrected it: `--tag ANSWER`/`ОТВЕТ` REQUIRES `--reply-to <message_id>` — answering means answering
+a SPECIFIC message (tg source line ~122: "ANSWER (ОТВЕТ) tag REQUIRES this"). `tg --tag ANSWER "x"`
+without `--reply-to` is correctly rejected; `tg --reply-to <id> --tag ОТВЕТ "x"` works (verified by
+threading a real reply to msg 3970). The ONLY arguably-rough edge: the rejection prints the generic
+"Only those HTML tags are supported…" message instead of a clear "ANSWER requires --reply-to" — a
+minor error-message UX nit, NOT a broken-HTML bug. Lesson: do not assert a root cause you have not
+verified in the source.
 
 ## rig-cli worktree hygiene incidents (2026-06-17, found while reconciling agent PRs)
 Two issues surfaced while the parallel rig-cli agents (PRs #27/#28/#29 + tg-ctl-boot) ran:
@@ -1104,3 +1105,16 @@ Two issues surfaced while the parallel rig-cli agents (PRs #27/#28/#29 + tg-ctl-
    against rig-cli are stepping on the shared checkout / each other (the tmux agent also reported a
    two-agent same-worktree collision). Must verify ~/xp/rig-cli is on `main` BEFORE running ship.sh
    (its post-merge pull targets that checkout).
+
+## tmux session-restore for codex / opencode / commandcode (not just claude) (CTO 2026-06-17, #3972)
+cc-save originally filtered `pane_current_command == claude`; tmux-v2 (#28) rewrote it to walk the
+pane process TREE for `claude`. EXTEND it so session restore works the SAME for the other agent CLIs:
+`codex`, `opencode`, `cmd` (commandcode). Per agent kind: detect its process in the pane tree, capture
+the cwd + its resumable session id, and on restore relaunch with that agent's resume syntax (claude
+`--resume <id>`; codex / opencode / commandcode each have their own — research each CLI's resume flag).
+Generalize cc-save/cc-restore from claude-only to a per-agent-kind map. Builds on #28 (the tmux boot +
+cc-save machine). Tests + smoke mandatory; verify live that each agent kind round-trips.
+
+## (DONE via PR #33) dashboard problematic-models badge — built, not a pending ROADMAP item
+[36] review dashboard per-model health + problematic-count badge on Models&roles tab — delivered as
+DRAFT PR #33 (review-cli), 61 tests + smoke, screenshot badge=4. Tracked on GitHub, not pending here.
