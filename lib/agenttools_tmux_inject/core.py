@@ -47,6 +47,12 @@ from typing import Optional, Sequence, Union
 _TMUX_ENV = "AGENTTOOLS_TMUX_BIN"
 _DEFAULT_TMUX = "tmux"
 
+# Empty leading key argument prepended to every send-keys payload. tmux send-keys has no
+# ``--`` end-of-options marker (optstring ``c:FHKlMN:Rt:X``; issue #4408), so this empty
+# key — which sends no characters — occupies the parser's first positional slot and lets a
+# dash-leading payload (``--help``) be taken as a key rather than misparsed as a flag.
+_DASH_GUARD_KEY = ""
+
 # Exit-class sentinels for ``InjectResult.error`` so callers can branch without string
 # matching. ``None`` error means success.
 ERR_NO_TMUX = "no-tmux"  # the tmux binary is not on PATH
@@ -237,13 +243,22 @@ def _build_text_argv(
     """Construct the ``tmux send-keys`` argv for the text portion of an injection.
 
     ``-l`` makes tmux send the argument(s) literally instead of interpreting key names.
-    ``--`` terminates option parsing so a message starting with ``-`` is never mistaken for
-    a flag. The target is passed via ``-t``.
+    The target is passed via ``-t``.
+
+    Leading-dash payloads (``--help``, ``-rf /tmp``) must not be misparsed as flags. tmux's
+    ``send-keys`` does **not** support a ``--`` end-of-options marker — its documented
+    synopsis is ``send-keys [-FHKlMRX] [-c ...] [-N ...] [-t ...] key ...`` and its option
+    string is ``c:FHKlMN:Rt:X`` with no ``--`` (tmux issue #4408: a ``--``-bearing argv can
+    fail with "invalid flag --", so EVERY send would break). Instead we prepend an **empty
+    literal key argument** (``""``): it sends nothing, but it consumes the parser's first
+    positional slot so the actual payload — even one starting with ``-`` — is taken as a key
+    rather than an option. This is the portable workaround recommended for that issue and
+    works on both the literal (``-l``) and interpreted paths.
     """
     argv = [tmux, "send-keys", "-t", target.as_tmux_arg()]
     if literal:
         argv.append("-l")
-    argv.append("--")
+    argv.append(_DASH_GUARD_KEY)
     argv.append(text)
     return argv
 

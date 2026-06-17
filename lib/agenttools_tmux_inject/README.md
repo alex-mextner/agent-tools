@@ -22,9 +22,11 @@ if has_session("work"):
 ```
 
 `inject(target, text, *, enter=True, literal=True)` is the common case. It runs
-`tmux send-keys -t <target> -l -- <text>` to type the text literally, then — when
+`tmux send-keys -t <target> -l '' <text>` to type the text literally, then — when
 `enter=True` (the default) — a *second*, interpreted `tmux send-keys -t <target> Enter`
-to press a real Return so the receiving program processes the line.
+to press a real Return so the receiving program processes the line. (The empty `''` is an
+empty literal key arg that guards a dash-leading `<text>` from being misparsed as a flag —
+`tmux send-keys` has no `--` end-of-options marker; see the Literal vs interpreted note.)
 
 ### Targets
 
@@ -45,12 +47,17 @@ reaches tmux.
 
 ### Literal vs interpreted, and Enter
 
-| Flag             | `send-keys` form        | Effect                                              |
-| ---------------- | ----------------------- | --------------------------------------------------- |
-| `literal=True`   | `send-keys -l -- TEXT`  | bytes verbatim — `Enter`/`C-c` in the text are typed as text (default) |
-| `literal=False`  | `send-keys -- KEYS`     | argument interpreted as tmux key *names* (`C-c`, `Enter`, `Escape`) |
-| `enter=True`     | extra `send-keys Enter` | presses a **real** Return after the text (default for `inject`) |
-| `enter=False`    | *(none)*                | leaves the text on the prompt, unsent               |
+| Flag             | `send-keys` form         | Effect                                              |
+| ---------------- | ------------------------ | --------------------------------------------------- |
+| `literal=True`   | `send-keys -l '' TEXT`   | bytes verbatim — `Enter`/`C-c` in the text are typed as text (default) |
+| `literal=False`  | `send-keys '' KEYS`      | argument interpreted as tmux key *names* (`C-c`, `Enter`, `Escape`) |
+| `enter=True`     | extra `send-keys Enter`  | presses a **real** Return after the text (default for `inject`) |
+| `enter=False`    | *(none)*                 | leaves the text on the prompt, unsent               |
+
+The empty `''` leading key arg is deliberate: `tmux send-keys` does **not** accept a `--`
+end-of-options marker (its documented synopsis is `send-keys [-FHKlMRX] … key …`), so an
+empty literal key is prepended to guard a payload that itself begins with `-` (`--help`,
+`-rf /tmp`) from being parsed as a flag. It sends no characters of its own.
 
 Enter is deliberately a separate, interpreted `send-keys Enter` call — *not* a `"\n"`
 appended to the literal text send. Under `-l` a trailing newline is a literal LF byte,
