@@ -101,8 +101,9 @@ when-to-use trigger; the body is the rule. They have no runtime and no dependenc
 > [`visual-proof-cycle`](skills/universal/visual-proof-cycle/SKILL.md) (capture and **look
 > at** any user-visible change before claiming it works). Both are universal skills, so rig
 > installs them by default (`skills.universal.all`), and their strong frontmatter triggers
-> surface them on any matching task. See the **Always-apply skills** section of
-> [`AGENTS.md`](AGENTS.md) for the mandate.
+> surface them on any matching task. The mandate lives in the universal layer itself —
+> [`skills/universal/`](skills/universal/) is the source of truth (see the **universal skills
+> layer** section of [`AGENTS.md`](AGENTS.md), which points back to it rather than restating it).
 
 ```
 skills/universal/shell-timeouts/SKILL.md
