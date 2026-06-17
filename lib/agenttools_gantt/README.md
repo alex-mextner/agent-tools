@@ -63,8 +63,10 @@ Returns the chart as a newline-joined block (no trailing newline, no trailing sp
 line). An empty `tasks` returns the single line `(no tasks)`.
 
 Raises `GanttError` (a `ValueError` subclass) on malformed input: a missing `id`/`start`,
-`end` before `start`, a dependency on an unknown id, a dependency cycle, or a `width` too
-small to lay out.
+a non-numeric or non-finite coordinate (including an `int` too large for a double, `inf`,
+or `nan`), `end` before `start`, an `end`/`duration` pair that disagrees, a negative
+`duration`, a dependency on an unknown id, a dependency cycle, or a `width` too small to
+lay out.
 
 ### Task shape
 
@@ -75,7 +77,7 @@ A task is a `Task` dataclass or a plain mapping with these keys:
 | `id` | yes | unique task id (referenced by `deps`) |
 | `label` | no (default: `id`) | the row label; truncated with `…` if it exceeds the gutter |
 | `start` | yes | start coordinate on the shared time axis |
-| `end` | no | end coordinate; **or** give `duration` (`end = start + duration`). Neither => a zero-length milestone. Supplying both is allowed only if they agree |
+| `end` | no | end coordinate; **or** give `duration` (`end = start + duration`). Neither => a zero-length milestone. Supplying both is allowed only if they agree (compared with a couple-of-ulp float tolerance, so consistent fractional inputs like `start=0.1, duration=0.2, end=0.3` are accepted) |
 | `deps` | no | ids this task waits on; affects row order, validated against the task set |
 | `status` | no | keys into the glyph map below; unknown / absent => `.` |
 

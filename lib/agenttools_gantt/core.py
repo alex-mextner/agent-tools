@@ -24,6 +24,11 @@ DESIGN NOTES
       epoch seconds, day indices, sprint days, whatever the caller uses, as long as they
       are consistent. The renderer only needs an ordering and a span; it never interprets a
       number as a calendar date. (``duration`` is sugar: ``end = start + duration``.)
+      Coordinates are IEEE-754 doubles, so the ``end``-vs-``duration`` agreement check is
+      tolerant to a couple of ulp of the operands' magnitude — beyond ~2**53 (where
+      consecutive integers are no longer exactly representable) a sub-ulp disagreement is
+      indistinguishable from rounding and may be accepted. Keep coordinates within double
+      precision; that covers epoch seconds, day/sprint indices, and any realistic span.
     * **Dependency-aware ordering.** Rows are topologically sorted so a task never prints
       above a dependency it waits on, with ties broken by ``start`` then declaration order
       so the result is stable. A dependency cycle is reported, not silently mis-ordered.
@@ -35,6 +40,7 @@ DESIGN NOTES
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -95,6 +101,29 @@ class Task:
     status: Optional[str] = None
 
     def __post_init__(self) -> None:
+        # Guard coordinates here so the contract holds for typed ``Task`` callers too, not
+        # only the dict path (which is coerced through ``_as_number``); the two paths are
+        # documented as equivalent. ``bool`` is rejected because ``True``/``False`` are
+        # ``int`` subclasses and a boolean in a time field is a caller mistake. The finite
+        # check must run before the ordering check: ``nan`` compares False against
+        # everything, so a non-finite ``end`` would slip past ``end < start`` and crash
+        # later in layout with a bare ValueError.
+        for field_name, value in (("start", self.start), ("end", self.end)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise GanttError(
+                    f"task {self.id!r}: {field_name} must be a number, got {value!r}"
+                )
+            # ``math.isfinite`` (and any later float math) raises ``OverflowError`` on an
+            # ``int`` too large for a double; treat that as non-finite so the contract stays
+            # ``GanttError``-only rather than leaking a bare ``OverflowError``.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError:
+                finite = False
+            if not finite:
+                raise GanttError(
+                    f"task {self.id!r}: {field_name} must be finite, got {value!r}"
+                )
         if self.end < self.start:
             raise GanttError(
                 f"task {self.id!r}: end ({self.end}) is before start ({self.start})"
@@ -139,7 +168,9 @@ def _coerce_task(raw: TaskLike, *, index: int) -> Task:
         end = _as_number(raw["end"], field_name="end", task_id=task_id)
         if has_duration:
             dur = _as_number(raw["duration"], field_name="duration", task_id=task_id)
-            if start + dur != end:
+            if dur < 0:
+                raise GanttError(f"task {task_id!r}: duration ({dur}) is negative")
+            if not _consistent_end_and_duration(start, dur, end):
                 raise GanttError(
                     f"task {task_id!r}: end ({end}) and start+duration "
                     f"({start + dur}) disagree"
@@ -180,12 +211,58 @@ def _as_number(value: object, *, field_name: str, task_id: str) -> float:
 
     ``bool`` is rejected explicitly — ``True``/``False`` are ``int`` subclasses in Python,
     and a boolean in a time field is always a caller mistake, not a 0/1 coordinate.
+    ``inf``/``nan`` are rejected here too: this is the one chokepoint every coordinate flows
+    through, so guarding it keeps non-finite values out of every downstream comparison and
+    layout calculation (which would otherwise raise a bare ``ValueError`` and break the
+    ``GanttError``-only contract) regardless of which fields the caller supplied.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise GanttError(
             f"task {task_id!r}: {field_name} must be a number, got {value!r}"
         )
-    return float(value)
+    try:
+        number = float(value)  # a huge ``int`` overflows here, not silently
+    except OverflowError:
+        raise GanttError(
+            f"task {task_id!r}: {field_name} must be finite, got {value!r}"
+        ) from None
+    if not math.isfinite(number):
+        raise GanttError(
+            f"task {task_id!r}: {field_name} must be finite, got {value!r}"
+        )
+    return number
+
+
+# ulp cushion for ``start + duration == end``; see ``_consistent_end_and_duration``.
+# Computing the sum and representing ``end`` each incur up to ~0.5 ulp of rounding, so a
+# couple of ulp of the result magnitude bounds the worst-case noise for a single addition.
+_ROUNDING_ULPS = 2
+
+
+def _consistent_end_and_duration(start: float, dur: float, end: float) -> bool:
+    """Is ``start + dur`` equal to ``end`` up to float rounding noise?
+
+    A plain ``start + dur == end`` is wrong: the axis is unit-agnostic floats, so consistent
+    fractional inputs round off the exact value (``0.1 + 0.2`` is ``0.30000000000000004``).
+    A *relative* tolerance keyed to the coordinate or the span is also wrong — the axis may
+    be epoch seconds (~1.7e9) or a huge span, where ``rel_tol`` becomes seconds of slop and
+    silently accepts a real mismatch.
+
+    The only error to absorb is the rounding of the addition itself, bounded by a couple of
+    ulp of the *result* magnitude (``max(|start + dur|, |end|)``). Keying the tolerance to
+    the result, not to ``start``/``dur`` separately, keeps it from inflating when ``start``
+    is huge but the span is small; it stays tiny at every scale (sub-nanosecond at epoch
+    scale) yet always swallows pure rounding, so a genuine disagreement is still caught.
+
+    ``start``/``dur``/``end`` are already finite (``_as_number`` guards that), but their sum
+    can still overflow to ``inf``; an overflowed sum is treated as a disagreement (a finite
+    ``end`` cannot equal it) rather than letting an infinite tolerance swallow the compare.
+    """
+    total = start + dur
+    if not math.isfinite(total):
+        return False
+    tol = _ROUNDING_ULPS * math.ulp(max(abs(total), abs(end)))
+    return abs(total - end) <= tol
 
 
 def _order_tasks(tasks: Sequence[Task]) -> List[Task]:
@@ -314,7 +391,9 @@ def render_gantt(
     Raises
     ------
     GanttError
-        On malformed input: a missing id/start, ``end`` before ``start``, a dependency on an
+        On malformed input: a missing id/start, a non-numeric or non-finite coordinate
+        (an ``int`` too large for a double, ``inf``, ``nan``), ``end`` before ``start``, an
+        ``end``/``duration`` pair that disagrees, a negative ``duration``, a dependency on an
         unknown id, a dependency cycle, or a ``width`` too small to lay out.
     """
     coerced = [_coerce_task(t, index=i) for i, t in enumerate(tasks)]

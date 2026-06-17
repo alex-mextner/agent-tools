@@ -13,6 +13,7 @@ fixed task set plus a fixed ``now`` yields a byte-identical string we assert as 
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -331,6 +332,172 @@ def test_duration_is_equivalent_to_end():
         width=30,
     )
     assert via_duration == via_end
+
+
+def test_fractional_end_and_duration_agree_within_float_tolerance():
+    """Consistent fractional end+duration is accepted despite float rounding.
+
+    ``0.1 + 0.2`` is ``0.30000000000000004`` in IEEE-754, so an exact ``==`` against an
+    ``end`` of ``0.3`` would wrongly reject a caller whose numbers are actually consistent.
+    The check tolerates that rounding noise.
+    """
+    out = render_gantt(
+        [{"id": "t", "label": "T", "start": 0.1, "duration": 0.2, "end": 0.3}],
+        width=30,
+    )
+    # Equivalent to giving only end (or only duration) — the agreeing pair is accepted.
+    assert out == render_gantt(
+        [{"id": "t", "label": "T", "start": 0.1, "end": 0.3}], width=30
+    )
+
+
+def test_real_end_duration_mismatch_still_rejected():
+    """A real (non-rounding) end-vs-duration mismatch is still a pointed error."""
+    with pytest.raises(GanttError, match=r"disagree"):
+        render_gantt([{"id": "t", "label": "T", "start": 0.0, "duration": 0.2, "end": 0.9}])
+
+
+def test_epoch_scale_duration_mismatch_still_rejected():
+    """On an epoch-second axis a 1s end/duration disagreement still raises.
+
+    The axis is unit-agnostic and may be epoch seconds (~1.7e9). A relative tolerance keyed
+    to the coordinate would be ~1s of slop there and would silently accept this wrong
+    duration; the ulp-based tolerance stays sub-microsecond regardless of the axis offset.
+    """
+    with pytest.raises(GanttError, match=r"disagree"):
+        render_gantt([{"id": "t", "start": 1_700_000_000, "duration": 10, "end": 1_700_000_011}])
+
+
+def test_epoch_scale_fractional_duration_accepted():
+    """A fractional duration on an epoch-scale start is accepted when it agrees.
+
+    ``end - start`` would lose the fractional part to float precision at epoch scale, so a
+    span-relative check could wrongly reject this; the ulp tolerance keeps it accepted.
+    """
+    out = render_gantt(
+        [{"id": "t", "start": 1_700_000_000.1, "duration": 0.2, "end": 1_700_000_000.3}],
+        width=30,
+    )
+    assert out == render_gantt(
+        [{"id": "t", "start": 1_700_000_000.1, "end": 1_700_000_000.3}], width=30
+    )
+
+
+def test_large_span_mismatch_still_rejected():
+    """A mismatch on a huge span is still caught — tolerance must not scale with span.
+
+    A relative tolerance keyed to ``duration`` would be ~1e3 here and swallow a 999-unit
+    error; the ulp tolerance stays tiny so the disagreement is reported.
+    """
+    with pytest.raises(GanttError, match=r"disagree"):
+        render_gantt(
+            [{"id": "t", "start": 0, "duration": 1_000_000_000_000, "end": 1_000_000_000_999}]
+        )
+
+
+def test_large_offset_small_duration_mismatch_still_rejected():
+    """At a huge start offset a small whole-unit mismatch is still caught.
+
+    The tolerance is keyed to the addition's rounding, not the coordinate magnitude, so an
+    8-unit gap near 1e16 must still raise rather than be swallowed as ulp noise.
+    """
+    with pytest.raises(GanttError, match=r"disagree"):
+        render_gantt(
+            [{"id": "t", "start": 10_000_000_000_000_000,
+              "duration": 1, "end": 10_000_000_000_000_008}]
+        )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        # Both fields supplied (consistency-check path)...
+        {"id": "t", "start": 0.0, "duration": 1.0, "end": float("inf")},
+        {"id": "t", "start": 0.0, "duration": float("nan"), "end": 1.0},
+        # ...and single-field paths that bypass the consistency check entirely.
+        {"id": "t", "start": 0.0, "end": float("inf")},
+        {"id": "t", "start": 0.0, "duration": float("inf")},
+        {"id": "t", "start": 0.0, "end": float("nan")},
+        {"id": "t", "start": float("inf"), "end": 1.0},
+        # An int too large for a double overflows on conversion — still a GanttError.
+        {"id": "t", "start": 10**400, "end": 10**400},
+    ],
+    ids=[
+        "inf-end+dur", "nan-dur+end", "inf-end", "inf-dur", "nan-end", "inf-start",
+        "overflow-int",
+    ],
+)
+def test_non_finite_coordinate_rejected(bad):
+    """Inf/NaN in any coordinate is a pointed GanttError, never a bare ValueError."""
+    with pytest.raises(GanttError, match=r"must be finite"):
+        render_gantt([bad])
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"start": 0.0, "end": float("inf")},
+        {"start": 0.0, "end": float("nan")},
+        {"start": float("inf"), "end": 1.0},
+        {"start": 10**400, "end": 10**400},
+    ],
+    ids=["inf-end", "nan-end", "inf-start", "overflow-int"],
+)
+def test_typed_task_non_finite_coordinate_rejected(kwargs):
+    """A directly-constructed Task with a non-finite coordinate raises, not a bare crash.
+
+    Task instances bypass the dict coercion path, so the finiteness contract is enforced in
+    Task.__post_init__ to keep typed and dict inputs equivalent.
+    """
+    with pytest.raises(GanttError, match=r"must be finite"):
+        Task(id="t", label="T", **kwargs)
+
+
+def test_overflowing_sum_is_a_mismatch_not_silently_accepted():
+    """When start+duration overflows to inf it cannot equal a finite end — so it raises.
+
+    Both operands are finite, but their sum overflows; an infinite intermediate must not
+    inflate the tolerance and swallow the comparison.
+    """
+    with pytest.raises(GanttError, match=r"disagree"):
+        render_gantt([{"id": "t", "start": 1e308, "duration": 1e308, "end": 1e308}])
+
+
+def test_negative_duration_rejected_even_when_end_supplied():
+    """A negative duration is rejected on the both-fields path, not only the duration-only one.
+
+    The tolerance could otherwise let a tiny negative duration that still rounds to ``end``
+    slip through, so the negative-duration guard runs before the consistency check.
+    """
+    with pytest.raises(GanttError, match=r"is negative"):
+        render_gantt([{"id": "t", "start": 1.0, "duration": -1e-16, "end": 1.0}])
+
+
+def test_typed_task_boolean_coordinate_rejected():
+    """A boolean coordinate is rejected for typed Tasks too, matching the dict contract."""
+    with pytest.raises(GanttError, match=r"must be a number"):
+        Task(id="t", label="T", start=True, end=1)
+
+
+def test_consistency_tolerance_boundary_is_pinned():
+    """The end/duration tolerance is a couple of ulp of the result magnitude, no more.
+
+    Pins the documented contract: a disagreement a few ulp wide is reported, while a
+    sub-ulp one (indistinguishable from float rounding) is accepted. Without this the
+    suite would silently tolerate a regression in the ``_ROUNDING_ULPS`` cushion.
+    """
+    base = 1e16
+    dur = 10.0
+    total = base + dur
+    unit = math.ulp(total)  # 2.0 at this magnitude; tolerance is 2 * unit = 4.0
+    # A 3-ulp gap (diff 6 > tol 4) is a real disagreement and must raise...
+    with pytest.raises(GanttError, match=r"disagree"):
+        render_gantt([{"id": "t", "start": base, "duration": dur, "end": total + 3 * unit}])
+    # ...while a gap right at the 2-ulp tolerance (diff 4 == tol 4) is accepted as rounding.
+    out = render_gantt(
+        [{"id": "t", "start": base, "duration": dur, "end": total + 2 * unit}], width=30
+    )
+    assert out  # rendered, not rejected
 
 
 def test_typed_task_and_dict_render_identically():
