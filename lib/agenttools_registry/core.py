@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -283,6 +284,31 @@ def trust_state(
 # The trust store — a JSON file of {name -> TrustPin}, written 0600 (it gates arbitrary
 # code execution). Mirrors review's modules-trust.json and tg's TrustStore.
 # --------------------------------------------------------------------------------------
+def _coerce_trusted_at(value: Any) -> Optional[float]:
+    """Coerce a raw store ``trusted_at`` to a finite float, or ``None`` if malformed.
+
+    A missing / null value defaults to ``0.0`` (a forward-compat read of a pin written
+    before timestamps). Anything non-numeric — a string like ``"yesterday"``, a bool, a
+    list/dict, or a non-finite ``nan``/``inf`` — is malformed and yields ``None`` so the
+    caller skips just that row instead of aborting the whole store load. A numeric string
+    (``"123"``) is accepted, since a serializer may legitimately stringify the number.
+    """
+    if value is None:
+        return 0.0
+    # bool is an int subclass; a JSON `true` in trusted_at is garbage, not 1.0.
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, str)):
+        # ValueError: a non-numeric string ("yesterday"); OverflowError: an arbitrary-
+        # precision JSON int (10**400) that overflows float(); TypeError: defensive.
+        try:
+            out = float(value)
+        except (ValueError, TypeError, OverflowError):
+            return None
+        return out if math.isfinite(out) else None
+    return None
+
+
 class TrustStore:
     """A name → :class:`TrustPin` mapping backed by a JSON file.
 
@@ -311,10 +337,17 @@ class TrustStore:
                 continue  # skip malformed rows rather than reject the whole store
             raw_meta = raw.get("meta")
             meta: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
+            # Missing/null trusted_at → 0.0; a malformed one (non-numeric "yesterday", a
+            # bool, [] / {}, or a non-finite nan/inf) skips THIS row silently rather than
+            # letting float() abort the whole load. Silent to honor the store contract
+            # ("malformed data degrades, never errors") even under PYTHONWARNINGS=error.
+            trusted_at = _coerce_trusted_at(raw.get("trusted_at"))
+            if trusted_at is None:
+                continue  # malformed row — skip rather than reject the whole store
             store._pins[name] = TrustPin(
                 cmd_sha256=str(raw["cmd_sha256"]),
                 invocation_sha256=(str(raw["invocation_sha256"]) if raw.get("invocation_sha256") is not None else None),
-                trusted_at=float(raw.get("trusted_at", 0.0) or 0.0),
+                trusted_at=trusted_at,
                 meta=meta,
             )
         return store

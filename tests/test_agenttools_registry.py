@@ -282,6 +282,128 @@ def test_store_load_skips_malformed_rows_keeps_good(tmp_path: Path):
     assert store.get("not-a-dict") is None
 
 
+def test_store_load_skips_row_with_non_numeric_trusted_at(tmp_path: Path):
+    # A hand-edited pin with valid JSON but a non-numeric trusted_at must NOT abort the
+    # whole load (float() would raise): the bad row is skipped, the good one survives.
+    # Skipping is SILENT, matching the missing-cmd_sha256 / non-dict skips above — the store
+    # contract is "malformed data degrades, never an error", so no warning is emitted.
+    p = tmp_path / "bad-trusted-at.json"
+    p.write_text(
+        json.dumps(
+            {
+                "good": {"cmd_sha256": "abc", "invocation_sha256": "def", "trusted_at": 123.0},
+                "bad": {"cmd_sha256": "xyz", "trusted_at": "yesterday"},  # non-numeric → skipped
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = TrustStore.load(p)
+    assert store.get("good") is not None
+    assert store.get("good").trusted_at == 123.0
+    assert store.get("bad") is None  # skipped, not fatal
+    assert len(store) == 1
+
+
+def test_store_load_skips_falsey_non_numeric_trusted_at(tmp_path: Path):
+    # A falsey-but-non-numeric trusted_at ([] / {}) is still malformed: it must be skipped,
+    # NOT silently defaulted to 0.0 (the `or 0.0` truthiness trick would have accepted it).
+    p = tmp_path / "falsey-trusted-at.json"
+    p.write_text(
+        json.dumps(
+            {
+                "good": {"cmd_sha256": "abc", "trusted_at": 5.0},
+                "empty-list": {"cmd_sha256": "xyz", "trusted_at": []},  # falsey, non-numeric
+                "empty-dict": {"cmd_sha256": "qrs", "trusted_at": {}},  # falsey, non-numeric
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = TrustStore.load(p)
+    assert store.get("good") is not None
+    assert store.get("empty-list") is None
+    assert store.get("empty-dict") is None
+    assert len(store) == 1
+
+
+def test_store_load_skips_bool_and_non_finite_trusted_at(tmp_path: Path):
+    # bool is an int subclass and float("nan"/"inf") succeeds, so a naive float() would
+    # silently accept a JSON `true` (→1.0) or "nan"/"inf" as a timestamp. These are garbage
+    # for a unix time → the row is skipped. A genuine numeric string ("123") is still kept.
+    p = tmp_path / "bool-and-inf.json"
+    p.write_text(
+        json.dumps(
+            {
+                "boolean": {"cmd_sha256": "a", "trusted_at": True},
+                "nan-str": {"cmd_sha256": "b", "trusted_at": "nan"},
+                "inf-str": {"cmd_sha256": "c", "trusted_at": "inf"},
+                "numeric-str": {"cmd_sha256": "d", "trusted_at": "123"},  # accepted
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = TrustStore.load(p)
+    assert store.get("boolean") is None
+    assert store.get("nan-str") is None
+    assert store.get("inf-str") is None
+    numeric = store.get("numeric-str")
+    assert numeric is not None and numeric.trusted_at == 123.0
+    assert len(store) == 1
+
+
+def test_store_load_skips_oversized_int_trusted_at(tmp_path: Path):
+    # An arbitrary-precision JSON int (10**400) overflows float() with OverflowError, which
+    # ValueError/TypeError don't cover — a naive parse would abort the WHOLE load. The
+    # oversized row is skipped; the good row survives.
+    big = "1" + "0" * 400  # 10**400 as a JSON integer literal
+    p = tmp_path / "oversized-int.json"
+    p.write_text(
+        '{"good": {"cmd_sha256": "a", "trusted_at": 1.0}, '
+        '"huge": {"cmd_sha256": "b", "trusted_at": ' + big + "}}",
+        encoding="utf-8",
+    )
+    store = TrustStore.load(p)
+    assert store.get("huge") is None
+    good = store.get("good")
+    assert good is not None and good.trusted_at == 1.0
+    assert len(store) == 1
+
+
+def test_store_load_missing_or_null_trusted_at_defaults_to_zero(tmp_path: Path):
+    # A pin with no trusted_at (or explicit null) is NOT malformed — it defaults to 0.0 and
+    # the row is kept (only genuinely non-numeric values are skipped).
+    p = tmp_path / "no-trusted-at.json"
+    p.write_text(
+        json.dumps(
+            {
+                "absent": {"cmd_sha256": "abc"},
+                "null": {"cmd_sha256": "def", "trusted_at": None},
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = TrustStore.load(p)
+    assert store.get("absent") is not None and store.get("absent").trusted_at == 0.0
+    assert store.get("null") is not None and store.get("null").trusted_at == 0.0
+
+
+def test_store_load_wholly_garbage_rows_degrades_to_empty(tmp_path: Path):
+    # Every row malformed (one non-dict, one missing cmd_sha256, one bad trusted_at) →
+    # the store degrades to empty rather than crashing.
+    p = tmp_path / "all-bad.json"
+    p.write_text(
+        json.dumps(
+            {
+                "not-a-dict": 7,
+                "no-sha": {"invocation_sha256": "x"},
+                "bad-ts": {"cmd_sha256": "abc", "trusted_at": "soon"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = TrustStore.load(p)
+    assert len(store) == 0
+
+
 def test_store_pin_missing_cmd_raises(tmp_path: Path):
     d = TrustDecision(
         name="x", state=TrustState.UNTRUSTED_MISSING_CMD, reason="", cmd_sha256=None,
