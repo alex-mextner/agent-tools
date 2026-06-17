@@ -1118,3 +1118,23 @@ cc-save machine). Tests + smoke mandatory; verify live that each agent kind roun
 ## (DONE via PR #33) dashboard problematic-models badge — built, not a pending ROADMAP item
 [36] review dashboard per-model health + problematic-count badge on Models&roles tab — delivered as
 DRAFT PR #33 (review-cli), 61 tests + smoke, screenshot badge=4. Tracked on GitHub, not pending here.
+
+## OWED: gh ship must work in every repo via provisioning, not a runtime alias hack (CTO 2026-06-17, #3975)
+`gh ship` is a gh alias → `<repo>/.claude/scripts/pr-ship.sh`, which only EXISTS in agent-tools (it
+delegates to `ci/ship/ship.sh`). In rig-cli/review-cli/tg-cli the delegator was MISSING → `gh ship`
+failed there. STOPGAP applied now: improved the gh alias to fall back to the canonical
+`~/xp/agent-tools/ci/ship/ship.sh` when no repo-local `pr-ship.sh` exists (unblocks the merge wave).
+DURABLE deliverable still OWED (CTO wants it PR'd + reviewed + merged): rig (or the agent-tools
+installer) must PROVISION `.claude/scripts/pr-ship.sh` into every managed repo so `gh ship` works
+everywhere on a clean machine — AND handle gitignore so the provisioned file doesn't dirty the tree
+(ship refuses a dirty worktree). Then drop the alias fallback. Test + review iterations + merge.
+
+## FOLLOW-UPS from the merge wave (2026-06-17)
+- **tg-cli #36 merged but NOT deployed:** the lowercase-english `--tag` + help-color landed on tg-cli
+  `main`, but the LIVE `tg` is `~/.files/bin/tg` (1.11.0), a separate checkout. `answer`/`decision`/
+  etc. won't work in the live tg until ~/.files is synced/rebuilt from tg-cli. Deploy step owed.
+- **review-cli stray-commit branch:** `salvage-readme-agenttools-fix` preserves local-main commit
+  5d7c957 (docs readme fix) that an agent made directly on the main checkout; it appears to DUPLICATE
+  already-merged #27-readme (0748b8a). Verify and delete the branch if redundant.
+- **multi-agent restore (#3972) recorded but NOT started** — codex/opencode/commandcode session
+  restore in cc-save/cc-restore. Delegate after the merge wave settles.
