@@ -183,6 +183,115 @@ def test_top_level_positional_choices_emit_values() -> None:
         assert c in out
 
 
+def test_positional_choice_with_metacharacters_is_safe(tmp_path: Path) -> None:
+    """A positional ``choices`` value containing shell metacharacters (``;`` ``&`` ``|`` ``$``
+    backtick) must be emitted so the generated ``_values`` line treats it as a single literal
+    argument — never breaking out into a second command. An unquoted ``bad; echo PWNED`` would
+    emit ``_values 'value' bad;\\ echo\\ PWNED``, where the ``;`` ends the command and zsh then
+    parses ``echo PWNED`` as a separate statement; single-quoting each choice prevents that."""
+    metachar_choices = ["bad; echo PWNED", "a&b|c", "$(whoami)", "`id`"]
+    p = argparse.ArgumentParser(prog="meta")
+    p.add_argument("token", choices=["safe", *metachar_choices])
+    out = generate_zsh(p, "meta")
+
+    # Positively verify structure: on the _values line every choice is one single-quoted word,
+    # so its metacharacters are inert text rather than parsed shell syntax.
+    values_line = next(ln for ln in out.splitlines() if ln.lstrip().startswith("_values"))
+    for choice in ["safe", *metachar_choices]:
+        assert f"'{choice}'" in values_line, f"choice {choice!r} not single-quoted on _values line"
+
+    # Strongest proof: the generated script must still parse in real zsh.
+    if shutil.which("zsh") is not None:
+        comp_file = tmp_path / "_meta"
+        comp_file.write_text(out)
+        proc = subprocess.run(
+            ["zsh", "-n", str(comp_file)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, (
+            f"zsh -n rejected a script with a metacharacter-laced positional choice "
+            f"(exit {proc.returncode}):\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
+
+
+def test_snippet_runs_compinit_after_fpath_change(tmp_path: Path) -> None:
+    """The managed zshrc block must (re-)run ``compinit`` AFTER prepending the comp_dir to
+    ``fpath`` — even when the user's own ``.zshrc`` already ran ``compinit`` earlier.
+
+    ``compinit`` scans ``$fpath`` at the moment it runs. A guard like
+    ``if (( ! $+functions[compinit] ))`` skips the re-run whenever the function is already
+    defined (the user ran it before this block), so its earlier scan of the OLD fpath misses
+    our directory and the freshly-written ``_<prog>`` file is never registered. The block must
+    therefore run compinit unconditionally, after the fpath change."""
+    comp_dir = tmp_path / "completions"
+    zshrc = tmp_path / ".zshrc"
+    install("sample", generate_zsh(_sample_parser(), "sample"), comp_dir=comp_dir, zshrc=zshrc)
+    text = zshrc.read_text()
+
+    # Line-oriented (comments mention compinit too): find the fpath line and the actual
+    # compinit COMMAND line, and assert the command runs after the fpath change.
+    code_lines = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+    fpath_pos = next(i for i, ln in enumerate(code_lines) if ln.startswith(f'fpath=("{comp_dir}"'))
+    compinit_pos = next(i for i, ln in enumerate(code_lines) if "compinit" in ln and "fpath" not in ln)
+    assert compinit_pos > fpath_pos, "compinit must run after the fpath addition"
+
+    # It must NOT be gated such that an already-defined compinit prevents the re-run.
+    assert "$+functions[compinit]" not in text, (
+        "compinit is skipped when the user already defined it — new completions won't load"
+    )
+
+
+def test_snippet_compinit_loads_new_completion_after_prior_compinit(tmp_path: Path) -> None:
+    """End-to-end zsh proof: simulate a user .zshrc that runs ``compinit`` BEFORE our managed
+    block, then source the resulting file and assert the freshly-added completion (our
+    ``_demo``) is actually registered. The pre-existing compinit must NOT stop our block from
+    re-scanning fpath."""
+    if shutil.which("zsh") is None:
+        pytest.skip("zsh not installed")
+
+    comp_dir = tmp_path / "completions"
+    zshrc = tmp_path / ".zshrc"
+    zcompdump_pre = tmp_path / ".zcompdump_pre"
+    zcompdump_block = tmp_path / ".zcompdump_block"
+
+    # A user .zshrc that runs compinit FIRST (defining the function + scanning the old fpath),
+    # then our managed block.
+    user_pre = (
+        "autoload -Uz compinit\n"
+        f"compinit -u -d {zcompdump_pre}\n"
+    )
+    zshrc.write_text(user_pre)
+    install("demo", generate_zsh(build_demo_parser(), "demo"), comp_dir=comp_dir, zshrc=zshrc)
+
+    # Source the full .zshrc in a non-interactive zsh and check that _demo became a known
+    # completion command PURELY as a result of the managed block re-running compinit after the
+    # fpath change — no fallback autoload here, so the prior compinit + our block are the only
+    # things that could have registered it. With the old guarded block (compinit skipped when
+    # already defined) the prior compinit scanned an fpath without comp_dir, so _comps[demo]
+    # would be empty and this fails.
+    script = (
+        "set -e\n"
+        f"export ZSH_COMPDUMP={zcompdump_block}\n"
+        f"source {zshrc}\n"
+        # compinit records each #compdef'd command in the _comps associative array. If our
+        # block re-scanned fpath, _comps[demo] points at the _demo function.
+        '[[ -n "${_comps[demo]}" ]] || { echo "NOT REGISTERED: _comps[demo] empty"; exit 1; }\n'
+        "echo OK\n"
+    )
+    proc = subprocess.run(
+        ["zsh", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0 and "OK" in proc.stdout, (
+        f"the managed block did not make _demo loadable after a prior compinit "
+        f"(exit {proc.returncode}):\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    )
+
+
 def test_suppressed_subparser_help_does_not_leak() -> None:
     """``add_parser('x', help=argparse.SUPPRESS)`` must not leak the SUPPRESS literal."""
     p = argparse.ArgumentParser(prog="s")

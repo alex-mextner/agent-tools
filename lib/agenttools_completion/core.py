@@ -272,9 +272,10 @@ def _emit_leaf(prog: str, path: List[str], parser: argparse.ArgumentParser) -> s
     if opt_specs:
         args_parts = ["_arguments -s", *opt_specs]
         lines.append("  " + " \\\n    ".join(args_parts))
-    # Offer positional choices (if any) as a values group after the options.
+    # Offer positional choices (if any) as a values group after the options. Single-quote each
+    # choice (via _zsh_sq) so shell metacharacters stay inert inside the _values command line.
     for choices in pos_choices:
-        values = " ".join(_zsh_value(c) for c in choices)
+        values = " ".join(_zsh_sq(c) for c in choices)
         lines.append(f"  _values 'value' {values}")
     lines.append("}")
     return "\n".join(lines)
@@ -437,21 +438,27 @@ def _zshrc_path(zshrc: Optional[Path]) -> Path:
 
 
 def _snippet(comp_dir: Path) -> str:
-    """The guarded fpath+compinit block written between the sentinels.
+    """The fpath+compinit block written between the sentinels.
 
-    We prepend ``comp_dir`` to ``fpath`` and ensure ``compinit`` runs. ``compinit`` is
-    guarded so we don't force a second run if the user already calls it: we only autoload +
-    run it when the ``compinit`` function/command isn't already defined. If the user's own
-    ``compinit`` runs *after* this block, it picks up our fpath entry anyway — either way the
-    completion loads."""
+    We prepend ``comp_dir`` to ``fpath`` and then run ``compinit`` *unconditionally, after*
+    the fpath change, so the newly written ``_<prog>`` file is actually picked up.
+
+    Why not guard on ``compinit`` already being defined? Because ``compinit`` scans ``$fpath``
+    *at the moment it runs*. If the user's own ``.zshrc`` ran ``compinit`` BEFORE this block,
+    a ``$+functions[compinit]``-style guard would see it defined and skip the re-run — but
+    that earlier run scanned the OLD fpath, without our directory, so our completion is never
+    registered even though ``install`` reported success. Re-running ``compinit`` after the
+    fpath change is the standard, idempotent way to refresh zsh's completion table (zsh's own
+    docs recommend exactly this); the only cost is a few ms of startup, which is the right
+    price for completions that actually load. ``autoload -Uz compinit`` is a no-op when it is
+    already autoloadable, so this is safe whether or not the user has touched compinit."""
     return (
         f"{_BEGIN}\n"
         f"# Managed by agent-tools (agenttools_completion). Edits inside this block are\n"
         f"# overwritten on the next `install`. Remove via the tool's `completion uninstall`.\n"
         f'fpath=("{comp_dir}" $fpath)\n'
-        f"if (( ! $+functions[compinit] )); then\n"
-        f"  autoload -Uz compinit && compinit\n"
-        f"fi\n"
+        f"# compinit must run after the fpath change so the new completion is picked up.\n"
+        f"autoload -Uz compinit && compinit\n"
         f"{_END}\n"
     )
 
