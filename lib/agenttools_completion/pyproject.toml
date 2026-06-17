@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenttools-completion"
+version = "0.1.0"
+description = "Universal zsh tab-completion generator + auto-installer for argparse CLIs (stdlib-only)."
+readme = "README.md"
+# 3.9 to match the lowest floor in the ecosystem (review-cli is >=3.9; rig-cli >=3.10),
+# the same floor agenttools-retry / agenttools-log target.
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alex Mextner" }]
+keywords = ["zsh", "completion", "compdef", "argparse", "shell", "tab-completion", "agent-tools"]
+# Intentionally ZERO runtime dependencies — stdlib only (argparse + os + re + string ops).
+# See lib/agenttools_completion/__init__.py for the dependency rationale.
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/alex-mextner/agent-tools"
+
+# The package source lives one directory up (lib/agenttools_completion, this file's directory
+# is the package itself). Point discovery at the parent so setuptools finds the package and
+# never wanders into the umbrella repo's non-Python content (skills/, ci/, …).
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["agenttools_completion*"]
+
+[tool.pytest.ini_options]
+testpaths = ["../../tests"]
