@@ -44,8 +44,13 @@ These are the same gates `rig` installs for any repo; they apply here too.
   separate step before each commit. Never bypass it for code changes.
 - **Atomic, conventional commits.** One logical change per commit; conventional message.
   Never `git --no-verify`. End commit messages with the `Co-Authored-By: Claude` line.
-- **Merge only via the ship gate.** `gh ship <PR>` (or `ci/ship/ship.sh`). Never a raw
-  `gh pr merge` — it skips the green-CI + resolved-threads + clean-tree gate.
+- **Merge ONLY via `gh ship <PR>`.** That is the single sanctioned merge interface (a gh
+  alias → the repo's provisioned `pr-ship.sh`). Do NOT invoke `ship.sh` / `pr-ship.sh` by
+  path, do NOT invent or hand-roll a merge script, do NOT `gh pr merge` — every alternative
+  skips the green-CI + resolved-threads + clean-tree gate. Flags pass straight through:
+  `gh ship 27`, `gh ship 36 --skip-ci`, `gh ship 33 --screenshot ./after.png "badge"`. If
+  `gh ship` is missing in a repo, fix the provisioning (`rig apply`) — never route around it
+  with the raw script.
 - **Work in a fresh worktree** off the origin default branch, never the main checkout
   (another agent may hold it). Remove your worktree when its branch is merged or pushed.
 - **Docs are English-only.** Every agent-facing doc in this repo — `AGENTS.md`, any repo

@@ -1,5 +1,10 @@
 # ship — green-CI-gated PR merge + cleanup
 
+> **Agents: the sanctioned interface is `gh ship <PR>`** (a gh alias → the repo's provisioned
+> `pr-ship.sh`). Never invoke this `ship.sh`/`pr-ship.sh` by path and never hand-roll a merge
+> script — `gh ship` is the single front door. This file documents the underlying behavior;
+> `ship.sh` is the source/template that `rig apply` provisions as `pr-ship.sh`.
+
 `ship.sh <PR>` is a portable "merge this PR safely, then clean up" helper. It is **not** a
 CI workflow — it's a local/CI command you run to merge a ready PR. Before it merges, it
 runs the same preflights the CI gates in this directory enforce, so you can't merge a PR
