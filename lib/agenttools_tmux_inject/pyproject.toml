@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenttools-tmux-inject"
+version = "0.1.0"
+description = "Inject text/keys into a named tmux pane/session (stdlib-only) for the agent-tools ecosystem."
+readme = "README.md"
+# 3.9 to match the lowest floor in the ecosystem (review-cli is >=3.9; rig-cli >=3.10).
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alex Mextner" }]
+keywords = ["tmux", "send-keys", "ipc", "agent-tools", "notification"]
+# Intentionally ZERO runtime dependencies — stdlib only (subprocess + shutil).
+# See lib/agenttools_tmux_inject/__init__.py for the dependency rationale.
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/alex-mextner/agent-tools"
+
+# This pyproject lives INSIDE the package directory: the package's modules (__init__.py,
+# core.py) sit next to this file, not in a subdirectory. So map the import package
+# ``agenttools_tmux_inject`` to "." (this directory) explicitly, rather than using
+# auto-discovery (which expects a subdir of the project root named after the package and
+# would otherwise find nothing here). README.md / pyproject.toml are non-package files and
+# are excluded automatically.
+[tool.setuptools]
+packages = ["agenttools_tmux_inject"]
+
+[tool.setuptools.package-dir]
+agenttools_tmux_inject = "."
+
+[tool.pytest.ini_options]
+testpaths = ["../../tests"]
