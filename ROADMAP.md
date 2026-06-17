@@ -1335,3 +1335,21 @@ Builds on the shared `providers` lib (§3 — it already owns board/failover/`oc
 is the agent-facing trigger + the cross-harness wiring on top). Pairs with the transient-rate-limit lesson
 (retry-then-fallback, NOT reduce-fan-out) and the enforcement DOCTRINE (hooks, rig-provisioned,
 cross-harness). Tracking: skills/universal + agent-hooks + lib/providers + rig provisioning.
+
+## CI/tooling follow-ups from the 2026-06-17 ship wave (found by the serial shippers)
+- **`dependency-review` preflight is flaky — one-line fix** (agent-tools `ci/dependency-review/workflow.yml`,
+  the source-of-truth drop-in copied into every repo). The SBOM-probe step runs under GitHub's default
+  `bash -e {0}`; `code="$(gh api .../dependency-graph/sbom -i | awk …)"` exits non-zero on ANY non-200 — the
+  exact "GHAS off / transient" case it's meant to gracefully detect — and `-e` then HARD-FAILS the whole step
+  instead of skipping. It flaked a real ship (tg #33, passed on rerun). Fix: append `|| true` to the probe
+  pipeline (and/or explicit `shell: bash` without `-e`). One line, but it lands in EVERY repo using the
+  drop-in → real CI-flakiness reduction. (do X because Y: harden the probe because a transient non-200 SBOM
+  response currently red-fails CI and blocks ships.) Dedicated PR.
+- **`review` CLI shim can't import `reviewlib` in agent/subagent shells** — `/opt/homebrew/bin/review` fails
+  to import `reviewlib` (it lives in `~/xp/review-cli`, not on the shim's sys.path); even an explicit
+  PYTHONPATH run produced no output. A shipper had to fall back to the sanctioned `REVIEW_SKIP=1` (tests /
+  secrets / leftover gates still ran). This makes the review-before-commit gate effectively non-functional in
+  those shells and is the deeper reason the gate fought us all session (the #36 marker-write fix only helps
+  when `review` actually RUNS). Investigate the shim's path resolution / install model
+  (`single-file-live-symlink-cli` + `no-npx-direct-binary`) so `review` runs from any shell. Pairs with the
+  require-review-before-commit + model-fallback items. Dedicated investigation + fix.
