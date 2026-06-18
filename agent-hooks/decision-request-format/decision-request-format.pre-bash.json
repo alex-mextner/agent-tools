@@ -1,0 +1,9 @@
+{
+  "id": "decision-request-format",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/decision-request-format/decision_request_format.py",
+  "priority": 25,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "On a `tg --tag decision …` send, runs the decision-request-discipline self-check: parses (shlex, not raw-match) the message body and, if it is missing structural markers (Context / Options / Recommendation), emits an exit-0 ADVISORY naming what's absent. ADVISORY ONLY — never blocks; a malformed decision request must stay sendable. on_error=open: a formatting reminder, not a boundary. Silence with ALLOW_RAW_DECISION_REQUEST=1 or `# decision-request-ok: <reason>`."
+}
