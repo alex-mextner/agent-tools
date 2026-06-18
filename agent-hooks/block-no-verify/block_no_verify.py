@@ -78,14 +78,158 @@ _GIT_GLOBAL_VALUE_FLAGS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--
 _INLINE_ENV = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 # Wrapper executables that prefix the REAL command and pass the rest through unchanged. `exec`
 # replaces the shell with the command (a transparent prefix), so a bypass behind it must be caught.
+# BEST-EFFORT, NOT EXHAUSTIVE: a commit wrapped in an UNLISTED wrapper (`unshare`, `runuser`,
+# `nsenter`, `chroot`, `systemd-run`, …) is not peeled and not gated — a documented known limitation
+# (see the test of the same name), the same precision trade as `bash -c '…'`. The gate is process
+# discipline, not a security boundary. To gate a new wrapper, add it here AND its separate-operand
+# flags to `_WRAPPER_VALUE_FLAGS` AND (if it takes a leading positional operand) `_OPERAND_DROP_
+# WRAPPERS` — completely; a HALF-added wrapper (a missing value-flag) re-opens the #69 bypass (a
+# `setpriv` added with an incomplete flag set did exactly that mid-review — codex).
 _WRAPPERS = frozenset({
     "timeout", "env", "nice", "ionice", "nohup", "setsid", "stdbuf", "time", "unbuffer", "command",
     "sudo", "doas", "exec",
+    # CPU-affinity / scheduling / privilege / lock wrappers that also prefix the REAL command — the
+    # same #69 class (`taskset -c 0 git commit --no-verify` was a bypass: argv[0] != git -> allow).
+    "taskset", "chrt", "setpriv", "flock",
 })
+# Cap on stacked wrappers (`timeout sudo nice git …`). Far above any real invocation; past it we fail
+# CLOSED (see ``_strip_wrappers``) — a pathological wrapper chain is obfuscation, not a real command.
+_MAX_WRAPPER_NESTING = 16
+# Wrappers that take a LEADING POSITIONAL operand before the command (timeout's duration, chrt's
+# priority, taskset's cpu mask, flock's lockfile). After their option flags are skipped, one non-git
+# positional is dropped so the real command is reached. (`env`/`sudo`/`setpriv`/`ionice`/`nice` have
+# NO such BARE positional — their command follows the flags/`VAR=val`/flag-values directly: `ionice`'s
+# class is the flag VALUE `-c 2`, and `nice`'s priority is `-n ADJ`/`-NN`, never a bare token — so
+# they need no drop and are absent here, codex.)
+_OPERAND_DROP_WRAPPERS = frozenset({"timeout", "taskset", "chrt", "flock"})
+# Operand-drop wrappers whose leading positional operand is a MANDATORY ARBITRARY string that can
+# legitimately be `git` (flock's lockfile is any path). For these the operand is dropped even when it
+# is literally `git` — the `_is_git_executable` guard would otherwise leave `flock git git commit
+# --no-verify` a bypass (codex). For the others (timeout/taskset/chrt) the operand must parse as a
+# number/mask, so the guard safely keeps a bare `git`-the-command from being eaten.
+_MANDATORY_OPERAND_WRAPPERS = frozenset({"flock"})
+# INVARIANT (symmetric with the value-flag one below): every operand-drop wrapper must be a recognized
+# wrapper, else its entry is dead config and a wrapper "added to operand-drop but forgotten in
+# _WRAPPERS" passes silently. An explicit import-time raise catches it (codex).
+if not _OPERAND_DROP_WRAPPERS <= _WRAPPERS:
+    raise RuntimeError(
+        f"operand-drop wrappers missing from _WRAPPERS: {_OPERAND_DROP_WRAPPERS - _WRAPPERS}"
+    )
+if not _MANDATORY_OPERAND_WRAPPERS <= _OPERAND_DROP_WRAPPERS:
+    raise RuntimeError(  # a mandatory-operand wrapper must first be an operand-drop wrapper
+        f"mandatory-operand wrappers not in operand-drop: "
+        f"{_MANDATORY_OPERAND_WRAPPERS - _OPERAND_DROP_WRAPPERS}"
+    )
 # Wrapper flags that take a SEPARATE value, so the NEXT token is the value, not the wrapped cmd:
 # `sudo -u USER git …`, `timeout -s SIGTERM …`. Skipping the value keeps the wrapped `git` from
 # being misread as the flag's argument. Only flags whose value is a NON-command operand are listed.
-_WRAPPER_VALUE_FLAGS = frozenset({"-u", "-g", "-s", "--signal", "-k", "--kill-after"})
+#
+# This is PER-WRAPPER, not a flat set: the SAME letter means different things to different wrappers
+# (codex review). `-s`/`-k` take a value for `timeout` (`--signal`/`--kill-after`) but are BOOLEAN
+# for `sudo` (`-s` = run a shell, `-k` = reset the auth timestamp); `sudo -s <cmd>` / `sudo -k <cmd>`
+# STILL execute `<cmd>`, so treating `-s`/`-k` as value-flags for sudo would eat the wrapped `git`
+# and OPEN a bypass (`sudo -s git commit --no-verify`). So a flag is value-consuming only for the
+# wrapper that actually defines it that way; any wrapper absent from the map has no separate-value
+# flags (its own options are glued or take no operand we must skip).
+# INVARIANT (audited, codex review): EVERY wrapper in `_WRAPPERS` that has a short/long flag taking a
+# SEPARATE operand MUST list that flag here, or the operand shifts the parse and a wrapped `git
+# commit --no-verify` slips (the very #69 class). `nohup`/`setsid`/`unbuffer`/`command` have NO
+# separate-operand flag (their options are glued, boolean, or none consume the wrapped slot), so they
+# are intentionally absent. Keep this list complete against current versions when bumping the wrapper
+# set — a missed separate-operand flag is a silent bypass, found only by an audit like this one.
+# (`env -S/--split-string` is NOT a plain value-flag — its operand IS a command string, handled by
+# re-tokenization in ``_strip_wrappers``/``_split_string_commands``, not by opaque skipping.)
+_WRAPPER_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    # sudo flags that consume a SEPARATE operand, across GNU/Linux sudo AND BSD sudo (`-c/--login-
+    # class`). Missing any (e.g. `-D/--chdir`, `-T/--command-timeout`, `-U/--other-user`, `-c`) re-
+    # opens the bypass: the operand would be read as the executable and the real `git commit` behind it
+    # would be missed (codex). This aims at completeness against shipping sudo builds, not a frozen
+    # version — when a sudo adds a new separate-operand flag, add it here. NOTE the failure direction:
+    # mis-listing a BOOLEAN flag here is a FALSE-NEGATIVE risk (the gate eats the next token, e.g. the
+    # real `git`, and lets the commit through), NOT an over-block — so only list a flag that genuinely
+    # takes a separate operand in the targeted sudo. The flags below all do, where they exist; on a
+    # sudo lacking one (`-c`/`-a` on plain Linux sudo) the real binary errors out and git never runs,
+    # so listing them is safe.
+    "sudo": frozenset({
+        "-u", "--user", "-g", "--group", "-p", "--prompt", "-r", "--role",
+        "-t", "--type", "-C", "--close-from", "-R", "--chroot", "-D", "--chdir",
+        "-T", "--command-timeout", "-U", "--other-user", "-c", "--login-class",
+        "-a", "--auth-type",
+    }),  # `-c/--login-class` and `-a/--auth-type <type>` (BSD) are separate operands (codex). `-h`/
+    # `--host` is OMITTED: sudo's `-h` has an OPTIONAL arg (`h::`) — a bare `sudo -h` prints help, the
+    # host is only the GLUED `-hHOST`/`--host=HOST`, so treating `-h` as unconditionally value-taking
+    # would mis-model it (and is non-exploitable for git either way — codex).
+    "doas": frozenset({"-u", "-a", "-C"}),  # -a <style> auth, -C <config> both take a separate operand
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "ionice": frozenset({
+        "-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u", "--uid",
+    }),
+    # `env` separate-operand options across GNU coreutils AND macOS/BSD: `-u/--unset NAME`,
+    # `-C/--chdir DIR` (GNU), `-P altpath` (macOS, alternate PATH to search — a LIVE local bypass,
+    # codex), `-a/--argv0 NAME` (GNU, overrides argv[0] — same role as `exec -a`). BOTH forms of argv0
+    # are listed: missing the short `-a` left `env -a x git commit --no-verify` a silent bypass (codex
+    # — the half-added-wrapper trap). `-S/--split-string` is handled separately (re-tokenized, not
+    # skipped) — see ``_split_string_commands``.
+    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-P", "-a", "--argv0"}),
+    # GNU `/usr/bin/time` (not the bash builtin): `-o/--output FILE`, `-f/--format FMT` take a separate
+    # operand. `time -o out git commit --no-verify` would otherwise read `out` as the executable.
+    "time": frozenset({"-o", "--output", "-f", "--format"}),
+    # bash `exec [-a NAME] cmd`: `-a` overrides argv[0] and takes a SEPARATE operand. Without it,
+    # `exec -a x git commit --no-verify` reads `x` as the executable and misses the real git (codex).
+    "exec": frozenset({"-a"}),
+    # coreutils `stdbuf` parses `-i/-o/-e MODE` via getopt, so the MODE may be SEPARATE (`stdbuf -o 0
+    # git …`), not only glued (`-oL`). A separate MODE would otherwise be read as the executable. The
+    # earlier "always glued" claim was wrong (codex).
+    "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
+    # `taskset [-c] MASK command`: `-c/--cpu-list` takes the cpu list; the bare MASK (`taskset 0x1
+    # git`) is a positional operand handled by the operand-drop set below.
+    "taskset": frozenset({"-c", "--cpu-list"}),
+    # `flock [options] FILE command`: `-w/--timeout`, `-E/--conflict-exit-code` take a value; FILE is
+    # the positional operand (operand-drop). (`flock FILE -c '<string>'` is a nested shell-string — the
+    # documented limitation, not re-parsed.)
+    "flock": frozenset({"-w", "--timeout", "-E", "--conflict-exit-code"}),
+    # `setpriv [options] program`: a pile of separate-operand options; no leading positional operand
+    # before the command, so setpriv is NOT in the operand-drop set. MUST list ALL value-options or a
+    # missing one shifts the parse (the #69 class) — `--ptracer any git commit --no-verify` slipped
+    # because `--ptracer` was missing (codex). Includes the SINGULAR id forms (`--ruid`/`--euid`/
+    # `--rgid`/`--egid`) alongside the paired `--reuid`/`--regid`.
+    "setpriv": frozenset({
+        "--ruid", "--euid", "--reuid", "--rgid", "--egid", "--regid", "--groups", "--ptracer",
+        "--securebits", "--pdeathsig", "--ambient-caps", "--inh-caps", "--bounding-set",
+        "--selinux-label", "--apparmor-profile", "--landlock-access", "--landlock-rule",
+    }),
+    # `chrt [policy] PRIORITY command`: the policy flags (`-f/-r/-b/-d/-i/-o/-R`) are boolean and
+    # PRIORITY is the positional operand (operand-drop), BUT the DEADLINE-policy scheduling params take
+    # a separate value: `-T/--sched-runtime`, `-P/--sched-period`, `-D/--sched-deadline`. Missing them
+    # left `chrt -d -T 10000 -P 30000 -D 300000 git commit --no-verify` a bypass — the half-added
+    # wrapper trap again (codex). The short T/P/D do not collide with the boolean policy letters.
+    "chrt": frozenset({"-T", "--sched-runtime", "-P", "--sched-period", "-D", "--sched-deadline"}),
+}
+# INVARIANT: every wrapper carrying value-flags MUST also be a recognized wrapper — otherwise
+# `_strip_wrappers` never peels it (it checks `_basename(argv[0]) in _WRAPPERS`), its value-flags
+# become dead config, AND the wrapped `git commit --no-verify` slips (argv[0] != git → allow). An
+# explicit `raise` (NOT `assert`, which `python -O` strips) turns a future "added to the value dict
+# but forgot _WRAPPERS" mistake into a loud import-time failure instead of a silent bypass (codex).
+if not set(_WRAPPER_VALUE_FLAGS) <= _WRAPPERS:
+    raise RuntimeError(
+        f"value-flag wrappers missing from _WRAPPERS: {set(_WRAPPER_VALUE_FLAGS) - _WRAPPERS}"
+    )
+
+
+def _short_value_letters(value_flags: frozenset[str]) -> frozenset[str]:
+    """The single-letter forms (`-u` -> `u`) of a wrapper's value-flags. Used so a COMBINED short
+    cluster ending in a value-letter (`-iP` = `-i -P`, `-P` taking the next token) consumes its
+    operand like the bare flag would (codex: `env -iP /path git commit --no-verify`)."""
+    return frozenset(f[1] for f in value_flags if len(f) == 2 and f.startswith("-"))
+
+
+# Per-wrapper short value-letters, PRECOMPUTED once from `_WRAPPER_VALUE_FLAGS` (codex nit: it was
+# recomputed on every `_skip_wrapper_args` call). The single source of truth for both the cluster
+# check and the env split-string scan.
+_WRAPPER_SHORT_VALUE_LETTERS = {w: _short_value_letters(f) for w, f in _WRAPPER_VALUE_FLAGS.items()}
+
+
 # Subcommands of git this gate inspects for a `--no-verify`/`-n` bypass flag.
 _GATED_SUBCOMMANDS = frozenset({"commit", "push"})
 # A `git -c <key>[=<value>]` config that disables hooks — a genuine bypass vector. `core.hooksPath`
@@ -335,44 +479,180 @@ def _is_git_executable(tok: str) -> bool:
     return _basename(tok) == "git"
 
 
-def _strip_wrappers(argv: list[str]) -> tuple[dict[str, str], list[str]]:
+def _strip_wrappers(argv: list[str]) -> tuple[dict[str, str], list[str], list[str]]:
     """Peel leading wrapper executables (`timeout 60`, `env A=b`, `nice -n 10`, `stdbuf -oL`, …) so
-    the REAL command beneath is what we inspect, returning (env, rest). A path-qualified wrapper
-    (`/usr/bin/sudo`) is matched by basename, like git (codex regression). A wrapper's own option
-    flags and its positional operand (`timeout`'s duration, `nice`'s priority) are skipped past; for
-    `env`, the `VAR=value` assignments are COLLECTED into `env` (an `env HUSKY=0 git …` is a real
-    hook-disabling bypass — so the assignments must reach the env check, not be discarded). Stops as
-    soon as the head is no longer a known wrapper, so a real `git` is never skipped over."""
+    the REAL command beneath is what we inspect, returning (env, rest, nested_command_strings). A
+    path-qualified wrapper (`/usr/bin/sudo`) is matched by basename, like git (codex regression). A
+    wrapper's own option flags and its positional operand (`timeout`'s duration, `nice`'s priority)
+    are skipped past; for `env`, the `VAR=value` assignments are COLLECTED into `env` (an `env HUSKY=0
+    git …` is a real hook-disabling bypass — so the assignments must reach the env check, not be
+    discarded). An `env -S '<command string>'` is NOT skipped opaquely (that would hide the wrapped
+    command): the split-string operand IS a command, so it is returned in `nested_command_strings` for
+    the caller to RE-INSPECT (codex). Stops as soon as the head is no longer a known wrapper, so a
+    real `git` is never skipped over.
+
+    After EACH wrapper is peeled, leading `VAR=value` assignments are collected and the loop CONTINUES
+    — a wrapper may accept its own assignments (`sudo FOO=bar …`) AND the next token may be ANOTHER
+    wrapper (`sudo FOO=bar timeout 5 git …` / `sudo FOO=bar env -S '…'`). Stopping the peel at the
+    `VAR=val` left the second wrapper unpeeled → argv[0] != git → a silent bypass (codex)."""
     env: dict[str, str] = {}
+    nested: list[str] = []
     guard = 0
-    while argv and _basename(argv[0]) in _WRAPPERS and guard < 16:
+    while argv and _basename(argv[0]) in _WRAPPERS:
+        if guard >= _MAX_WRAPPER_NESTING:
+            # The head is STILL a wrapper after the cap — a pathological `sudo … sudo git commit
+            # --no-verify` chain. Fail CLOSED (raise → block), symmetric with the `env -S` depth cap;
+            # exiting the loop with a wrapper still at argv[0] used to fall through to `allow` (codex).
+            raise ValueError("wrapper nesting too deep")
         guard += 1
         wrapper, argv = _basename(argv[0]), argv[1:]
-        argv = _skip_wrapper_args(wrapper, argv)
         if wrapper == "env":
-            assigned, argv = _split_inline_env(argv)  # `env [-i] VAR=val … cmd` → collect VAR=val
-            env.update(assigned)
-    return env, argv
+            split_cmds, argv = _split_string_commands(argv)  # capture & remove `-S '<command>'`
+            nested.extend(split_cmds)
+        argv = _skip_wrapper_args(wrapper, argv)
+        # Collect leading `VAR=val` after ANY wrapper (env's `VAR=val cmd`, or a wrapper's own
+        # `sudo FOO=bar …` operands) so both the env reaches the hook-disable check AND a wrapper that
+        # FOLLOWS the assignment is still peeled by the next loop iteration.
+        assigned, argv = _split_inline_env(argv)
+        env.update(assigned)
+    return env, argv, nested
+
+
+def _split_string_commands(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Scan an `env` invocation's LEADING options for a `-S`/`--split-string` command, returning
+    (nested-command-strings, argv-with-the-`-S`-clause-removed). The `-S` operand is a COMMAND env
+    re-splits and runs, so it must be inspected as a command, not swallowed as an opaque value (the
+    `env -S 'git commit --no-verify'` bypass — codex). CRITICAL: env appends the TAIL after the `-S`
+    string as further args of that command (`env -S 'git commit' --no-verify` runs `git commit
+    --no-verify`), so the nested command is the `-S` string PLUS the shlex-quoted tail — the tail must
+    NOT leak back to the outer git check (codex). `-S` may sit after other env options and may be
+    COMBINED in a short cluster (`env -iS '…'` = `-i -S`); both are handled. A NON-`-S` value-flag
+    (bare `-u FOO` or a combined cluster ending in a value-letter, `-iP /tmp`) has its operand skipped
+    so the scan reaches a later `-S` (`env -iP /tmp -S '…'` — codex). Once `-S` is seen, env runs ONLY
+    that command, so the returned outer argv is empty.
+
+    LIMITATION: the `-S` string is re-tokenized with shlex + the segment splitter, which catches the
+    common bypass (`env -S 'git commit --no-verify'`) but does NOT exactly replicate env's own
+    split-string semantics. env `-S` does `${VAR}` substitution and `#` comments (shlex tokenizes
+    `${X}`/`#` literally → under-block: `env -S '${X} commit --no-verify'` is not gated) and only
+    whitespace-splits (it does NOT interpret `;`/`&&` as separators, so `env -S 'git status; git
+    commit --no-verify'` is OVER-blocked here — the safe direction). Both are the documented precision
+    trade of the nested-shell-string limitation (`bash -c '…'`); the gate is process discipline, not a
+    security boundary (codex)."""
+    env_value_flags = _WRAPPER_VALUE_FLAGS.get("env", frozenset())
+    env_short_letters = _ENV_SHORT_VALUE_LETTERS  # single source of truth (derived from the dict)
+    kept: list[str] = []
+    i = 0
+    while i < len(argv) and argv[i].startswith("-") and argv[i] != "--":
+        tok = argv[i]
+        s_value, consumed_next = _extract_split_string(tok, argv, i)
+        if s_value is not None:
+            tail = argv[i + (2 if consumed_next else 1):]
+            nested = " ".join([s_value, *(shlex.quote(t) for t in tail)]).rstrip()
+            return [nested], kept  # env runs ONLY this command; outer argv is exhausted
+        takes_value = (tok in env_value_flags
+                       or (not tok.startswith("--")
+                           and _cluster_takes_next_value(tok, env_short_letters)))
+        if takes_value and i + 1 < len(argv):
+            kept.extend(argv[i:i + 2])  # a value-flag/cluster (`-u FOO`, `-iP /tmp`) — keep both
+            i += 2
+            continue
+        kept.append(tok)  # a boolean env flag (`-i`, `-0`) — keep for the later skip
+        i += 1
+    return [], kept + argv[i:]
+
+
+# env short options whose letter consumes the REST of a short cluster as a VALUE — so a later `S` in
+# the cluster is that value, NOT a split-string flag (`-uS` = `-u S`). DERIVED from the single source
+# of truth `_WRAPPER_VALUE_FLAGS["env"]` (not hardcoded), so adding a new env short value-flag there
+# automatically extends this set — a hardcoded copy would drift and re-open the cluster bypass the PR
+# closes (codex). `S` is excluded: `_extract_split_string` tests for `S` FIRST, so it is the flag we
+# hunt, never a value-letter that precedes/masks it. (`-S` is intentionally NOT in the env value set.)
+_ENV_SHORT_VALUE_LETTERS = _WRAPPER_SHORT_VALUE_LETTERS["env"]
+
+
+def _extract_split_string(tok: str, argv: list[str], i: int) -> tuple[str | None, bool]:
+    """If `tok` is an env `-S`/`--split-string` option, return (its command string, consumed-next-tok)
+    — else (None, False). Handles the separate (`-S str` → next token), glued short (`-Sstr`), a SHORT
+    CLUSTER reaching `S` before any other value-letter (`-iS str` = `-i -S str`, GNU env allows
+    combining), and the `=`-glued long form (`--split-string=str`). A cluster letter that consumes a
+    value (`-u`/`-C`) BEFORE `S` means the `S` is that flag's value, not split-string (`-uS` = `-u S`),
+    so the cluster is walked left-to-right and only an `S` reached first counts."""
+    if tok in ("-S", "--split-string") and i + 1 < len(argv):
+        return argv[i + 1], True
+    if tok.startswith("--split-string="):
+        return tok[len("--split-string="):], False
+    if not tok.startswith("-") or tok.startswith("--"):
+        return None, False
+    for pos, ch in enumerate(tok[1:], start=1):
+        if ch == "S":  # reached `S` before any other value-letter — it is the split-string flag
+            glued = tok[pos + 1:]
+            if glued:
+                return glued, False  # `-Sgit…` / `-iSgit…` — string glued after S
+            return (argv[i + 1], True) if i + 1 < len(argv) else (None, False)
+        if ch in _ENV_SHORT_VALUE_LETTERS:  # `-u`/`-C` consumes the rest as ITS value — no split-string
+            return None, False
+    return None, False
+
+
+def _cluster_takes_next_value(tok: str, short_letters: frozenset[str]) -> bool:
+    """True when a short cluster's LAST char is a value-letter AND no earlier value-letter already
+    consumed the cluster tail as ITS glued value. `-iP` → True (`-P` takes the next token); `-Px` →
+    False (`-P` already took the glued `x`); `-iv` → False (no value-letter at the end).
+
+    HEURISTIC LIMIT (codex): this looks only at the last char, so a BOOLEAN flag whose GLUED value
+    happens to end in a value-letter is mis-read as a value-cluster (`sudo -hmyhost`: `-h` is boolean
+    with an optional host value, but the tail ends in `t` = sudo's `--type`, so this returns True and
+    the next token is eaten). Today that only affects `sudo -h<host>` — already a documented, tested,
+    non-exploitable exclusion (host mode doesn't run git locally). If a future BOOLEAN wrapper flag
+    with a glued value is added, pin its behavior so a real false-negative is a conscious choice."""
+    body = tok[1:]
+    if not body or body[-1] not in short_letters:
+        return False
+    for ch in body[:-1]:
+        if ch in short_letters:
+            return False  # an earlier value-letter glued the rest as its value
+    return True
 
 
 def _skip_wrapper_args(wrapper: str, argv: list[str]) -> list[str]:
-    """Drop one wrapper's own option flags + (for timeout/nice/ionice) its leading numeric operand,
-    returning argv positioned at the wrapped command (or at the wrapper's `VAR=val` env, for `env`).
-    A flag in ``_WRAPPER_VALUE_FLAGS`` (`sudo -u alice`, `timeout -s TERM`) consumes the following
-    token as its value. Conservative: a token already recognizable as git ends the skip immediately,
-    so the wrapped `git` is never consumed."""
+    """Drop one wrapper's own option flags + (for an `_OPERAND_DROP_WRAPPERS` wrapper) its leading
+    positional operand, returning argv positioned at the wrapped command (or at the `VAR=val` env, for
+    `env`).
+    A flag in THIS wrapper's value set (`sudo -u alice`, `timeout -s TERM`) consumes the following
+    token as its value UNCONDITIONALLY — that flag's value is a MANDATORY separate operand. The next
+    token is that operand even when it is literally `git` (`sudo -u git …`: the user/group is named
+    "git"), so it must NOT be guarded by `_is_git_executable`: doing so misread the `-u` value as the
+    wrapped executable and let `sudo -u git git commit --no-verify` slip past the gate — TWO `git`
+    tokens, the first is the user value, the SECOND is the real executable (the #69 sudo-value
+    bypass). A COMBINED short cluster ending in a value-letter (`-iP <path>`) consumes its operand too.
+    The value set is PER-WRAPPER so a flag that is value-taking for ONE wrapper but boolean for another
+    (`sudo -s` = run a shell, vs `timeout -s` = a signal) does not wrongly eat the wrapped `git` (codex
+    review). The `_is_git_executable` stop is kept only on the FALLTHROUGH operand drop below."""
+    value_flags = _WRAPPER_VALUE_FLAGS.get(wrapper, frozenset())
+    short_letters = _WRAPPER_SHORT_VALUE_LETTERS.get(wrapper, frozenset())
     i = 0
     while i < len(argv) and argv[i].startswith("-") and argv[i] != "--":
-        if argv[i] in _WRAPPER_VALUE_FLAGS and i + 1 < len(argv) and not _is_git_executable(
-                argv[i + 1]):
-            i += 2  # the flag + its separate value (`-u alice`, `-s SIGTERM`)
+        consumes_next = (argv[i] in value_flags
+                         or (not argv[i].startswith("--")
+                             and _cluster_takes_next_value(argv[i], short_letters)))
+        if consumes_next and i + 1 < len(argv):
+            i += 2  # the flag/cluster + its MANDATORY separate value (`-u git`, `-iP /path`)
             continue
         i += 1  # `-n`, `--signal=SIGTERM`, `-oL`, `-i`, `-E` … (the wrapper's own flag)
     if i < len(argv) and argv[i] == "--":
         i += 1
-    if (wrapper in ("timeout", "nice", "ionice")
-            and i < len(argv) and not _is_git_executable(argv[i])):
-        i += 1  # drop the duration (`60`, `1m`) / priority operand
+    if wrapper in _OPERAND_DROP_WRAPPERS and i < len(argv) and _basename(argv[i]) not in _WRAPPERS:
+        # Drop the leading positional operand (timeout duration, chrt priority, taskset mask, flock
+        # lockfile). NEVER drop a following WRAPPER (`taskset -c 0 sudo git …`: cpu-list was the `-c`
+        # value, `sudo` is the command). The `_is_git_executable` guard differs by wrapper: for
+        # flock the operand is a MANDATORY ARBITRARY PATH that may legitimately be named `git`
+        # (`flock git git commit …` locks a file "git" then runs git) — so it MUST be dropped even
+        # then, else the bypass slips (codex). For timeout/taskset/chrt the operand must parse as a
+        # duration/mask/priority, so a literal `git` is invalid (the real util rejects it, git never
+        # runs) — there the guard safely avoids eating a bare `git` that is actually the command.
+        if wrapper in _MANDATORY_OPERAND_WRAPPERS or not _is_git_executable(argv[i]):
+            i += 1
     return argv[i:]
 
 
@@ -594,37 +874,62 @@ _HOOK_ENV_MSG = (
 )
 
 
-def find_bypass(command: str) -> str | None:
-    """Inspect a PARSED command and return a human message for the FIRST gate-bypass found, or None
-    if the command is clean. Raises ValueError on an unparseable command so ``main`` can fail
-    closed."""
+_MAX_SPLIT_STRING_DEPTH = 8  # bound the `env -S 'env -S …'` recursion; deeper is pathological
+
+
+def _inspect_segment(raw_segment: list[str], depth: int) -> str | None:
+    """Inspect ONE shell segment (already split on separators) for a gate bypass, returning the human
+    message or None. An `env -S '<command>'` operand is RE-INSPECTED as a command (bounded by
+    `depth`), so a bypass hidden in a split-string is caught instead of swallowed (codex)."""
+    segment = _strip_leading_shell_noise(_strip_redirects(raw_segment))
+    seg_env, rest = _split_inline_env(segment)
+    # `_strip_wrappers` already collects EVERY leading `VAR=val` between/after wrappers into
+    # `wrapper_env` (including a wrapper's own operands, `sudo HUSKY=0 git …`), so `after_wrappers`
+    # never starts with a `VAR=val` token and IS the executable argv — no further env split is needed.
+    wrapper_env, argv, nested_cmds = _strip_wrappers(rest)
+    # The hook-disabling env check runs on EVERY segment — inline (`HUSKY=0 make`), wrapper-collected
+    # (`env HUSKY=0 make` / `sudo HUSKY=0 git …`), AND an env-setting builtin (`export HUSKY=0`) —
+    # regardless of whether the command is git. The merge prefers later values.
+    if _hook_disable_env({**seg_env, **wrapper_env, **_export_env(argv)}):
+        return _HOOK_ENV_MSG
+    for nested in nested_cmds:  # `env -S '<command>'` — re-inspect the split-string as a command
+        message = _find_bypass(nested, depth + 1)
+        if message:
+            return message
+    parsed = _git_subcommand_argv(argv)
+    if parsed is None:
+        return None
+    subcommand, global_args, subcommand_argv = parsed
+    if _hook_disable_config(global_args):
+        return _HOOK_PATH_MSG
+    if _has_no_verify_flag(subcommand, subcommand_argv):
+        return _NO_VERIFY_MSG
+    return None
+
+
+def _find_bypass(command: str, depth: int) -> str | None:
+    """Depth-tracked core of ``find_bypass`` — see it. `depth` bounds the `env -S 'env -S …'` nesting;
+    past the cap we FAIL CLOSED (raise → ``main`` blocks), not open — a pathologically nested wrapper
+    is exactly the obfuscation this gate must not wave through (codex). The cap is far above any real
+    invocation, so a legitimate command never hits it."""
+    if depth > _MAX_SPLIT_STRING_DEPTH:
+        raise ValueError("split-string nesting too deep")
     tokens = _tokenize(command)
     if tokens is None:
         raise ValueError("unbalanced quotes")
     for raw_segment in _segments(tokens):
-        segment = _strip_leading_shell_noise(_strip_redirects(raw_segment))
-        seg_env, rest = _split_inline_env(segment)
-        wrapper_env, after_wrappers = _strip_wrappers(rest)
-        # A wrapper like `sudo` accepts `VAR=value` operands of its OWN (`sudo FOO=bar git …`); peel
-        # any that survive the wrapper strip so both the leftover env and the real `git` are seen
-        # (codex). Without this, `sudo HUSKY=0 git commit --no-verify` would slip — argv[0] would be
-        # `HUSKY=0`, not `git`.
-        post_env, argv = _split_inline_env(after_wrappers)
-        # The hook-disabling env check runs on EVERY segment — inline (`HUSKY=0 make`), wrapper-
-        # collected (`env HUSKY=0 make`), post-wrapper (`sudo HUSKY=0 git …`), AND an env-setting
-        # builtin (`export HUSKY=0`) — regardless of whether the command is git, so all forms behave
-        # the same. The merge prefers later values.
-        if _hook_disable_env({**seg_env, **wrapper_env, **post_env, **_export_env(argv)}):
-            return _HOOK_ENV_MSG
-        parsed = _git_subcommand_argv(argv)
-        if parsed is None:
-            continue
-        subcommand, global_args, subcommand_argv = parsed
-        if _hook_disable_config(global_args):
-            return _HOOK_PATH_MSG
-        if _has_no_verify_flag(subcommand, subcommand_argv):
-            return _NO_VERIFY_MSG
+        message = _inspect_segment(raw_segment, depth)
+        if message:
+            return message
     return None
+
+
+def find_bypass(command: str) -> str | None:
+    """Inspect a PARSED command and return a human message for the FIRST gate-bypass found, or None
+    if the command is clean. Raises ValueError — so ``main`` fails CLOSED (blocks) — on an unparseable
+    command (unbalanced quotes) AND on a pathologically deep `env -S` split-string nesting that
+    exceeds the recursion cap (see ``_find_bypass``)."""
+    return _find_bypass(command, 0)
 
 
 def main() -> int:
