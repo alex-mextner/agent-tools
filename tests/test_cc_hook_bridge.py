@@ -40,6 +40,10 @@ import cc_hook_bridge.dispatch as dispatch  # noqa: E402
 BLOCK_RAW_PR_MERGE = (
     _REPO / "agent-hooks" / "block-raw-pr-merge" / "block_raw_pr_merge.py"
 )
+# The pre-agent guard: background-subagent-gate (blocks a foreground non-trivial dispatch).
+BACKGROUND_SUBAGENT_GATE = (
+    _REPO / "agent-hooks" / "background-subagent-gate" / "background_subagent_gate.py"
+)
 
 
 def _install_descriptor(hooks_dir: Path, *, hook_id: str, point: str, cmd: Path,
@@ -83,9 +87,107 @@ def test_point_for_event_maps_tool_to_logical_point():
     assert dispatch.point_for_event("PreToolUse", "Edit") == "pre-write"
     assert dispatch.point_for_event("PreToolUse", "MultiEdit") == "pre-write"
     assert dispatch.point_for_event("PreToolUse", "NotebookEdit") == "pre-write"
+    # the subagent-dispatch tools map to the new pre-agent point (CC calls them Agent/Task)
+    assert dispatch.point_for_event("PreToolUse", "Agent") == "pre-agent"
+    assert dispatch.point_for_event("PreToolUse", "Task") == "pre-agent"
     assert dispatch.point_for_event("Stop", None) == "stop"
     # an unmapped tool (e.g. Read) on PreToolUse has no logical point → nothing fires
     assert dispatch.point_for_event("PreToolUse", "Read") is None
+
+
+def test_to_v1_event_forwards_agent_id_and_type_for_pre_agent():
+    """The subagent signal (agent_id/agent_type) must be surfaced under args so a
+    subagent-exempt gate can tell a subagent's tool use apart from the main thread's."""
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Agent",
+          "tool_input": {"prompt": "do the thing", "run_in_background": False},
+          "agent_id": "sub-42", "agent_type": "general-purpose", "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="pre-agent")
+    assert v1["point"] == "pre-agent"
+    assert v1["args"]["agent_id"] == "sub-42"
+    assert v1["args"]["agent_type"] == "general-purpose"
+    # the dispatch payload (incl. run_in_background) rides along in args from tool_input
+    assert v1["args"]["run_in_background"] is False
+    assert v1["args"]["prompt"] == "do the thing"
+
+
+def test_to_v1_event_main_thread_has_no_agent_id():
+    """A main-thread Agent dispatch carries NO agent_id (the signal is absent) → the gate
+    treats it as the orchestrator, not a subagent."""
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Agent",
+          "tool_input": {"prompt": "do the thing"}, "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="pre-agent")
+    assert "agent_id" not in v1["args"]
+
+
+def test_to_v1_event_top_level_agent_id_overrides_tool_input():
+    """CC's TOP-LEVEL agent_id is authoritative: a (possibly stale/forged) tool_input.agent_id
+    must be OVERWRITTEN by the real top-level value, not win over it (T2)."""
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Agent",
+          "tool_input": {"prompt": "do the thing", "agent_id": "forged", "agent_type": "x"},
+          "agent_id": "real-sub", "agent_type": "general-purpose", "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="pre-agent")
+    assert v1["args"]["agent_id"] == "real-sub"
+    assert v1["args"]["agent_type"] == "general-purpose"
+
+
+def test_to_v1_event_forged_tool_input_agent_id_does_not_exempt():
+    """A forged tool_input.agent_id with NO top-level signal must be DROPPED — a main-thread
+    dispatch that injects agent_id into tool_input must NOT exempt itself (T2)."""
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Agent",
+          "tool_input": {"prompt": "do the thing", "agent_id": "forged", "agent_type": "forged-t"},
+          "cwd": "/repo"}  # ← no top-level agent_id/agent_type
+    v1 = dispatch.to_v1_event(cc, point="pre-agent")
+    assert "agent_id" not in v1["args"]
+    assert "agent_type" not in v1["args"]
+
+
+def test_to_v1_event_forwards_agent_id_for_pre_bash():
+    """The subagent signal must ride through for pre-bash too, not only pre-agent — so
+    no-long-inline-process / orchestrator-stays-thin receive it for a subagent's Bash (T5)."""
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+          "tool_input": {"command": "npm test"},
+          "agent_id": "sub-7", "agent_type": "general-purpose", "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="pre-bash")
+    assert v1["args"]["agent_id"] == "sub-7"
+    assert v1["args"]["agent_type"] == "general-purpose"
+
+
+def test_to_v1_event_forged_tool_input_agent_id_dropped_for_pre_bash():
+    """The same forged-signal protection applies to pre-bash: a forged tool_input.agent_id on a
+    main-thread Bash (no top-level signal) must NOT exempt it from the inline-process gate."""
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+          "tool_input": {"command": "review", "agent_id": "forged"}, "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="pre-bash")
+    assert "agent_id" not in v1["args"]
+
+
+def test_to_v1_event_forged_tool_input_agent_id_dropped_for_pre_write():
+    """The forged-signal protection must also hold for pre-WRITE: an Edit carrying
+    `agent_id:"forged"` in tool_input with NO top-level signal must have it DROPPED, so
+    orchestrator-stays-thin still judges it as a main-thread code write (#7)."""
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Edit",
+          "tool_input": {"file_path": "/repo/src/a.ts", "old_string": "a",
+                         "new_string": "b", "agent_id": "forged", "agent_type": "forged-t"},
+          "cwd": "/repo"}  # ← no top-level agent_id/agent_type
+    v1 = dispatch.to_v1_event(cc, point="pre-write")
+    assert "agent_id" not in v1["args"]
+    assert "agent_type" not in v1["args"]
+
+
+def test_to_v1_event_emits_the_point_for_each_logical_point():
+    """`point` must round-trip into the v1 event for every point. orchestrator-stays-thin reads
+    `event.get("point")`; if the bridge ever stopped setting it the hook would silently
+    downgrade to allow. Lock it for pre-bash, pre-write, and pre-agent (#10)."""
+    cases = [
+        ("pre-bash", "Bash", {"command": "npm test"}),
+        ("pre-write", "Write", {"file_path": "/repo/x.py", "content": "x"}),
+        ("pre-agent", "Agent", {"prompt": "do the thing"}),
+    ]
+    for point, tool, tool_input in cases:
+        cc = {"hook_event_name": "PreToolUse", "tool_name": tool,
+              "tool_input": tool_input, "cwd": "/repo"}
+        v1 = dispatch.to_v1_event(cc, point=point)
+        assert v1["point"] == point
 
 
 def test_to_v1_event_carries_the_bash_command():
@@ -207,6 +309,91 @@ def test_real_guard_passes_benign_bash(tmp_path):
         out = json.loads(proc.stdout)
         decision = out.get("hookSpecificOutput", {}).get("permissionDecision")
         assert decision != "deny", out
+
+
+# ── clean-room proof: the pre-agent point routes + the subagent signal is honored ─────────
+
+def test_pre_agent_foreground_dispatch_is_blocked(tmp_path):
+    """An `Agent` PreToolUse with no run_in_background routes to a pre-agent descriptor and
+    BLOCKS (the orchestrator must dispatch non-trivial subagents in the background)."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="background-subagent-gate", point="pre-agent",
+                        cmd=BACKGROUND_SUBAGENT_GATE, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Agent",
+        # a clearly non-trivial single-line prompt (> 200 chars) run in the FOREGROUND
+        "tool_input": {"prompt": "implement the feature: " + "x" * 220},
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
+    assert "BACKGROUND" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_pre_agent_background_dispatch_passes(tmp_path):
+    """The same gate, but a `run_in_background: true` dispatch is NOT blocked."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="background-subagent-gate", point="pre-agent",
+                        cmd=BACKGROUND_SUBAGENT_GATE, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Agent",
+        "tool_input": {"prompt": "implement the feature: " + "x" * 220, "run_in_background": True},
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    if proc.stdout.strip():
+        out = json.loads(proc.stdout)
+        assert out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", out
+
+
+def test_pre_agent_subagent_signal_forwarded_exempts(tmp_path):
+    """A foreground dispatch made INSIDE a subagent (agent_id present) must be ALLOWED — proving
+    the bridge forwards agent_id and the subagent-exempt gate reads it."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="background-subagent-gate", point="pre-agent",
+                        cmd=BACKGROUND_SUBAGENT_GATE, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Task",
+        "tool_input": {"prompt": "implement the feature: " + "x" * 220},
+        "agent_id": "sub-99",  # ← the subagent signal CC adds inside a dispatched agent
+        "agent_type": "general-purpose",
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    if proc.stdout.strip():
+        out = json.loads(proc.stdout)
+        assert out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", out
+
+
+def test_forged_tool_input_agent_id_does_not_exempt_clean_room(tmp_path):
+    """End-to-end (T2): a main-thread foreground dispatch that injects `agent_id` INTO
+    tool_input — with NO top-level CC agent signal — must STILL be BLOCKED. The bridge drops
+    the forged signal, so the subagent-exempt gate does not let the orchestrator off the hook."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="background-subagent-gate", point="pre-agent",
+                        cmd=BACKGROUND_SUBAGENT_GATE, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Agent",
+        # forged agent_id inside tool_input; CC top-level carries NO agent_id (main thread)
+        "tool_input": {"prompt": "implement the feature: " + "x" * 220, "agent_id": "forged"},
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
 
 
 def test_unmatched_tool_does_not_run_pre_bash_hook(tmp_path):

@@ -89,8 +89,9 @@ The shipped hooks and their points:
 
 | Point | Hooks |
 | --- | --- |
-| `pre-bash` | `block-no-verify` (fail-closed), `block-raw-pr-merge`, `require-review-before-commit`, `require-ticket-before-commit`, `enforce-timeout-on-bash` |
-| `pre-write` | `block-secrets-write`, `block-raw-process-env` |
+| `pre-agent` **(bridge-ready; NOT yet live in CC — needs the rig-cli `Agent\|Task` matcher)** | `background-subagent-gate` (orchestration doctrine: block a non-trivial FOREGROUND subagent dispatch; subagent-exempt) |
+| `pre-bash` | `block-no-verify` (fail-closed), `block-raw-pr-merge`, `require-review-before-commit`, `require-ticket-before-commit`, `enforce-timeout-on-bash`, `orchestrator-stays-thin` (impl-bash, warn→block, subagent-exempt), `no-long-inline-process` (review/--watch/build-test/long-sleep, subagent-exempt), `skills-read-gate` (mandatory skills before work, warn→block), `visual-proof-gate` (block a UI commit with no looked-at screenshot) |
+| `pre-write` | `block-secrets-write`, `block-raw-process-env`, `orchestrator-stays-thin` (non-docs code Edit/Write, warn→block, subagent-exempt) |
 | `post-write` | `format-on-write` (reacts to the completed write; never blocks — see the bridge note: not carried to CC yet) |
 | `stop` | `stop-completion-selfcheck` |
 
@@ -103,11 +104,17 @@ at the top level (a broken bridge must never wedge every tool call), while an in
 fail-closed hook still blocks.
 
 **Non-obvious:** the bridge only maps the points CC has a matching event for —
-`PreToolUse` → `pre-bash`/`pre-write` and `Stop` → `stop` (see `point_for_event` in
-`dispatch.py`). It does **not** yet map `PostToolUse` → `post-write`, so `format-on-write` —
-the one `post-write` hook — is not carried to CC through this bridge today; it works on
-harnesses whose own `post-write`/`PostToolUse` event you map it to directly. Don't assume every
-shipped hook is live in CC just because the bridge exists.
+`PreToolUse` → `pre-bash`/`pre-write`/`pre-agent` (the last for the `Agent`/`Task` subagent
+tools) and `Stop` → `stop` (see `point_for_event` in `dispatch.py`). It does **not** yet map
+`PostToolUse` → `post-write`, so `format-on-write` — the one `post-write` hook — is not carried
+to CC through this bridge today; it works on harnesses whose own `post-write`/`PostToolUse`
+event you map it to directly. Don't assume every shipped hook is live in CC just because the
+bridge exists. The bridge also forwards CC's `agent_id`/`agent_type` (present only inside a
+dispatched subagent) into the v1 event, so a subagent-exempt gate can tell a subagent's own
+tool use apart from the orchestrator's. **rig-cli follow-up:** for CC to actually *fire*
+`pre-agent`, rig-cli must add an `Agent|Task` PreToolUse matcher to `settings.json`
+(`hook_bridge_entries`) — that wiring lives in the separate rig-cli repo; the bridge half
+(point mapping + signal forwarding) lives here.
 
 **The "runs before the command" trap.** `pre-bash` hooks run *before* the command they gate,
 so the precondition they check must already be satisfied. The clearest example is

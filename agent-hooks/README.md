@@ -72,10 +72,21 @@ These are the *logical* points; map them to your harness's actual tool-use event
 
 | point          | fires when…                                  | hooks                                   |
 | -------------- | -------------------------------------------- | --------------------------------------- |
-| `pre-bash`     | before a shell command runs                  | block-no-verify, block-raw-pr-merge, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash |
-| `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env |
+| `pre-agent` **(bridge-ready; NOT yet live in CC — needs the rig-cli `Agent\|Task` matcher)** | before a subagent dispatch (Agent/Task tool) | background-subagent-gate                 |
+| `pre-bash`     | before a shell command runs                  | block-no-verify, block-raw-pr-merge, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash, orchestrator-stays-thin, no-long-inline-process, skills-read-gate, visual-proof-gate |
+| `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env, orchestrator-stays-thin |
 | `post-write`   | after a file write/edit has landed on disk   | format-on-write                         |
 | `stop`         | when the agent is about to end its turn      | stop-completion-selfcheck               |
+
+### `pre-agent` — gate a subagent dispatch (bridge-ready; NOT yet live in CC — needs the rig-cli `Agent|Task` matcher)
+
+`pre-agent` fires before the orchestrator dispatches a subagent (CC's `Agent`/`Task` tool),
+so a hook can shape *how* work is fanned out — block a non-trivial **foreground** dispatch and
+require `run_in_background: true` (or a Workflow). The bridge maps it from CC's `PreToolUse`
+on `Agent`/`Task` and forwards CC's `agent_id`/`agent_type` (present only inside a dispatched
+subagent) into `args`, so a subagent-exempt gate can tell the orchestrator's dispatch apart
+from a worker's. For CC to fire this point, rig-cli must wire an `Agent|Task` PreToolUse
+matcher (a rig-cli follow-up; the bridge half lives here).
 
 ### `post-write` — react to a *completed* write
 
