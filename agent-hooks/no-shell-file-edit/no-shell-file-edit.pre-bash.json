@@ -1,0 +1,9 @@
+{
+  "id": "no-shell-file-edit",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/no-shell-file-edit/no_shell_file_edit.py",
+  "priority": 36,
+  "timeout_ms": 8000,
+  "on_error": "open",
+  "description": "Blocks editing a tracked SOURCE file from the shell, enforcing the hyperide rule 'edits only via Edit/Write; no sed/perl/awk for editing files'. Blocks an in-place stream editor on a tracked source file (`sed -i` incl. clustered `-Ei`/`-ri`, `perl -i`/`-pi`, `gawk -i inplace`), a `>`/`>>`/`>|`/`>& file` redirect onto a tracked source file (operator may be glued: `app.ts>app.ts`), and `tee`/`dd of=` writing a tracked source file. Decided from a PARSED command (shlex-tokenized, comments stripped, `-i`/redirect read off the argv; `bash -c '...'` re-parsed incl. nesting + outer redirect) — never a raw substring, so `echo \"sed -i\"`, a `# sed -i` comment, and `commit -m 'use sed -i'` pass. Allows read-only sed/awk/grep filters, `gawk -i json` (non-inplace include), `>&2` fd-dups, and writes to /tmp or new/non-source files. NOT subagent-exempt. Escape hatch: ALLOW_SHELL_FILE_EDIT=1 + ALLOW_SHELL_FILE_EDIT_REASON='why', or inline `# shell-file-edit-ok: why`. on_error=open (inner git lookup timeout-bounded, fails toward allow)."
+}
