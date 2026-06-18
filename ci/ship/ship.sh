@@ -152,10 +152,26 @@ fi
 [ "${UNRESOLVED:-0}" = "0" ] || { echo "Refusing: PR #$PR has $UNRESOLVED unresolved review thread(s) — resolve them, then re-run." >&2; exit 1; }
 
 # --- local branch sanity (no unpushed/diverged commits; clean worktree) ----------------
-WT=$(git worktree list --porcelain | awk -v b="refs/heads/$BRANCH" '/^worktree /{w=$2} $0=="branch "b{print w}')
-if [ -n "$WT" ] && [ -n "$(git -C "$WT" status --short)" ]; then
-  echo "Refusing: worktree $WT has uncommitted changes. Commit or discard first." >&2; git -C "$WT" status --short >&2; exit 1
-fi
+# A branch can be checked out in MORE THAN ONE worktree (git permits it; a stray/leftover
+# tree often lingers). Collect ALL of them: feeding a single $WT that had concatenated two
+# paths to `git -C` / `git worktree remove` was the exit-128 bug this script had. Parse the
+# stable `--porcelain` line form (`worktree <path>` then `branch <ref>`); the `-z` variant
+# isn't available on older git (e.g. Apple git 2.39), so don't rely on it.
+# (bash 3.2 compatible — `#!/usr/bin/env bash` is 3.2 on stock macOS; guard every empty-array
+# expansion with the `${arr[@]+...}` idiom so `set -u` doesn't trip on an empty WTS.)
+WTS=()
+while IFS= read -r wpath; do
+  [ -n "$wpath" ] && WTS+=("$wpath")
+done < <(
+  git worktree list --porcelain 2>/dev/null \
+    | awk -v b="refs/heads/$BRANCH" '/^worktree /{w=substr($0,10)} $0=="branch "b{print w}'
+)
+for wt in ${WTS[@]+"${WTS[@]}"}; do
+  if [ -n "$(git -C "$wt" status --short 2>/dev/null)" ]; then
+    echo "Refusing: worktree $wt has uncommitted changes. Commit or discard first." >&2
+    git -C "$wt" status --short >&2; exit 1
+  fi
+done
 git fetch -q origin "$BRANCH" 2>/dev/null || true
 if git show-ref --verify --quiet "refs/heads/$BRANCH" && git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
   AHEAD=$(git rev-list --count "origin/$BRANCH..$BRANCH" 2>/dev/null || echo 0)
@@ -234,37 +250,64 @@ else
   run gh pr merge "$PR" "--$MERGE_METHOD"
 fi
 
-# --- cleanup: remote branch, local worktree+branch, refresh main -----------------------
-if [ "${CROSS_REPO:-false}" = "true" ]; then
-  echo "[ship] PR head is a fork — leaving its branch to the fork owner."
-elif git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
-  echo "[ship] deleting remote branch origin/${BRANCH} ..."; run git push -q origin --delete "$BRANCH"
-fi
-
-# Don't delete the worktree out from under a session running inside it.
-SELF=0
-if [ -n "$WT" ]; then
-  WT_REAL=$(cd "$WT" 2>/dev/null && pwd -P || echo "$WT")
-  { [ "$ORIG_PWD" = "$WT_REAL" ] || [ "${ORIG_PWD#"$WT_REAL"/}" != "$ORIG_PWD" ]; } && SELF=1
-fi
-if [ "$SELF" = "1" ]; then
-  echo "[ship] running inside the PR's worktree ($WT_REAL) — leaving it in place; remove later from $MAIN_CHECKOUT."
-else
-  if [ -n "$WT" ]; then
-    echo "[ship] removing worktree $WT and local branch ${BRANCH} ..."
-    [ "$(git -C "$WT" symbolic-ref --quiet --short HEAD 2>/dev/null || echo)" = "$BRANCH" ] && run git -C "$WT" checkout --detach --quiet
-    run git worktree remove "$WT" || run git worktree remove --force "$WT"
+# --- cleanup --------------------------------------------------------------------------
+# The merge ABOVE already succeeded. Cleanup (remote branch delete, worktree/branch
+# removal, main refresh) is best-effort housekeeping: a failure here must NEVER mask the
+# fact that #$PR is merged, nor abort the script with a non-zero exit (the exit-128 that
+# made a clean squash-merge look like a failed ship). So the whole cleanup runs in a
+# function whose result is REPORTED, not propagated — `set -e` is relaxed inside it and
+# every step is allowed to fail with a warning.
+cleanup() {
+  set +e  # local to this function's subshell-free body: warn, don't abort
+  if [ "${CROSS_REPO:-false}" = "true" ]; then
+    echo "[ship] PR head is a fork — leaving its branch to the fork owner."
+  elif git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+    echo "[ship] deleting remote branch origin/${BRANCH} ..."
+    run git push -q origin --delete "$BRANCH" || echo "[ship] WARNING: could not delete remote branch origin/${BRANCH} — delete it manually." >&2
   fi
-  git show-ref --verify --quiet "refs/heads/$BRANCH" && run git branch -D "$BRANCH"
-  run git worktree prune
-fi
 
-if [ -d "$MAIN_CHECKOUT" ]; then
-  echo "[ship] refreshing main checkout at ${MAIN_CHECKOUT} ..."
-  [ "$(git -C "$MAIN_CHECKOUT" symbolic-ref --quiet --short HEAD 2>/dev/null || echo)" = "$DEFAULT_BRANCH" ] || run git -C "$MAIN_CHECKOUT" checkout "$DEFAULT_BRANCH"
-  run git -C "$MAIN_CHECKOUT" fetch origin
-  [ "$DRY_RUN" = "1" ] || git -C "$MAIN_CHECKOUT" pull --ff-only origin "$DEFAULT_BRANCH" || echo "[ship] WARNING: could not fast-forward $DEFAULT_BRANCH — pull manually." >&2
+  # Don't delete a worktree out from under the session running inside it. With multiple
+  # worktrees for this branch, remove EACH one (the one we're inside is skipped, kept for
+  # the user to remove later).
+  for wt in ${WTS[@]+"${WTS[@]}"}; do
+    [ -n "$wt" ] || continue
+    wt_real=$(cd "$wt" 2>/dev/null && pwd -P || echo "$wt")
+    if [ "$ORIG_PWD" = "$wt_real" ] || [ "${ORIG_PWD#"$wt_real"/}" != "$ORIG_PWD" ]; then
+      echo "[ship] running inside the PR's worktree ($wt_real) — leaving it in place; remove later from $MAIN_CHECKOUT."
+      continue
+    fi
+    echo "[ship] removing worktree $wt ..."
+    [ "$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || echo)" = "$BRANCH" ] && run git -C "$wt" checkout --detach --quiet
+    run git worktree remove "$wt" 2>/dev/null \
+      || run git worktree remove --force "$wt" \
+      || echo "[ship] WARNING: could not remove worktree $wt — remove it manually (git worktree remove --force)." >&2
+  done
+
+  # Delete the local branch only once no worktree still has it checked out (git refuses
+  # otherwise, and that refusal is fine — the merge is already done).
+  if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    run git branch -D "$BRANCH" || echo "[ship] WARNING: could not delete local branch ${BRANCH} (still checked out somewhere?) — delete it manually." >&2
+  fi
+  run git worktree prune || true
+
+  if [ -d "$MAIN_CHECKOUT" ]; then
+    echo "[ship] refreshing main checkout at ${MAIN_CHECKOUT} ..."
+    [ "$(git -C "$MAIN_CHECKOUT" symbolic-ref --quiet --short HEAD 2>/dev/null || echo)" = "$DEFAULT_BRANCH" ] || run git -C "$MAIN_CHECKOUT" checkout "$DEFAULT_BRANCH"
+    run git -C "$MAIN_CHECKOUT" fetch origin
+    [ "$DRY_RUN" = "1" ] || git -C "$MAIN_CHECKOUT" pull --ff-only origin "$DEFAULT_BRANCH" || echo "[ship] WARNING: could not fast-forward $DEFAULT_BRANCH — pull manually." >&2
+  fi
+  return 0
+}
+
+# Report the merge FIRST (it is the durable, already-applied result), then run cleanup
+# in a way that can only warn. `|| true` belt-and-suspenders so even an unexpected
+# non-zero from cleanup can't flip ship's exit code after a successful merge.
+if [ "$DRY_RUN" = "1" ]; then
+  echo "[ship] [dry-run] would merge #$PR, then clean up."
+else
+  echo "[ship] merged #$PR (${BRANCH}) — running best-effort cleanup ..."
 fi
+cleanup || echo "[ship] WARNING: post-merge cleanup hit an error — #$PR IS merged; finish cleanup manually." >&2
 
 if [ "$DRY_RUN" = "1" ]; then echo "[ship] [dry-run] complete — nothing changed for #$PR."
 else echo "[ship] shipped #$PR — merged + cleaned up."; fi
