@@ -79,9 +79,127 @@ UI_PATH_REGEX="${SHIP_UI_PATH_REGEX-(^|/)(components|pages|views|ui|app|src/app)
 
 run() { if [ "$DRY_RUN" = "1" ]; then echo "[dry-run] $*"; else "$@"; fi; }
 
+# --- core.bare corruption guard --------------------------------------------------------
+# A WORKING checkout whose `git config core.bare` is wrongly `true` is a real corruption
+# class (external cause — see rig-cli #19/#52, where `rig doctor --fix` repairs it). It
+# breaks EVERY git op in that directory (status / diff / commit / worktree all fail fatal
+# with "this operation must be run in a work tree"), so ship's later main-refresh /
+# worktree ops would fail CONFUSINGLY mid-ship (it bit a real ship this session). We catch
+# it EARLY — before any destructive git op on the checkout — and ABORT (exit 1, ship's
+# uniform "Refusing:" preflight code) with the repo + the one-line fix, rather than auto-fix
+# (ship must never silently rewrite repo config).
+#
+# Detection keys off git's per-path `rev-parse --is-bare-repository` verdict (NOT a raw
+# `core.bare` config read, NOT `worktree list`'s bare marker): both of those read `true` for a
+# LEGITIMATE linked worktree of a genuine bare repo (shared config), whereas rev-parse correctly
+# reports such a worktree as not-bare — at the worktree root AND from any subdirectory of it.
+# That single property is the false-positive shield, so the two entry points below differ only
+# in WHERE they look, not in the test:
+#   • abort_if_core_bare DIR — used for an explicit checkout/worktree PATH (the main checkout,
+#     each linked worktree). It also requires the WORKING-checkout layout (`.git` at DIR's root)
+#     so a genuine bare repo dir (`foo.git`, no `.git` entry, rev-parse=true) is excluded.
+#   • abort_if_cwd_core_bare — used for the AMBIENT cwd, which may be a SUBDIRECTORY of the
+#     corrupt checkout (the realistic "ship launched from inside it" shape). `.git` lives only
+#     at the worktree root, so the DIR layout gate above would wrongly pass a subdir. We can't
+#     drop the genuine-bare exclusion entirely, though: a GENUINE bare repo (`foo.git`) — or any
+#     subdir inside one — also reports rev-parse=bare, but there `core.bare=true` is LEGITIMATE,
+#     so firing the "corruption" diagnostic (and worse, telling the user to run `config core.bare
+#     false`, which would BREAK a real bare repo) is actively wrong. The clean discriminator,
+#     evaluable from a subdir, is `rev-parse --is-inside-git-dir`: it is FALSE in a corrupt
+#     working checkout (cwd is a work tree) but TRUE inside a genuine bare repo (the bare dir IS
+#     the git dir). We also require a `.git` entry somewhere in the cwd's ancestry (present for a
+#     working checkout, absent for a bare repo) as belt-and-suspenders.
+# $3 is the exact fix command to print. It MUST match where core.bare actually lives: a plain
+# `git config core.bare false` writes the SHARED config, but a WORKTREE-SCOPED core.bare=true
+# (extensions.worktreeConfig + `config --worktree core.bare true`) keeps winning over a shared
+# `false`, so for that case the fix must be `config --worktree core.bare false`. Callers compute
+# the right command (see core_bare_fix_cmd) so the printed advice actually repairs the repo.
+die_core_bare() {  # $1 = dir to name, $2 = human label, $3 = exact fix command to print
+  {
+    echo "Refusing: $2 at $1 has core.bare=true but is a WORKING checkout (corruption)."
+    echo "  Every git op there fails 'fatal: this operation must be run in a work tree',"
+    echo "  which would break ship's main-refresh mid-merge. Fix it, then re-run ship:"
+    echo "    $3"
+    echo "  (or run \`rig doctor --fix\` to detect + repair it)."
+  } >&2
+  exit 1
+}
+# Single-quote a string for safe copy-paste into a shell, escaping embedded single quotes via
+# the '\'' idiom. The printed fix is meant to be pasted-and-run, so a path with a space, quote,
+# or `$` must not break or get re-expanded.
+shell_squote() {  # $1 = string -> prints a safely single-quoted form
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+# Pick the correct `core.bare false` command for DIR: if core.bare=true lives in the
+# WORKTREE-scoped config, the fix must also be --worktree-scoped, else a shared-config `false`
+# is shadowed by the worktree `true` and the repo stays broken. The worktree scope only exists
+# when extensions.worktreeConfig is enabled — without it, `config --worktree` aliases the shared
+# config and would falsely select the --worktree form, so gate on that extension first.
+core_bare_fix_cmd() {  # $1 = dir
+  local q; q=$(shell_squote "$1")
+  # Read both flags through git's --bool parser so a value written as 1/yes/on (not just the
+  # literal "true") is matched — the same normalization the abort itself uses via rev-parse.
+  if [ "$(git -C "$1" config --bool extensions.worktreeConfig 2>/dev/null)" = "true" ] \
+     && [ "$(git -C "$1" config --worktree --bool --get core.bare 2>/dev/null)" = "true" ]; then
+    printf 'git -C %s config --worktree core.bare false' "$q"
+  else
+    printf 'git -C %s config core.bare false' "$q"
+  fi
+}
+abort_if_core_bare() {  # $1 = dir to check, $2 = human label for the diagnostic
+  local dir="$1" label="$2"
+  [ -e "$dir/.git" ] || return 0   # no working-checkout layout (genuine bare / not a checkout) — not our class
+  [ "$(git -C "$dir" rev-parse --is-bare-repository 2>/dev/null || echo false)" = "true" ] || return 0
+  die_core_bare "$dir" "$label" "$(core_bare_fix_cmd "$dir")"
+}
+# True iff some ancestor of the cwd (inclusive) holds a `.git` entry — the working-checkout
+# layout. A genuine bare repo has none in its ancestry; a corrupt working checkout has one at
+# its root. Resolve the physical cwd (`pwd -P`) so a symlinked path or a stale inherited $PWD
+# can't make the ancestor walk miss the real `.git`.
+cwd_has_ancestor_dotgit() {
+  local d
+  d=$(pwd -P 2>/dev/null) || d="$PWD"
+  case "$d" in /*) : ;; *) return 1 ;; esac  # need an absolute path to walk to / safely
+  while :; do
+    [ -e "$d/.git" ] && return 0
+    [ "$d" = "/" ] && return 1
+    d=$(dirname "$d")
+  done
+}
+abort_if_cwd_core_bare() {  # the cwd may be a subdir of the corrupt checkout — no DIR layout gate
+  [ "$(git rev-parse --is-bare-repository 2>/dev/null || echo false)" = "true" ] || return 0
+  # Genuine bare repo (or a subdir of one): rev-parse --is-inside-git-dir is TRUE there and the
+  # cwd has no ancestor `.git`. Leave it alone — core.bare=true is legitimate, not corruption.
+  # The two discriminators are ANDed, so default --is-inside-git-dir to `false` (treat-as-corrupt)
+  # if rev-parse hiccups: that keeps the guard FIRING on a transient failure rather than silently
+  # falling through to the bare `show-toplevel` crash. A standalone genuine bare repo is still
+  # excluded by the independent no-ancestor-`.git` check below. (The only residual false-positive
+  # needs BOTH a rev-parse hiccup AND a genuine bare repo nested under a working checkout — then
+  # the ancestor `.git` is found and the guard mis-fires; this fail-safe trades that far-fetched
+  # case for catching real corruption on a transient failure, which is the right bias for ship.)
+  [ "$(git rev-parse --is-inside-git-dir 2>/dev/null || echo false)" = "true" ] && return 0
+  cwd_has_ancestor_dotgit || return 0
+  # Name + fix the PHYSICAL cwd (pwd -P), consistent with cwd_has_ancestor_dotgit, so a symlinked
+  # or stale-$PWD path is reported as git actually sees it.
+  local here; here=$(pwd -P 2>/dev/null) || here="$PWD"
+  die_core_bare "$here" "current checkout" "$(core_bare_fix_cmd "$here")"
+}
+
+# Guard the CURRENT directory FIRST — before `git rev-parse --show-toplevel` below, which under
+# core.bare=true dies with the bare `fatal: this operation must be run in a work tree` (and
+# `set -e` aborts the script) — i.e. exactly the confusing failure this guard replaces, with NO
+# diagnostic. The most realistic shape is ship launched from INSIDE the corrupt checkout (its
+# root OR a subdir), so the cwd guard must run before any cwd-scoped git op. (MAIN_CHECKOUT is
+# guarded again below in case it differs from the cwd, e.g. SHIP_MAIN_CHECKOUT points elsewhere.)
+abort_if_cwd_core_bare
+
 ROOT=$(git rev-parse --show-toplevel); cd "$ROOT"
 command -v gh >/dev/null 2>&1 || { echo "gh CLI not found" >&2; exit 1; }
 MAIN_CHECKOUT="${SHIP_MAIN_CHECKOUT:-$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')}"
+# Guard the MAIN checkout NOW — ship's post-merge refresh runs git ops against it (checkout /
+# fetch / pull), which would fail opaquely under core.bare. Firing before the merge means a
+# hard abort here is safe: nothing is merged yet.
+abort_if_core_bare "$MAIN_CHECKOUT" "main checkout"
 
 # --- resolve PR state -----------------------------------------------------------------
 read -r BRANCH STATE MERGEABLE CROSS_REPO MERGE_STATE < <(gh pr view "$PR" \
@@ -167,6 +285,16 @@ done < <(
     | awk -v b="refs/heads/$BRANCH" '/^worktree /{w=substr($0,10)} $0=="branch "b{print w}'
 )
 for wt in ${WTS[@]+"${WTS[@]}"}; do
+  # Guard each linked PR worktree — this catches a REAL corruption the MAIN-checkout guard
+  # above misses: WORKTREE-SCOPED core.bare=true (extensions.worktreeConfig + `git -C "$wt"
+  # config --worktree core.bare true`). Plain core.bare on the MAIN config leaves linked
+  # worktrees healthy (each has its own gitdir + work tree, so they report not-bare), but the
+  # worktree-scoped form makes THIS worktree itself report rev-parse=bare with `status` failing.
+  # That matters because the dirty-check right below runs `git -C "$wt" status --short
+  # 2>/dev/null`: under the corruption it exits 128 and the fatal is swallowed, leaving empty
+  # output — so a worktree with unshipped changes would read as "clean" and could later be
+  # removed. Aborting here, before that fooled check, prevents losing unshipped work.
+  abort_if_core_bare "$wt" "PR worktree"
   if [ -n "$(git -C "$wt" status --short 2>/dev/null)" ]; then
     echo "Refusing: worktree $wt has uncommitted changes. Commit or discard first." >&2
     git -C "$wt" status --short >&2; exit 1

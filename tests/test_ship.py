@@ -474,5 +474,362 @@ def test_ship_from_inside_worktree_without_reroot_target_leaves_it(repo_with_pr_
     assert wt.exists(), "worktree removed despite no re-root target"
 
 
+def _bare_corrupt_checkout(tmp_path: Path, name: str = "corrupt") -> Path:
+    """A WORKING checkout (has a `.git` dir + a commit) deliberately corrupted with
+    `core.bare=true` — the rig-cli #19/#52 class. Every git op inside it then fails fatal
+    with "this operation must be run in a work tree"; ship.sh's guard must catch it."""
+    d = tmp_path / name
+    d.mkdir()
+    _git("init", "-q", "-b", "main", cwd=d)
+    _git("config", "user.email", "t@t", cwd=d)
+    _git("config", "user.name", "t", cwd=d)
+    (d / "README.md").write_text("# x\n", encoding="utf-8")
+    (d / "sub").mkdir()
+    (d / "sub" / "f.txt").write_text("nested\n", encoding="utf-8")
+    _git("add", "-A", cwd=d)
+    _git("commit", "-qm", "init", cwd=d)
+    # The corruption: flip core.bare on a non-bare working checkout.
+    _git("config", "core.bare", "true", cwd=d)
+    return d
+
+
+def test_core_bare_main_checkout_aborts_early(repo_with_pr_worktree, tmp_path):
+    """A main checkout corrupted with core.bare=true must make ship ABORT EARLY (before the
+    merge) with a clear diagnostic naming the repo + the one-line fix, and a nonzero exit —
+    not fail confusingly mid-ship in the post-merge main-refresh. ship is run from a HEALTHY
+    cwd (the PR worktree's repo) with SHIP_MAIN_CHECKOUT pointed at the corrupt checkout, so
+    the test isolates the main-checkout guard deterministically."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+    corrupt = _bare_corrupt_checkout(tmp_path)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(corrupt)  # the corrupted checkout to guard
+    # Run from the healthy main checkout so `git rev-parse --show-toplevel` (cwd-scoped) is
+    # fine and execution reaches the MAIN_CHECKOUT guard.
+    r = _sh(
+        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test",
+        cwd=main, env=env,
+    )
+
+    assert r.returncode != 0, (
+        f"ship must abort on a core.bare main checkout; got 0\n{r.stdout}\n{r.stderr}"
+    )
+    # Aborts EARLY — before any merge happens.
+    assert "merged #1" not in r.stdout, f"ship merged despite the corrupt checkout:\n{r.stdout}"
+    # The diagnostic names the corruption, the repo path, and the one-line fix.
+    assert "core.bare=true" in r.stderr, f"missing core.bare diagnostic:\n{r.stderr}"
+    assert str(corrupt) in r.stderr, f"diagnostic does not name the repo path:\n{r.stderr}"
+    assert "config core.bare false" in r.stderr, f"missing the one-line fix:\n{r.stderr}"
+    assert "rig doctor --fix" in r.stderr, f"missing the rig doctor fix hint:\n{r.stderr}"
+
+
+def test_core_bare_self_cwd_main_checkout_aborts(tmp_path):
+    """The most realistic shape: ship is launched from INSIDE the corrupt checkout (cwd ==
+    corrupt). The cwd guard must fire BEFORE `git rev-parse --show-toplevel` (which under
+    core.bare dies with the bare 'must be run in a work tree' and `set -e` aborts — the exact
+    confusing failure, with no diagnostic). So we assert not just nonzero + no-merge, but that
+    the guard's DIAGNOSTIC actually fired (naming the corruption + the one-line fix) — proving
+    the cwd guard, not the incidental rev-parse failure, did the abort."""
+    corrupt = _bare_corrupt_checkout(tmp_path, name="corrupt-cwd")
+    bindir = _fake_gh_dir(tmp_path)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "main"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    # No SHIP_MAIN_CHECKOUT override: ship derives it from `git worktree list` in the cwd.
+    r = _sh(
+        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test",
+        cwd=corrupt, env=env,
+    )
+
+    assert r.returncode != 0, f"ship must abort in a core.bare checkout; got 0\n{r.stdout}"
+    assert "merged #1" not in r.stdout, f"ship merged despite the corrupt cwd:\n{r.stdout}"
+    # The cwd guard fired with its diagnostic — NOT a bare rev-parse failure.
+    assert "core.bare=true" in r.stderr, f"cwd guard diagnostic did not fire:\n{r.stderr}"
+    assert str(corrupt) in r.stderr, f"diagnostic does not name the corrupt cwd:\n{r.stderr}"
+    assert "config core.bare false" in r.stderr, f"missing the one-line fix:\n{r.stderr}"
+
+
+def test_core_bare_cwd_subdir_aborts_with_diagnostic(tmp_path):
+    """Sharper shape of the realistic case: ship launched from a SUBDIRECTORY of the corrupt
+    checkout (not its root). `.git` lives only at the worktree root, so a layout-gated cwd check
+    would miss this — but `git rev-parse --is-bare-repository` reports `true` from a subdir of a
+    core.bare checkout, so the cwd guard must STILL fire with its diagnostic before the
+    rev-parse --show-toplevel that would otherwise die bare. Pins review finding #1."""
+    corrupt = _bare_corrupt_checkout(tmp_path, name="corrupt-subdir")
+    subdir = corrupt / "sub"  # a real subdirectory created by the fixture
+    bindir = _fake_gh_dir(tmp_path)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "main"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    r = _sh(
+        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test",
+        cwd=subdir, env=env,
+    )
+
+    assert r.returncode != 0, f"ship must abort when launched from a corrupt subdir; got 0\n{r.stdout}"
+    assert "merged #1" not in r.stdout, f"ship merged despite the corrupt subdir cwd:\n{r.stdout}"
+    # The guard's diagnostic fired — NOT the bare rev-parse failure.
+    assert "core.bare=true" in r.stderr, f"cwd guard did not fire from a subdir:\n{r.stderr}"
+    assert "config core.bare false" in r.stderr, f"missing the one-line fix:\n{r.stderr}"
+
+
+def test_core_bare_guard_no_false_positive_on_healthy_repo(repo_with_pr_worktree, tmp_path):
+    """A HEALTHY main checkout (and a healthy linked worktree) must NOT trip the guard. ship
+    runs to a normal successful (faked) merge — proving the guard doesn't fire on a legitimate
+    working checkout nor on a normal linked worktree (whose `.git` is a file, not a dir)."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(main, bindir)
+
+    assert r.returncode == 0, (
+        f"guard false-positived on a healthy repo; ship exited {r.returncode}\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "merged #1" in r.stdout, r.stdout
+    # The guard's refusal text must be absent — proof it stayed silent on a healthy checkout.
+    assert "has core.bare=true" not in r.stderr, f"guard fired on a healthy repo:\n{r.stderr}"
+
+
+def test_core_bare_guard_no_false_positive_on_genuine_bare_repo_worktree(tmp_path):
+    """The load-bearing assumption: a LINKED worktree of a GENUINE bare repo (the bare repo's
+    config legitimately has core.bare=true, and that config is shared with its worktrees) must
+    NOT trip the guard. `git rev-parse --is-bare-repository` reports such a linked worktree as
+    NOT bare even though `git config core.bare` reads true — which is exactly why the guard
+    keys off the per-path rev-parse verdict, not a raw config read. If this assumption were
+    wrong on some git, a legitimate ship would be refused; this test pins it.
+
+    Setup: a genuine bare repo with a commit, plus a worktree added from the bare repo. ship is
+    run from that worktree (SHIP_MAIN_CHECKOUT also points at it) and must reach a normal merge.
+    """
+    bare = tmp_path / "genuine.git"
+    _sh("git", "init", "--bare", "-q", "-b", "main", str(bare), cwd=tmp_path)
+
+    # Seed the bare repo with one commit on `feat` via a throwaway checkout, then a worktree.
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git("init", "-q", "-b", "main", cwd=seed)
+    _git("config", "user.email", "t@t", cwd=seed)
+    _git("config", "user.name", "t", cwd=seed)
+    _git("remote", "add", "origin", str(bare), cwd=seed)
+    (seed / "README.md").write_text("# x\n", encoding="utf-8")
+    _git("add", "-A", cwd=seed)
+    _git("commit", "-qm", "init", cwd=seed)
+    _git("push", "-q", "origin", "main", cwd=seed)
+    _git("push", "-q", "origin", "main:feat", cwd=seed)
+
+    # Sanity-check the premise: the bare repo's shared config IS core.bare=true ...
+    cfg = _sh("git", "-C", str(bare), "config", "core.bare", cwd=tmp_path).stdout.strip()
+    assert cfg == "true", f"premise broken: genuine bare repo not core.bare=true (got {cfg!r})"
+
+    # ... but a LINKED worktree of it reports NOT-bare via rev-parse (the whole assumption).
+    wt = tmp_path / "bare-wt"
+    _git("worktree", "add", "-q", str(wt), "feat", cwd=bare)
+    isbare = _sh(
+        "git", "-C", str(wt), "rev-parse", "--is-bare-repository", cwd=tmp_path
+    ).stdout.strip()
+    assert isbare == "false", (
+        f"assumption broken on this git: a genuine-bare-repo worktree reports is-bare={isbare!r}"
+        " — the guard would false-positive a legitimate ship here"
+    )
+
+    bindir = _fake_gh_dir(tmp_path)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(wt)
+    r = _sh(
+        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, (
+        f"guard false-positived on a genuine-bare-repo worktree; ship exited {r.returncode}\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "has core.bare=true" not in r.stderr, (
+        f"guard wrongly fired on a genuine-bare-repo linked worktree:\n{r.stderr}"
+    )
+
+
+@pytest.mark.parametrize("where", ["root", "subdir"])
+def test_cwd_guard_no_false_positive_inside_genuine_bare_repo(tmp_path, where):
+    """The symmetric counterpart to test_core_bare_cwd_subdir_aborts_with_diagnostic: the cwd
+    is the ROOT of (where=root) or a SUBDIR of (where=subdir) a GENUINE bare repo, where
+    `core.bare=true` is LEGITIMATE. The cwd guard reports rev-parse=bare in both, so a naive
+    rev-parse-only check would FIRE and print a "corruption" diagnostic recommending `git config
+    core.bare false` — which would BREAK the real bare repo. The guard must recognise the
+    genuine-bare case (via --is-inside-git-dir / no-ancestor-.git) and NOT fire. Both cwds are
+    exercised: the root hits --is-inside-git-dir on the git-dir itself; the subdir hits it from
+    within. ship then proceeds past the cwd guard (failing later for unrelated reasons — no PR);
+    we only assert the cwd guard did not emit its corruption diagnostic / destructive fix."""
+    bare = tmp_path / "genuine.git"
+    _sh("git", "init", "--bare", "-q", "-b", "main", str(bare), cwd=tmp_path)
+    if where == "root":
+        cwd = bare
+    else:
+        cwd = bare / "refs"  # a real subdir that exists inside every bare repo
+        assert cwd.is_dir(), "expected refs/ inside the bare repo"
+
+    bindir = _fake_gh_dir(tmp_path)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "main"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    # Point SHIP_MAIN_CHECKOUT elsewhere so the MAIN-checkout guard isn't what we measure.
+    env["SHIP_MAIN_CHECKOUT"] = str(tmp_path)
+    r = _sh(
+        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test",
+        cwd=cwd, env=env,
+    )
+
+    # The cwd guard must NOT have fired: no corruption diagnostic, no destructive fix advice.
+    assert "has core.bare=true" not in r.stderr, (
+        f"cwd guard wrongly flagged a genuine bare repo as corrupt:\n{r.stderr}"
+    )
+    # It must NOT have recommended the bare-breaking `config core.bare false` for the bare repo.
+    assert not ("config core.bare false" in r.stderr and str(bare) in r.stderr), (
+        f"cwd guard recommended the destructive bare-breaking fix for a genuine bare repo:\n{r.stderr}"
+    )
+    # Positive anchor (guards against a vacuous pass): execution must have REACHED a point AFTER
+    # the cwd guard. ship's next git op is `git rev-parse --show-toplevel`, which under a bare
+    # repo fails with the bare "must be run in a work tree" — its presence proves the cwd guard
+    # was reached and CORRECTLY passed (had it wrongly fired, ship would have exited with the
+    # corruption diagnostic instead, and this string would be absent).
+    assert "must be run in a work tree" in r.stderr, (
+        "ship did not reach the post-cwd-guard rev-parse — the no-false-positive assertion "
+        f"could be passing vacuously:\n{r.stderr}"
+    )
+
+
+def test_core_bare_pr_worktree_aborts(repo_with_pr_worktree, tmp_path):
+    """The per-worktree guard's real, non-exotic trigger: a LINKED worktree corrupted with
+    WORKTREE-SCOPED core.bare=true (extensions.worktreeConfig + `config --worktree core.bare
+    true`). Unlike core.bare on the MAIN config (which leaves linked worktrees healthy), this
+    DOES make the worktree itself report rev-parse=bare with `status` failing — so the loop's
+    `git -C "$wt" status --short 2>/dev/null` would return empty (fatal swallowed) and the
+    worktree would look CLEAN, risking removal of unshipped work. ship is run from the MAIN
+    checkout (so the cwd/main guards pass); the per-worktree guard must catch the corrupt
+    worktree and ABORT before the fooled dirty-check, with the diagnostic + nonzero exit."""
+    main, wt = repo_with_pr_worktree
+
+    # Worktree-scoped core.bare corruption (the supported-git mechanism, not hand-corruption).
+    _git("config", "extensions.worktreeConfig", "true", cwd=main)
+    _git("config", "--worktree", "core.bare", "true", cwd=wt)
+    # Sanity-check the premise actually took: the worktree now reports bare + status fails.
+    isbare = _sh("git", "-C", str(wt), "rev-parse", "--is-bare-repository", cwd=main).stdout.strip()
+    if isbare != "true":
+        pytest.skip(f"this git does not honor worktree-scoped core.bare (is-bare={isbare!r})")
+
+    bindir = _fake_gh_dir(tmp_path)
+    r = _run_ship(main, bindir)  # cwd = main (healthy); the corrupt tree is the linked worktree
+
+    assert r.returncode != 0, (
+        f"ship must abort on a bare-corrupted linked worktree; got 0\n{r.stdout}\n{r.stderr}"
+    )
+    assert "merged #1" not in r.stdout, f"ship merged despite the corrupt worktree:\n{r.stdout}"
+    # The per-worktree guard fired (labelled "PR worktree"), not a swallowed dirty-check.
+    assert "PR worktree" in r.stderr, f"per-worktree guard did not fire:\n{r.stderr}"
+    assert "core.bare=true" in r.stderr, f"missing core.bare diagnostic:\n{r.stderr}"
+    assert str(wt) in r.stderr, f"diagnostic does not name the corrupt worktree:\n{r.stderr}"
+    # The worktree (and any unshipped work) survives — ship aborted before any removal.
+    assert wt.exists(), "corrupt worktree was removed despite the abort"
+
+    # ROUND-TRIP (the assertion that catches a wrong fix): the printed fix MUST be the
+    # WORKTREE-SCOPED form. A plain `config core.bare false` writes the shared config, which the
+    # worktree-scoped `true` shadows — so the suggested command would NOT repair it and the next
+    # ship would fail again. The fix must use `--worktree`. Verify the advice is right AND that
+    # actually running it repairs the worktree (rev-parse no longer bare).
+    assert "config --worktree core.bare false" in r.stderr, (
+        "per-worktree fix is not worktree-scoped — applying it would NOT repair worktree-scoped "
+        f"core.bare, and the next ship would fail again:\n{r.stderr}"
+    )
+    _git("config", "--worktree", "core.bare", "false", cwd=wt)
+    repaired = _sh("git", "-C", str(wt), "rev-parse", "--is-bare-repository", cwd=main).stdout.strip()
+    assert repaired == "false", (
+        f"applying the printed fix did NOT repair the worktree (still is-bare={repaired!r})"
+    )
+
+
+def test_core_bare_fix_command_is_paste_safe_for_special_path(tmp_path):
+    """Regression anchor for shell_squote — the one non-trivial encoding in the guard. The
+    corrupt checkout lives under a dir whose name has a SPACE, a `$`, AND a single quote `'` (all
+    legal on Unix). The single quote specifically exercises shell_squote's `'\\''` escaping branch
+    — without it that trickiest, easiest-to-break line has zero coverage. The printed fix must be
+    safely single-quoted so a user can copy-paste-run it verbatim. We assert: (a) the diagnostic
+    contains the path wrapped in single quotes (not bare/double-quoted, which would mis-split on
+    the space or expand `$x`), and (b) running the EXACT printed command repairs the repo (a
+    true round-trip through a shell), proving the quoting is correct end-to-end."""
+    base = tmp_path / "weird $x 'dir"  # space + `$` + a single quote in the path
+    base.mkdir()
+    corrupt = base / "repo"
+    corrupt.mkdir()
+    _git("init", "-q", "-b", "main", cwd=corrupt)
+    _git("config", "user.email", "t@t", cwd=corrupt)
+    _git("config", "user.name", "t", cwd=corrupt)
+    (corrupt / "README.md").write_text("# x\n", encoding="utf-8")
+    _git("add", "-A", cwd=corrupt)
+    _git("commit", "-qm", "init", cwd=corrupt)
+    _git("config", "core.bare", "true", cwd=corrupt)
+
+    # A separate HEALTHY repo to run ship from, so `git rev-parse --show-toplevel` (cwd-scoped)
+    # succeeds and execution reaches the MAIN-checkout guard (which points at the corrupt repo).
+    runner = tmp_path / "runner"
+    runner.mkdir()
+    _git("init", "-q", "-b", "main", cwd=runner)
+    _git("config", "user.email", "t@t", cwd=runner)
+    _git("config", "user.name", "t", cwd=runner)
+    (runner / "README.md").write_text("# x\n", encoding="utf-8")
+    _git("add", "-A", cwd=runner)
+    _git("commit", "-qm", "init", cwd=runner)
+
+    bindir = _fake_gh_dir(tmp_path)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "main"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(corrupt)
+    # Run from the healthy runner so the MAIN-checkout guard (not the cwd guard) emits the
+    # diagnostic naming the special-char corrupt path.
+    r = _sh(
+        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test",
+        cwd=runner, env=env,
+    )
+
+    assert r.returncode != 0, f"ship must abort on the corrupt checkout; got 0\n{r.stdout}"
+    # (a) The path appears in its safely shell-quoted form (single-quoted, with any embedded `'`
+    #     escaped via the '\'' idiom) — not bare/double-quoted, which would mis-split on the space,
+    #     expand `$x`, or be cut off at the `'`.
+    expected_quote = "'" + str(corrupt).replace("'", "'\\''") + "'"
+    assert expected_quote in r.stderr, (
+        f"fix command did not shell-quote the special-char path (paste-unsafe).\n"
+        f"expected quoted form: {expected_quote}\nstderr:\n{r.stderr}"
+    )
+    # (b) Extract the exact `git -C ... config core.bare false` line and run it through a shell;
+    #     it must repair the repo (rev-parse no longer bare), proving the quoting round-trips.
+    fix_line = ""
+    for line in r.stderr.splitlines():
+        if "config core.bare false" in line:
+            fix_line = line.strip()
+            break
+    assert fix_line, f"no fix command found in diagnostic:\n{r.stderr}"
+    rc = _sh("bash", "-c", fix_line, cwd=tmp_path)
+    assert rc.returncode == 0, f"pasted fix command failed to run: {rc.stderr}\ncmd: {fix_line}"
+    repaired = _sh("git", "-C", str(corrupt), "rev-parse", "--is-bare-repository", cwd=tmp_path).stdout.strip()
+    assert repaired == "false", (
+        f"the pasted fix did not repair the special-char-path repo (is-bare={repaired!r})\n"
+        f"cmd: {fix_line}"
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
