@@ -3,7 +3,7 @@
   "point": "pre-bash",
   "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/require-review-before-commit/require_review.py",
   "priority": 20,
-  "timeout_ms": 3000,
+  "timeout_ms": 4000,
   "on_error": "open",
-  "description": "On a `git commit`, checks that an AI code review ran this session (a marker file touched by the review tool). If none ran, blocks with a reminder to run review on the uncommitted diff first. on_error=open: this is a process-discipline gate, not a security gate — a crash should warn, not wedge committing."
+  "description": "On a real `git commit` (detected from the PARSED argv — not `git stash`/`worktree`/`status`, not a `commit` token in a comment/message/pathspec/sibling), checks that an AI code review ran this session (a marker file touched by the review tool). If none ran, blocks with a reminder to run review on the uncommitted diff first. Skips: a DOCS-ONLY staged diff (every path a doc extension *.md/*.mdx/*.rst/*.adoc, or a NON-code file under docs/ — source/script/config like *.py/docs/conf.py/docs/Makefile never counts, a bare *.txt counts only under docs/; and only for a plain commit — not `-a`/`-p`/pathspec/`--pathspec-from-file`/`--git-dir`/`GIT_DIR=`); an inline `REVIEW_SKIP=1 git commit`; a `[skip-review: <reason>]` commit-message trailer. The `git diff --cached` lister is timeout-bounded; on failure it forfeits the docs-only fast-path (the marker gate still runs — NOT an allow). on_error=open: process-discipline gate, not a security gate — a crash should warn, not wedge committing."
 }

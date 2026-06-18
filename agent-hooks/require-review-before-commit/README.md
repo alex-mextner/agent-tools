@@ -5,6 +5,36 @@
 On a `git commit`, checks that an AI code review ran recently for the current change. If
 none did, it **blocks** with a reminder to review the uncommitted diff first.
 
+## What it does NOT gate
+
+- **Non-commit git ops** — `git stash`, `git worktree`, `git status`, `git add`. Only a real
+  `git commit` segment is gated. The commit is detected from the *parsed argv*, not the raw
+  string, so a `commit` token in a comment / message / pathspec / sibling command never trips
+  it.
+- **A commit WRAPPED in another program** — `sudo git commit`, `env VAR=1 git commit`, `time git
+  commit`, `bash -c 'git commit …'`, a `(git commit …)` subshell or `{ git commit; }` group. The
+  detector requires the
+  segment's executable to BE git (or a path to it), so a wrapper is not recognized. This is a
+  deliberate trade for precision (matching `commit` as a bare substring false-blocked `git help
+  commit` / `git commit-graph`); the gate is process discipline (`on_error: open`), not a security
+  boundary. The direct and absolute-path (`/usr/bin/git`) forms are fully covered.
+- **Docs-only commits** — when every staged path is documentation (a doc extension
+  `*.md`/`*.mdx`/`*.markdown`/`*.rst`/`*.adoc`/`*.rdoc`/`*.pod`, or a non-code file under a
+  `docs/` directory), the commit is
+  allowed without a review marker. **Source/script/config never counts as docs** — code even
+  under `docs/` (`docs/conf.py`, `docs/build.py`, `docs/Makefile`) still requires review. A bare
+  `.txt` requires review when it's *outside* `docs/` (e.g. a top-level `requirements.txt`); under
+  `docs/` a `.txt` is treated as documentation (release notes, plans). This fast-path reads the
+  staged *index*, so it does
+  NOT fire for `git commit -a/-am`, `-p/--patch/--interactive`, `--pathspec-from-file`, an
+  explicit pathspec, or a `--git-dir`/`GIT_DIR=…`-redirected commit — those can include content
+  the cwd index doesn't list, so the gate stays.
+- **Explicit per-commit skip** — opt out of a single commit with either:
+  - inline env: `REVIEW_SKIP=1 git commit …` (read from the command, scoped to the commit
+    segment — `REVIEW_SKIP=1 echo x; git commit` does *not* bypass), or
+  - a commit-message trailer: `git commit -m '… [skip-review: <reason>]'` — honest, since it
+    lands in the commit.
+
 ## How it knows a review ran
 
 It looks for a **marker file** that your review tool touches on a successful run, and
