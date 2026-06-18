@@ -187,9 +187,41 @@ def test_commit_amend_with_staged_ui_is_gated(tmp_path, monkeypatch):
 
 def test_commit_continue_is_allowed(tmp_path, monkeypatch):
     """`git commit --continue` (mid rebase/merge) carries no new authored change to prove → it
-    is in SKIP_COMMIT and allowed even with staged UI files (#12)."""
+    is a skip flag (is_skip_commit) and allowed even with staged UI files (#12)."""
     repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
     out, _e, c = _run("git commit --continue", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+
+
+# ── codex P2: a skip token in a COMMENT / MESSAGE must NOT bypass the gate ───────────────
+
+@pytest.mark.parametrize("command", [
+    "git commit -m x # --abort",                  # skip token in a trailing shell comment
+    "git commit -m 'x' # leftover --skip note",   # comment after a quoted message
+    "git commit -m 'support --skip in messages'",  # skip token inside the commit message
+    "git commit -am 'fix --continue handling'",   # -am clusters; value carries --continue
+    "git commit -am --skip",                      # -am clusters; the VALUE is literally `--skip`
+    "git commit -aF --abort",                     # -aF clusters; the file-path value is `--abort`
+    "git commit -- --skip",                       # `--skip` is a PATHSPEC after `--`, not a flag
+    "git commit -m x -- --abort src/",            # pathspec named --abort after `--`
+    "git rebase --abort && git commit -m x",      # skip flag on a SIBLING command, not the commit
+])
+def test_skip_token_in_comment_or_message_does_not_bypass(command, tmp_path, monkeypatch):
+    """codex P2 bypass: ``SKIP_COMMIT`` used to match the RAW string, so a normal commit could
+    skip the visual-proof gate by putting ``--abort``/``--skip`` in shell text Git never runs
+    (a trailing comment) or inside the commit message. The skip exemption now derives from the
+    PARSED argv, so these are real authoring commits → BLOCK when UI is staged with no proof."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(command, repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE, command
+    assert _decision(out) == "block"
+
+
+def test_real_skip_flag_still_exempt_after_parsing(tmp_path, monkeypatch):
+    """The fix must not over-block: a genuine ``git commit --abort`` (skip flag in the real
+    argv, not a comment) is still exempt even with staged UI files."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("git commit --abort", repo, monkeypatch, proof_dir=tmp_path / "proof")
     assert c == 0 and _decision(out) == "allow"
 
 

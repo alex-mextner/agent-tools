@@ -41,6 +41,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -62,7 +63,11 @@ DEFAULT_MANDATORY = "delegate-work-to-subagents,visual-proof-cycle"
 # are allowed between `git` and `commit`, but the run may NOT cross a command separator — so
 # plain text such as `echo "remember to git, then commit"` does NOT trip it (B2).
 GIT_COMMIT = re.compile(r"(?:^|[|&;]\s*)git(?:[ \t]+[^\s;&|]+)*?[ \t]+commit\b")
-SKIP_COMMIT = re.compile(r"--(?:continue|abort|skip)\b")
+# A rebase/merge plumbing step (`git commit --continue/--abort/--skip`) is not a fresh authoring
+# action → not gated. Detected from the PARSED argv (see ``is_skip_commit``), NOT the raw string:
+# a token that only appears in a shell COMMENT (`git commit -m x # --abort`) or in the commit
+# MESSAGE (`git commit -m 'support --skip'`) must NOT exempt a real commit from the skills gate.
+SKIP_FLAGS = frozenset({"--continue", "--abort", "--skip"})
 # A command starts at the line start or right after a &&/;/|/( separator. The build/test
 # runner must be at this command HEAD — not buried inside a string argument — so that
 # `git commit -m "fix: npm test was flaky"` and `echo "see npm test output"` are NOT
@@ -96,10 +101,115 @@ def _mandatory_skills() -> list[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
+def _strip_shell_comment(command: str) -> str:
+    """Drop a trailing shell comment (`# …`) the shell never executes.
+
+    Only an UNQUOTED `#` that starts a word begins a comment, so a `#` inside a quoted commit
+    message (`-m 'fix #42'`) is preserved. Best-effort: on a tokenization failure the raw
+    command is returned unchanged."""
+    try:
+        return " ".join(shlex.split(command, comments=True))
+    except ValueError:
+        return command
+
+
+# SYNC: the commit-segment parser below (_segments / _commit_flags / is_skip_commit) is mirrored
+# in visual-proof-gate/visual_proof_gate.py — each hook is a self-contained standalone script run
+# as its own subprocess (no shared import path), so the logic is duplicated by design. Keep both
+# in step when changing skip-flag handling.
+_SHELL_SEP = frozenset({"&&", "||", ";", "|", "&"})
+_GIT_GLOBAL_VALUE_FLAGS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace"})
+
+
+def _segments(tokens: list[str]) -> list[list[str]]:
+    """Split a token list on shell command separators (&&, ||, ;, |, &)."""
+    segs: list[list[str]] = []
+    cur: list[str] = []
+    for tok in tokens:
+        if tok in _SHELL_SEP:
+            segs.append(cur)
+            cur = []
+        else:
+            cur.append(tok)
+    segs.append(cur)
+    return segs
+
+
+def _takes_following_value(tok: str) -> bool:
+    """True when a `git commit` flag token consumes the NEXT token as its value.
+
+    Long forms `--message`/`--file` (without `=`); and any short cluster ENDING in `m` or `F`
+    (`-m`, `-am`, `-aF`) — the typical `git commit -am 'msg'`, where the message is the following
+    token. Stripping it is what stops `git commit -am --skip` (message == a skip flag) from
+    falsely reading `--skip` as a continuation flag and exempting a real commit (codex)."""
+    if tok.startswith("--"):
+        return tok in ("--message", "--file")  # `--message=…`/`--file=…` carry their own value
+    if tok.startswith("-") and len(tok) > 1:
+        return tok[-1] in ("m", "F")  # short cluster like -m / -am / -aF takes the next token
+    return False
+
+
+def _commit_flags(segment: list[str]) -> list[str] | None:
+    """If `segment`'s executable is `git` and its subcommand is `commit`, return the tokens AFTER
+    `commit` with message-carrying flags AND their values removed; otherwise None. Walks past git
+    GLOBAL options (`-C dir`, `-c k=v`, …) to reach the subcommand."""
+    if not segment or segment[0] != "git":
+        return None
+    i = 1
+    while i < len(segment):
+        tok = segment[i]
+        if tok in _GIT_GLOBAL_VALUE_FLAGS and i + 1 < len(segment):
+            i += 2  # global flag + its separate value
+            continue
+        if tok.startswith("-"):
+            i += 1  # other global flag / `-Cdir` / `-ck=v` joined form
+            continue
+        break
+    if i >= len(segment) or segment[i] != "commit":
+        return None
+    out: list[str] = []
+    j = i + 1
+    while j < len(segment):
+        tok = segment[j]
+        if tok == "--":
+            break  # everything after `--` is a literal PATHSPEC, never a flag — stop collecting
+        if _takes_following_value(tok) and j + 1 < len(segment):
+            j += 2  # drop the flag AND its value (-m MSG / -am MSG / --message MSG / -F PATH)
+            continue
+        if tok.startswith(("--message=", "--file=")) or (tok.startswith("-m") and len(tok) > 2):
+            j += 1  # drop -mMSG / --message=MSG / --file=PATH (value glued to the flag)
+            continue
+        out.append(tok)
+        j += 1
+    return out
+
+
+def is_skip_commit(command: str) -> bool:
+    """True only when the actual `git commit` SEGMENT carries --continue/--abort/--skip.
+
+    Parses the argv after stripping shell comments, scopes to the `git commit` segment, and
+    removes `-m`/`-F` message VALUES — so a skip token that lives only in a comment
+    (`git commit -m x # --abort`), in the commit message (`git commit -m 'support --skip'`), or on
+    a SIBLING command (`git rebase --abort && git commit -m x`) does NOT exempt an authoring
+    commit. On a tokenization failure this returns False → the commit is GATED (the safe way)."""
+    try:
+        tokens = shlex.split(command, comments=True)
+    except ValueError:
+        return False
+    for seg in _segments(tokens):
+        flags = _commit_flags(seg)
+        if flags is not None:
+            return any(tok in SKIP_FLAGS for tok in flags)
+    return False
+
+
 def _is_work_action(command: str) -> bool:
-    if GIT_COMMIT.search(command) and not SKIP_COMMIT.search(command):
+    # Detect the commit on the comment-stripped command, and judge skip-ness from the parsed
+    # argv — so a skip token in a trailing comment / commit message can't bypass the gate.
+    stripped = _strip_shell_comment(command)
+    if GIT_COMMIT.search(stripped) and not is_skip_commit(command):
         return True
-    return bool(BUILD_OR_TEST.search(command))
+    return bool(BUILD_OR_TEST.search(stripped))
 
 
 def _fresh(p: Path) -> bool:

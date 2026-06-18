@@ -16,6 +16,12 @@ Blocked (conservative, anchored at a command start so a substring in a path/word
   `mvn|gradle test|build|verify|package`
 - **`sleep N`** with `N >= 10` (short sleeps like `sleep 2` are fine)
 
+Leading **no-op wrappers** are peeled off each segment before matching, so a wrapped long
+process is still caught — `timeout 600 npm test`, `env CI=1 pytest`, `timeout 5m review`,
+`nice -n10 review`, `time make build`, `stdbuf -oL pytest`, `nohup cargo build`. The wrapper's
+own args (`timeout`'s duration, `env`'s `KEY=VALUE` assignments, `-k`/`-n`/`--signal` flags) are
+skipped; only the *wrapped* command's long-running-ness decides (`timeout 5 ls` stays allowed).
+
 **Subagent-exempt:** a dispatched subagent (`agent_id` present) is *expected* to run these in
 the background, so it is always allowed. This gate governs the orchestrator only. `args.agent_id`
 must originate from a **trusted, transport-level** signal — never from model-controlled

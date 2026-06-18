@@ -95,6 +95,45 @@ def test_allow_benign(command, monkeypatch):
     assert _decision(out) == "allow"
 
 
+# ── codex: WRAPPED long processes (timeout/env/nice/time/…) must still BLOCK ─────────────
+
+@pytest.mark.parametrize("command", [
+    "timeout 600 npm test",          # timeout + duration wraps the suite
+    "timeout 5m review",             # duration with a unit suffix
+    "timeout -k 5 600 pytest",       # timeout with its own -k flag + value, then duration
+    "env CI=1 pytest",               # env + a KEY=VALUE assignment
+    "env CI=1 NODE_ENV=test vitest",  # multiple env assignments
+    "nice -n10 review -C /repo",     # nice + joined -n10
+    "nice -n 10 npm run build",      # nice + separated -n 10
+    "time make build",              # bare wrapper, no args of its own
+    "stdbuf -oL pytest tests/",      # stdbuf + a flag, no positional
+    "nohup cargo build",            # nohup wraps directly
+    "git pull && timeout 600 npm test",  # wrapper on a non-head segment
+])
+def test_block_wrapped_long_process(command, monkeypatch):
+    """codex: ``_matched_long_process`` anchored on the runner and missed common wrappers, so
+    ``timeout 600 npm test`` / ``env CI=1 pytest`` / ``timeout 5m review`` slipped through. The
+    wrapper is now peeled off each segment before matching → these BLOCK."""
+    out, _e, code = _run(command, monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE, command
+    assert json.loads(out)["decision"] == "block"
+
+
+@pytest.mark.parametrize("command", [
+    "timeout 5 ls",                  # a wrapped SHORT/benign command is not long-running
+    "env EDITOR=vim git status",     # env wrapping a benign command
+    "nice -n10 git log",             # nice wrapping a benign command
+    "time true",                    # time wrapping a no-op
+    "timeout 30 cat big.log",        # a wrapped non-suite command
+])
+def test_allow_wrapped_benign_command(command, monkeypatch):
+    """Unwrapping must not over-block: a wrapper in front of a BENIGN command is still allowed —
+    only the wrapped command's own long-running-ness decides."""
+    out, _e, code = _run(command, monkeypatch)
+    assert code == 0, command
+    assert _decision(out) == "allow"
+
+
 # ── SUBAGENT-EXEMPT ────────────────────────────────────────────────────────────────────
 
 def test_subagent_exempt_allows_long_process(monkeypatch):

@@ -212,6 +212,40 @@ def test_real_build_at_command_head_still_blocks_on_repeat(command, tmp_path, mo
     assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
+# ── codex P2: a skip token in a COMMENT / MESSAGE must NOT exempt a real commit ──────────
+
+@pytest.mark.parametrize("command", [
+    "git commit -m x # --abort",                  # skip token in a trailing shell comment
+    "git commit -m 'x' # leftover --skip note",   # comment after a quoted message
+    "git commit -m 'support --skip in messages'",  # skip token inside the commit message
+    "git commit -am 'fix --continue handling'",   # -am clusters; value carries --continue
+    "git commit -am --skip",                      # -am clusters; the VALUE is literally `--skip`
+    "git commit -aF --abort",                     # -aF clusters; the file-path value is `--abort`
+    "git commit -- --skip",                       # `--skip` is a PATHSPEC after `--`, not a flag
+    "git commit -m x -- --abort src/",            # pathspec named --abort after `--`
+    "git rebase --abort && git commit -m x",      # skip flag on a SIBLING command, not the commit
+])
+def test_skip_token_in_comment_or_message_does_not_bypass(command, tmp_path, monkeypatch):
+    """codex P2 bypass: ``SKIP_COMMIT`` used to match the RAW string, so a normal commit was
+    mis-classified as a non-work skip action (and the mandatory-skills gate skipped) by putting
+    ``--abort``/``--skip`` in a trailing comment or in the commit message. The skip exemption now
+    derives from the PARSED argv, so these are real work actions → WARN then BLOCK on repeat."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    out1, _e1, c1 = _run(command, monkeypatch, invoked=invoked, tier=tier)
+    assert c1 == 0 and _decision(out1) == "allow", command  # first offense WARNs
+    out2, _e2, c2 = _run(command, monkeypatch, invoked=invoked, tier=tier)
+    assert c2 == srg.BLOCK_EXIT_CODE and _decision(out2) == "block", command
+
+
+def test_real_skip_flag_still_exempt_after_parsing(tmp_path, monkeypatch):
+    """The fix must not over-block: a genuine ``git commit --abort`` (skip flag in the real
+    argv, not a comment) is still a non-work action and allowed even on a repeat."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _run("git commit --abort", monkeypatch, invoked=invoked, tier=tier)
+    out, _e, c = _run("git commit --abort", monkeypatch, invoked=invoked, tier=tier)
+    assert c == 0 and _decision(out) == "allow"
+
+
 # ── T1: NOT subagent-exempt — an agent_id present must STILL block (locks the doctrine) ──
 
 def test_blocks_even_with_agent_id_present(tmp_path, monkeypatch):
