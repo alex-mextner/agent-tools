@@ -28,6 +28,32 @@ Capturing a screenshot of an *idle* or *not-yet-rendered* state and calling it p
 An empty panel, a loading spinner, or the wrong screen captured "successfully" proves
 nothing. Make sure the capture shows the thing you changed, in its rendered state.
 
+## When a before/after screenshot is impossible: attach a schematic
+
+Sometimes there is nothing to screenshot — the change is docs, CI, or pure backend —
+or you need to convey *how it should work*: a target state or design that doesn't
+exist yet. In those cases the proof artifact is a **schematic** (SVG, mermaid, or
+ASCII) instead of a capture. Attach it the same way you'd attach a screenshot.
+
+The sanctioned generator is **codex** — ask it for a self-contained diagram:
+
+```bash
+# valid, self-contained SVG:
+codex exec "Output ONLY a self-contained SVG diagramming X"
+```
+
+codex also emits mermaid flowcharts; SVG and mermaid can be attached directly.
+If codex isn't available, hand-draw the schematic as ASCII or mermaid yourself —
+the point is the artifact, not the generator.
+
+Treat an LLM-generated SVG as untrusted: it's an active format that can carry
+active content (e.g. `<script>`, event handlers, `href`/`xlink:href` fetches,
+`<foreignObject>`). Default to rasterizing SVG → PNG before attaching,
+using a renderer that executes no scripts and loads no external resources (`resvg`
+is static by design — prefer it; librsvg's behavior is version-dependent). Attach
+raw SVG only on a surface you've confirmed treats it as a static image. Mermaid and
+ASCII carry no such risk — attach them directly.
+
 ## Why
 
 Visual bugs are invisible to compilers and unit tests by definition. A human (or a
