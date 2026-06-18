@@ -266,21 +266,63 @@ cleanup() {
     run git push -q origin --delete "$BRANCH" || echo "[ship] WARNING: could not delete remote branch origin/${BRANCH} — delete it manually." >&2
   fi
 
-  # Don't delete a worktree out from under the session running inside it. With multiple
-  # worktrees for this branch, remove EACH one (the one we're inside is skipped, kept for
-  # the user to remove later).
+  # Remove EACH worktree for this branch. The one the session is running INSIDE can't be
+  # removed while it's our cwd — but we don't have to give up: re-root into the main checkout
+  # first (this script's cwd becomes the deleted dir until we cd elsewhere), then remove it
+  # from there. The preflight already refused a dirty worktree before merge, so at cleanup the
+  # trees are normally clean — but as defence-in-depth (a post-merge hook could write into a
+  # tree) we re-check EACH worktree and never escalate to --force on a tree that isn't
+  # confirmed clean (a dirty/broken tree is left in place rather than destroying unshipped
+  # work).
+  SELF_REMOVED=""   # set to the main checkout we re-rooted into, iff we ACTUALLY removed our own tree
   for wt in ${WTS[@]+"${WTS[@]}"}; do
     [ -n "$wt" ] || continue
+    is_self=0; reroot_target=""
     wt_real=$(cd "$wt" 2>/dev/null && pwd -P || echo "$wt")
+
+    # Confirm-clean once per worktree: clean ONLY if `git status` both succeeds AND reports an
+    # empty tree. A status failure (broken/missing gitdir) is NOT treated as clean — so we
+    # never --force a tree we couldn't verify. Capture rc with `|| st_rc=$?` (not a trailing
+    # `$?`) so this stays correct even if the block is ever moved out of cleanup()'s `set +e`.
+    st_rc=0; st=$(git -C "$wt" status --porcelain 2>/dev/null) || st_rc=$?
+    is_clean=0; { [ "$st_rc" -eq 0 ] && [ -z "$st" ]; } && is_clean=1
+
     if [ "$ORIG_PWD" = "$wt_real" ] || [ "${ORIG_PWD#"$wt_real"/}" != "$ORIG_PWD" ]; then
-      echo "[ship] running inside the PR's worktree ($wt_real) — leaving it in place; remove later from $MAIN_CHECKOUT."
-      continue
+      # We are inside this worktree. A dirty/unverifiable self-tree is left alone (no re-root,
+      # no removal) — destroying it would lose unshipped work.
+      if [ "$is_clean" != "1" ]; then
+        echo "[ship] WARNING: PR worktree $wt_real has uncommitted/unverifiable changes — leaving it in place (refusing to --force-remove unshipped work)." >&2
+        continue
+      fi
+      # Re-root into the main checkout so we can remove it. The target must be a DISTINCT tree,
+      # not the worktree itself nor a path UNDER it (a nested checkout) — removing the worktree
+      # would otherwise delete our new cwd too.
+      main_real=$(cd "$MAIN_CHECKOUT" 2>/dev/null && pwd -P || echo "")
+      if [ -z "$main_real" ] || [ "$main_real" = "$wt_real" ] || [ "${main_real#"$wt_real"/}" != "$main_real" ]; then
+        echo "[ship] running inside the PR's worktree ($wt_real) and no separate main checkout to re-root into — leaving it in place; remove it manually." >&2
+        continue
+      fi
+      echo "[ship] inside the PR's worktree ($wt_real) — re-rooting into $main_real to remove it ..."
+      cd "$main_real" || { echo "[ship] WARNING: could not cd into $main_real — leaving worktree $wt_real in place." >&2; continue; }
+      is_self=1; reroot_target="$main_real"
     fi
     echo "[ship] removing worktree $wt ..."
-    [ "$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || echo)" = "$BRANCH" ] && run git -C "$wt" checkout --detach --quiet
-    run git worktree remove "$wt" 2>/dev/null \
-      || run git worktree remove --force "$wt" \
-      || echo "[ship] WARNING: could not remove worktree $wt — remove it manually (git worktree remove --force)." >&2
+    # Detach HEAD only for a confirmed-clean tree we intend to remove — never mutate (detach)
+    # a dirty/unverifiable tree we're about to leave in place.
+    [ "$is_clean" = "1" ] && [ "$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || echo)" = "$BRANCH" ] && run git -C "$wt" checkout --detach --quiet
+    # Plain `remove` first (git itself refuses a dirty/busy tree, which is safe). Escalate to
+    # --force ONLY for a confirmed-clean tree — never force away a dirty/unverifiable one.
+    removed=0
+    if run git worktree remove "$wt" 2>/dev/null; then removed=1
+    elif [ "$is_clean" = "1" ] && run git worktree remove --force "$wt"; then removed=1
+    fi
+    if [ "$removed" = "1" ]; then
+      # Record self-removal ONLY after a confirmed real removal (so the caller-contract NOTE
+      # below never fires falsely — not in dry-run, not when removal failed and the dir lives).
+      [ "$is_self" = "1" ] && [ "$DRY_RUN" != "1" ] && SELF_REMOVED="$reroot_target"
+    else
+      echo "[ship] WARNING: could not remove worktree $wt — remove it manually (git worktree remove --force)." >&2
+    fi
   done
 
   # Delete the local branch only once no worktree still has it checked out (git refuses
@@ -295,6 +337,14 @@ cleanup() {
     [ "$(git -C "$MAIN_CHECKOUT" symbolic-ref --quiet --short HEAD 2>/dev/null || echo)" = "$DEFAULT_BRANCH" ] || run git -C "$MAIN_CHECKOUT" checkout "$DEFAULT_BRANCH"
     run git -C "$MAIN_CHECKOUT" fetch origin
     [ "$DRY_RUN" = "1" ] || git -C "$MAIN_CHECKOUT" pull --ff-only origin "$DEFAULT_BRANCH" || echo "[ship] WARNING: could not fast-forward $DEFAULT_BRANCH — pull manually." >&2
+  fi
+
+  # CALLER CONTRACT: if we removed the worktree the SESSION was launched from, the parent
+  # shell's cwd now points at a deleted directory (this script re-rooted, the parent did
+  # not). Make that explicit so the caller cd's out before its next git/relative-path
+  # command (which would otherwise fail with `getcwd: cannot access parent directories`).
+  if [ -n "$SELF_REMOVED" ]; then
+    echo "[ship] NOTE: removed the worktree you launched from — your shell's cwd is now gone. cd into $SELF_REMOVED (the main checkout) before your next command." >&2
   fi
   return 0
 }
