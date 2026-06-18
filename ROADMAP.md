@@ -1,7 +1,8 @@
 # Agent CLI Ecosystem — Roadmap
 
-Status snapshot: **2026-06-16**. This is the handoff/roadmap for the agent-native CLI ecosystem
-(`tg-cli`, `review-cli`, `rig-cli`, `draw-cli`, `3d-cli`, `task-cli`) + the `agent-tools` umbrella.
+Status snapshot: **2026-06-18** (latest activity at the end of this file). This is the
+handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, `rig-cli`,
+`draw-cli`, `3d-cli`, `task-cli`) + the `agent-tools` umbrella.
 
 > **North-star architecture (DECIDED — do not re-litigate):** the whole CLI ecosystem is
 > **Python-only**. `tg-cli` (currently Bun/TS) migrates to Python **LAST**. The shared
@@ -1364,3 +1365,87 @@ cross-harness). Tracking: skills/universal + agent-hooks + lib/providers + rig p
   when `review` actually RUNS). Investigate the shim's path resolution / install model
   (`single-file-live-symlink-cli` + `no-npx-direct-binary`) so `review` runs from any shell. Pairs with the
   require-review-before-commit + model-fallback items. Dedicated investigation + fix.
+
+---
+
+## ✅ Done (2026-06-18) — enforcement-doctrine + review-resilience wave landed; CTO #4133 migration COMPLETE
+
+*All PRs below verified MERGED on each repo's `origin/main` via `gh pr view <N> -R <repo> --json
+state,mergeCommit` (three repos — the `-R` matters). Snapshot taken 2026-06-18.*
+
+### agent-tools
+
+- ✅ **#61** (`26136cb`) — `no-shell-file-edit` PreToolUse gate: blocks in-place stream-edits (`sed -i`,
+  `perl -i`, in-place `awk`) and shell-redirect overwrites onto a tracked source, forcing real Edit/Write.
+- ✅ **#62** (`8050a58`) — `decision-request-discipline` skill + advisory `tg`-decision self-check hook
+  (the CTO-decision-request half of the #4133 migration).
+- ✅ **#63** (`e6f7639`) — `require-review-before-commit` hardened: **docs-only skip**, per-commit skip
+  trailer, parser-scoped skip-flag — closes the "too-broad gate" complaint + the #20 raw-string bypass.
+- ✅ **#64** (`c01b5e1`) — `ship.sh` hardened against exit-128 on multi-worktree checkouts + made the
+  post-merge cleanup non-masking (this is the exit-128 fix only; the broader `ship.sh` self-cleanup work
+  is a SEPARATE, still-in-flight item — see Open follow-ups below).
+- ✅ **#65** (`92b889b`) — evidence-first `ticket-documentation-standard` folded into
+  `strict-ticket-discipline` (the ticket-doc-standard half of #4133).
+- ✅ **#66** (`ede5bb9`) — migrated the `timeout-evil` + `schematic-via-codex` doctrine into the
+  test-discipline + visual-proof-cycle skills (the development.md residual of #4133).
+
+### review-cli
+
+- ✅ **#46** (`132233a`) — in-seat `--retry` (retryable vs seat-fatal classification before reserve-replace),
+  scoped to diff mode.
+- ✅ **#47** (`44232c0`) — hardened `_ensure_opencode_readonly_agent`: validate/rewrite a permissive global
+  opencode agent so a stray write-capable config can't leak into a read-only review (security).
+- ✅ **#48** (`585b08b`) — dashboard JS unit tests (`resolveModel`/`filteredRuns`) + hardened the
+  lib-absent smoke path (exit-4).
+
+### rig-cli
+
+- ✅ **#50** (`c0d3b15`) — tmux migration neutralizes pre-existing rig-owned plugin/continuum/resurrect
+  init lines so a second `rig apply` can't double-initialize them.
+
+### 🎯 CTO request #4133 — migrate hyperide docs/rules as ENFORCED mechanisms — COMPLETE
+
+The brief: don't copy hyperide's `docs/rules` as prose, encode them as enforced mechanisms. Status:
+
+- **cto-decision-requests → DONE via #62** (decision-request-discipline skill + advisory hook).
+- **ticket-documentation-standard → DONE via #65** (evidence-first standard inside strict-ticket-discipline).
+- **development.md → DONE** — the bulk already landed on `main` (the tamper-proof `ci/pr-checklist` gate,
+  the 42 universal skills, and the enforcement agent-hooks), with the `timeout-evil` + `schematic-via-codex`
+  residuals closed by **#66**.
+- **Intentionally NOT migrated** (project-specific to hyperide, not universal ecosystem doctrine): Linear
+  ticket-naming conventions, hyperide `bun` command recipes, the hyperide release flow, and the
+  `ext-test-projects` debug workflow. These stay in the product repo where they belong.
+
+### Open follow-ups carried forward (genuinely open — lower-value, not this session's blockers)
+
+These survive the wave and stay open:
+
+- **oc provider-auth probe** + **tg-cli `.gitignore`** hygiene (small).
+- **rig smoke — real-catalog CI** (in flight).
+- **review-gate / review-tool: pinned `git diff` vs `rtk` fragility** — the marker re-derives
+  `git diff --cached`; an rtk-intercepted diff can make the stamp check misread. Pin to a real `git`.
+- **rig-cli `core.bare=true` forensics** — investigate the bare-repo edge that tripped worktree ops.
+- **review-cli CI: ruff + ~12 latent errors** to fix-or-justify.
+- **continuum autosave startup-race** — watch (the status-right ordering fix held, keep an eye on it).
+- **opencode permission-schema floor** — watch (a schema-version regression could re-open the #47 hole).
+- **ship.sh self-cleanup** (in flight — a concurrent agent owns `ci/ship/ship.sh`; distinct from the
+  #64 exit-128 hardening above, this is the broader post-merge self-cleanup pass).
+- **review-cli spec-web autosave race #30** + **stale `DEFAULT_MODELS` #25** (in flight).
+- **HOLD-for-CTO:** `tg` deploy / inline buttons / spawning new PRs — parked pending CTO direction
+  (ties into the new forum-topics item below).
+
+### ➡️ NEW (CTO 2026-06-18) — tg-cli / tg-ctl: Telegram forum-topics mode — one topic per agent
+
+Replace the current flat `/agent` phonetic selector with **persistent per-agent Telegram forum topics**.
+Each agent runs in its OWN forum topic (`message_thread_id`):
+
+- **Topic creation spins up an agent.** A `forum_topic_created` update triggers the existing `/new` flow —
+  clarifying the working **PATH** + **MODEL** for that agent — and **binds topic → agent**.
+- **Routing is per-topic.** Inbound messages in a topic route to that topic's agent; the agent's replies
+  post back into the **same** topic. No more phonetic disambiguation — the topic IS the address.
+- **Wiring:** ties into the HOLD `tg /new` feature (interactive PATH/MODEL selection via inline buttons,
+  tg-cli#27) and tg-ctl routing (`discover.ts` / `routes.ts` — the topic→agent map lives here).
+- ⚠️ **NEEDS CTO CONFIRMATION before building:** the request referenced an attached screenshot
+  (a "mirror this existing UX" pointer) that **did not arrive**. The exact `/new` clarification UX to
+  mirror must be confirmed with the CTO before implementation — do not guess the flow.
+- **Tracking:** tg-cli (new issue, or extend tg-cli#27 `/new`) + tg-ctl routing.
