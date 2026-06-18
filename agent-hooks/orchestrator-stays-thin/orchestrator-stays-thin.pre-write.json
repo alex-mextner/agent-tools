@@ -1,0 +1,9 @@
+{
+  "id": "orchestrator-stays-thin",
+  "point": "pre-write",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/orchestrator-stays-thin/orchestrator_stays_thin.py",
+  "priority": 45,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "Keeps the main thread thin: a non-docs CODE Edit/Write by the orchestrator warns-then-blocks (delegate to a subagent/Workflow instead). Docs (*.md/mdx/txt/rst, docs/) and subagent writes (agent_id present) are allowed. WARN first, BLOCK on repeat within ORCH_THIN_TTL_S (900s). Escape hatch: ALLOW_ORCHESTRATOR_WORK=1 + ALLOW_ORCHESTRATOR_WORK_REASON='why'. on_error=open: delegation discipline, not a security boundary."
+}

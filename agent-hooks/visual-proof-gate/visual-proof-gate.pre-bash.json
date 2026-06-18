@@ -1,0 +1,9 @@
+{
+  "id": "visual-proof-gate",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/visual-proof-gate/visual_proof_gate.py",
+  "priority": 46,
+  "timeout_ms": 8000,
+  "on_error": "open",
+  "description": "Blocks a `git commit` that stages USER-VISIBLE files (.tsx/.jsx/.vue/.svelte/.css/.scss/.html/.svg/images, or under components|ui|pages|app|views|public|assets/) unless a fresh 'looked at a screenshot' marker exists in ~/.cache/agent-tools/visual-proof/ (within VISUAL_PROOF_WINDOW_S, 3600s). No user-visible files staged => allow. The `git diff --cached` lister is timeout-bounded and fails OPEN. Escape hatch: ALLOW_NO_VISUAL_PROOF=1 + ALLOW_NO_VISUAL_PROOF_REASON='why', or inline `# visual-proof-ok: why`. on_error=open."
+}

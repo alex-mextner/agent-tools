@@ -1,0 +1,9 @@
+{
+  "id": "background-subagent-gate",
+  "point": "pre-agent",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/background-subagent-gate/background_subagent_gate.py",
+  "priority": 30,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "Blocks the orchestrator from dispatching a non-trivial subagent in the FOREGROUND — a foreground subagent blocks the main thread until it finishes, defeating orchestration. Allows `run_in_background: true`, trivial one-liner dispatches, and subagent-made dispatches (agent_id present). Escape hatch: ALLOW_FOREGROUND_SUBAGENT=1 + ALLOW_FOREGROUND_SUBAGENT_REASON='why'. on_error=open: orchestration discipline, not a security boundary."
+}

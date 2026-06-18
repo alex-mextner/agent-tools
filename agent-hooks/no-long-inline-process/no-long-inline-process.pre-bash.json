@@ -1,0 +1,9 @@
+{
+  "id": "no-long-inline-process",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/no-long-inline-process/no_long_inline_process.py",
+  "priority": 35,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "Blocks the orchestrator from running a long-running process inline: the `review` CLI, any `--watch` flag, a build/test suite (npm/pnpm/yarn/bun test|build, pytest/vitest/jest/cypress/playwright, cargo/go test|build, make test|build|all), or `sleep N` with N>=10. Dispatch it to a BACKGROUND subagent instead. Patterns anchored at a command start so a substring in a path never trips it; `sleep 2` passes. Subagent-exempt (agent_id present). Escape hatch: ALLOW_INLINE_PROCESS=1 + ALLOW_INLINE_PROCESS_REASON='why', or inline `# inline-process-ok: why`. on_error=open."
+}

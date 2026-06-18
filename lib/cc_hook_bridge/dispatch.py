@@ -4,7 +4,9 @@ Reads a Claude Code hook event on stdin, runs the installed ``agents-hooks/v1``
 descriptors that apply, and translates the v1 exit-10 BLOCK into CC's own block signal.
 
 Confirmed CC contract (https://code.claude.com/docs/en/hooks, CC 2.1.177):
-  - PreToolUse stdin : {tool_name, tool_input{}, cwd, permission_mode, hook_event_name, …}
+  - PreToolUse stdin : {tool_name, tool_input{}, cwd, permission_mode, hook_event_name, …};
+                       when the action fires INSIDE a dispatched subagent the event ALSO
+                       carries {agent_id, agent_type} — the reliable main-vs-subagent signal.
   - PreToolUse block : exit 0 + {"hookSpecificOutput": {"hookEventName": "PreToolUse",
                        "permissionDecision": "deny", "permissionDecisionReason": "..."}}
                        (we use the STRUCTURED JSON form, not exit 2, because it carries a
@@ -43,6 +45,14 @@ _KNOWN_EVENTS = frozenset({"PreToolUse", "Stop", "PostToolUse"})
 # content won't be scanned by the pre-write guards. Keep this set in sync with the README's
 # point table and the rig-cli matcher `Edit|Write|MultiEdit|NotebookEdit`.
 _WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
+# The subagent-dispatch tools CC exposes. CC's prompt calls them "Agent/Task"; we match BOTH
+# for forward-compat. A PreToolUse on either maps to the `pre-agent` point, the gate that
+# governs HOW the orchestrator fans work out (background vs. foreground, trivial vs. not).
+# NOTE (rig-cli follow-up, out of scope here): for CC to actually FIRE pre-agent the
+# settings.json matcher must be wired in rig-cli's `hook_bridge_entries` — an `Agent|Task`
+# PreToolUse matcher carrying `cc_hook_bridge PreToolUse`. That is a separate repo; this
+# bridge half (the point mapping + agent_id forwarding) lives here.
+_AGENT_TOOLS = frozenset({"Agent", "Task"})
 
 
 def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
@@ -54,6 +64,8 @@ def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
             return "pre-bash"
         if tool_name in _WRITE_TOOLS:
             return "pre-write"
+        if tool_name in _AGENT_TOOLS:
+            return "pre-agent"
     return None
 
 
@@ -61,10 +73,11 @@ def to_v1_event(cc_event: dict, *, point: str) -> dict:
     """Translate a CC hook event into the agents-hooks/v1 event a hook script reads.
 
     ``args`` carries the action payload the v1 hooks look for: ``args.command`` for a bash
-    command, ``args.file_path``/``args.content`` for a write, ``args.session_id`` for stop.
-    We pass the WHOLE ``tool_input`` through under ``args`` so a hook can read any field,
-    and additionally surface ``command`` at the top level (a couple of v1 hooks read it
-    there as a fallback).
+    command, ``args.file_path``/``args.content`` for a write, ``args.session_id`` for stop,
+    ``args.run_in_background``/``args.prompt`` for a pre-agent dispatch, and (when CC fires
+    inside a subagent) ``args.agent_id``/``args.agent_type``. We pass the WHOLE ``tool_input``
+    through under ``args`` so a hook can read any field, and additionally surface ``command``
+    at the top level (a couple of v1 hooks read it there as a fallback).
 
     For pre-write we NORMALIZE the proposed text into ``args.content`` regardless of which
     edit tool fired, because the shipped pre-write hooks (block-secrets-write,
@@ -92,6 +105,23 @@ def to_v1_event(cc_event: dict, *, point: str) -> dict:
     # stop has no tool_input; carry the CC session id so a stop hook can key its marker.
     if "session_id" not in args and cc_event.get("session_id"):
         args["session_id"] = cc_event["session_id"]
+    # Forward the subagent signal: when CC fires this event INSIDE a dispatched subagent it
+    # carries TOP-LEVEL {agent_id, agent_type}. Surfacing them under `args` is what lets a
+    # subagent-exempt gate (background-subagent-gate, orchestrator-stays-thin,
+    # no-long-inline-process) tell a subagent's own tool use apart from the main thread's via
+    # `_is_subagent`. (The Agent/Task tool_input — incl. `run_in_background` — is already in
+    # `args` from `dict(tool_input)`.)
+    #
+    # PRECEDENCE (T2): CC's TOP-LEVEL agent_id/agent_type are the ONLY authoritative source.
+    # A value sitting in tool_input is attacker/prompt-controllable — a forged
+    # `tool_input.agent_id` must NOT exempt a main-thread dispatch. So: if the signal is present
+    # at the top level, it OVERWRITES whatever was in args; if it is ABSENT at the top level, we
+    # DROP any copy that rode in via tool_input. The exemption can only come from CC itself.
+    for key in ("agent_id", "agent_type"):
+        if cc_event.get(key) is not None:
+            args[key] = cc_event[key]
+        else:
+            args.pop(key, None)
     return {
         "hook_api": HOOK_API,
         "event_id": cc_event.get("session_id", ""),
