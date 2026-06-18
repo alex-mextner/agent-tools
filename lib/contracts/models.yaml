@@ -113,3 +113,26 @@ aliases:
   commandcode:latest: moonshotai/Kimi-K2.7-Code
   zai:latest: glm-5.2
   fireworks:latest: accounts/fireworks/models/fable-5
+
+# ── fallback_chain: the agent-facing, CROSS-HARNESS resilience order ─────────────────────
+# THE single source of truth for "what does the agent fall to when its main model keeps
+# erroring (rate-limit / overload / 5xx)". Every harness — cc, codex, oc, pi — reads THIS
+# one list so they all agree on the priority order; the model-error-fallback agent-hook and
+# the `model-fallback` skill both resolve the next executor from here, never from a hand-
+# copied list. The order is the priority (strongest/cheapest-preferred first); on the Nth
+# repeated model error the live executor DROPS to the next entry, and returns to the top
+# once the preferred one recovers.
+#
+# `harness` is the EXECUTOR boundary, not a `provider` in the models list above: a step
+# whose harness == the currently-running one is an in-process MODEL SWAP (claude:fable ->
+# claude:opus); a step whose harness differs RE-DISPATCHES the unit of work to that harness
+# as an executor (shell out to `opencode` / `codex exec`). `model` is the concrete id passed
+# to that harness's own model selector. This list is DATA the schema validates only loosely
+# (harness/model are free strings) because the harness names are tool wiring, not the model
+# board's closed provider enum.
+fallback_chain:
+  - { harness: claude, model: fable,    notation: "claude:fable" }   # 1 — preferred: in-harness, cheapest-capable
+  - { harness: claude, model: opus,     notation: "claude:opus" }    # 2 — in-harness swap on repeated fable errors
+  - { harness: oc,     model: GLM-5.2,  notation: "oc:GLM-5.2" }      # 3 — CROSS-HARNESS: opencode executor, different provider quota
+  - { harness: codex,  model: gpt5.5,   notation: "codex:gpt5.5" }    # 4 — CROSS-HARNESS: codex executor, last resort
+

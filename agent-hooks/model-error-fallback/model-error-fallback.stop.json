@@ -1,0 +1,9 @@
+{
+  "id": "model-error-fallback",
+  "point": "stop",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/model-error-fallback/model_error_fallback.py",
+  "priority": 20,
+  "timeout_ms": 4000,
+  "on_error": "open",
+  "description": "Counts consecutive transient model errors (rate-limit / overload / API 5xx) per unit of work and, past a threshold, switches the active executor down the cross-harness chain claude:fable -> claude:opus -> oc:GLM-5.2 -> codex:gpt5.5 — an in-harness model swap within Claude, a re-dispatch to opencode/codex across the boundary. Promotes back toward the preferred model on recovery (return-to-top). Advisory: on_error=open, always allows; the switch instruction rides in the message + a machine-readable `fallback` block. The chain is read from the ONE definition in lib/contracts/models.yaml `fallback_chain:` so every harness agrees."
+}
