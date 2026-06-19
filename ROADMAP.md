@@ -1,8 +1,13 @@
 # Agent CLI Ecosystem — Roadmap
 
-Status snapshot: **2026-06-18** (latest activity at the end of this file). This is the
+Status snapshot: **2026-06-19** (latest activity at the end of this file). This is the
 handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, `rig-cli`,
 `draw-cli`, `3d-cli`, `task-cli`) + the `agent-tools` umbrella.
+
+> **Reading order:** the AUTHORITATIVE current state is **§Remaining work (prioritized)** and the
+> **§Open-ticket ledger** below — start there. The two collapsed `📜 …` blocks are dated session
+> transcript (2026-06-15 → 06-17), kept for history; anything still open from them lives in the
+> ledger, so a folded section is not an assertion that it shipped.
 
 > **North-star architecture (DECIDED — do not re-litigate):** the whole CLI ecosystem is
 > **Python-only**. `tg-cli` (currently Bun/TS) migrates to Python **LAST**. The shared
@@ -12,6 +17,9 @@ handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, `rig
 > interactivity orthogonal). `agent-tools` = WHAT (the catalog), `rig` = HOW (installs it).
 
 ---
+
+<details>
+<summary>📜 <b>Session transcript — 2026-06-15 / 06-16 handoff state</b> (landed-work logs + superseded next-actions/in-flight/open-PR snapshots; click to expand)</summary>
 
 ## ✅ Done (this session, 2026-06-15)
 
@@ -229,6 +237,8 @@ before acting — items 1–4 + 6's #18 LANDED later in this same 2026-06-16 ses
   alex-mextner/tg-cli#31 — NOT mass-suppressed; the self-gate goes green on main once #31 lands.
 
 ---
+
+</details>
 
 ## 🗺️ Remaining work (prioritized)
 
@@ -607,6 +617,9 @@ packaging systemic), #33 (lib-advertise). SYSTEMIC TODO → `lib/pyproject.toml`
   not from an unrelated product repo.
 
 ---
+
+<details>
+<summary>📜 <b>Session transcript — 2026-06-15 → 06-17 CTO feature sections</b> (~50 dated items: GHAS-parity, rig tmux/error-system/status, review-cli resilience/help/dashboard, task-cli, hooks-doctrine wave. Most shipped across the 06-16/06-17 merge waves; the authoritative open subset is the §Open-ticket ledger above. Click to expand.)</summary>
 
 ## 🆕 From the GHAS-parity analysis (2026-06-15, tg#3777/#3779/#3780)
 
@@ -1368,6 +1381,8 @@ cross-harness). Tracking: skills/universal + agent-hooks + lib/providers + rig p
 
 ---
 
+</details>
+
 ## ✅ Done (2026-06-18) — enforcement-doctrine + review-resilience wave landed; CTO #4133 migration COMPLETE
 
 *All PRs below verified MERGED on each repo's `origin/main` via `gh pr view <N> -R <repo> --json
@@ -1449,3 +1464,42 @@ Each agent runs in its OWN forum topic (`message_thread_id`):
   (a "mirror this existing UX" pointer) that **did not arrive**. The exact `/new` clarification UX to
   mirror must be confirmed with the CTO before implementation — do not guess the flow.
 - **Tracking:** tg-cli (new issue, or extend tg-cli#27 `/new`) + tg-ctl routing.
+
+## ✅ Done (2026-06-19) — security-bypass follow-ups + review-cli lint gate + worktree sweep
+
+*All PRs verified MERGED on each repo's `origin/main`; the block-no-verify fixes re-probed against the
+merged hook (feeding `{"args":{"command":…}}`, the shape the hook actually reads). Snapshot 2026-06-19.*
+
+- ✅ **agent-tools #71** (`0f6da0e`) — block-no-verify: close the `sudo -u git git commit --no-verify`
+  value-flag bypass (the `-u` value `git` was mis-read as the executable) **and** the symmetric
+  over-block of benign commands carrying a `commit`/`mergeCommit` substring. Post-merge probe 8/8.
+- ✅ **agent-tools #72** (`85d4603`) — block-no-verify: gate `runuser`'s `-u user [--] command`
+  direct-exec form (the sudo sibling), value-flags from authoritative man7. The su-compatible
+  positional form passes args to the shell (not a direct exec) so it is intentionally left ungated —
+  caught by the gate-review after an over-gating first revision was reverted. 4 review rounds.
+- ✅ **review-cli #51** (`72766eb`) — add a pinned-`ruff` CI `lint` job (none existed) + fix the 13
+  latent errors + add `--retry` to `_VALUE_TAKING_OPTS` (with a behavioral pre-scan test). CI lint job
+  green; post-merge `ruff check .` clean.
+- ✅ **Resolved by investigation — no code change shipped (analysis recorded on the tasks):**
+  - *ship.sh per-worktree dirty-check (#38)* — already safe: removal happens only in `cleanup()`, which
+    gates `--force` on `git status` rc==0 AND empty; the preflight conflation removes nothing. A blanket
+    preflight abort was tried and **reverted** (it regressed the "broken worktree must not block merge" test).
+  - *review-gate ↔ review-tool `git diff` pin (rtk fragility)* — already pinned: both sides use the
+    identical `git diff --no-ext-diff --cached`; the agent-tools hook is mtime-based (no diff hash);
+    review-cli execs git via subprocess (rtk's shell rewrite never fires). Not a live risk.
+- ✅ **Orphan-worktree sweep** — rig-cli 8→5, review-cli 2→1. Removed 3 confirmed-merged orphans (patches
+  backed up); **kept 6 worktrees holding genuine UNSHIPPED work** (`feat/resumable-sessions`,
+  `feat/gh-repo-settings-autonomous`, `feat/rig-github-provision-autonomous` [17 uncommitted files],
+  `rig-gitignore`, `fix/tmux-socket-leak-regression-hermetic`) — these need CTO triage (finish vs abandon),
+  NOT an orphan sweep.
+
+### Still open after 2026-06-19 (each assessed, deferred with cause)
+
+- **review-cli per-provider opencode auth probe** — `backend_available()` only checks the `opencode`
+  binary, not commandcode/zai provider auth. Fix is delicate (a false-negative prunes good seats from the
+  review pool); needs opencode's auth-storage semantics + a configured/unconfigured test host to verify.
+- **runuser su-positional form** — ungated by design (args go to the shell, not exec); best-effort, like
+  `unshare`/`nsenter`/`bash -c`.
+- **Watches:** continuum autosave start-race; opencode permission-schema floor — observational.
+- **HOLD-for-CTO:** the forum-topics `/new` UX (needs the missing screenshot); `tg` deploy / inline buttons.
+- **6 kept worktree branches** (above) — CTO triage.
