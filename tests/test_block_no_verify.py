@@ -752,9 +752,34 @@ def test_allow_harmless_export(command, monkeypatch):
 # ── FAIL-CLOSED: unparseable / malformed input still DENIES ───────────────────────────────────
 
 def test_unbalanced_quotes_fail_closed(monkeypatch):
-    """An unparseable command (unbalanced quote) cannot be inspected → BLOCK (fail-closed)."""
+    """An unparseable command that COULD be a git commit/push (has both tokens) still fail-closes."""
     out, code = _run("git commit -m 'unterminated --no-verify", monkeypatch)
     assert code == bnv.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_unparseable_non_git_command_allowed(monkeypatch):
+    """#40: an unparseable command that CANNOT be the gated case — no `git`+`commit`/`push` tokens —
+    must NOT fail-closed. Failing closed there was pure over-block: a `tg` report whose HTML body
+    made shlex unparseable got blocked live. A git-commit/push-shaped unparseable command still
+    fail-closes (test above)."""
+    # unbalanced quote + HTML, no git/commit/push → allow (was: blocked)
+    out, code = _run("tg --tag report 'oops <code>x</code> unterminated", monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+    # has 'push' but no 'git' → needs BOTH → allow
+    out, code = _run("echo 'unterminated push notification", monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+    # git + push but unparseable → STILL fail-closed (the gate is not weakened)
+    out, code = _run("git push origin 'unterminated --no-verify", monkeypatch)
+    assert code == bnv.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_plausible_git_commit_or_push_helper():
+    """The cheap raw scan requires BOTH a git token AND a commit/push token (word-boundaried)."""
+    assert bnv._plausible_git_commit_or_push("git commit --no-verify")
+    assert bnv._plausible_git_commit_or_push("sudo GIT push origin")
+    assert not bnv._plausible_git_commit_or_push("tg report about a commit")  # no git
+    assert not bnv._plausible_git_commit_or_push("git status")  # no commit/push
+    assert not bnv._plausible_git_commit_or_push("legitimate --no-verify flag")  # neither
 
 
 def test_malformed_event_fail_closed(monkeypatch):

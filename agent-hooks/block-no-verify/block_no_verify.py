@@ -954,6 +954,26 @@ def find_bypass(command: str) -> str | None:
     return _find_bypass(command, 0)
 
 
+def _plausible_git_commit_or_push(command: str) -> bool:
+    """Cheap raw scan used ONLY on the fail-closed path: could this command possibly BE a gated
+    `git commit`/`git push`? It must mention a `git` token AND a `commit`/`push` token (word-
+    boundaried, case-insensitive). A command lacking either CANNOT be the gated case. Deliberately
+    permissive — ANY `git` + ANY `commit`/`push` anywhere — so a genuinely-unparseable real commit
+    still fails closed."""
+    low = command.lower()
+    return bool(re.search(r"\bgit\b", low)) and bool(re.search(r"\b(?:commit|push)\b", low))
+
+
+def _looks_obfuscated(command: str) -> bool:
+    """An `env -S '…'` / `--split-string` re-tokenizes an arbitrary string into argv — it can HIDE a
+    `git commit --no-verify` inside a form where the raw `_plausible_git_commit_or_push` scan never
+    sees the tokens. So when the precise parse FAILS, the mere presence of that construct means we
+    cannot rule out a concealed bypass and must fail CLOSED, even with no visible `git`/`commit`.
+    This is the obfuscation case the gate must never wave through (codex), kept DISTINCT from a plain
+    command whose quoting is merely awkward (#40)."""
+    return bool(re.search(r"\benv\b[^\n]*(?:-S\b|--split-string)", command))
+
+
 def main() -> int:
     try:
         event = json.load(sys.stdin)
@@ -969,10 +989,21 @@ def main() -> int:
 
     try:
         message = find_bypass(command)
-    except Exception as exc:  # noqa: BLE001 — fail-closed: any inspection failure DENIES
-        warn(f"could not inspect the command: {exc} — blocking (fail-closed)")
-        emit("block", "block-no-verify: could not inspect the command (fail-closed)")
-        return BLOCK_EXIT_CODE
+    except Exception as exc:  # noqa: BLE001 — inspection failed; decide by a cheap raw scan
+        # The precise parse blew up (unbalanced quotes / exotic content). Two DISTINCT cases:
+        #  • OBFUSCATION via `env -S '…'`/`--split-string` (incl. its NESTED form — that nesting is
+        #    the only thing that drives the recursion-cap raise) could HIDE a bypass past the raw
+        #    scan → fail CLOSED, even with no visible git/commit (don't wave obfuscation through);
+        #  • a command that could plausibly be the gated case (`git` + `commit`/`push`) → fail CLOSED.
+        # Otherwise the parse failure is just awkward quoting on a benign command (e.g. a `tg` report
+        # with an HTML body) → ALLOW; blocking it was pure over-block (#40).
+        if _plausible_git_commit_or_push(command) or _looks_obfuscated(command):
+            warn(f"could not inspect a possible git commit/push or obfuscation: {exc} — blocking (fail-closed)")
+            emit("block", "block-no-verify: could not inspect the command (fail-closed)")
+            return BLOCK_EXIT_CODE
+        warn(f"unparseable but neither a git commit/push nor obfuscation ({exc}) — allowing")
+        emit("allow")
+        return 0
 
     if message:
         emit("block", message)
