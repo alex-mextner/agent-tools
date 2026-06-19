@@ -245,23 +245,23 @@ def test_known_limitation_nested_shell_string_not_gated(command, monkeypatch):
 
 @pytest.mark.parametrize("command", [
     "unshare git commit --no-verify",
-    "runuser -u git -- git commit --no-verify",
     "nsenter -t 1 -m -- git commit --no-verify",
     "chroot /path git commit --no-verify",
     "systemd-run git commit --no-verify",
 ])
 def test_known_limitation_unlisted_privilege_wrappers_not_gated(command, monkeypatch):
     """KNOWN LIMITATION (codex): `_WRAPPERS` is a best-effort, not exhaustive, set. Several util-linux
-    privilege/namespace wrappers (`unshare`, `runuser`, `nsenter`, `chroot`, `systemd-run`) are NOT in
-    it, so a commit wrapped in one is not peeled and not gated — the same precision trade as the
-    `bash -c` nested-shell-string limitation. The gate is PROCESS DISCIPLINE, not a security boundary:
-    an agent that wants to bypass it can already use `bash -c '…'` (also not gated), so chasing every
-    privilege wrapper is whack-a-mole with no security gain — and each addition carries real risk
-    (`setpriv` was added mid-review with an incomplete flag set and itself re-opened the #69 bypass).
-    Gating these correctly needs a deliberate, separately-reviewed pass (each has intricate operand
-    semantics: `nsenter -t PID -m --`, `runuser -u USER -g -s --`, `systemd-run`'s large flag set,
-    `chroot DIR`). PINNED so a silent change is caught; to gate one, add it to `_WRAPPERS` + its
-    value-flags + operand-drop COMPLETELY, with block AND allow tests — never half-add it."""
+    privilege/namespace wrappers (`unshare`, `nsenter`, `chroot`, `systemd-run`) are NOT in it, so a
+    commit wrapped in one is not peeled and not gated — the same precision trade as the `bash -c`
+    nested-shell-string limitation. (`sudo` and `runuser` — the two common privilege wrappers an agent
+    actually reaches for — ARE gated; see test_runuser_direct_exec_form_gated_positional_form_not.) The gate is
+    PROCESS DISCIPLINE, not a security boundary: an agent that wants to bypass it can already use
+    `bash -c '…'` (also not gated), so chasing every namespace wrapper is whack-a-mole with no security
+    gain — and each addition carries real risk (`setpriv` was added mid-review with an incomplete flag
+    set and itself re-opened the #69 bypass). Gating these correctly needs a deliberate, separately-
+    reviewed pass (each has intricate operand semantics: `nsenter -t PID -m --`, `systemd-run`'s large
+    flag set, `chroot DIR`). PINNED so a silent change is caught; to gate one, add it to `_WRAPPERS` +
+    its value-flags + operand-drop COMPLETELY, with block AND allow tests — never half-add it."""
     out, code = _run(command, monkeypatch)
     assert code == 0 and _decision(out) == "allow", command
 
@@ -846,6 +846,62 @@ def test_crux_per_wrapper_value_flags_no_boolean_collision(monkeypatch):
     assert bnv.find_bypass("nice -n 10 git commit --no-verify") is not None
     assert bnv.find_bypass("sudo -s ls") is None
     assert bnv.find_bypass("timeout -s TERM ls") is None
+    # runuser: `-s` is its SHELL-path VALUE flag (boolean for sudo, signal-value for timeout — three
+    # different meanings for the same letter), and its booleans (`-l`/`-f`/`-m`/`-p`/`-P`) must NOT
+    # eat the wrapped git. Pin both so a future flag edit to the new wrapper can't regress silently.
+    assert bnv.find_bypass("runuser -s /bin/sh -u git -- git commit --no-verify") is not None
+    assert bnv.find_bypass("runuser -l -u git -- git commit --no-verify") is not None
+    assert bnv.find_bypass("runuser -s /bin/sh -u alice -- ls") is None
+
+
+def test_runuser_direct_exec_form_gated_positional_form_not(monkeypatch):
+    """RUNUSER, the privilege sibling of sudo. Only its `-u user [--] command` form DIRECTLY execs the
+    command (the same #69 class as `sudo -u git git commit`): `-u` consumes the user value (even when
+    literally `git`), an optional `--` is skipped, the real `git commit` is reached and BLOCKED. The
+    su-compatible `[-] user [args]` form passes its trailing args to the user's login SHELL rather than
+    exec'ing them, so `runuser alice git commit --no-verify` does NOT run `git commit` — it is NOT a
+    bypass and is intentionally left ungated (gating it would add only over-block; its exact exec
+    semantics are version/shell-dependent and unverifiable on this host). `-c`/`--command` carry a
+    command STRING, out of scope like `bash -c`."""
+    # `-u user [--] command` direct-exec form → BLOCK (commit + push, -n + --no-verify, with/without --).
+    assert bnv.find_bypass("runuser -u git -- git commit --no-verify") is not None
+    assert bnv.find_bypass("runuser -u alice git commit --no-verify") is not None
+    assert bnv.find_bypass("runuser -u git -- git push --no-verify") is not None
+    assert bnv.find_bypass("runuser -g git -u alice git commit -n") is not None
+    # long `--user` form (separate value path) and the glued `--user=git` form. The `=` form blocks
+    # because the whole `--user=git` token is dropped as a flag (its value stays glued, never leaks as
+    # a bare `git`); pin both so a future `--flag=value` matching change can't silently over/under-block.
+    assert bnv.find_bypass("runuser --user git -- git commit --no-verify") is not None
+    assert bnv.find_bypass("runuser --user=git -- git commit --no-verify") is not None
+    # Each remaining value-flag's consumption is load-bearing: if one ever drops out of the set its
+    # value `git` would be read as the wrapped executable and the real `git commit` behind it would be
+    # MISSED (a bypass, not just over-block). Pin -G/--supp-group, -w/--whitelist-environment and
+    # --session-command (a value form `-c` lacks) so a future flag-list edit can't silently re-open it.
+    assert bnv.find_bypass("runuser -G git -u alice git commit -n") is not None
+    assert bnv.find_bypass("runuser --supp-group git -u alice git commit -n") is not None
+    assert bnv.find_bypass("runuser -w VAR=1 -u git -- git commit --no-verify") is not None
+    assert bnv.find_bypass("runuser --session-command x -u git -- git commit -n") is not None
+    # benign `-u` form → allow (no false positive)
+    assert bnv.find_bypass("runuser -u git -- git status") is None
+    assert bnv.find_bypass("runuser -u alice git commit -m ok") is None
+    # `-c`/`--command` STRING is out of scope (the command is inside the quoted value, like `bash -c`)
+    assert bnv.find_bypass("runuser -c 'git commit --no-verify' git") is None
+    # su-compatible POSITIONAL form: args go to the user's shell, not a direct exec → NOT gated.
+    # Pinned so a future operand-drop change can't silently start gating (over-blocking) this form.
+    assert bnv.find_bypass("runuser alice git commit --no-verify") is None
+    assert bnv.find_bypass("runuser alice git status") is None
+    assert bnv.find_bypass("runuser deploy ./release.sh") is None
+    assert bnv.find_bypass("runuser - alice git commit --no-verify") is None   # bare login-dash form
+    assert bnv.find_bypass("runuser git git commit --no-verify") is None       # user literally `git`
+    # NARROW residual over-block: a user literally named `git` with a command whose name (`commit`) is
+    # a git subcommand is indistinguishable from `git commit` at argv[0]. `git` is a common username,
+    # but a command literally named `commit`/`push` is near-nonexistent, so this is accepted + pinned.
+    assert bnv.find_bypass("runuser git commit --no-verify") is not None
+    # full hook path: the direct-exec vector BLOCKS, the positional form ALLOWS.
+    out, code = _run("runuser -u git -- git commit --no-verify", monkeypatch)
+    assert code == bnv.BLOCK_EXIT_CODE and _decision(out) == "block"
+    out, code = _run("runuser alice git commit --no-verify", monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
 
 
 if __name__ == "__main__":  # pragma: no cover

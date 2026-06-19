@@ -91,6 +91,12 @@ _WRAPPERS = frozenset({
     # CPU-affinity / scheduling / privilege / lock wrappers that also prefix the REAL command — the
     # same #69 class (`taskset -c 0 git commit --no-verify` was a bypass: argv[0] != git -> allow).
     "taskset", "chrt", "setpriv", "flock",
+    # `runuser` is the privilege sibling of `sudo`: its `-u user [--] command` form DIRECTLY execs the
+    # command, so `runuser -u git -- git commit --no-verify` slipped (argv[0] != git -> allow). Gated
+    # like sudo via the value-flags below (the `-u` user value is consumed, the real `git` reached). Its
+    # su-compatible `[-] user [args]` form is NOT gated — those args go to the user's shell, not a direct
+    # exec, so it's a best-effort limitation like `unshare`/`nsenter` (see _MANDATORY_OPERAND comment).
+    "runuser",
 })
 # Cap on stacked wrappers (`timeout sudo nice git …`). Far above any real invocation; past it we fail
 # CLOSED (see ``_strip_wrappers``) — a pathological wrapper chain is obfuscation, not a real command.
@@ -105,8 +111,14 @@ _OPERAND_DROP_WRAPPERS = frozenset({"timeout", "taskset", "chrt", "flock"})
 # Operand-drop wrappers whose leading positional operand is a MANDATORY ARBITRARY string that can
 # legitimately be `git` (flock's lockfile is any path). For these the operand is dropped even when it
 # is literally `git` — the `_is_git_executable` guard would otherwise leave `flock git git commit
-# --no-verify` a bypass (codex). For the others (timeout/taskset/chrt) the operand must parse as a
-# number/mask, so the guard safely keeps a bare `git`-the-command from being eaten.
+# --no-verify` a bypass (codex). For timeout/taskset/chrt the operand must parse as a number/mask, so
+# the guard safely keeps a bare `git`-the-command from being eaten. `runuser` is NOT here (nor in
+# operand-drop): only its `-u user [--] command` form DIRECTLY execs the command (the sudo-like vector,
+# gated by the `-u`/value-flags above). Its su-compatible `[-] user [args]` form passes the trailing
+# args to the user's LOGIN SHELL rather than exec'ing them, so `runuser alice git commit --no-verify`
+# does not itself run `git commit` — gating it would add only over-block with no bypass closed, and its
+# exact exec semantics are version/shell-dependent (not verifiable on this host). It is left ungated as
+# a documented best-effort limitation, like `unshare`/`nsenter`/`chroot` and `bash -c '…'`.
 _MANDATORY_OPERAND_WRAPPERS = frozenset({"flock"})
 # INVARIANT (symmetric with the value-flag one below): every operand-drop wrapper must be a recognized
 # wrapper, else its entry is dead config and a wrapper "added to operand-drop but forgotten in
@@ -205,6 +217,16 @@ _WRAPPER_VALUE_FLAGS: dict[str, frozenset[str]] = {
     # left `chrt -d -T 10000 -P 30000 -D 300000 git commit --no-verify` a bypass — the half-added
     # wrapper trap again (codex). The short T/P/D do not collide with the boolean policy letters.
     "chrt": frozenset({"-T", "--sched-runtime", "-P", "--sched-period", "-D", "--sched-deadline"}),
+    # `runuser [options] -u user [[--] command]` / su-compatible `runuser [options] [-] user [args]`.
+    # ALL separate-operand options (man7 runuser.1), or a missing one shifts the parse (the #69 class).
+    # `-c/--command`/`--session-command` take a command STRING (out of scope, like `bash -c`) but STILL
+    # consume their value, so they MUST be listed or the next token is misread. `-u/--user` is the
+    # value form the bypass used (`runuser -u git -- git commit --no-verify`); the bare `-`/`-l`/`-f`/
+    # `-m`/`-p`/`-P` flags are boolean and intentionally absent.
+    "runuser": frozenset({
+        "-c", "--command", "--session-command", "-g", "--group", "-G", "--supp-group",
+        "-s", "--shell", "-u", "--user", "-w", "--whitelist-environment",
+    }),
 }
 # INVARIANT: every wrapper carrying value-flags MUST also be a recognized wrapper — otherwise
 # `_strip_wrappers` never peels it (it checks `_basename(argv[0]) in _WRAPPERS`), its value-flags
