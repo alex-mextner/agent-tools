@@ -1492,6 +1492,20 @@ merged hook (feeding `{"args":{"command":…}}`, the shape the hook actually rea
   `feat/gh-repo-settings-autonomous`, `feat/rig-github-provision-autonomous` [17 uncommitted files],
   `rig-gitignore`, `fix/tmux-socket-leak-regression-hermetic`) — these need CTO triage (finish vs abandon),
   NOT an orphan sweep.
+- ✅ **agent-tools #73** (`0229a0e`) — ROADMAP archival: folded the 06-15→06-17 transcript into collapsed
+  `<details>` (additions-only, content preserved) so the file reads as a roadmap, not a transcript.
+- ✅ **tg-cli #44** (`790a562`) — **tg-ctl "Claude Code not in tmux" daemon bug, fixed + DEPLOYED.** The
+  launchd daemon intermittently read an EMPTY `tmux list-panes` (exit 0, no panes — a momentary connect to
+  the wrong/empty server), silently degraded EVERY inbound message to the misleading "not in tmux" reply
+  and idle-exit-thrashed every 30 min, despite live agent panes (discovery code + env verified correct;
+  unreproducible from a TTY). `panesWithRetry` retries ONLY that flake (exit-0+empty), never a non-zero
+  exit (no-server steady state — would block the daemon ~240ms/msg). 8 unit tests, 4 review rounds.
+  Deployed: installed checkout `~/.files/repos/tg-cli` refreshed, daemon restarted, live `discovery=ok`.
+- ✅ **tg-cli #45** (`2157f09`) — **forum-topics mode, FOUNDATION (increment 1/4)** (CTO "делай", no
+  screenshot needed). Spec + pure core (types, binding store, lifecycle state machine, model catalog,
+  Cyrillic-aware slug) + leak-safe `stepUpdates` routing behind `topicsEnabled` (default OFF). 29 tests,
+  6 review rounds. Increments 2-4 (the entrypoint executor: agent spawn + `/new` button UX + per-topic
+  routing + outbound threading) remain — the spec is the contract. See task #31.
 
 ### Still open after 2026-06-19 (each assessed, deferred with cause)
 
@@ -1500,6 +1514,12 @@ merged hook (feeding `{"args":{"command":…}}`, the shape the hook actually rea
   review pool); needs opencode's auth-storage semantics + a configured/unconfigured test host to verify.
 - **runuser su-positional form** — ungated by design (args go to the shell, not exec); best-effort, like
   `unshare`/`nsenter`/`bash -c`.
-- **Watches:** continuum autosave start-race; opencode permission-schema floor — observational.
-- **HOLD-for-CTO:** the forum-topics `/new` UX (needs the missing screenshot); `tg` deploy / inline buttons.
+- **Watches:** opencode permission-schema floor — observational. (The continuum/CC-outside-tmux flap that
+  fed the autosave watch is addressed by the tg-ctl #44 discovery-resilience fix above.)
+- **forum-topics increments 2-4** — the executor (agent spawn + `/new` path/model button UX + per-topic
+  routing + outbound threading + lifecycle polish). Foundation shipped (#45); the spec is the contract.
+  Awaiting CTO go-ahead to build increment 2 now (it spawns agents + drives a UX — confirmed before building).
+- **block-no-verify fail-closed over-block (#40)** — a benign non-git command with unparseable quoting
+  (a `tg` report with an HTML body) fail-closes; do a cheap "is there a git commit/push at all?" pre-check
+  before failing closed. Caught live this session.
 - **6 kept worktree branches** (above) — CTO triage.
