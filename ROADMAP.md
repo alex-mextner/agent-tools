@@ -242,6 +242,17 @@ before acting — items 1–4 + 6's #18 LANDED later in this same 2026-06-16 ses
 
 ## 🗺️ Remaining work (prioritized)
 
+### review qa — agent-as-tester mode for review-cli
+
+Spec SHIPPED (review-cli `docs/specs/review-qa.md`, PR #52, 6-agent workflow design + adversarial critique). Implementation NOT started — the spec's §11 / its own "open issues — resolve before building" list are blocking for an implementer. Phased build:
+
+- **Ship the mode skeleton + suites gate first** because it is the smallest verifiable slice and proves the registry wiring: new `reviewlib/modes/qa.py` (`MODE = ModeSpec(name="qa", diff_policy="none", aliases=("test",))`), one import + one entry in `reviewlib/modes/registry.py:34`, no `cli.py` dispatch surgery. Add `EXIT_QA_NO_SUITES=5` (next free after the verified 3/4) and the no-suites 3-part WHAT/WHY/HOW gate (mirror `_fail_not_a_repo`, `cli.py:104`); a green run with no authored cases is a lie.
+- **Add the write/exec executor next** because qa is the FIRST mode needing a non-read-only agent — it must NOT ride `run_panel`/the board (codex `-s read-only` at `backends.py:74`, opencode deny-all at `backends.py:233`). New `reviewlib/qa/executor.py` spawns ONE backend (claude default; codex `-s workspace-write --full-auto` alternate; opencode out of v1) in an isolated `git worktree add` of the SUT (`--in-place` escape hatch), single-seat. Comment the deliberate exception next to `_READONLY_AGENT_DENIED_PERMISSIONS`; carve out the long timeout (qa is `panel_mode` at `cli.py:1579` → would get the short `PANEL_TIMEOUT_DEFAULT`).
+- **Backend SUT against an existing stage before any harness** because it needs zero new repos: deterministic `reviewlib/qa/env.py` (stage-detect → reuse-if-reachable → never-tear-down-what-you-didn't-bring-up; else `EXIT_QA_NO_ENV=6`), then compose bring-up + health gate (`EXIT_QA_ENV_UNHEALTHY=7`) reusing the `ext-test-projects/e2e/docker-compose.e2e.yml` `-p`-namespaced pattern, guaranteed teardown via `reviewlib/backstop.py`.
+- **web/ext Playwright harness is a SEPARATE prerequisite** because rig cannot clone external repos (`riglib/catalog.py:48` scans only skills/agent_hooks/git_hooks/ci/mcp): create `alex-mextner/vscode-playwright` by selective copy from private `hyperide/hyper-ext-e2e` `e2e/` (generalize `launchVSCode`, drop HyperIDE specifics — needs human curation), ship it as an agent-tools skill via its own `install.sh`. Drive ext via `launchVSCode()`+CDP `window.screenshot` (never `screencapture`), web via the `agent-browser` skill.
+- **bot harness last, Tier-1 hermetic only for v1** because real-Telegram driving needs unprovisioned credentials: a mock Bot-API server the SUT polls via `TG_API_BASE` (verified honored by `tg-ctl:2169`). PREREQUISITE filed against tg-cli: make the `tg` OUTBOUND sender honor `TG_API_BASE` (currently hardcoded at `tg:610`) so captured `sendMessage` works. Tier 2 (Telethon MTProto + agent-browser Telegram Web, dedicated test account, fail-closed on real `TG_CHAT_ID`) deferred until credentials exist.
+- See docs/specs/review-qa.md §11 for the open CTO decisions (tester backend, isolation default, single-seat, seeding subset, rig Option A vs B, suite format, bot credentials, k3s).
+
 ### 1. task-cli (after foundation lands)
 
 - **Phase 1** (foundation, in-flight): Python CLI — backends (GitHub Issues default, Linear per-repo)
