@@ -722,7 +722,10 @@ def _block() -> int:
         f"address its findings before committing. (Set/touch {marker} on a successful "
         "review, set REVIEW_MARKER, or — for a genuine exception — skip per-commit with "
         "`REVIEW_SKIP=1 git commit …` or a `[skip-review: <reason>]` message trailer. "
-        "Docs-only commits are allowed without review.)",
+        "A PURE-docs commit auto-allows — but only the simple form: `git commit -a`/`-am`, "
+        "a trailing pathspec, or a preceding `git add` of other files FORFEITS that fast-path "
+        "(the commit may include un-reviewed non-docs changes), so a docs-only diff can still "
+        "land here — stage just the docs and `git commit` them alone, or skip as above.)",
     )
     return BLOCK_EXIT_CODE
 
