@@ -331,6 +331,374 @@ def test_cleanup_guard_leaves_worktree_dirtied_after_preflight(repo_with_pr_work
     assert str(wt) in remaining, f"dirty worktree was unlinked at cleanup:\n{remaining}"
 
 
+# ---------------------------------------------------------------------------------------
+# Version-bump gate: a ship of shippable SOURCE must bump the declared version (skill:
+# bump-version-on-release). The canonical failure is a version that never moves across
+# releases (`rig --version` stuck on a hardcoded 0.1.0). These tests pin the four required
+# behaviours: source-change-without-bump is BLOCKED; with-bump PASSES; a docs-only PR is NOT
+# required to bump; the override works with a reason.
+# ---------------------------------------------------------------------------------------
+
+# A fake `gh` that lets the test drive both `gh pr diff --name-only` (changed paths) and the
+# full `gh pr diff` patch, via env vars — so the version-bump gate sees exactly the shape
+# under test. SHIP_TEST_NAME_ONLY = newline list of changed paths; SHIP_TEST_PATCH = the full
+# unified diff text. (--skip-ci so the CI rollup isn't queried; review-threads -> 0.)
+_FAKE_GH_VBUMP = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        else
+          echo '[]'
+        fi ;;
+      diff)
+        if printf '%s ' "$@" | grep -q -- --name-only; then
+          printf '%s' "${SHIP_TEST_NAME_ONLY:-src/a.py}"
+        else
+          printf '%s' "${SHIP_TEST_PATCH:-}"
+        fi ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged" ;;
+      *) : ;;
+    esac ;;
+  api) echo 0 ;;
+  *) : ;;
+esac
+"""
+
+
+def _fake_gh_vbump_dir(tmp_path: Path) -> Path:
+    bindir = tmp_path / "binvb"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_VBUMP, encoding="utf-8")
+    gh.chmod(0o755)
+    return bindir
+
+
+@pytest.fixture
+def repo_with_pyproject(tmp_path):
+    """A repo on `main` carrying a pyproject.toml with a version, branch `feat` in a worktree,
+    and an origin remote. The version-bump gate auto-detects pyproject.toml at the root."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+
+    main = tmp_path / "main"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    (main / "pyproject.toml").write_text(
+        '[project]\nname = "mytool"\nversion = "0.4.1"\n', encoding="utf-8"
+    )
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", "feat", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+    wt = tmp_path / "wt-feat"
+    _git("worktree", "add", "-q", str(wt), "feat", cwd=main)
+    return main, wt
+
+
+def _run_ship_vbump(main, bindir, *, name_only, patch, extra_args=(), env_extra=None):
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_TEST_NAME_ONLY"] = name_only
+    env["SHIP_TEST_PATCH"] = patch
+    if env_extra:
+        env.update(env_extra)
+    return _sh(
+        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", *extra_args,
+        cwd=main, env=env,
+    )
+
+
+# A PR diff that BUMPS pyproject's version (0.4.1 -> 0.4.2) alongside a source change.
+_PATCH_WITH_BUMP = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/pyproject.toml b/pyproject.toml\n"
+    "--- a/pyproject.toml\n+++ b/pyproject.toml\n"
+    '@@ -3 +3 @@\n-version = "0.4.1"\n+version = "0.4.2"\n'
+)
+
+# A PR diff that changes source but does NOT touch the version line.
+_PATCH_NO_BUMP = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+)
+
+# A docs-only PR diff (README only — no shippable source, no version change).
+_PATCH_DOCS_ONLY = (
+    "diff --git a/README.md b/README.md\n"
+    "--- a/README.md\n+++ b/README.md\n"
+    "@@ -1 +1,2 @@\n # x\n+more docs\n"
+)
+
+
+def test_source_change_without_version_bump_is_blocked(repo_with_pyproject, tmp_path):
+    """A PR that changes shippable source but leaves the declared version unchanged must be
+    REFUSED — this ship is a release, the version must move."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(main, bindir, name_only="src/a.py", patch=_PATCH_NO_BUMP)
+
+    assert r.returncode != 0, f"ship should refuse a source change with no version bump\n{r.stdout}\n{r.stderr}"
+    assert "version in pyproject.toml is UNCHANGED" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_source_change_with_version_bump_passes(repo_with_pyproject, tmp_path):
+    """A PR that changes shippable source AND bumps the version passes the gate and merges."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main, bindir, name_only="src/a.py\npyproject.toml", patch=_PATCH_WITH_BUMP
+    )
+
+    assert r.returncode == 0, f"ship should pass with a version bump\n{r.stdout}\n{r.stderr}"
+    assert "version-bump gate OK" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_docs_only_pr_is_not_required_to_bump(repo_with_pyproject, tmp_path):
+    """A docs-only PR (no shippable source) must NOT be forced to bump the version."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(main, bindir, name_only="README.md", patch=_PATCH_DOCS_ONLY)
+
+    assert r.returncode == 0, f"docs-only PR must not be blocked\n{r.stdout}\n{r.stderr}"
+    assert "no shippable source" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_version_bump_override_with_reason(repo_with_pyproject, tmp_path):
+    """The --no-version-bump-ok <reason> override lets a genuine no-release ship of source
+    through (e.g. a revert), recording the reason — and merges."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main, bindir, name_only="src/a.py", patch=_PATCH_NO_BUMP,
+        extra_args=("--no-version-bump-ok", "pure revert of #99, no behavior change"),
+    )
+
+    assert r.returncode == 0, f"override should allow the ship\n{r.stdout}\n{r.stderr}"
+    assert "version-bump gate OVERRIDDEN" in r.stdout, r.stdout
+    assert "pure revert of #99" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_version_bump_override_via_env(repo_with_pyproject, tmp_path):
+    """SHIP_SKIP_VERSION_BUMP=1 is the env-driven equivalent of the override flag."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main, bindir, name_only="src/a.py", patch=_PATCH_NO_BUMP,
+        env_extra={"SHIP_SKIP_VERSION_BUMP": "1"},
+    )
+
+    assert r.returncode == 0, f"env override should allow the ship\n{r.stdout}\n{r.stderr}"
+    assert "version-bump gate OVERRIDDEN" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_no_version_file_skips_gate(repo_with_pr_worktree, tmp_path):
+    """A repo with no pyproject.toml/package.json at the root: the gate has nothing to check,
+    so it skips (does not block) — and ship still merges."""
+    main, _wt = repo_with_pr_worktree  # this fixture has only README.md, no version file
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(main, bindir, name_only="src/a.py", patch=_PATCH_NO_BUMP)
+
+    assert r.returncode == 0, f"no version file -> gate skips\n{r.stdout}\n{r.stderr}"
+    assert "no version file" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+# A PR diff that touches the version LINE cosmetically (quote style) WITHOUT changing the
+# value — must NOT count as a bump (the value must actually move).
+_PATCH_COSMETIC_VERSION = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n+++ b/src/a.py\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/pyproject.toml b/pyproject.toml\n"
+    "--- a/pyproject.toml\n+++ b/pyproject.toml\n"
+    "@@ -3 +3 @@\n-version = \"0.4.1\"\n+version  =  \"0.4.1\"\n"
+)
+
+
+def test_cosmetic_version_edit_is_not_a_bump(repo_with_pyproject, tmp_path):
+    """A whitespace/quote-only edit to the version line, with the VALUE unchanged, must be
+    treated as NOT bumped — the gate requires the version value to actually move, not merely
+    that a `+version` line appears in the diff."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main, bindir, name_only="src/a.py\npyproject.toml", patch=_PATCH_COSMETIC_VERSION
+    )
+
+    assert r.returncode != 0, f"cosmetic version edit must not pass as a bump\n{r.stdout}\n{r.stderr}"
+    assert "version in pyproject.toml is UNCHANGED" in r.stderr, r.stderr
+
+
+@pytest.fixture
+def repo_with_package_json(tmp_path):
+    """A repo whose version file is package.json (the Node path), to cover that code branch
+    independently of pyproject.toml."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+    main = tmp_path / "main"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    (main / "package.json").write_text(
+        '{\n  "name": "mytool",\n  "version": "1.0.0"\n}\n', encoding="utf-8"
+    )
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", "feat", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+    wt = tmp_path / "wt-feat"
+    _git("worktree", "add", "-q", str(wt), "feat", cwd=main)
+    return main, wt
+
+
+_PATCH_PKGJSON_BUMP = (
+    "diff --git a/src/a.js b/src/a.js\n"
+    "--- a/src/a.js\n+++ b/src/a.js\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+    "diff --git a/package.json b/package.json\n"
+    "--- a/package.json\n+++ b/package.json\n"
+    '@@ -3 +3 @@\n-  "version": "1.0.0"\n+  "version": "1.0.1"\n'
+)
+_PATCH_PKGJSON_NO_BUMP = (
+    "diff --git a/src/a.js b/src/a.js\n"
+    "--- a/src/a.js\n+++ b/src/a.js\n"
+    "@@ -1 +1 @@\n-old\n+new\n"
+)
+
+
+def test_package_json_source_without_bump_is_blocked(repo_with_package_json, tmp_path):
+    """The package.json (Node) code path: source change with no version bump is BLOCKED."""
+    main, _wt = repo_with_package_json
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(main, bindir, name_only="src/a.js", patch=_PATCH_PKGJSON_NO_BUMP)
+
+    assert r.returncode != 0, f"package.json source w/o bump must be blocked\n{r.stdout}\n{r.stderr}"
+    assert "version in package.json is UNCHANGED" in r.stderr, r.stderr
+
+
+def test_package_json_with_bump_passes(repo_with_package_json, tmp_path):
+    """The package.json (Node) code path: a real version bump passes the gate and merges."""
+    main, _wt = repo_with_package_json
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main, bindir, name_only="src/a.js\npackage.json", patch=_PATCH_PKGJSON_BUMP
+    )
+
+    assert r.returncode == 0, f"package.json bump should pass\n{r.stdout}\n{r.stderr}"
+    assert "version-bump gate OK" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_mixed_docs_and_source_without_bump_is_blocked(repo_with_pyproject, tmp_path):
+    """A PR mixing a docs change AND a shippable source change, with no version bump, must
+    still be BLOCKED — one shippable path is enough to make the ship a release."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    r = _run_ship_vbump(
+        main, bindir, name_only="README.md\nsrc/a.py", patch=_PATCH_NO_BUMP
+    )
+
+    assert r.returncode != 0, f"mixed docs+source w/o bump must be blocked\n{r.stdout}\n{r.stderr}"
+    assert "version in pyproject.toml is UNCHANGED" in r.stderr, r.stderr
+
+
+def test_ci_only_pr_is_not_required_to_bump(repo_with_pyproject, tmp_path):
+    """A pure-CI PR (e.g. a GitLab CI config) is exempt — CI-only is not a release."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    patch = (
+        "diff --git a/.gitlab-ci.yml b/.gitlab-ci.yml\n"
+        "--- a/.gitlab-ci.yml\n+++ b/.gitlab-ci.yml\n"
+        "@@ -1 +1,2 @@\n stages:\n+  - lint\n"
+    )
+    r = _run_ship_vbump(main, bindir, name_only=".gitlab-ci.yml", patch=patch)
+
+    assert r.returncode == 0, f"CI-only PR must not be blocked\n{r.stdout}\n{r.stderr}"
+    assert "no shippable source" in r.stdout, r.stdout
+
+
+def test_ship_version_files_override_locates_nested_manifest(tmp_path):
+    """SHIP_VERSION_FILES pins a non-standard version file; the gate checks THAT file. Here a
+    nested package's pyproject is the version source and a source change without bumping it is
+    blocked."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+    main = tmp_path / "main"
+    (main / "pkg").mkdir(parents=True)
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    (main / "pkg" / "pyproject.toml").write_text(
+        '[project]\nname = "m"\nversion = "2.0.0"\n', encoding="utf-8"
+    )
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", "feat", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+    _git("worktree", "add", "-q", str(tmp_path / "wt"), "feat", cwd=main)
+
+    bindir = _fake_gh_vbump_dir(tmp_path)
+    r = _run_ship_vbump(
+        main, bindir, name_only="pkg/app.py", patch=_PATCH_NO_BUMP,
+        env_extra={"SHIP_VERSION_FILES": "pkg/pyproject.toml"},
+    )
+
+    assert r.returncode != 0, f"pinned version file w/o bump must block\n{r.stdout}\n{r.stderr}"
+    assert "version in pkg/pyproject.toml is UNCHANGED" in r.stderr, r.stderr
+
+
 def test_dry_run_self_clean_does_not_warn_or_remove(repo_with_pr_worktree, tmp_path):
     """--dry-run from inside the PR worktree must NOT remove the tree and must NOT emit the
     caller-contract 'cwd is now gone' warning (the worktree is still there). Guards against

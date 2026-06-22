@@ -160,6 +160,11 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
 - there are **no unresolved review threads**;
 - a UI-touching PR carries an embedded **screenshot** (override with `--no-screenshot-ok
   <reason>`);
+- a PR that changes **shippable source** (not docs/test/CI) has **bumped the declared
+  version** (`pyproject.toml` `version` / `package.json` `"version"`) vs the PR base — a ship
+  of source is a release, so `--version` stays a real freshness signal instead of a stale
+  literal (skill: `bump-version-on-release`); override a genuine no-release ship with
+  `--no-version-bump-ok <reason>` or `SHIP_SKIP_VERSION_BUMP=1`;
 - the local branch has **no unpushed/diverged commits** and a **clean worktree**.
 
 Then it squash-merges, deletes the remote branch, removes the local worktree + branch (unless
