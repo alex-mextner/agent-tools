@@ -3,9 +3,9 @@
 
 When the agent is about to `git commit`, this checks the commit message (and the
 current branch name) for a reference to a tracking ticket — a task-cli id, a
-GitHub issue, or a Linear key. If none is found, it WARNS (default) or, in strict
-mode, BLOCKS, reminding the author that every non-trivial change should start from
-a ticket with acceptance criteria + motivation + user-impact.
+GitHub issue, or a Linear key. If none is found, it BLOCKS by default (strict),
+reminding the author that every non-trivial change should start from a ticket with
+acceptance criteria + motivation + user-impact.
 
 Enforces the `strict-ticket-discipline` skill. Pairs with task-cli.
 
@@ -22,15 +22,21 @@ Exempt from the gate (no ticket expected): trivial-chore commit types
 (`chore:`/`docs:`/`style:`/`ci:`/`build:`/`test:`), and `wip`/`fixup!`/`squash!`
 /`amend`/merge/revert commits. Configure via env (see README).
 
+Per-commit escapes (mirror the review-gate's REVIEW_SKIP), for the rare legit
+ticketless commit:
+  - a `[skip-ticket: <reason>]` trailer in the commit message, and
+  - an inline `REQUIRE_TICKET_SKIP=1 git commit …` env on the command.
+And `REQUIRE_TICKET_STRICT=0` is an explicit opt-out back to warn-only.
+
 Contract (agents-hooks/v1):
   stdin  : JSON event; the shell command is in args.command
   stdout : protocol JSON only
   exit 0 : allow      exit 10 : BLOCK      other : error (host on_error policy)
 
-on_error is "open": this is process discipline, not a security boundary — a crash
-in the check must never make committing impossible. By default it ALSO only warns
-(allows with an advisory message) even when it finds no ticket, so it can't
-over-block; set REQUIRE_TICKET_STRICT=1 to turn a missing ticket into a hard block.
+on_error is "open": a CRASH in the check still fails open — process discipline,
+not a security boundary, so a bug must never make committing impossible. But on a
+SUCCESSFUL run with no ticket reference and no exemption/escape, the default is now
+a hard BLOCK (exit 10). Set REQUIRE_TICKET_STRICT=0 to fall back to warn-only.
 """
 
 from __future__ import annotations
@@ -45,8 +51,31 @@ import sys
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
-# Strict mode turns a missing-ticket warning into a hard block.
-STRICT = os.environ.get("REQUIRE_TICKET_STRICT") == "1"
+# A STABLE marker embedded in every block message — a fixed string the task-cli Docker
+# test (and any external assertion) can grep for to confirm THIS gate blocked, regardless
+# of how the surrounding advice is reworded. Do not change it casually.
+BLOCK_MARKER = "[require-ticket] BLOCKED: no ticket reference"
+
+# Strict is now the DEFAULT: a missing ticket is a hard BLOCK. Set REQUIRE_TICKET_STRICT=0
+# (or false/no/off) to opt back out to warn-only. Any other value — including unset — is
+# strict. `os.environ.get(...)` here reads the HOOK's process env, which is the right
+# scope for a global on/off knob; the per-commit `REQUIRE_TICKET_SKIP=1 git commit` inline
+# escape is parsed from the COMMAND string instead (see has_inline_skip).
+_STRICT_FALSEY = frozenset({"0", "false", "no", "off"})
+STRICT = os.environ.get("REQUIRE_TICKET_STRICT", "1").strip().lower() not in _STRICT_FALSEY
+
+# Per-commit escape: a `[skip-ticket: <reason>]` trailer in the commit message. The reason
+# is mandatory (non-empty), so the escape is a deliberate, documented choice — not a blank
+# bypass. Mirrors the review-gate's `[skip-review: <reason>]`.
+# Require a NON-WHITESPACE reason between the colon and the closing bracket, so a blank
+# `[skip-ticket: ]` is not a valid escape (the reason must be a deliberate, real choice).
+SKIP_TICKET_TRAILER = re.compile(r"\[skip-ticket:\s*\S[^\]]*\]", re.IGNORECASE)
+
+# A leading `VAR=value` inline-env assignment on the command (`REQUIRE_TICKET_SKIP=1 git
+# commit …`). Mirrors the review-gate's inline `REVIEW_SKIP` parse: read from the COMMAND
+# the agent is about to run, NOT the hook's own process env.
+_INLINE_ENV = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
+_SKIP_FALSEY = frozenset({"", "0", "false", "no", "off"})
 
 GIT_COMMIT = re.compile(r"\bgit\b.*\bcommit\b")
 # `git commit --continue/--abort/--skip` (merge/rebase plumbing) and `--amend`
@@ -87,6 +116,7 @@ TICKET_PATTERNS = (
     re.compile(rf"\b{_KEY_NUM}\b"),                          # ABC-123 (Linear/Jira/task)
     re.compile(r"\btask\s*[:#]\s*\S+", re.IGNORECASE),      # task:ABC-12 / task #12
     re.compile(r"\bT-\d+\b"),                                # T-12 (short task id)
+    re.compile(r"\[ticket:\s*\S[^\]]*\]", re.IGNORECASE),  # [ticket: <id-or-slug>] trailer (non-blank)
     re.compile(
         rf"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|ref[s]?)\b[:\s]+{_REF}\b",
         re.IGNORECASE,
@@ -126,6 +156,48 @@ def is_exempt(message: str) -> bool:
         return True
     m = CONVENTIONAL.match(subject)
     return bool(m and m.group(1).lower() in EXEMPT_TYPES)
+
+
+def has_skip_trailer(message: str) -> bool:
+    """True when the commit message carries a `[skip-ticket: <reason>]` escape trailer."""
+    return bool(SKIP_TICKET_TRAILER.search(message))
+
+
+def has_inline_skip(command: str) -> bool:
+    """True when the FIRST `git commit` segment is prefixed with `REQUIRE_TICKET_SKIP=<truthy>`.
+
+    Reads the inline env on the COMMAND the agent is about to run (`REQUIRE_TICKET_SKIP=1 git
+    commit …`), not the hook's process env — mirroring the review-gate's `REVIEW_SKIP`. Scoped
+    to the leading assignments of the segment that contains `git commit`, so an assignment on a
+    SIBLING command (`REQUIRE_TICKET_SKIP=1 echo x; git commit …`) does NOT bypass the gate.
+    Falsey values (`0`/`false`/`no`/`off`/empty) are matched case-insensitively so they don't
+    accidentally skip. Best-effort: a tokenization failure → no skip (the commit stays gated)."""
+    for segment in re.split(r"&&|\|\||;|\|", command):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            continue
+        env: dict[str, str] = {}
+        rest = tokens
+        for idx, tok in enumerate(tokens):
+            m = _INLINE_ENV.match(tok)
+            if not m:
+                rest = tokens[idx:]
+                break
+            env[m.group(1)] = m.group(2)
+        else:
+            rest = []
+        # Only honor the assignment on the segment that actually runs `git commit`.
+        if not (rest and _is_git_executable(rest[0]) and "commit" in rest[1:]):
+            continue
+        if env.get("REQUIRE_TICKET_SKIP", "").strip().lower() not in _SKIP_FALSEY:
+            return True
+    return False
+
+
+def _is_git_executable(tok: str) -> bool:
+    """True when `tok` is the git binary — bare `git` or a path to it (`/usr/bin/git`)."""
+    return os.path.basename(tok) == "git"
 
 
 def commit_message_from_command(command: str, cwd: str | None = None) -> str:
@@ -272,6 +344,13 @@ def main() -> int:
     if is_exempt(message):
         return _allow()  # trivial chore / WIP / merge — no ticket expected
 
+    # Per-commit escapes (the deliberate, documented bypass for a legit ticketless commit):
+    # a `[skip-ticket: <reason>]` message trailer, or an inline `REQUIRE_TICKET_SKIP=1`.
+    if has_skip_trailer(message):
+        return _allow()  # explicit `[skip-ticket: …]` escape
+    if has_inline_skip(command):
+        return _allow()  # explicit inline `REQUIRE_TICKET_SKIP=1 git commit …` escape
+
     branch = current_branch(cwd)
     # Ticket detection is permissive: scan the message, the raw command (a ticket
     # id may ride in any flag, e.g. a -F path), and the branch name.
@@ -282,20 +361,29 @@ def main() -> int:
     ):
         return _allow()  # a ticket reference is present → proceed
 
-    advice = (
-        "No ticket reference found in this commit message or branch. Non-trivial "
-        "changes should start from a ticket (task-cli / GitHub Issue / Linear) with "
-        "acceptance criteria, motivation, and user-impact — then reference it in the "
-        "commit (e.g. `Refs #123`, `task:ABC-12`, `ENG-456`). If this is a trivial "
-        "chore, use a `chore:`/`docs:` type (exempt) or set REQUIRE_TICKET_EXEMPT_TYPES."
+    # The shared human-facing guidance — what's wrong and how to satisfy the gate. It carries NO
+    # marker: the stable BLOCK_MARKER must appear ONLY on a real block, so an external check that
+    # greps stdout for the marker (the task-cli Docker test) never gets a false positive on a
+    # warn-mode allow. The block path prepends the marker; the warn path uses the guidance alone.
+    guidance = (
+        "Non-trivial changes should start from a ticket "
+        "(task-cli / GitHub Issue / Linear) with acceptance criteria, motivation, and "
+        "user-impact — then reference it in the commit (e.g. `Closes #123`, `Fixes #4`, "
+        "`task:ABC-12`, `ENG-456`). If this is a trivial chore, use a `chore:`/`docs:` type "
+        "(exempt). Deliberate escape: add a `[skip-ticket: <reason>]` trailer or run "
+        "`REQUIRE_TICKET_SKIP=1 git commit …`; opt the whole gate back to warn-only with "
+        "REQUIRE_TICKET_STRICT=0."
     )
     if STRICT:
-        emit("block", advice)
+        # Marker LEADS the block message so an external assertion can grep one fixed string.
+        emit("block", f"{BLOCK_MARKER}. {guidance}")
         return BLOCK_EXIT_CODE
-    # Default: advisory. Surface the reminder but let the commit proceed so the
-    # gate can never over-block real work.
-    warn(advice)
-    emit("allow", advice)
+    # Warn-only opt-out: surface the reminder but let the commit proceed (and DON'T leak the
+    # BLOCK_MARKER — this is an allow). The advisory deliberately says "no ticket reference found",
+    # not "BLOCKED", so the marker is unambiguous proof of a real block.
+    advisory = f"No ticket reference found — committing anyway (warn-only). {guidance}"
+    warn(advisory)
+    emit("allow", advisory)
     return 0
 
 

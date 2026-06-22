@@ -30,7 +30,7 @@ _spec.loader.exec_module(mod)
 def run_hook(
     command: str,
     *,
-    strict: bool = False,
+    strict: bool | None = None,
     env_extra: dict | None = None,
     cwd: str | None = None,
 ) -> tuple[int, str | None]:
@@ -39,12 +39,18 @@ def run_hook(
     The event's `cwd` defaults to an isolated empty temp dir (no git repo) so the
     hook's branch detection returns "" — otherwise the host checkout's branch name
     could leak a ticket pattern and make these tests non-deterministic.
+
+    `strict`: None → leave REQUIRE_TICKET_STRICT UNSET (exercise the real default,
+    which is now strict-block); True → `=1`; False → `=0` (explicit warn-only opt-out).
     """
     env = dict(os.environ)
     env.pop("REQUIRE_TICKET_STRICT", None)
+    env.pop("REQUIRE_TICKET_SKIP", None)
     env.pop("REQUIRE_TICKET_EXEMPT_TYPES", None)
-    if strict:
+    if strict is True:
         env["REQUIRE_TICKET_STRICT"] = "1"
+    elif strict is False:
+        env["REQUIRE_TICKET_STRICT"] = "0"
     if env_extra:
         env.update(env_extra)
 
@@ -65,6 +71,33 @@ def run_hook(
         raise AssertionError(f"empty stdout; stderr={proc.stderr!r}")
     decision = json.loads(out)["decision"]
     return proc.returncode, decision
+
+
+def _run_hook_raw(command: str, **kwargs) -> dict:
+    """Like run_hook but also returns the protocol `message` (for marker assertions)."""
+    env = dict(os.environ)
+    env.pop("REQUIRE_TICKET_STRICT", None)
+    env.pop("REQUIRE_TICKET_SKIP", None)
+    env.pop("REQUIRE_TICKET_EXEMPT_TYPES", None)
+    if kwargs.get("env_extra"):
+        env.update(kwargs["env_extra"])
+    with tempfile.TemporaryDirectory() as isolated:
+        event = json.dumps({"args": {"command": command}, "cwd": isolated})
+        proc = subprocess.run(
+            [sys.executable, str(_SCRIPT)],
+            input=event,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=isolated,
+            timeout=10,
+        )
+    payload = json.loads((proc.stdout or "").strip())
+    return {
+        "code": proc.returncode,
+        "decision": payload["decision"],
+        "message": payload.get("message", ""),
+    }
 
 
 class TicketHeuristic(unittest.TestCase):
@@ -175,17 +208,40 @@ class MessageExtraction(unittest.TestCase):
 
 
 class EndToEnd(unittest.TestCase):
-    def test_missing_ticket_warns_but_allows_by_default(self):
+    def test_missing_ticket_blocks_by_default(self):
+        # The new default (REQUIRE_TICKET_STRICT unset) is a hard BLOCK.
         code, decision = run_hook('git commit -m "feat: add export"')
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+    def test_block_message_carries_stable_marker(self):
+        # The Docker test asserts on this fixed marker — it must lead the block message.
+        proc_out = _run_hook_raw('git commit -m "feat: add export"')
+        self.assertEqual(proc_out["code"], mod.BLOCK_EXIT_CODE)
+        self.assertEqual(proc_out["decision"], "block")
+        self.assertIn(mod.BLOCK_MARKER, proc_out["message"])
+        self.assertIn("[require-ticket] BLOCKED: no ticket reference", proc_out["message"])
+
+    def test_missing_ticket_warns_but_allows_when_strict_disabled(self):
+        # REQUIRE_TICKET_STRICT=0 is the explicit warn-only opt-out.
+        code, decision = run_hook('git commit -m "feat: add export"', strict=False)
         self.assertEqual(code, 0)
         self.assertEqual(decision, "allow")
+
+    def test_warn_mode_message_omits_block_marker(self):
+        # An ALLOW (warn-only) must NOT carry BLOCK_MARKER — else an external check that greps
+        # stdout for the marker gets a false positive on an allowed commit.
+        out = _run_hook_raw('git commit -m "feat: add export"', env_extra={"REQUIRE_TICKET_STRICT": "0"})
+        self.assertEqual(out["code"], 0)
+        self.assertEqual(out["decision"], "allow")
+        self.assertNotIn(mod.BLOCK_MARKER, out["message"])
 
     def test_present_ticket_allows_clean(self):
         code, decision = run_hook('git commit -m "feat: add export (Refs #123)"')
         self.assertEqual(code, 0)
         self.assertEqual(decision, "allow")
 
-    def test_missing_ticket_blocks_in_strict_mode(self):
+    def test_missing_ticket_blocks_in_explicit_strict_mode(self):
         code, decision = run_hook('git commit -m "feat: add export"', strict=True)
         self.assertEqual(code, mod.BLOCK_EXIT_CODE)
         self.assertEqual(decision, "block")
@@ -237,6 +293,117 @@ class EndToEnd(unittest.TestCase):
             )
         self.assertEqual(code, 0)
         self.assertEqual(decision, "allow")
+
+
+class ValidRefFormsPassByDefault(unittest.TestCase):
+    """Every accepted ticket-reference form must PASS end-to-end under the strict default
+    (no REQUIRE_TICKET_STRICT set) — so a legitimately-ticketed commit is never wedged."""
+
+    def _assert_allows(self, subject: str):
+        code, decision = run_hook(f'git commit -m "{subject}"')
+        self.assertEqual(code, 0, f"{subject!r} should pass but exit={code}")
+        self.assertEqual(decision, "allow", f"{subject!r} should pass")
+
+    def test_closes_hash(self):
+        self._assert_allows("feat: add export\\n\\nCloses #123")
+
+    def test_fixes_hash(self):
+        self._assert_allows("fix: crash\\n\\nFixes #4")
+
+    def test_bare_hash(self):
+        self._assert_allows("feat: add export #88")
+
+    def test_task_cli_key_num_id(self):
+        self._assert_allows("feat: add export ENG-456")
+
+    def test_task_cli_task_form(self):
+        self._assert_allows("feat: add export task:ABC-12")
+
+    def test_ticket_trailer(self):
+        self._assert_allows("feat: add export [ticket: PROJ-9]")
+
+    def test_ticket_trailer_with_slug(self):
+        # a non-numeric task-cli id inside a [ticket: …] trailer also counts
+        self._assert_allows("feat: add export [ticket: backfill-orders]")
+
+
+class PerCommitEscapes(unittest.TestCase):
+    """The two deliberate escapes must let a ticketless commit through under the strict default."""
+
+    def test_skip_ticket_trailer_allows(self):
+        code, decision = run_hook(
+            'git commit -m "feat: x [skip-ticket: one-off backfill]"'
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(decision, "allow")
+
+    def test_skip_ticket_trailer_requires_reason(self):
+        # a blank `[skip-ticket:]` is NOT a valid escape — it must still block.
+        code, decision = run_hook('git commit -m "feat: x [skip-ticket: ]"')
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+    def test_inline_skip_env_allows(self):
+        code, decision = run_hook('REQUIRE_TICKET_SKIP=1 git commit -m "feat: x"')
+        self.assertEqual(code, 0)
+        self.assertEqual(decision, "allow")
+
+    def test_inline_skip_falsey_does_not_allow(self):
+        code, decision = run_hook('REQUIRE_TICKET_SKIP=0 git commit -m "feat: x"')
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+    def test_inline_skip_on_sibling_does_not_bypass(self):
+        # the assignment is on a SIBLING command, not the `git commit` segment → still blocks.
+        code, decision = run_hook(
+            'REQUIRE_TICKET_SKIP=1 echo hi && git commit -m "feat: x"'
+        )
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+    def test_skip_trailer_helper(self):
+        self.assertTrue(mod.has_skip_trailer("feat: x [skip-ticket: reason]"))
+        self.assertFalse(mod.has_skip_trailer("feat: x"))
+        self.assertFalse(mod.has_skip_trailer("feat: x [skip-ticket: ]"))
+
+    def test_inline_skip_helper(self):
+        self.assertTrue(mod.has_inline_skip('REQUIRE_TICKET_SKIP=1 git commit -m x'))
+        self.assertTrue(mod.has_inline_skip('REQUIRE_TICKET_SKIP=yes git commit -m x'))
+        self.assertFalse(mod.has_inline_skip('REQUIRE_TICKET_SKIP=0 git commit -m x'))
+        self.assertFalse(mod.has_inline_skip('git commit -m x'))
+        self.assertFalse(
+            mod.has_inline_skip('REQUIRE_TICKET_SKIP=1 echo x; git commit -m y')
+        )
+
+    def test_inline_skip_with_shell_op_in_message_fails_safe(self):
+        # The inline-skip parser splits on `;`/`&&`/`||` BEFORE quote-aware tokenizing, so a
+        # commit MESSAGE that itself contains a shell operator breaks the segment and the inline
+        # escape is silently NOT honored. Direction is fail-SAFE (the commit is gated, not
+        # bypassed) — documented here so the behavior is intentional, not a silent surprise. The
+        # robust escape for such a message is the `[skip-ticket: …]` trailer, which is unaffected.
+        code, decision = run_hook(
+            'REQUIRE_TICKET_SKIP=1 git commit -m "fix: handle a; b edge case"'
+        )
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+
+class StrictToggle(unittest.TestCase):
+    def test_strict_default_when_unset(self):
+        # the module-level STRICT reflects the env at import; assert the falsey set directly.
+        self.assertIn("0", mod._STRICT_FALSEY)
+        self.assertIn("false", mod._STRICT_FALSEY)
+        self.assertIn("off", mod._STRICT_FALSEY)
+
+    def test_strict_zero_warns(self):
+        code, decision = run_hook('git commit -m "feat: x"', strict=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(decision, "allow")
+
+    def test_strict_unset_blocks(self):
+        code, decision = run_hook('git commit -m "feat: x"', strict=None)
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
 
 
 class GitDashCAndSkipScope(unittest.TestCase):
