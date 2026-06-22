@@ -24,6 +24,24 @@ rest of this doc makes sense.
 
 ---
 
+## Orchestration doctrine: the main agent only orchestrates
+
+The main/orchestrator agent **only orchestrates**: it **PLANS**, **DISPATCHES** work to
+subagents/workflows, and **VERIFIES** results. It does **not** implement inline. **All**
+implementation work — fixes, features, builds, investigations, migrations — runs in
+**subagent swarms** (the `Agent` tool or a Workflow), never in the main thread. Fan out
+broadly and in **parallel**, grouped **by repo** (one shipping agent per repo at a time) to
+avoid worktree/ship collisions, and parallel **across** repos. Each dispatched agent carries
+the full discipline: **ticket → fresh worktree → tests → review-gate (`[ok]`) → `gh ship`**.
+The orchestrator **verifies every "done"** — PR merged **and** CI green, never trusting a
+subagent's "all green" on its own word — and marks a roadmap item done only after it is
+verified **and** the CTO has confirmed it's OK. This is enforced mechanically by the
+`orchestrator-stays-thin` agent-hook, which blocks the main agent's implementation-shaped
+Bash/Edit/Write while exempting subagents (see [Agent-hooks](#agent-hooks-the-agents-own-mid-session-gates)
+below). The hook is the mechanism; this section is the intent.
+
+---
+
 ## How the catalog is discovered: directory convention, zero registration
 
 There is no central registry, manifest, or index file you edit to "add" a catalog item.
