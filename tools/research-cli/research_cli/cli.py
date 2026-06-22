@@ -5,10 +5,16 @@ REACHED VIA ``bin/research`` -> :func:`main`. Commands self-register: every modu
 becomes a subcommand with ZERO edits here (self-registering-commands skill). Drop a file,
 get a command.
 
-IMPORT-CLEAN AT TOP (lazy-heavy-imports skill): this dispatcher imports only stdlib, and
-each command module is imported lazily when first dispatched, so ``research --help`` /
-``research --version`` and an unrelated command never pay for another command's heavy
-deps (or the providers import).
+IMPORT-CLEAN AT TOP (lazy-heavy-imports skill): this dispatcher imports only stdlib (the
+shared error layer in ``._errors`` is itself stdlib-only), and each command module is
+imported lazily when first dispatched, so ``research --help`` / ``research --version`` and an
+unrelated command never pay for another command's heavy deps (or the providers import).
+
+ERRORS (error-system v2): a diagnosed dispatcher failure is raised as a shared
+``agenttools_errors`` structured error (WHAT / WHY / HOW-to-fix) and rendered through
+:func:`guard`, so an unknown command gets the did-you-mean heuristic and a command-load
+failure renders the same three-part block + a stable per-class exit code as the rest of the
+ecosystem (rig / review / …) — not a bare ``print`` + an ad-hoc number.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ import sys
 from typing import Callable, Dict, List, Optional, Tuple
 
 from . import __version__
+from ._errors import EXIT_INTERNAL, AgentToolError, guard, unknown_item_error
 
 # A command module's public contract: NAME (str), SUMMARY (str), run(argv) -> int.
 _RunFn = Callable[[List[str]], int]
@@ -77,10 +84,11 @@ def _usage(commands: Dict[str, Tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    commands = _discover()
-
+def _dispatch(argv: List[str], commands: Dict[str, Tuple[str, str]]) -> int:
+    """Route ``argv`` to a command, raising a structured :class:`AgentToolError` on a diagnosed
+    failure (unknown command / load failure). Meta paths (help/version) print and return here.
+    Wrapped by :func:`main` in :func:`guard`, which renders the error + maps it to its exit code.
+    """
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(_usage(commands))
         return 0
@@ -90,17 +98,28 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     name, rest = argv[0], argv[1:]
     if name not in commands:
-        print(f"research: unknown command {name!r}\n", file=sys.stderr)
-        print(_usage(commands), file=sys.stderr)
-        return 2  # usage error
+        # The shared builder gives the did-you-mean heuristic (suggest the nearest command) and
+        # the 3-part block, instead of a bare "unknown command 'x'" string + a raw usage dump.
+        raise unknown_item_error(category="command", bad=name, known=set(commands))
 
     mod_name, _ = commands[name]
     try:
         run = _load_run(mod_name)
     except Exception as exc:
-        print(f"research: cannot load command {name!r}: {exc}", file=sys.stderr)
-        return 70  # internal software error
+        # A command that fails to IMPORT is a bug in the tool, not user usage — exit INTERNAL.
+        raise AgentToolError(
+            what=f"cannot load command {name!r}: {exc}",
+            why=f"importing {mod_name} failed — the command module is broken",
+            fix="file a bug; re-run another command, or reinstall research-cli",
+            exit_code=EXIT_INTERNAL,
+        ) from exc
     return int(run(rest))
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    commands = _discover()
+    return guard(lambda: _dispatch(argv, commands))
 
 
 if __name__ == "__main__":  # pragma: no cover

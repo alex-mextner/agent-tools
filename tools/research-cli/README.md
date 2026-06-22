@@ -78,7 +78,8 @@ call), so the output is testable and never itself a hallucination.
 A seat is reachable iff its provider's API key resolves through the shared **key cascade**
 (env vars first, in name order, then `.env` files). The provider → key-name map is in
 `research_cli/providers.py` (`PROVIDER_KEY_NAMES`). With no key for any seat, `research
-ask` prints an empty-panel note and exits `69` (`EX_UNAVAILABLE`) — it never crashes.
+ask` prints an empty-panel note and exits `7` (the shared `EXIT_NETWORK` class) — it never
+crashes.
 
 To wire a **live** backend for the MVP, set `RESEARCH_BACKEND_CMD` to a shell template that
 receives `{model}`, `{lens}`, `{question}` and prints the answer to stdout, e.g.:
@@ -94,12 +95,23 @@ follow-up below.
 
 ## Exit codes (structured)
 
-| Code | Meaning |
-| --- | --- |
-| `0` | a synthesis was produced (≥1 seat answered) |
-| `2` | usage error (no question, bad flag) |
-| `69` | `EX_UNAVAILABLE` — no seat reachable / answered (no key, no backend) |
-| `70` | `EX_SOFTWARE` — internal/config error (e.g. a malformed manifest) |
+research-cli uses the shared **`agenttools_errors`** contract (error-system v2): a diagnosed
+failure prints a three-part **what / why / how-to-fix** block and exits with a stable
+per-class code, the same contract every ecosystem CLI (rig / review / …) uses.
+
+| Code | Class | Meaning |
+| --- | --- | --- |
+| `0` | `EXIT_OK` | a synthesis was produced (≥1 seat answered) |
+| `1` | `EXIT_INTERNAL` | an internal bug (an uncaught exception — see the traceback) |
+| `2` | `EXIT_USAGE` | usage/config error: no question, a bad flag, or a malformed/missing manifest |
+| `4` | `EXIT_UNKNOWN_ITEM` | an unknown command (with a did-you-mean suggestion) |
+| `7` | `EXIT_NETWORK` | no seat reachable / answered (no key, no backend, offline) |
+
+> **Contract change:** earlier versions returned the ad-hoc `69` (`EX_UNAVAILABLE`) for "no
+> seat answered" and `70` (`EX_SOFTWARE`) for a bad manifest. Those are replaced by the shared
+> codes above so a caller branches on ONE contract across every tool: "nothing reachable" is
+> the NETWORK class (`7`), a malformed manifest is the USAGE/config class (`2`), and an unknown
+> command is the UNKNOWN_ITEM class (`4`).
 
 ## Install (from the agent-tools umbrella checkout)
 
