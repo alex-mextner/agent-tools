@@ -9,8 +9,9 @@ Workflow. It enforces `delegate-work-to-subagents`.
 ONE script binds TWO points via two descriptors; it branches on ``event["point"]``:
   - pre-write : a CODE Edit/Write (non-docs) by the main thread → warn-then-block
   - pre-bash  : a clearly multi-step / implementation-shaped Bash by the main thread →
-                warn-then-block. Read-only inspection one-liners (git status, ls, cat,
-                grep, find) are NEVER blocked.
+                warn-then-block. Read-only inspection is NEVER blocked — a single one-liner
+                (git status, ls, cat, grep, find) OR a fully read-only chain of any length
+                across |/&&/;/||/newline (find ... | grep ... | head, git status && ls).
 
 TIERED (warn → block): the FIRST offense in the TTL window WARNs (allow + message); a REPEAT
 in the window BLOCKs. The tier is tracked by a marker file keyed by a hash of cwd. This gives
@@ -168,15 +169,41 @@ def _is_code_write(args: dict) -> bool:
     return True
 
 
+def _is_all_read_only(command: str) -> bool:
+    """True when EVERY chain segment's HEAD is a read-only inspection command.
+
+    A fully read-only pipe (`find ... | grep ... | head`, `tail X | grep Y | wc -l`) is the
+    orchestrator's bread-and-butter inspection and must never be blocked, no matter how many
+    segments it has (#80).
+
+    The judgement is per-segment-HEAD, NOT a whole-string scan: a build/edit token that appears
+    only as an ARGUMENT/needle of a read-only command (`cat tee.log`, `grep cargo notes.txt`)
+    must stay allowed — exactly the single-command carve-out this replaced (`tee`/`sed -i` are
+    unanchored in BUILD_EDIT, so a whole-string scan would mis-flag them). A real build/edit or
+    heredoc segment has a NON-read-only head (`sed ...`, `tee ...`, `npm ...`, the heredoc body),
+    so it breaks `all(...)` and the caller then judges the command as implementation. HEREDOC is
+    additionally vetoed up front — no inspection one-liner contains a `<<WORD` redirect.
+    """
+    if HEREDOC.search(command):
+        return False
+    # NOTE: judged on the segment HEAD only — READ_ONLY_BASH is head-anchored (`^\s*…`), so a
+    # build/edit head with a read-only word in its args (`sed -i … grep.py`) is NOT waved through
+    # (regression-guarded by test_build_edit_head_with_read_only_needle_blocks). Inherited gap
+    # (pre-#80, also true of the old single-command carve-out): a read-only HEAD with a mutating
+    # flag — `find . -delete`, `find . -exec sed -i …` — reads as inspection. Out of scope here.
+    segments = [s for s in CHAIN.split(command) if s.strip()]
+    return bool(segments) and all(READ_ONLY_BASH.search(s) for s in segments)
+
+
 def _is_implementation_bash(command: str) -> bool:
     if not command.strip():
         return False
-    chained = bool(CHAIN.search(command))
-    # The read-only carve-out is for a SINGLE inspection one-liner only. A chain that merely
-    # STARTS with a read-only command (`git status && sed -i ...`, `ls; npm run build`) must be
-    # judged on its full content, not waved through on its prefix (B1).
-    if not chained and READ_ONLY_BASH.search(command):
-        return False  # single inspection one-liner → never block
+    # A fully read-only pipe of ANY length is inspection, never implementation (#80). The older
+    # single-command carve-out was a subset of this; an all-read-only chain now passes too.
+    if _is_all_read_only(command):
+        return False
+    # A chain that merely STARTS with a read-only command (`git status && sed -i ...`,
+    # `ls; npm run build`) is judged on its full content, not waved through on its prefix (B1).
     if HEREDOC.search(command) or BUILD_EDIT.search(command):
         return True
     # Multiple chained steps (>= 2 operators, i.e. > 2 commands joined) is implementation-shaped.

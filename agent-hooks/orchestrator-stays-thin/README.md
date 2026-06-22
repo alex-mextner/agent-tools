@@ -14,9 +14,15 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   warn-then-block. Implementation-shaped = chained `> 2` steps (`&&`/`;`/`||`/`|`/newline), OR a
   heredoc, OR an obvious build/edit (`sed -i`, `tee`, `npm`/`cargo`/`make` build). A bare
   `>`/`>>` redirect is **not** implementation on its own (`python foo.py > out.log` is allowed).
-  A **single, unchained** read-only inspection one-liner (`git status`, `ls`, `cat`, `grep`,
-  `find`, …) is **never** blocked — but a chain that merely *starts* read-only
-  (`git status && sed -i ...`) is judged on its **full** content, not waved through on its prefix.
+  A read-only inspection command is **never** blocked — including a **fully read-only chain of
+  any length** where every segment's head is inspection (`git status`/`log`/`diff`/`show`/`branch`,
+  `ls`, `cat`, `grep`, `find`, `head`, `tail`, `wc`, …), across `|`, `&&`, `;`, `||` or newline
+  (`find ... | grep ... | head`, `tail X | grep Y | wc -l`, `git status && ls && cat x`). But a
+  chain that merely *starts* read-only (`git status && sed -i ...`), or that mixes in any
+  build/edit/heredoc segment, is judged on its **full** content — not waved through on its prefix.
+  Judgement is per-segment-**head**: a build token used only as an argument/needle of a read-only
+  command (`cat tee.log`, `grep cargo notes`) stays allowed; only a build/edit *at a segment head*
+  (`sed -i ...`, `tee ...`, `npm`/`cargo`/`make` build) counts.
 
 **Subagent-exempt:** a dispatched subagent (`agent_id` present) does the actual work, so it is
 always allowed. This gate governs the orchestrator only. `args.agent_id` must come from a
