@@ -441,11 +441,18 @@ def test_cli_version_and_help(capsys):
     assert "Commands:" in capsys.readouterr().out
 
 
-def test_cli_unknown_command_is_usage_error(capsys):
+def test_cli_unknown_command_is_unknown_item_error(capsys):
+    # research-cli now routes a diagnosed failure through the shared agenttools_errors layer,
+    # which classifies an unknown command as the precise UNKNOWN_ITEM class (4) — distinct from
+    # a plain bad-flag usage error (2) — and renders the 3-part what/why/fix block.
     from research_cli.cli import main
 
-    assert main(["frobnicate"]) == 2
-    assert "unknown command" in capsys.readouterr().err
+    from agenttools_errors import EXIT_UNKNOWN_ITEM
+
+    assert main(["frobnicate"]) == EXIT_UNKNOWN_ITEM
+    err = capsys.readouterr().err
+    assert "unknown command" in err  # the WHAT line
+    assert "fix:" in err  # the HOW-to-fix line of the shared block
 
 
 def test_command_help_exits_zero(capsys):
