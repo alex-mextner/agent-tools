@@ -37,6 +37,23 @@ works even when the harness launches the hook outside the repo. A trailer keywor
 (`Closes`/`Fixes`/`Refs`) only counts when it's followed by a real ref — `fix: null deref`
 is a bugfix subject, not a reference, so in strict mode it correctly still needs a ticket.
 
+## What counts as a `git commit` (argv-scoped detection)
+
+The gate fires **only** on a real `git commit` invocation, decided by **parsing** the
+command into argv — never by raw-string matching the words "git"/"commit". The command is
+tokenized (quote-, comment-, separator- and multi-line-aware), each shell segment has its
+leading shell noise / redirects / inline env / wrapper executables peeled, and a segment is
+gated only when its executable is `git` and its subcommand is exactly `commit`. So a benign
+command that merely *mentions* those words is **not** gated — `gh issue create --body
+"…git commit…"`, `echo "git commit"`, `git log --grep=commit`, `git config commit.gpgsign`,
+`git help commit`, and `git commit-graph write` all pass through (agent-tools#97; the same
+class of over-match `block-no-verify` fixed in #59). A real commit behind a wrapper —
+`env FOO=bar git commit`, `sudo git commit`, `sudo -u git git commit`,
+`runuser -u git -- git commit`, `timeout 60 git commit`, `/usr/bin/git commit` — **is** still
+gated. An *unlisted* wrapper (`unshare`, `bash -c '…'`) or an unparseable command is not gated
+— a documented best-effort limitation, consistent with `on_error: open` (process discipline,
+not a security boundary).
+
 ## Exemptions (no ticket expected)
 
 These commits skip the gate by default:

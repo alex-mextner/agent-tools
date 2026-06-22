@@ -178,17 +178,24 @@ class Exemptions(unittest.TestCase):
         self.assertFalse(mod.is_exempt("feat: add export\n\ndocs: also touched a doc"))
 
 
+def _commit_argv(command: str) -> list[str]:
+    """Helper for the unit tests: parse `command` and return the FIRST commit segment's argv (the
+    tokens after `commit`), or [] if there is no real commit segment."""
+    segs = mod.commit_segments(command)
+    return segs[0].argv if segs else []
+
+
 class MessageExtraction(unittest.TestCase):
     def test_pulls_dash_m(self):
-        msg = mod.commit_message_from_command('git commit -m "feat: x Refs #5"')
+        msg = mod.commit_message_from_argv(_commit_argv('git commit -m "feat: x Refs #5"'))
         self.assertIn("Refs #5", msg)
 
     def test_pulls_attached_dash_m(self):
-        msg = mod.commit_message_from_command('git commit -m"ENG-1 thing"')
+        msg = mod.commit_message_from_argv(_commit_argv('git commit -m"ENG-1 thing"'))
         self.assertIn("ENG-1", msg)
 
     def test_pulls_message_equals(self):
-        msg = mod.commit_message_from_command('git commit --message="task:T-3 thing"')
+        msg = mod.commit_message_from_argv(_commit_argv('git commit --message="task:T-3 thing"'))
         self.assertIn("task:T-3", msg)
 
     def test_pulls_from_file(self):
@@ -196,15 +203,31 @@ class MessageExtraction(unittest.TestCase):
             fh.write("feat: big change\n\nCloses #99\n")
             path = fh.name
         try:
-            msg = mod.commit_message_from_command(f"git commit -F {path}")
+            msg = mod.commit_message_from_argv(_commit_argv(f"git commit -F {path}"))
             self.assertIn("Closes #99", msg)
         finally:
             os.unlink(path)
 
-    def test_unbalanced_quotes_fall_back_to_raw(self):
-        # shlex would raise; we must not crash, just scan the raw string.
-        msg = mod.commit_message_from_command('git commit -m "unterminated #7')
-        self.assertIn("#7", msg)
+    def test_pulls_glued_dash_m_ticket(self):
+        # a KEY-NUM ticket glued onto -m / --message= must be detected.
+        self.assertIn("ABC-123", mod.commit_message_from_argv(_commit_argv("git commit -mABC-123")))
+        self.assertIn("ENG-7", mod.commit_message_from_argv(_commit_argv("git commit --message=ENG-7")))
+
+    def test_pulls_glued_dash_F_file(self):
+        # `-FPATH` glued (git accepts both `-F path` and `-Fpath`) — the message file must be read.
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("feat: big change\n\nCloses #321\n")
+            path = fh.name
+        try:
+            msg = mod.commit_message_from_argv(_commit_argv(f"git commit -F{path}"))
+            self.assertIn("Closes #321", msg)
+        finally:
+            os.unlink(path)
+
+    def test_unbalanced_quotes_are_not_a_commit_segment(self):
+        # An unbalanced-quote command can't be tokenized → no commit segment is parsed (the safe
+        # direction for require-ticket, which is on_error=open: an unparseable command is not gated).
+        self.assertEqual(mod.commit_segments('git commit -m "unterminated #7'), [])
 
 
 class EndToEnd(unittest.TestCase):
@@ -367,25 +390,27 @@ class PerCommitEscapes(unittest.TestCase):
         self.assertFalse(mod.has_skip_trailer("feat: x [skip-ticket: ]"))
 
     def test_inline_skip_helper(self):
-        self.assertTrue(mod.has_inline_skip('REQUIRE_TICKET_SKIP=1 git commit -m x'))
-        self.assertTrue(mod.has_inline_skip('REQUIRE_TICKET_SKIP=yes git commit -m x'))
-        self.assertFalse(mod.has_inline_skip('REQUIRE_TICKET_SKIP=0 git commit -m x'))
-        self.assertFalse(mod.has_inline_skip('git commit -m x'))
+        # The helper now reads the PARSED commit segment's env (scoped by the parser to the real
+        # `git commit` segment), so a sibling-command assignment is already excluded.
+        self.assertTrue(mod.has_inline_skip(_commit_segment('REQUIRE_TICKET_SKIP=1 git commit -m x')))
+        self.assertTrue(mod.has_inline_skip(_commit_segment('REQUIRE_TICKET_SKIP=yes git commit -m x')))
+        self.assertFalse(mod.has_inline_skip(_commit_segment('REQUIRE_TICKET_SKIP=0 git commit -m x')))
+        self.assertFalse(mod.has_inline_skip(_commit_segment('git commit -m x')))
+        # the assignment on a SIBLING command does not land on the commit segment's env
         self.assertFalse(
-            mod.has_inline_skip('REQUIRE_TICKET_SKIP=1 echo x; git commit -m y')
+            mod.has_inline_skip(_commit_segment('REQUIRE_TICKET_SKIP=1 echo x; git commit -m y'))
         )
 
-    def test_inline_skip_with_shell_op_in_message_fails_safe(self):
-        # The inline-skip parser splits on `;`/`&&`/`||` BEFORE quote-aware tokenizing, so a
-        # commit MESSAGE that itself contains a shell operator breaks the segment and the inline
-        # escape is silently NOT honored. Direction is fail-SAFE (the commit is gated, not
-        # bypassed) — documented here so the behavior is intentional, not a silent surprise. The
-        # robust escape for such a message is the `[skip-ticket: …]` trailer, which is unaffected.
+    def test_inline_skip_with_shell_op_in_message_is_honored(self):
+        # The new quote-aware tokenizer keeps a `;` INSIDE the commit message inside the quoted token,
+        # so the inline `REQUIRE_TICKET_SKIP=1` is correctly recognized on the commit segment and the
+        # escape is honored — an improvement over the old `re.split`-based parser, which broke the
+        # segment on the message's `;` and (fail-safe but wrongly) still blocked.
         code, decision = run_hook(
             'REQUIRE_TICKET_SKIP=1 git commit -m "fix: handle a; b edge case"'
         )
-        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
-        self.assertEqual(decision, "block")
+        self.assertEqual(code, 0)
+        self.assertEqual(decision, "allow")
 
 
 class StrictToggle(unittest.TestCase):
@@ -406,26 +431,194 @@ class StrictToggle(unittest.TestCase):
         self.assertEqual(decision, "block")
 
 
+def _commit_segment(command: str):
+    """The FIRST parsed commit segment of `command`, or None."""
+    segs = mod.commit_segments(command)
+    return segs[0] if segs else None
+
+
 class GitDashCAndSkipScope(unittest.TestCase):
     def test_effective_cwd_honors_dash_C(self):
         # `git -C <repo> commit` acts on <repo> — branch detection must read THAT repo.
-        self.assertEqual(mod.effective_cwd("git -C /srv/repo commit -m x", "/event"), "/srv/repo")
-        self.assertEqual(mod.effective_cwd("git -C/srv/repo commit -m x", "/event"), "/srv/repo")
+        self.assertEqual(
+            mod.effective_cwd(_commit_segment("git -C /srv/repo commit -m x"), "/event"),
+            "/srv/repo",
+        )
+        self.assertEqual(
+            mod.effective_cwd(_commit_segment("git -C/srv/repo commit -m x"), "/event"),
+            "/srv/repo",
+        )
         # a relative -C resolves against the event cwd
-        self.assertEqual(mod.effective_cwd("git -C sub commit -m x", "/event"), "/event/sub")
+        self.assertEqual(
+            mod.effective_cwd(_commit_segment("git -C sub commit -m x"), "/event"), "/event/sub"
+        )
         # no -C → the event cwd is unchanged
-        self.assertEqual(mod.effective_cwd("git commit -m x", "/event"), "/event")
+        self.assertEqual(mod.effective_cwd(_commit_segment("git commit -m x"), "/event"), "/event")
 
-    def test_argv_without_message_strips_message_values(self):
-        # a flag named only in the MESSAGE is dropped; a real argv flag is kept
-        self.assertNotIn("--amend", mod._argv_without_message('git commit -m "uses --amend"'))
-        self.assertIn("--amend", mod._argv_without_message('git commit --amend -m "x"'))
+    def test_is_skip_commit_ignores_skip_flag_in_message(self):
+        # a flag named only in the MESSAGE is NOT a real skip flag; a real argv flag IS.
+        self.assertFalse(mod.is_skip_commit(_commit_argv('git commit -m "uses --amend"')))
+        self.assertTrue(mod.is_skip_commit(_commit_argv('git commit --amend -m "x"')))
+        # a message-bearing short CLUSTER (`-am`) whose VALUE is literally `--amend` must not exempt.
+        self.assertFalse(mod.is_skip_commit(_commit_argv('git commit -am "--amend"')))
+        self.assertFalse(mod.is_skip_commit(_commit_argv('git commit -am "support --skip"')))
+        self.assertTrue(mod.is_skip_commit(_commit_argv('git commit -am "x" --amend')))
+
+    def test_amend_as_am_message_value_still_blocks(self):
+        # `git commit -am "--amend"` authors a real, ticketless commit (message is "--amend") → BLOCK.
+        code, decision = run_hook('git commit -am "--amend"', strict=True)
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
 
     def test_skip_flag_in_message_does_not_exempt(self):
         # `--amend` inside the commit MESSAGE must NOT exempt a real, ticketless commit.
         code, decision = run_hook('git commit -m "support the --amend flag"', strict=True)
         self.assertEqual(code, mod.BLOCK_EXIT_CODE)
         self.assertEqual(decision, "block")
+
+
+class OverMatchRegression(unittest.TestCase):
+    """agent-tools#97 — the gate must fire ONLY on a real `git commit` invocation, never when
+    the words "git"/"commit" merely appear as a substring/argument/message-body of SOME OTHER
+    command. The old raw regex ``\\bgit\\b.*\\bcommit\\b`` over the RAW command string blocked
+    every benign command that mentioned both words (a LIVE false positive: a subagent's `gh
+    issue create` whose body said "git commit"). These reproduce that class FIRST — they fail
+    against the raw-regex code (it BLOCKS them) and pass once detection is argv-scoped."""
+
+    def test_gh_issue_create_mentioning_commit_is_allowed(self):
+        # The LIVE repro: an issue body that contains the words "git commit" is NOT a commit.
+        code, decision = run_hook(
+            'gh issue create --title "fix the gate" --body "we should git commit only on a real commit"'
+        )
+        self.assertEqual(code, 0, "gh issue create is not a git commit — must allow")
+        self.assertEqual(decision, "allow")
+
+    def test_echo_mentioning_git_commit_is_allowed(self):
+        code, decision = run_hook('echo "git commit"')
+        self.assertEqual(code, 0, "echo is not a git commit — must allow")
+        self.assertEqual(decision, "allow")
+
+    def test_git_log_grep_commit_is_allowed(self):
+        # `git log --grep=commit` is a `git log`, not a `git commit`.
+        code, decision = run_hook("git log --grep=commit")
+        self.assertEqual(code, 0, "git log is not a git commit — must allow")
+        self.assertEqual(decision, "allow")
+
+    def test_git_log_grep_separate_value_is_allowed(self):
+        code, decision = run_hook("git log --grep commit -n 5")
+        self.assertEqual(code, 0)
+        self.assertEqual(decision, "allow")
+
+    def test_grep_for_word_commit_is_allowed(self):
+        # The exact command class that blocked ME mid-session: a grep whose PATTERN says "commit".
+        code, decision = run_hook('grep -rn "git commit" src/')
+        self.assertEqual(code, 0)
+        self.assertEqual(decision, "allow")
+
+    def test_git_config_commit_gpgsign_is_allowed(self):
+        # `git config commit.gpgsign` mentions commit but is not authoring one.
+        code, decision = run_hook("git config commit.gpgsign true")
+        self.assertEqual(code, 0)
+        self.assertEqual(decision, "allow")
+
+    def test_git_help_commit_is_allowed(self):
+        code, decision = run_hook("git help commit")
+        self.assertEqual(code, 0)
+        self.assertEqual(decision, "allow")
+
+    def test_git_commit_graph_is_allowed(self):
+        # `git commit-graph write` is a DIFFERENT subcommand — not `git commit`.
+        code, decision = run_hook("git commit-graph write")
+        self.assertEqual(code, 0)
+        self.assertEqual(decision, "allow")
+
+    def test_commit_word_in_filename_is_allowed(self):
+        code, decision = run_hook('cat commit_message.txt | grep "git commit"')
+        self.assertEqual(code, 0)
+        self.assertEqual(decision, "allow")
+
+    def test_tg_report_mentioning_git_commit_is_allowed(self):
+        # A status report whose body talks ABOUT a git commit must not be gated.
+        code, decision = run_hook('tg "I will git commit the fix once review passes"')
+        self.assertEqual(code, 0)
+        self.assertEqual(decision, "allow")
+
+    # --- the gate must STILL fire on a real commit (over-match fix must not under-match) ----
+
+    def test_real_no_ticket_commit_still_blocks(self):
+        code, decision = run_hook('git commit -m "feat: add export"')
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+    def test_real_commit_after_a_mentioning_sibling_still_blocks(self):
+        # `echo "git commit" && git commit -m feat` — the SECOND segment is a real commit.
+        code, decision = run_hook('echo "git commit" && git commit -m "feat: add export"')
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+
+class WrapperClasses(unittest.TestCase):
+    """The gate must see a real `git commit` even behind the wrapper classes block-no-verify
+    handles (env-prefix, sudo, runuser, timeout), so a wrapped no-ticket commit is still gated,
+    and the accepted ticket forms / escapes keep working through the wrapper."""
+
+    def test_env_prefixed_no_ticket_commit_blocks(self):
+        code, decision = run_hook('env FOO=bar git commit -m "feat: add export"')
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+    def test_var_assignment_prefixed_no_ticket_commit_blocks(self):
+        code, decision = run_hook('FOO=bar git commit -m "feat: add export"')
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+    def test_sudo_no_ticket_commit_blocks(self):
+        code, decision = run_hook('sudo git commit -m "feat: add export"')
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+    def test_sudo_u_user_no_ticket_commit_blocks(self):
+        # `sudo -u git git commit …` — the `-u` value "git" must not be misread as the executable.
+        code, decision = run_hook('sudo -u git git commit -m "feat: add export"')
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+    def test_runuser_no_ticket_commit_blocks(self):
+        code, decision = run_hook('runuser -u git -- git commit -m "feat: add export"')
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+    def test_timeout_no_ticket_commit_blocks(self):
+        code, decision = run_hook('timeout 60 git commit -m "feat: add export"')
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+    def test_wrapped_commit_with_ticket_allows(self):
+        code, decision = run_hook('env FOO=bar git commit -m "feat: add export (Closes #5)"')
+        self.assertEqual(code, 0)
+        self.assertEqual(decision, "allow")
+
+    def test_path_qualified_git_no_ticket_commit_blocks(self):
+        code, decision = run_hook('/usr/bin/git commit -m "feat: add export"')
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+    def test_effective_cwd_reads_git_dash_C_through_a_wrapper(self):
+        # `env A=1 git -C /repo commit`: env's own options must NOT shadow the real `git -C /repo`.
+        seg = _commit_segment("env A=1 git -C /repo commit -m x")
+        self.assertIsNotNone(seg)
+        self.assertEqual(mod.effective_cwd(seg, "/event"), "/repo")
+
+    def test_branch_ticket_satisfies_wrapped_commit(self):
+        # A ticket id encoded in the branch name (read via `git -C`) satisfies the gate even through
+        # a wrapper — exercised end-to-end against a real temp repo on a ticketed branch.
+        with tempfile.TemporaryDirectory() as repo:
+            subprocess.run(["git", "init", "-q", "-b", "feature/ENG-42-export", repo], check=True)
+            code, decision = run_hook(
+                f'env A=1 git -C {repo} commit -m "feat: add export"', cwd=repo
+            )
+        self.assertEqual(code, 0, "branch ENG-42 should satisfy the gate")
+        self.assertEqual(decision, "allow")
 
 
 if __name__ == "__main__":
