@@ -1,12 +1,17 @@
 # require-ticket-before-commit
 
-**Point:** `pre-bash` · **Fail policy:** `open` · **Priority:** 25 · **Default:** warn (advisory)
+**Point:** `pre-bash` · **Fail policy:** `open` (on crash) · **Priority:** 25 · **Default:** **block** (strict)
 
 On a `git commit`, checks the commit message and branch name for a reference to a
-tracking ticket. If none is found — and the commit isn't an exempt chore/WIP/merge —
-it **warns** (default) or, in strict mode, **blocks**, with a reminder that non-trivial
-changes should start from a ticket with acceptance criteria, motivation, and
-user-impact. Enforces the `strict-ticket-discipline` skill; pairs with task-cli.
+tracking ticket. If none is found — and the commit isn't an exempt chore/WIP/merge,
+and no per-commit escape is present — it **blocks** by default (strict), with a
+reminder that non-trivial changes should start from a ticket with acceptance criteria,
+motivation, and user-impact. Set `REQUIRE_TICKET_STRICT=0` to fall back to warn-only.
+Enforces the `strict-ticket-discipline` skill; pairs with task-cli.
+
+The block message always leads with the stable marker `[require-ticket] BLOCKED: no
+ticket reference` (exit code `10`), so an external check (e.g. a task-cli Docker test)
+can assert on one fixed string.
 
 ## Ticket-detection heuristic
 
@@ -41,19 +46,34 @@ These commits skip the gate by default:
 - WIP / fixup markers: `wip…`, `fixup!`, `squash!`, `amend!`, `merge…`, `revert…`
 - `git commit --amend/--continue/--abort/--skip` (not authoring a fresh change)
 
+## Per-commit escapes (the deliberate, documented bypass)
+
+For the rare legitimate ticketless commit, escape a single commit (mirrors the
+review-gate's `REVIEW_SKIP`):
+
+- a `[skip-ticket: <reason>]` trailer in the commit message (the reason is mandatory), or
+- an inline env on the command: `REQUIRE_TICKET_SKIP=1 git commit …`.
+
+The inline escape is scoped to the `git commit` segment, so an assignment on a sibling
+command (`REQUIRE_TICKET_SKIP=1 echo x; git commit …`) does **not** bypass the gate.
+
 ## Configure (env)
 
-- `REQUIRE_TICKET_STRICT=1` — turn a missing ticket into a hard **block** (default: warn).
+- `REQUIRE_TICKET_STRICT=0` — opt the whole gate back to **warn-only** (default: strict
+  block). Any other value, including unset, is strict.
+- `REQUIRE_TICKET_SKIP=1` (inline on the commit command) — skip THIS commit's check.
 - `REQUIRE_TICKET_EXEMPT_TYPES="chore,docs"` — override the exempt commit-type set
   (comma-separated; replaces the default list).
 
 ## Why an agent-hook
 
 The check has to happen *before* the commit, mid-session, while you can still add the
-reference. It's also why this is fail-open and warn-by-default: it's process discipline,
-not a security boundary, so a crash or a heuristic miss must never make committing
-impossible. (Contrast `block-no-verify` / `block-secrets-write`, which are fail-closed.)
-For a hard CI backstop, pair with an optional `ci/ticket-required` gate.
+reference. The gate **blocks** a ticketless non-chore commit by default — but it stays
+`on_error: open`, so a *crash* in the check (not a missing ticket) still fails open and
+never makes committing impossible. A no-ticket commit has clear, cheap escapes (a
+`[skip-ticket: <reason>]` trailer or `REQUIRE_TICKET_SKIP=1`), so strict-by-default
+nudges the discipline without wedging legitimate work. For a hard CI backstop, pair with
+an optional `ci/ticket-required` gate.
 
 ## Install
 
@@ -68,17 +88,25 @@ chmod +x require_ticket_before_commit.py
 ```bash
 chmod +x require_ticket_before_commit.py
 
-# no ticket → warns but allows (default)
+# no ticket → BLOCK by default (exit 10), message leads with the stable marker
 echo '{"args":{"command":"git commit -m \"feat: add export\""}}' | ./require_ticket_before_commit.py; echo " exit=$?"
-# → {"hook_api":"agents-hooks/v1","decision":"allow","message":"No ticket reference ..."}  exit=0
+# → {"hook_api":"agents-hooks/v1","decision":"block","message":"[require-ticket] BLOCKED: ..."}  exit=10
 
 # ticket present → clean allow
-echo '{"args":{"command":"git commit -m \"feat: add export (Refs #123)\""}}' | ./require_ticket_before_commit.py; echo " exit=$?"
+echo '{"args":{"command":"git commit -m \"feat: add export (Closes #123)\""}}' | ./require_ticket_before_commit.py; echo " exit=$?"
 # → {"hook_api":"agents-hooks/v1","decision":"allow"}  exit=0
 
-# strict mode, no ticket → block (exit 10)
-REQUIRE_TICKET_STRICT=1 sh -c 'echo "{\"args\":{\"command\":\"git commit -m x\"}}" | ./require_ticket_before_commit.py'; echo " exit=$?"
-# → decision":"block ...  exit=10
+# `[skip-ticket: reason]` escape → allow
+echo '{"args":{"command":"git commit -m \"feat: x [skip-ticket: one-off backfill]\""}}' | ./require_ticket_before_commit.py; echo " exit=$?"
+# → {"hook_api":"agents-hooks/v1","decision":"allow"}  exit=0
+
+# inline REQUIRE_TICKET_SKIP=1 escape → allow
+echo '{"args":{"command":"REQUIRE_TICKET_SKIP=1 git commit -m \"feat: x\""}}' | ./require_ticket_before_commit.py; echo " exit=$?"
+# → {"hook_api":"agents-hooks/v1","decision":"allow"}  exit=0
+
+# warn-only opt-out, no ticket → allow with advisory
+REQUIRE_TICKET_STRICT=0 sh -c 'echo "{\"args\":{\"command\":\"git commit -m x\"}}" | ./require_ticket_before_commit.py'; echo " exit=$?"
+# → {"hook_api":"agents-hooks/v1","decision":"allow", ...}  exit=0
 
 # exempt chore type → clean allow even without a ticket
 echo '{"args":{"command":"git commit -m \"chore: bump lockfile\""}}' | ./require_ticket_before_commit.py; echo " exit=$?"
