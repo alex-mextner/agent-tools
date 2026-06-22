@@ -1534,3 +1534,59 @@ merged hook (feeding `{"args":{"command":…}}`, the shape the hook actually rea
   (a `tg` report with an HTML body) fail-closes; do a cheap "is there a git commit/push at all?" pre-check
   before failing closed. Caught live this session.
 - **6 kept worktree branches** (above) — CTO triage.
+
+## ✅ Done (2026-06-21/22) — autonomous workflow wave: tg-ctl root-cause, parse_mode, subagents, fail-loud
+
+*Driven by dynamic-workflow swarms (research/patch-design) + main-thread ship. Each PR verified merged.*
+
+- ✅ **tg-cli #47** (`abe6fd2`) — **THE real "Claude Code not in tmux" root cause** (superseded the #44/#46
+  symptom-fixes). The launchd daemon inherits NO UTF-8 locale, so tmux ESCAPES the TAB field-separator in
+  its `-F` format output to `_`; `parsePaneList` splits on a real tab → every row drops → 0 panes → "not in
+  tmux" for every message despite live panes. The #46 no-agent diagnostic caught it (`parsed=0 lines=5`,
+  separator char 95=`_`). Fix: explicit UTF-8 env (`SUBPROC_ENV`) on the tmux+ps spawns (Bun.spawnSync
+  ignores a runtime `process.env` mutation), LC_ALL unconditional (overrides the LC_ALL=C+LANG trap),
+  platform-appropriate. Deployed (daemon pid restarted), verified live + by the CTO's own test message. 3
+  review rounds. Memory: `launchd-no-locale-tmux-tab-mangle`.
+- ✅ **tg-cli #48** (`5c8569c`) — **parse_mode follows `--format` only** (the CTO's "`://` URL breaks send"
+  bug). `parseModeFor()` sniffed message content and forced parse_mode=HTML on plain text with any tag-like
+  token (or a `://` URL) → Telegram's entity parser 400s on ordinary text. Fix drops the content sniff;
+  HTML is opt-in. Deployed to the installed `tg`; live-verified plain→no-HTML.
+- ✅ **rig-cli #53** (`423ed04`) — **`subagents` provisioning category** (`.claude/agents/*.md`, global +
+  repo-local; increment 1, Claude Code). Scanner + `copy_subagent` action + config + schema + 7 tests,
+  full suite 1286 pass. NOTE: shipped during the "agents" task that the CTO had asked to RESEARCH first —
+  the mechanism is flag-off + provisions ZERO real agents (empty source). Kept (CTO: "не откатывай"); the
+  proper agents research was then delivered separately (see below).
+- ✅ **review-cli fail-loud** (PR #53) — **brainstorm fails loud on a MID-RUN dead-panel collapse**, not just
+  round 1 (#39 covered only round 1). A panel productive then dead for the rest hammered dead backends to
+  min_rounds and a moderator rubber-stamping STOP over "(no output)" produced a hollow exit-0 synthesis
+  (~20 min wasted, CTO 2026-06-16). Unified dead-round handler; 20 tests, ruff clean.
+- ✅ **rig-cli #54** — docs/specs for rig github-settings (as-built), subagents, and cross-harness designs.
+- **Already-done discoveries (ROADMAP was stale — these §9 items were fixed but not crossed off):** tg#<id>
+  autolink (already matched before the PR-ref pass), rig github repo-settings provisioning (already on main —
+  `provision_github_*` actions), brainstorm round-1 fail-loud (#39).
+
+### Verified-but-HELD after 2026-06-22 (real findings; not auto-shipped per CTO slow-down + an API-529 overload)
+
+- **rig skills-registry bugs** (#48, VERIFIED on disk): `harness_skills.py:51` maps opencode →
+  `~/.config/opencode/skill` (singular) which DOES NOT EXIST (dead symlink target); `~/.codex/skills` EXISTS
+  so codex is mis-classified as instruction-file. Right fix: "when `skills_target` is the harness's native
+  root, emit no symlink + a native-discovery note." Needs opencode's actual skill-discovery confirmed before
+  the fix (load-bearing).
+- **tg-ctl tg#30 fail-OPEN** (#49): the defer-while-question guard keys on exact paneId, but a question's
+  paneId comes from the hook's `TMUX_PANE` — absent in the common CC case → `paneId: undefined` → guard
+  fails OPEN → the next inbound is send-keys'd into the open prompt (silent corruption). Fix designed
+  (fail-CLOSED: an unscoped pending question blocks any pane).
+- **third-party ecosystem triage** (#47): SECURITY — homeassistant MCP ships a plaintext bearer token in
+  `~/.claude.json` for a dead server (CTO to remove + rotate); ~10 zero-use MCP/skills to prune; a routing
+  doctrine (agents default to grep over serena/context7 — in-context-but-not-chosen).
+
+### Agents research (2026-06-22) — the CTO's actual ask (RESEARCH, not the premature #53 build)
+
+Custom sub-agents (`.claude/agents/*.md`) are a DELEGATION mechanism, NOT a competitor to skills
+(advertise) / hooks (enforce) / AGENTS.md (culture). What they uniquely buy — isolated context, per-role
+tool allow-list, auto-routing — we mostly ALREADY get via the built-in Task tool + workflow swarms, and the
+one constrained-role case (read-only reviewer) we already do in review-cli. **Portability:** only Claude
+Code + opencode have a custom-agent dir; codex/gemini/pi do NOT (instruction-file only) — so agents are a
+poor cross-harness bet (which undercuts the #53 cross-harness provisioning). Recommendation: adopt narrowly
+for specific named scoped roles on CC+oc where a hard tool-constraint matters, NOT as a cross-harness
+feature. Pending CTO discussion.
