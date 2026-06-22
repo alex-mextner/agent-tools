@@ -134,6 +134,21 @@ The daily cron rig provisions runs exactly `python3 <checkout>/lib/checker/model
 at **12:00 (noon)** — launchd on macOS, crontab on Linux. See
 [rig-cli](https://github.com/alex-mextner/rig-cli) (`models:` block / `rig status`).
 
+#### Exit codes (the cron / a wrapper script branches on these)
+
+The CLI uses the shared [`agenttools_errors`](../agenttools_errors/README.md) contract — a
+failure prints the three-part `error:` / `why:` / `fix:` block on stderr and exits with a
+stable, per-class code:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | success (proposed / validated / nothing to do) |
+| `2` | the manifest is malformed or violates an invariant (`EXIT_CONFIG`) — run `--validate` for the full list |
+| `127` | PyYAML is not installed (`EXIT_MISSING_DEP`) — the error carries the install command |
+
+An *unexpected* crash (a bug) still propagates as a traceback + exit `1`, kept distinct from a
+*diagnosed* config error so a wrapper can tell "the manifest is bad" from "the checker broke".
+
 ### Tests
 
 `tests/test_model_freshness.py` — hermetic: endpoints mocked via the injected `pollers`

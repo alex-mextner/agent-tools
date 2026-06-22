@@ -45,6 +45,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+# The cron runs this file directly (`python3 .../lib/checker/model_freshness.py`), which puts
+# `lib/checker/` — not `lib/` — on sys.path, so a sibling package (`agenttools_errors`) won't
+# resolve without help. Put `lib/` on the path so the shared error layer imports both when run
+# as a script AND when imported as `checker.model_freshness` (the test/cron-as-module path).
+_LIB_ROOT = Path(__file__).resolve().parent.parent
+if str(_LIB_ROOT) not in sys.path:
+    # append, not insert(0): the lib/ packages are uniquely named (agenttools_*), so appending
+    # resolves them without risking shadowing a same-named stdlib/site module at the front.
+    sys.path.append(str(_LIB_ROOT))
+
+# Shared error/exit-code layer (error-system v2). agenttools_errors is itself stdlib-only, so
+# a top-level import keeps this module's "stdlib-first at import" invariant — `--help` stays
+# fast/offline.
+from agenttools_errors import (  # noqa: E402  (after the sys.path bootstrap above)
+    EXIT_OK,
+    AgentToolError,
+    ConfigError,
+    MissingDepError,
+    guard,
+)
+
 # ── paths ──────────────────────────────────────────────────────────────────────────────
 _HERE = Path(__file__).resolve().parent
 _CONTRACTS = _HERE.parent / "contracts"
@@ -222,6 +243,15 @@ class ManifestError(ValueError):
     """The manifest is malformed or violates a cross-reference invariant."""
 
 
+class MissingYamlError(ManifestError):
+    """PyYAML — the checker's one runtime dep — is not installed.
+
+    A *subclass* of ManifestError so existing ``except ManifestError`` (in ``run()`` and the
+    tests) still catches it, but a distinct type so ``main()`` can map it to the
+    missing-dependency exit code (127) + an install hint instead of a config error (2).
+    """
+
+
 def load_manifest(path: Path = MANIFEST_PATH) -> Manifest:
     """Parse + lightly-structure models.yaml. Lazy yaml import (manifest is the only YAML).
 
@@ -233,7 +263,8 @@ def load_manifest(path: Path = MANIFEST_PATH) -> Manifest:
     except ImportError as exc:
         # PyYAML is the checker's one runtime dep. The cron runs `python3 model_freshness.py`,
         # so a machine without it must get a clear, actionable error — not a raw traceback.
-        raise ManifestError(
+        # MissingYamlError (a ManifestError subclass) lets main() exit 127 with an install hint.
+        raise MissingYamlError(
             "PyYAML is required to read the manifest but is not installed. "
             "Install it: `python3 -m pip install --user pyyaml` (or via your package "
             "manager). rig provisions it as a dependency (`rig doctor`)."
@@ -776,40 +807,50 @@ def _print_human(result: RunResult) -> None:
         print(f"  {action}")
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="model-freshness",
-        description="Propose model-version bumps for lib/contracts/models.yaml (PROPOSE, never merge).",
-    )
-    parser.add_argument("--validate", action="store_true", help="validate the manifest and exit")
-    parser.add_argument("--dry-run", action="store_true", help="poll + compute, but never open a PR / write a report")
-    parser.add_argument("--report", action="store_true", help="force the dated-report path even if gh is available")
-    parser.add_argument("--timeout", type=float, default=20.0, help="per-request HTTP timeout seconds")
-    parser.add_argument("--json", action="store_true", help="emit a JSON summary instead of human text")
-    args = parser.parse_args(argv)
+def _manifest_error(exc: ManifestError) -> AgentToolError:
+    """Map a raw ManifestError to the shared structured error (WHAT/WHY/HOW + exit code).
 
+    A missing PyYAML is a missing-DEPENDENCY failure (127 + install hint); any other manifest
+    fault is a CONFIG error (2). The message already carries the actionable detail, so it goes
+    into ``what``; ``why``/``fix`` add the class-specific guidance.
+    """
+    if isinstance(exc, MissingYamlError):
+        return MissingDepError(
+            what="cannot read the model manifest — PyYAML is not installed",
+            why="model_freshness needs PyYAML to parse lib/contracts/models.yaml",
+            fix="install PyYAML, then re-run the checker",
+            install="python3 -m pip install --user pyyaml",
+        )
+    return ConfigError(
+        what=f"model manifest is invalid: {exc}",
+        why="lib/contracts/models.yaml is malformed or violates a cross-reference invariant",
+        fix="fix the manifest (run with --validate to list every problem), then re-run",
+    )
+
+
+def _run_cli(args: argparse.Namespace) -> int:
+    """The checker body, raising structured agenttools_errors on failure (rendered by guard)."""
     try:
         manifest = load_manifest()
     except ManifestError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        raise _manifest_error(exc) from exc
 
     if args.validate:
         problems = validate_manifest(manifest)
         if problems:
-            print("manifest INVALID:", file=sys.stderr)
-            for p in problems:
-                print(f"  - {p}", file=sys.stderr)
-            return 1
+            raise ConfigError(
+                what="manifest INVALID:\n  - " + "\n  - ".join(problems),
+                why="lib/contracts/models.yaml violates a cross-reference invariant a schema can't express",
+                fix="fix each problem listed above, then re-run --validate",
+            )
         print(f"manifest OK — {len(manifest.models)} models, {len(manifest.roles)} roles, "
               f"{len(manifest.aliases)} aliases")
-        return 0
+        return EXIT_OK
 
     try:
         result = run(dry_run=args.dry_run, force_report=args.report, timeout=args.timeout)
     except ManifestError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        raise _manifest_error(exc) from exc
 
     if args.json:
         print(json.dumps(
@@ -829,7 +870,23 @@ def main(argv: list[str] | None = None) -> int:
         ))
     else:
         _print_human(result)
-    return 0
+    return EXIT_OK
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="model-freshness",
+        description="Propose model-version bumps for lib/contracts/models.yaml (PROPOSE, never merge).",
+    )
+    parser.add_argument("--validate", action="store_true", help="validate the manifest and exit")
+    parser.add_argument("--dry-run", action="store_true", help="poll + compute, but never open a PR / write a report")
+    parser.add_argument("--report", action="store_true", help="force the dated-report path even if gh is available")
+    parser.add_argument("--timeout", type=float, default=20.0, help="per-request HTTP timeout seconds")
+    parser.add_argument("--json", action="store_true", help="emit a JSON summary instead of human text")
+    args = parser.parse_args(argv)
+    # guard() renders any structured AgentToolError as the 3-part block (what/why/fix) on
+    # stderr and returns its stable exit code; an unexpected bug propagates → traceback + 1.
+    return guard(lambda: _run_cli(args))
 
 
 if __name__ == "__main__":

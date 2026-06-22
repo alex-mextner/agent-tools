@@ -421,3 +421,116 @@ def test_schema_enum_matches_known_capabilities():
     schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
     enum = schema["$defs"]["capability"]["enum"]
     assert set(enum) == set(mf.KNOWN_CAPABILITIES)
+
+
+# ── main() exit codes + structured errors (#89: adopt agenttools_errors) ────────────────
+# main() is the cron entrypoint; a calling script branches on its exit code, so the code per
+# failure class is a contract. These cover the boundary the unit tests above never touched.
+import agenttools_errors as errs  # noqa: E402  (lib/ is on sys.path; sibling of checker)
+
+
+def _invalid_manifest(tmp_path: Path) -> Path:
+    """A manifest that loads but violates a cross-reference invariant (vision→non-vision)."""
+    data = {
+        "version": 1,
+        "models": [{"id": "code-only", "provider": "openai", "capabilities": ["code"]}],
+        "roles": {"vision": "code-only"},
+    }
+    return _write_manifest(tmp_path, data)
+
+
+def test_main_validate_invalid_manifest_exits_usage_not_internal(tmp_path, monkeypatch, capsys):
+    """A manifest that violates an invariant is a CONFIG error → exit 2 (EXIT_USAGE/CONFIG),
+    NOT 1 (EXIT_INTERNAL is reserved for unexpected bugs/tracebacks)."""
+    manifest = _invalid_manifest(tmp_path)
+    monkeypatch.setattr(mf, "load_manifest", _load_factory(manifest))
+
+    code = mf.main(["--validate"])
+    # An invariant violation raises ConfigError → EXIT_CONFIG. (EXIT_USAGE == EXIT_CONFIG == 2,
+    # but assert against the constant the code actually raises so this can't silently lie if
+    # agenttools_errors ever splits the two.)
+    assert code == errs.EXIT_CONFIG == 2
+    err = capsys.readouterr().err
+    assert "why:" in err and "fix:" in err  # structured 3-part block, not a bare line
+
+
+def test_main_malformed_manifest_exits_usage(tmp_path, monkeypatch, capsys):
+    """An unparseable / non-mapping manifest → structured config error, exit 2."""
+    bad = tmp_path / "models.yaml"
+    bad.write_text("just a string, not a mapping\n", encoding="utf-8")
+    monkeypatch.setattr(mf, "load_manifest", _load_factory(bad))
+
+    code = mf.main([])  # live run path; load_manifest raises before any network
+    assert code == errs.EXIT_CONFIG == 2
+    err = capsys.readouterr().err
+    assert "why:" in err and "fix:" in err
+
+
+def test_main_missing_pyyaml_exits_missing_dep(monkeypatch, capsys):
+    """PyYAML absent is a missing-DEPENDENCY failure → exit 127 + an install hint,
+    distinct from a malformed-config (2)."""
+    def _raise_missing_dep(*a, **k):
+        # MissingYamlError is exactly what load_manifest() raises when `import yaml` fails.
+        raise mf.MissingYamlError(
+            "PyYAML is required to read the manifest but is not installed. "
+            "Install it: `python3 -m pip install --user pyyaml`."
+        )
+    monkeypatch.setattr(mf, "load_manifest", _raise_missing_dep)
+
+    code = mf.main(["--validate"])
+    assert code == errs.EXIT_MISSING_DEP == 127
+    out = capsys.readouterr()
+    blob = out.err + out.out
+    assert "install" in blob.lower()
+
+
+def test_main_validate_ok_exits_zero(monkeypatch, capsys):
+    """The happy path stays byte-compatible: a valid manifest → exit 0, human summary."""
+    monkeypatch.setattr(mf, "load_manifest", _load_factory(MANIFEST))
+    code = mf.main(["--validate"])
+    assert code == errs.EXIT_OK == 0
+    assert "manifest OK" in capsys.readouterr().out
+
+
+def test_main_run_path_manifest_error_exits_config(monkeypatch, capsys):
+    """The SECOND ManifestError mapping — a fault surfacing from run() (not the initial
+    load_manifest) — must also render structured + exit 2. run() reloads the manifest, so a
+    ManifestError from there is the live-run analogue of the validate-path config error."""
+    monkeypatch.setattr(mf, "load_manifest", _load_factory(MANIFEST))  # initial load is fine
+
+    def _boom(*a, **k):
+        raise mf.ManifestError("manifest invalid:\n  - vision role points at a non-vision model")
+    monkeypatch.setattr(mf, "run", _boom)
+
+    code = mf.main([])  # live-run path (no --validate)
+    assert code == errs.EXIT_CONFIG == 2
+    err = capsys.readouterr().err
+    assert "why:" in err and "fix:" in err
+
+
+def test_main_unexpected_bug_propagates_not_swallowed(monkeypatch):
+    """Contract (README): an UNEXPECTED exception is a bug → guard() must let it propagate
+    (traceback + exit 1), NOT diagnose it as a config error. A regression where guard starts
+    swallowing arbitrary exceptions would otherwise pass unnoticed."""
+    def _bug(*a, **k):
+        raise RuntimeError("something genuinely unexpected broke")
+    monkeypatch.setattr(mf, "load_manifest", _bug)
+
+    with pytest.raises(RuntimeError, match="genuinely unexpected"):
+        mf.main(["--validate"])
+
+
+def _load_factory(path: Path):
+    """Return a load_manifest replacement that ALWAYS reads `path` (main() calls it with no
+    arg, so the default-path plumbing can't be redirected otherwise). Delegates to the real
+    parser by importing the module's function object captured before patching."""
+    real = _REAL_LOAD_MANIFEST
+
+    def _load_manifest(p: Path = path) -> "mf.Manifest":  # noqa: F821
+        return real(path)
+
+    return _load_manifest
+
+
+# Capture the genuine parser once, before any test monkeypatches mf.load_manifest.
+_REAL_LOAD_MANIFEST = mf.load_manifest
