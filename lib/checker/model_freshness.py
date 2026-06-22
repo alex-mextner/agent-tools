@@ -47,6 +47,19 @@ from typing import Any, Callable
 
 # ── paths ──────────────────────────────────────────────────────────────────────────────
 _HERE = Path(__file__).resolve().parent
+
+# Shared structured-error layer (error-system v2: WHAT / WHY / HOW-to-fix + stable exit codes).
+# The ._errors shim adds lib/ to sys.path. This module runs BOTH as a package (`from checker
+# import model_freshness`, the tests + any importer) and as a bare script (the cron runs
+# `python3 lib/checker/model_freshness.py`, so there's no package context) — so import the shim
+# relatively when packaged, else absolutely after putting this dir on the path. Stdlib-only, so
+# --validate/--help stay fast (PyYAML stays lazy inside load_manifest).
+try:  # package context (tests, any importer)
+    from ._errors import EXIT_USAGE, UsageError, guard  # noqa: F401  (EXIT_USAGE: public contract)
+except ImportError:  # bare-script context (the cron)
+    if str(_HERE) not in sys.path:
+        sys.path.insert(0, str(_HERE))
+    from _errors import EXIT_USAGE, UsageError, guard  # type: ignore[no-redef]  # noqa: F401
 _CONTRACTS = _HERE.parent / "contracts"
 MANIFEST_PATH = _CONTRACTS / "models.yaml"
 SCHEMA_PATH = _CONTRACTS / "models.schema.json"
@@ -776,40 +789,67 @@ def _print_human(result: RunResult) -> None:
         print(f"  {action}")
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="model-freshness",
-        description="Propose model-version bumps for lib/contracts/models.yaml (PROPOSE, never merge).",
-    )
-    parser.add_argument("--validate", action="store_true", help="validate the manifest and exit")
-    parser.add_argument("--dry-run", action="store_true", help="poll + compute, but never open a PR / write a report")
-    parser.add_argument("--report", action="store_true", help="force the dated-report path even if gh is available")
-    parser.add_argument("--timeout", type=float, default=20.0, help="per-request HTTP timeout seconds")
-    parser.add_argument("--json", action="store_true", help="emit a JSON summary instead of human text")
-    args = parser.parse_args(argv)
+def _manifest_error(exc: "ManifestError") -> UsageError:
+    """Wrap a load/validate :class:`ManifestError` as the shared usage error (exit 2).
 
+    A malformed or unreadable manifest is the "invalid config" class per the
+    ``structured-exit-codes`` skill: the message is the diagnosed WHY, and the fix points the
+    user (and the cron) at the manifest + the validate command.
+    """
+    # ``render()`` already prefixes ``error:`` and argparse brands the prog, so the WHAT line
+    # carries no extra "model-freshness:" prefix (kept consistent across both builders).
+    return UsageError(
+        what="the manifest is unusable",
+        why=str(exc),
+        fix=f"fix {MANIFEST_PATH}, then re-run --validate",
+    )
+
+
+def _validate_failed_error(problems: list[str]) -> UsageError:
+    """Build the structured error for a manifest that LOADS but is invalid (exit 2).
+
+    Every cross-reference problem is listed in the WHY (joined with ``; `` — NOT embedded
+    newlines, which the shared ``render`` sanitizes away, collapsing a faked multi-line list)
+    so the user sees them all at once; the FIX names the manifest. Same voice as
+    :func:`_manifest_error`.
+    """
+    return UsageError(
+        what=f"the manifest is invalid ({len(problems)} problem(s))",
+        why="; ".join(problems),
+        fix=f"fix the listed entries in {MANIFEST_PATH}, then re-run --validate",
+    )
+
+
+def _validate() -> int:
+    """Handle ``--validate``: load + check the manifest, raising the structured error on failure.
+
+    This is the ONLY place that pre-loads the manifest — the normal (non-validate) path lets
+    :func:`run` do its own single load+validate, so the manifest isn't read twice.
+    """
     try:
         manifest = load_manifest()
     except ManifestError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        raise _manifest_error(exc) from exc
+    problems = validate_manifest(manifest)
+    if problems:
+        raise _validate_failed_error(problems)
+    print(f"manifest OK — {len(manifest.models)} models, {len(manifest.roles)} roles, "
+          f"{len(manifest.aliases)} aliases")
+    return 0
 
+
+def _dispatch(args: argparse.Namespace) -> int:
+    """Run the parsed command; a load/validate failure raises a structured ``UsageError`` (exit 2)."""
     if args.validate:
-        problems = validate_manifest(manifest)
-        if problems:
-            print("manifest INVALID:", file=sys.stderr)
-            for p in problems:
-                print(f"  - {p}", file=sys.stderr)
-            return 1
-        print(f"manifest OK — {len(manifest.models)} models, {len(manifest.roles)} roles, "
-              f"{len(manifest.aliases)} aliases")
-        return 0
+        return _validate()
 
+    # The normal path: run() loads+validates the manifest once itself, raising ManifestError on
+    # a bad/invalid one — translated here so the rendering stays in one place (no separate
+    # pre-load, so the manifest is read exactly once).
     try:
         result = run(dry_run=args.dry_run, force_report=args.report, timeout=args.timeout)
     except ManifestError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        raise _manifest_error(exc) from exc
 
     if args.json:
         print(json.dumps(
@@ -830,6 +870,22 @@ def main(argv: list[str] | None = None) -> int:
     else:
         _print_human(result)
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="model-freshness",
+        description="Propose model-version bumps for lib/contracts/models.yaml (PROPOSE, never merge).",
+    )
+    parser.add_argument("--validate", action="store_true", help="validate the manifest and exit")
+    parser.add_argument("--dry-run", action="store_true", help="poll + compute, but never open a PR / write a report")
+    parser.add_argument("--report", action="store_true", help="force the dated-report path even if gh is available")
+    parser.add_argument("--timeout", type=float, default=20.0, help="per-request HTTP timeout seconds")
+    parser.add_argument("--json", action="store_true", help="emit a JSON summary instead of human text")
+    # argparse handles its OWN flag-parsing usage errors (terse usage + SystemExit(2)); guard
+    # wraps only the command body, where the diagnosed manifest/validate errors are raised.
+    args = parser.parse_args(argv)
+    return guard(lambda: _dispatch(args))
 
 
 if __name__ == "__main__":

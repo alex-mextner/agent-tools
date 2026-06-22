@@ -134,13 +134,33 @@ The daily cron rig provisions runs exactly `python3 <checkout>/lib/checker/model
 at **12:00 (noon)** — launchd on macOS, crontab on Linux. See
 [rig-cli](https://github.com/alex-mextner/rig-cli) (`models:` block / `rig status`).
 
+### Exit codes
+
+A diagnosed failure is rendered through the shared `agenttools_errors` layer (error-system v2:
+a three-part **WHAT / WHY / HOW-to-fix** block on stderr + a stable per-class exit code) — the
+same contract `review` / `rig` / research-cli use — so the cron's log and a calling script can
+branch on the failure class:
+
+| code | class | when |
+|------|-------|------|
+| `0` | success | proposed / wrote a report / `--validate` passed |
+| `2` | `EXIT_USAGE` | a usage/config problem: the manifest is unusable (missing/unreadable/malformed `models.yaml`, or PyYAML not installed), `--validate` found cross-reference problems, **or** argparse rejected an unknown flag (its own `SystemExit(2)`, which matches `EXIT_USAGE`) |
+| `1` | `EXIT_INTERNAL` | an unexpected crash (a bug — the traceback is shown) |
+
 ### Tests
 
 `tests/test_model_freshness.py` — hermetic: endpoints mocked via the injected `pollers`
 hook, `gh` via the injected `gh_available` hook (no network, no real `gh`). Covers manifest
 load/validate (incl. the vision cross-reference + the Kimi vision example), version
 comparison, proposal computation, the report fallback, gh idempotency/dry-run, key
-harvesting, endpoint parsers, and schema conformance.
+harvesting, endpoint parsers, and schema conformance. (This file `importorskip`s PyYAML, so it
+skips wholesale on a yaml-less runner.)
+
+`tests/test_model_freshness_errors.py` — the error-layer contract: a load/validate failure
+renders the shared 3-part block and returns `EXIT_USAGE`, the success path stays exit 0, and
+the `_errors` shim re-exports the shared objects (not copies). Deliberately **yaml-free**
+(failures injected via monkeypatch), so the exit-code contract is exercised even in the
+dependency-free CI gate.
 
 ```sh
 uv run --with pytest --with pyyaml --with jsonschema python -m pytest tests/test_model_freshness.py -q
