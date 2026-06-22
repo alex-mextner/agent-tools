@@ -20,6 +20,7 @@ that isn't actually ready even with a one-liner.
 | CI still running | Ship **watches** pending checks to completion (polls every `SHIP_CI_POLL`s up to `SHIP_CI_WAIT`s) instead of refusing — you don't babysit. |
 | Unresolved review threads | Same check as [`../review-threads/`](../review-threads/). |
 | UI-touching PR with no screenshot | Same check as [`../screenshots/`](../screenshots/); override with `--no-screenshot-ok`. |
+| **Shippable source changed but the version is UNCHANGED** | A ship of source is a release; the declared version (`pyproject.toml` `version`/`package.json` `"version"`) must be bumped so `--version` stays a real freshness signal (skill: `bump-version-on-release`). Docs-only / pure test/CI PRs are exempt. Override a genuine no-release ship with `--no-version-bump-ok <reason>` (or `SHIP_SKIP_VERSION_BUMP=1`). |
 | Local branch has unpushed/diverged commits, or dirty worktree | Avoids merging stale/uncommitted local state. |
 
 Then it squash-merges, deletes the remote branch, removes the local branch+worktree
@@ -55,6 +56,8 @@ Nothing org-/tracker-/layout-specific is hard-coded. Configure via env:
 | `SHIP_MAIN_CHECKOUT` | first worktree | Where to fast-forward after merge. |
 | `SHIP_UI_PATH_REGEX` | common FE paths | What makes a PR "UI-touching". **Set empty to disable the screenshot gate.** |
 | `SHIP_IMAGE_UPLOAD_CMD` | (unset) | Optional uploader for `--screenshot`: a command that takes the image (`{FILE}` token or `$1`) and prints a public URL. Without it, `--screenshot` just embeds a local-path note. |
+| `SHIP_SKIP_VERSION_BUMP` | (unset) | `=1` overrides the version-bump gate (env equivalent of `--no-version-bump-ok`). |
+| `SHIP_VERSION_FILES` | auto-detect | Space-separated version files to check (relative to repo root). Default: `pyproject.toml` then `package.json` at the root. Set for a non-standard layout. |
 
 ## Flags
 
@@ -62,6 +65,8 @@ Nothing org-/tracker-/layout-specific is hard-coded. Configure via env:
   or stuck; the other preflights still run).
 - `--dry-run` — print, change nothing.
 - `--no-screenshot-ok <reason>` — override the UI screenshot requirement, logged.
+- `--no-version-bump-ok <reason>` — override the version-bump requirement for a genuine
+  no-release ship (docs-only, pure test/CI, a revert), logged.
 - `--screenshot <path> [desc]` — upload (via `SHIP_IMAGE_UPLOAD_CMD`) and post a screenshot
   as a PR comment; repeatable.
 

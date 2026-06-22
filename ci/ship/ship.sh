@@ -24,6 +24,8 @@
 #                          billing-blocked / stuck — it still runs the other preflights).
 #   --dry-run              print what would happen; change nothing.
 #   --no-screenshot-ok R   override the UI screenshot requirement with a logged reason R.
+#   --no-version-bump-ok R override the version-bump requirement with a logged reason R
+#                          (genuine no-release ship: docs-only, pure test/CI, a revert).
 #   --screenshot P [D]     attach a local screenshot P (desc D) via SHIP_IMAGE_UPLOAD_CMD,
 #                          then post it as a PR comment. Repeatable.
 #
@@ -39,12 +41,18 @@
 #                          stdout. Receives the image path as {FILE} (or as $1 if no token).
 #                          Used only with --screenshot. If unset, --screenshot embeds a
 #                          local-path note instead (does NOT satisfy the screenshot gate).
+#   SHIP_SKIP_VERSION_BUMP=1  override the version-bump gate (same effect as
+#                          --no-version-bump-ok, with a generic env-set reason). Use only for a
+#                          genuine no-release ship.
+#   SHIP_VERSION_FILES     space-separated list of version files to check (relative to the repo
+#                          root). Default: auto-detect pyproject.toml then package.json at the
+#                          root. Set it for a non-standard layout (e.g. a nested package).
 set -euo pipefail
 
 ORIG_PWD=$(pwd -P)
-PR=""; SKIP_CI=0; DRY_RUN=0; NO_SHOT_OK=""
+PR=""; SKIP_CI=0; DRY_RUN=0; NO_SHOT_OK=""; NO_VBUMP_OK=""
 SHOT_PATHS=(); SHOT_DESCS=()
-USAGE='Usage: ship.sh <PR-number> [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--screenshot <path> [desc]]...'
+USAGE='Usage: ship.sh <PR-number> [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--screenshot <path> [desc]]...'
 
 # --- arg parse (PR number is the lone bare arg; --screenshot takes path + optional desc) --
 args=("$@"); i=0; n=${#args[@]}
@@ -56,6 +64,9 @@ while [ "$i" -lt "$n" ]; do
     --no-screenshot-ok)
       i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "--no-screenshot-ok needs a <reason>." >&2; exit 1; }
       NO_SHOT_OK=${args[$i]}; [ -n "$NO_SHOT_OK" ] || { echo "--no-screenshot-ok reason empty." >&2; exit 1; } ;;
+    --no-version-bump-ok)
+      i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "--no-version-bump-ok needs a <reason>." >&2; exit 1; }
+      NO_VBUMP_OK=${args[$i]}; [ -n "$NO_VBUMP_OK" ] || { echo "--no-version-bump-ok reason empty." >&2; exit 1; } ;;
     --screenshot|--shot)
       i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "$a needs a <path>." >&2; exit 1; }
       p=${args[$i]}; case "$p" in /*) : ;; *) p="$ORIG_PWD/$p" ;; esac
@@ -304,6 +315,145 @@ git fetch -q origin "$BRANCH" 2>/dev/null || true
 if git show-ref --verify --quiet "refs/heads/$BRANCH" && git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
   AHEAD=$(git rev-list --count "origin/$BRANCH..$BRANCH" 2>/dev/null || echo 0)
   [ "$AHEAD" = "0" ] || { echo "Refusing: local $BRANCH has $AHEAD unpushed commit(s). Push first." >&2; exit 1; }
+fi
+
+# --- version-bump gate: a release of shippable source MUST bump the declared version ----
+# Rationale (skill: bump-version-on-release): a tool's version is a freshness signal — it
+# tells a user which build they run and whether a fix landed. That only works if the
+# declared version is bumped on EVERY release. The canonical failure is a version that never
+# moves across many ships (e.g. a permanently-stale `0.1.0`), turning `--version` into noise.
+# So: if this PR changes shippable SOURCE (not docs / not tests / not CI) and the repo's
+# declared version field is UNCHANGED vs the PR base, refuse — this ship is a release and the
+# version must move. Override for a genuine no-release ship via --no-version-bump-ok <reason>
+# or SHIP_SKIP_VERSION_BUMP=1.
+#
+# Repo-agnostic: detection works off the PR's own changed files + diff (no tracker / layout /
+# org hard-coded). A changed path is "shippable source" UNLESS it matches the docs/test/CI
+# exclusion set below; the version file is auto-located (pyproject.toml `version =`, then
+# package.json `"version"`) or pinned via SHIP_VERSION_FILES.
+
+# A path is NON-shippable (does NOT, on its own, make a ship a release) iff it is docs, a
+# test, or CI/meta. Everything else is treated as shippable source. Kept deliberately broad
+# on the exclusion side so a docs-only / test-only / CI-only PR is never forced to bump.
+is_nonshippable_path() {  # $1 = path -> rc 0 if non-shippable (docs/test/CI), 1 otherwise
+  local base; base=${1##*/}
+  # A dependency MANIFEST named with a docs-ish extension (`requirements.txt`,
+  # `constraints*.txt`) is a SHIPPABLE change (a dep bump is a release), so it must NOT be
+  # swept into the `.txt` docs bucket below — check it first and return "shippable".
+  case "$base" in
+    requirements.txt|requirements-*.txt|constraints.txt|constraints-*.txt) return 1 ;;
+  esac
+  case "$1" in
+    # docs & prose
+    *.md|*.mdx|*.markdown|*.rst|*.txt|*.adoc) return 0 ;;
+    docs/*|*/docs/*|LICENSE|LICENSE.*|*/LICENSE|NOTICE|NOTICE.*|.gitignore|.gitattributes) return 0 ;;
+    # CI / repo meta — provider config dirs AND the common single-file CI configs, so a
+    # pure-CI PR on any major provider is exempt (not just GitHub Actions under .github/).
+    .github/*|*/.github/*|.gitlab/*|.circleci/*|.buildkite/*) return 0 ;;
+  esac
+  case "$base" in
+    .gitlab-ci.yml|.gitlab-ci.yaml|.travis.yml|.travis.yaml|azure-pipelines.yml|azure-pipelines.yaml) return 0 ;;
+    appveyor.yml|appveyor.yaml|.appveyor.yml|Jenkinsfile|.drone.yml|bitbucket-pipelines.yml|cloudbuild.yaml|cloudbuild.yml) return 0 ;;
+  esac
+  case "$1" in
+    # tests (common conventions across languages)
+    test/*|*/test/*|tests/*|*/tests/*|__tests__/*|*/__tests__/*) return 0 ;;
+    test_*.py|*/test_*.py|*_test.py|*/*_test.py) return 0 ;;
+    *.test.ts|*.test.tsx|*.test.js|*.test.jsx|*.spec.ts|*.spec.tsx|*.spec.js|*.spec.jsx) return 0 ;;
+    *_test.go|*/*_test.go) return 0 ;;
+  esac
+  return 1
+}
+
+# True iff at least one changed path is shippable source. Reads newline-separated paths on stdin.
+any_shippable_source() {  # stdin: changed paths -> rc 0 if any shippable
+  local p found=1
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if ! is_nonshippable_path "$p"; then found=0; fi
+  done
+  return $found
+}
+
+# Locate the repo's version file: the explicit override, else pyproject.toml (with a
+# `[project] version =`), else package.json (with a `"version"`). Prints the path, or nothing.
+locate_version_file() {
+  local f
+  if [ -n "${SHIP_VERSION_FILES:-}" ]; then
+    for f in $SHIP_VERSION_FILES; do [ -f "$ROOT/$f" ] && { printf '%s' "$f"; return 0; }; done
+    return 1
+  fi
+  if [ -f "$ROOT/pyproject.toml" ] && grep -Eq '^[[:space:]]*version[[:space:]]*=' "$ROOT/pyproject.toml"; then
+    printf 'pyproject.toml'; return 0
+  fi
+  if [ -f "$ROOT/package.json" ] && grep -Eq '"version"[[:space:]]*:' "$ROOT/package.json"; then
+    printf 'package.json'; return 0
+  fi
+  return 1
+}
+
+# True iff the PR's diff CHANGES THE VALUE of the version line of $1 — not merely that an
+# added version line exists. The distinction matters: requiring only a `+version` line would
+# pass a cosmetic edit (whitespace/quote churn) or even a DOWNGRADE as "bumped", which defeats
+# the "the version must MOVE" intent. So we extract the removed (`-`) and added (`+`) version
+# VALUES inside that file's diff section and require a NEW value that differs from the OLD.
+# (A version DECLARED for the first time — an added `+` with no matching `-` — also counts: a
+# brand-new version field is a move from "no version".)
+version_line_bumped() {  # $1 = version file path; uses $PR_DIFF (full patch text)
+  local file="$1" oldv newv
+  # Restrict to that file's section of the unified diff so an unrelated `version` elsewhere
+  # can't falsely satisfy the gate. A file's section runs from its `diff --git a/.. b/<file>`
+  # header up to the next `diff --git`.
+  local section
+  section=$(printf '%s\n' "$PR_DIFF" \
+    | awk -v f="$file" '
+        /^diff --git / { insec = ($0 == "diff --git a/" f " b/" f) ? 1 : 0; next }
+        insec { print }
+      ')
+  # Extract the quoted value from a version-declaration line (both pyproject `version = "X"`
+  # and package.json `"version": "X"` quote the value). `head -1` guards against multiple
+  # matches (e.g. a workspace member) — take the first, which is the package's own.
+  newv=$(printf '%s\n' "$section" | grep -E '^\+[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)' \
+           | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1)
+  oldv=$(printf '%s\n' "$section" | grep -E '^-[[:space:]]*(version[[:space:]]*=|"version"[[:space:]]*:)' \
+           | head -1 | grep -oE '[0-9][0-9A-Za-z.+_-]*' | head -1)
+  [ -n "$newv" ] || return 1            # no new version value declared -> not bumped
+  [ "$newv" != "$oldv" ] || return 1    # value unchanged (cosmetic-only edit) -> not bumped
+  return 0
+}
+
+if [ "${SHIP_SKIP_VERSION_BUMP:-0}" = "1" ] && [ -z "$NO_VBUMP_OK" ]; then
+  NO_VBUMP_OK="SHIP_SKIP_VERSION_BUMP=1 (env)"
+fi
+if [ -n "$NO_VBUMP_OK" ]; then
+  echo "[ship] version-bump gate OVERRIDDEN — reason: $NO_VBUMP_OK"
+else
+  if PR_FILES_VB=$(gh pr diff "$PR" --name-only 2>/dev/null); then
+    if printf '%s\n' "$PR_FILES_VB" | any_shippable_source; then
+      # Shippable source changed -> this ship is a release. The version field must have moved.
+      if VFILE=$(locate_version_file); then
+        if PR_DIFF=$(gh pr diff "$PR" 2>/dev/null); then
+          if ! version_line_bumped "$VFILE"; then
+            { echo "Refusing: PR #$PR changes shippable source but the version in $VFILE is UNCHANGED — this ship is a release, so bump the version (skill: bump-version-on-release)."
+              echo "  Semver: patch for a fix, minor for a feature, major for a breaking change. Edit $VFILE's version field, push, re-run ship."
+              echo "  If this is genuinely NOT a release (docs-only / pure test or CI / a revert), override: --no-version-bump-ok <reason> (or SHIP_SKIP_VERSION_BUMP=1)."; } >&2
+            exit 1
+          fi
+          echo "[ship] version-bump gate OK — $VFILE version is bumped in PR #$PR."
+        else
+          echo "Refusing: could not read the diff for PR #$PR — cannot evaluate the version-bump gate (override with --no-version-bump-ok <reason> if intended)." >&2
+          exit 1
+        fi
+      else
+        echo "[ship] version-bump gate: no version file (pyproject.toml/package.json) found at repo root — skipping (set SHIP_VERSION_FILES for a non-standard layout)."
+      fi
+    else
+      echo "[ship] version-bump gate: PR #$PR changes no shippable source (docs/tests/CI only) — no bump required."
+    fi
+  else
+    echo "Refusing: could not list changed files for PR #$PR — cannot evaluate the version-bump gate (override with --no-version-bump-ok <reason> if intended)." >&2
+    exit 1
+  fi
 fi
 
 # --- screenshot gate (optional uploader + UI-touching check) ---------------------------
