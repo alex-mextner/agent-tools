@@ -24,6 +24,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 # research-cli lives at tools/research-cli/; put it on the path. Its providers.py adds lib/ so
 # the shared agenttools_errors / agenttools_providers resolve from the source checkout.
 _TOOL = Path(__file__).resolve().parent.parent / "tools" / "research-cli"
@@ -99,6 +101,16 @@ def test_ask_no_seat_answered_is_network_class_with_fix(tmp_path, monkeypatch):
     # unreachable (the key cascade resolves nothing), so 0 seats answer -> the NETWORK class
     # (was the ad-hoc 69). Deterministic + network-free: is_reachable only reads env + .env
     # files (no HTTP), so clearing the keys and running in an empty cwd guarantees 0 reachable.
+    #
+    # Hidden PyYAML dependency: this is the ONLY error test that drives the live `ask` panel
+    # pass, which loads the real manifest (lib/contracts/models.yaml) to resolve the board
+    # BEFORE it can know any seat is unreachable. Without PyYAML that manifest load fails
+    # first and the command returns EXIT_USAGE (a missing-dep config error), never reaching
+    # the reachability check — so the NETWORK class is unobservable. Skip rather than assert a
+    # code the path structurally cannot produce here, matching the sibling manifest-driven
+    # tests in test_research_cli.py that all importorskip("yaml") (agent-tools#87).
+    pytest.importorskip("yaml")
+
     all_key_names = {n for names in PROVIDER_KEY_NAMES.values() for n in names}
     for name in all_key_names:
         monkeypatch.delenv(name, raising=False)
