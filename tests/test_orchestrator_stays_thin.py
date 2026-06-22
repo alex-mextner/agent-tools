@@ -168,6 +168,132 @@ def test_plain_redirect_is_not_implementation(tmp_path, monkeypatch):
     assert c2 == 0 and _decision(out2) == "allow"
 
 
+# ── #80: a FULLY read-only pipe of ANY length is never blocked ───────────────────────────
+
+@pytest.mark.parametrize("command", [
+    "find . -name foo | grep bar | head",      # the live-session repro
+    "tail -100 log | grep err | wc -l",        # 3-segment inspection
+    "find . | grep x | head -5",               # 3 segments, trailing args
+    "cat a.txt | grep -i warn | grep -v ok | head -20",  # 4 segments
+])
+def test_read_only_pipe_any_length_allows(command, tmp_path, monkeypatch):
+    """A pipe where EVERY segment is read-only inspection must never warn or block, even
+    with 3+ segments (it tripped `len(CHAIN.findall()) >= 2` before #80)."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense does not even warn
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")  # never primes a block
+    assert c2 == 0 and _decision(out2) == "allow"
+
+
+@pytest.mark.parametrize("command", [
+    "find . | grep x | sed -i 's/a/b/' f.py",     # read-only segments + in-place edit
+    "tail -50 log | grep err | npm install pkg",  # read-only segments + installer
+    "cat a | grep b | tee out.txt",               # read-only segments + tee write
+])
+def test_read_only_pipe_with_one_impl_segment_blocks_on_repeat(command, tmp_path, monkeypatch):
+    """One build/edit segment anywhere in an otherwise-read-only pipe still blocks (#80)."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_read_only_pipe_with_heredoc_segment_blocks_on_repeat(tmp_path, monkeypatch):
+    """A heredoc inside an otherwise-read-only pipe still blocks (#80)."""
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "cat <<EOF > f\nbody\nEOF\ngrep x f | head"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_pipe_with_non_read_only_segment_unchanged(tmp_path, monkeypatch):
+    """A pipe with a segment that is neither read-only nor build/edit keeps the old
+    `>= 2 operators is implementation` behavior — the carve-out only covers ALL-read-only."""
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "find . | python score.py | head"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+@pytest.mark.parametrize("command", [
+    "cat tee.log",                       # `tee` is the FILE being read, not a write
+    "grep tee notes.txt",                # `tee` is the search NEEDLE
+    "cat Cargo.toml",                    # build-manifest is an inspection target
+    "head package.json",                 # ditto
+    "grep dep Cargo.toml | head",        # read-only pipe, build-token as an argument
+])
+def test_read_only_with_build_token_argument_allows(command, tmp_path, monkeypatch):
+    """A build/edit token appearing only as the ARGUMENT/needle of a read-only command keeps
+    the carve-out (#80 review #1) — judgement is per-segment-HEAD, not a whole-string scan.
+    `tee`/`sed -i` are unanchored in BUILD_EDIT, so a whole-string veto would mis-flag these."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense does not even warn
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")  # never primes a block
+    assert c2 == 0 and _decision(out2) == "allow"
+
+
+def test_single_read_only_via_new_path_still_allows(tmp_path, monkeypatch):
+    """The old single-command carve-out is now a subset of _is_all_read_only — pin it (#80
+    review #2): a bare `git status` still routes through the new path and is never blocked."""
+    assert ost._is_all_read_only("git status") is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": "git status"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == 0 and _decision(out2) == "allow"
+
+
+@pytest.mark.parametrize("command", [
+    "git status && ls && cat x",          # all-read-only && chain (>= 2 operators)
+    "ls; cat foo.txt; grep err foo.txt",  # all-read-only ; chain
+])
+def test_read_only_non_pipe_chain_allows(command, tmp_path, monkeypatch):
+    """The carve-out covers ANY operator, not just `|` — a read-only `&&`/`;` chain of any
+    length is inspection too (#80 review #3). `git` is narrowly scoped in READ_ONLY_BASH
+    (status/log/diff/show/branch only), so `git add && git commit && git push` is NOT covered
+    — see test_git_mutating_chain_still_blocks_on_repeat."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense does not even warn
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")  # never primes a block
+    assert c2 == 0 and _decision(out2) == "allow"
+
+
+def test_git_mutating_chain_still_blocks_on_repeat(tmp_path, monkeypatch):
+    """`git` is narrowly scoped to read-only subcommands, so a mutating git chain is NOT
+    waved through as all-read-only and still blocks on repeat (#80 review #1 — no security
+    regression: add/commit/push do not match READ_ONLY_BASH)."""
+    assert ost._is_all_read_only("git add -A && git commit -m x && git push") is False
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "git add -A && git commit -m x && git push"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_build_edit_head_with_read_only_needle_blocks(tmp_path, monkeypatch):
+    """ANCHOR INVARIANT (#80 review #1): the per-segment-HEAD contract holds only because
+    READ_ONLY_BASH is head-anchored (`^\\s*`). A segment whose HEAD is a build/edit command
+    (`sed -i ...`) but whose ARGUMENT contains a read-only word (`grep.py`) must NOT be waved
+    through. If READ_ONLY_BASH were ever de-anchored, `.search()` would match the `grep` needle
+    mid-segment and silently allow an in-place edit — this test fails loud on that regression."""
+    cmd = "find . | sed -i 's/a/b/' grep.py"
+    assert ost._is_all_read_only(cmd) is False
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": cmd}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
 # ── T3: heredoc-to-file is implementation ────────────────────────────────────────────────
 
 def test_heredoc_to_file_blocks_on_repeat(tmp_path, monkeypatch):
