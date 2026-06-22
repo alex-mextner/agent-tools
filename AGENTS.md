@@ -194,6 +194,16 @@ them to *every* project and user. If you want the catalog of always-apply behavi
   as a **CLI + skill**, not an MCP server (an MCP pays a permanent context tax). Add an MCP slot
   only when the agent genuinely can't reach the system from a shell. `review` is a CLI+skill for
   exactly this reason — don't wrap it in MCP.
+- **An unused tool / skill / MCP / command is a SIGNAL, not a deletion candidate.** When something
+  installed is never invoked, the reflex "prune it" is *wrong* — same root as the dead-code rule.
+  "Unused" almost always means **broken, unwired, forgotten, or superseded-but-not-migrated**: a
+  capability someone built and never finished routing to its callsites (a registry that points at a
+  path the harness doesn't read; a skill the model never gets advertised; a command wired to no
+  invoker). Investigate WHY it's unused (`git log -S` the symbol, read the commit that added it,
+  check for a missing wiring/registration step), then **FIX or wire it** — or leave it. Deleting
+  destroys both the signal and a probably-useful-but-broken capability. This applies to the
+  catalog's own skills/hooks AND to a user's installed toolset: never propose pruning a user's
+  tools because they "look unused" — find out why they aren't used and fix that.
 
 ---
 
