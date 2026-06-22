@@ -181,3 +181,50 @@ def test_exempt_and_non_commit_allowed(command):
     r = _run(command)
     assert r["code"] == 0
     assert r["decision"] == "allow"
+
+
+# ── OVER-MATCH REGRESSION (agent-tools#97) ──────────────────────────────────────────────────────
+# The gate must fire ONLY on a real `git commit` invocation — never when the words "git"/"commit"
+# merely appear as a substring/argument/message-body of some OTHER command. The old raw regex
+# `\bgit\b.*\bcommit\b` over the RAW command string blocked every benign command that mentioned both
+# words (a LIVE false positive: a subagent's `gh issue create` whose body said "git commit").
+
+
+@pytest.mark.parametrize("command", [
+    # the LIVE repro: an issue body containing the words "git commit"
+    'gh issue create --title "fix gate" --body "we should git commit only on a real commit"',
+    'echo "git commit"',                       # echo is not a commit
+    "git log --grep=commit",                   # git log, not git commit (glued value)
+    "git log --grep commit -n 5",              # git log, not git commit (separate value)
+    'grep -rn "git commit" src/',              # a grep whose pattern says "commit"
+    "git config commit.gpgsign true",          # mentions commit, not authoring one
+    "git help commit",                         # help for the commit subcommand
+    "git commit-graph write",                  # a DIFFERENT subcommand
+    'tg "I will git commit the fix once review passes"',  # a status report ABOUT a commit
+])
+def test_mentioning_commit_is_not_gated(command):
+    r = _run(command)
+    assert r["code"] == 0, f"{command!r} is not a git commit — must allow, got exit={r['code']}"
+    assert r["decision"] == "allow"
+
+
+def test_real_commit_after_a_mentioning_sibling_still_blocks():
+    # `echo "git commit" && git commit -m feat` — the SECOND segment is a real, ticketless commit.
+    r = _run('echo "git commit" && git commit -m "feat: add export"')
+    assert r["code"] == 10
+    assert r["decision"] == "block"
+
+
+@pytest.mark.parametrize("command", [
+    'env FOO=bar git commit -m "feat: add export"',          # env-prefixed
+    'FOO=bar git commit -m "feat: add export"',              # bare inline VAR=value
+    'sudo git commit -m "feat: add export"',                 # sudo
+    'sudo -u git git commit -m "feat: add export"',          # sudo -u <user named git>
+    'runuser -u git -- git commit -m "feat: add export"',    # runuser
+    'timeout 60 git commit -m "feat: add export"',           # timeout (operand-drop)
+    '/usr/bin/git commit -m "feat: add export"',             # path-qualified git
+])
+def test_wrapped_no_ticket_commit_still_blocks(command):
+    r = _run(command)
+    assert r["code"] == 10, f"{command!r} is a real wrapped commit — must block, got exit={r['code']}"
+    assert r["decision"] == "block"
