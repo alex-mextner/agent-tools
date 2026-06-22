@@ -97,6 +97,7 @@ def _run_hook_raw(command: str, **kwargs) -> dict:
         "code": proc.returncode,
         "decision": payload["decision"],
         "message": payload.get("message", ""),
+        "stderr": proc.stderr or "",
     }
 
 
@@ -229,6 +230,59 @@ class MessageExtraction(unittest.TestCase):
         # direction for require-ticket, which is on_error=open: an unparseable command is not gated).
         self.assertEqual(mod.commit_segments('git commit -m "unterminated #7'), [])
 
+    def test_dash_F_dash_does_not_read_a_file_named_dash(self):
+        # `-F -` is the STDIN sentinel, NOT a file named "-": the message extractor must not try to
+        # open it (it would fail) and must contribute no text — the stdin-message detection handles it.
+        self.assertEqual(
+            mod.commit_message_from_argv(_commit_argv("git commit -F -")).strip(), ""
+        )
+
+
+class StdinMessageDetection(unittest.TestCase):
+    """`git commit -F -` streams the message on GIT's stdin, which a PreToolUse hook cannot read.
+    The detector must recognize every spelling of the stdin sentinel so the gate can fail-open."""
+
+    def test_detects_dash_F_dash(self):
+        self.assertTrue(mod.commit_reads_stdin_message(_commit_argv("git commit -F -")))
+
+    def test_detects_long_file_dash(self):
+        self.assertTrue(mod.commit_reads_stdin_message(_commit_argv("git commit --file -")))
+
+    def test_detects_glued_dash_F_dash(self):
+        self.assertTrue(mod.commit_reads_stdin_message(_commit_argv("git commit -F-")))
+
+    def test_detects_file_equals_dash(self):
+        self.assertTrue(mod.commit_reads_stdin_message(_commit_argv("git commit --file=-")))
+
+    def test_real_file_is_not_stdin(self):
+        self.assertFalse(mod.commit_reads_stdin_message(_commit_argv("git commit -F /tmp/msg.txt")))
+
+    def test_dash_m_is_not_stdin(self):
+        self.assertFalse(mod.commit_reads_stdin_message(_commit_argv('git commit -m "feat: x"')))
+
+    def test_dash_after_ddash_is_a_pathspec_not_stdin(self):
+        # after `--` everything is a literal pathspec — a `-` there is a file, not a -F value.
+        self.assertFalse(mod.commit_reads_stdin_message(_commit_argv("git commit -m x -- -")))
+
+    def test_reader_and_detector_agree_on_every_file_spelling(self):
+        # PARITY: a readable `-F`/`--file` value (any of the four spellings) must be READ by
+        # commit_message_from_argv AND not be mistaken for stdin; a `-` value must do the opposite.
+        # Pins that the two parsers don't drift (the docstring claims they recognize the same forms).
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("feat: x\n\nCloses #5\n")
+            path = fh.name
+        try:
+            for spelling in (f"-F {path}", f"-F{path}", f"--file {path}", f"--file={path}"):
+                argv = _commit_argv(f"git commit {spelling}")
+                self.assertIn("Closes #5", mod.commit_message_from_argv(argv), spelling)
+                self.assertFalse(mod.commit_reads_stdin_message(argv), spelling)
+        finally:
+            os.unlink(path)
+        for stdin_spelling in ("-F -", "-F-", "--file -", "--file=-"):
+            argv = _commit_argv(f"git commit {stdin_spelling}")
+            self.assertEqual(mod.commit_message_from_argv(argv).strip(), "", stdin_spelling)
+            self.assertTrue(mod.commit_reads_stdin_message(argv), stdin_spelling)
+
 
 class EndToEnd(unittest.TestCase):
     def test_missing_ticket_blocks_by_default(self):
@@ -316,6 +370,33 @@ class EndToEnd(unittest.TestCase):
             )
         self.assertEqual(code, 0)
         self.assertEqual(decision, "allow")
+
+    def test_dash_F_dash_fails_open_with_log(self):
+        # `git commit -F -` streams the message on git's stdin, which the hook CANNOT read. It must
+        # fail-OPEN (allow) rather than false-block a possibly-ticketed commit — and LOG the bypass.
+        out = _run_hook_raw("git commit -F -")
+        self.assertEqual(out["code"], 0, "-F - is unreadable — must fail-open, not block")
+        self.assertEqual(out["decision"], "allow")
+        self.assertNotIn(mod.BLOCK_MARKER, out["message"])
+        # the allow must be VISIBLE as an unreadable-message bypass, not a silent pass.
+        self.assertIn("stdin", out["message"].lower())
+        # and the `-` sentinel must NOT have been treated as a file to open (no spurious read warning).
+        self.assertNotIn("could not read commit-message file", out["stderr"])
+
+    def test_dash_F_dash_fails_open_even_in_strict_mode(self):
+        # strict default doesn't change it — an unreadable message can't be ticket-checked.
+        code, decision = run_hook("git commit -F -", strict=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(decision, "allow")
+
+    def test_dash_F_real_file_without_ticket_still_blocks(self):
+        # the fail-open is ONLY for `-F -`: a READABLE -F file with no ticket still blocks.
+        with tempfile.TemporaryDirectory() as repo:
+            msg_path = Path(repo) / "COMMIT_MSG.txt"
+            msg_path.write_text("feat: add export\n", encoding="utf-8")
+            code, decision = run_hook("git commit -F COMMIT_MSG.txt", strict=True, cwd=repo)
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
 
 
 class ValidRefFormsPassByDefault(unittest.TestCase):

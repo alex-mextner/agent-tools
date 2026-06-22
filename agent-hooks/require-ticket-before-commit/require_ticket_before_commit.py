@@ -499,14 +499,22 @@ def has_inline_skip(segment: CommitSegment) -> bool:
     return segment.env.get("REQUIRE_TICKET_SKIP", "").strip().lower() not in _SKIP_FALSEY
 
 
+# The `-F -` sentinel: git reads the commit message from its OWN stdin. A PreToolUse hook cannot
+# read that (the hook's stdin is the JSON event, not git's), so a `-F -` value is NOT a file path to
+# open — it's the unreadable-message marker that triggers the fail-open in _evaluate_commit_segment.
+_STDIN_SENTINEL = "-"
+
+
 def commit_message_from_argv(argv: list[str], cwd: str | None = None) -> str:
     """Pull the commit message out of the already-parsed commit argv: -m/--message and -F/--file.
 
     Returns ONLY the message text — the concatenation of every -m value and the contents of any -F
     file — so the conventional-type / WIP exemption check sees the real subject line, not the `git
     commit …` argv. A relative `-F` path is resolved against `cwd` (the command's working directory
-    from the event), since the hook may run elsewhere. Stops at `--` (the rest are literal
-    pathspecs, never message flags)."""
+    from the event), since the hook may run elsewhere. A `-F -` (stdin) value contributes NO text —
+    git streams that message on its own stdin, which the hook can't read; commit_reads_stdin_message
+    detects it separately so the caller fails open. Stops at `--` (the rest are literal pathspecs,
+    never message flags)."""
     parts: list[str] = []
     i = 0
     while i < len(argv):
@@ -533,7 +541,45 @@ def commit_message_from_argv(argv: list[str], cwd: str | None = None) -> str:
     return "\n".join(parts)
 
 
+def _file_flag_values(argv: list[str]) -> list[str]:
+    """Every `-F`/`--file` VALUE in the parsed commit argv — separate `-F <p>`/`--file <p>`, glued
+    `-F<p>`, and `--file=<p>` — in order. Stops at `--` (literal pathspecs, never message flags).
+
+    Recognizes the SAME four spellings `commit_message_from_argv` reads from disk, so the
+    stdin-sentinel detector and the message reader agree on what a `-F`/`--file` value is (a value
+    that reads as a file in one MUST be seen as a file in the other, and vice versa for `-`). The two
+    keep separate loops because the reader interleaves `-m` values and file CONTENTS while this one
+    only collects the file VALUES; a parity test pins that they don't drift."""
+    values: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            break
+        if tok in ("-F", "--file") and i + 1 < len(argv):
+            values.append(argv[i + 1])
+            i += 2
+            continue
+        if tok.startswith("--file="):
+            values.append(tok.split("=", 1)[1])
+        elif tok.startswith("-F") and len(tok) > 2:
+            values.append(tok[2:])  # -FPATH glued (and -F- → "-")
+        i += 1
+    return values
+
+
+def commit_reads_stdin_message(argv: list[str]) -> bool:
+    """True when the commit's message comes from git's STDIN via `-F -` (any spelling: `-F -`,
+    `-F-`, `--file -`, `--file=-`). That message is on git's own stdin, which a PreToolUse hook
+    cannot read — so the caller must fail OPEN rather than false-block a possibly-ticketed commit."""
+    return any(v == _STDIN_SENTINEL for v in _file_flag_values(argv))
+
+
 def _read_message_file(path: str, cwd: str | None = None) -> str:
+    # `-F -` is the stdin sentinel, not a file named "-": don't try to open it (it would fail and
+    # warn spuriously). commit_reads_stdin_message handles that case at the decision layer.
+    if path == _STDIN_SENTINEL:
+        return ""
     resolved = os.path.expanduser(path)
     if cwd and not os.path.isabs(resolved):
         resolved = os.path.join(cwd, resolved)
@@ -663,6 +709,20 @@ def _evaluate_commit_segment(segment: CommitSegment, event_cwd: str | None) -> i
         return None
     # Honor `git -C <repo>`: message-file + branch detection must target the repo the commit acts on.
     cwd = effective_cwd(segment, event_cwd)
+    # `git commit -F -` streams the message on GIT's stdin, which a PreToolUse hook CANNOT read (the
+    # hook's stdin is the JSON event, not git's). We genuinely cannot ticket-check an unreadable
+    # message, so FAIL OPEN (allow) rather than false-block a possibly-ticketed commit — but LOG it
+    # loudly, since `-F -` is a real bypass surface for this gate (agent-tools#101). This is distinct
+    # from `-F <file>`, which IS readable and is ticket-checked normally below.
+    if commit_reads_stdin_message(segment.argv):
+        note = (
+            "commit message is on git's stdin (`-F -`) — a PreToolUse hook cannot read it, so the "
+            "ticket gate is FAILING OPEN and allowing this commit unchecked. This is a known "
+            "`-F -` bypass surface; prefer `-m`/`-F <file>` so the gate can verify the ticket."
+        )
+        warn(note)
+        emit("allow", note)
+        return 0
     message = commit_message_from_argv(segment.argv, cwd)
     # Exemption is judged from the message text only (the real subject line), not the `git commit …`
     # argv — otherwise the command words could mis-trigger it.

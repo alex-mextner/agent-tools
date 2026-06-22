@@ -167,6 +167,46 @@ def test_inline_skip_on_sibling_does_not_bypass():
     assert r["decision"] == "block"
 
 
+# ── -F MESSAGE SOURCE: file readable, stdin (-F -) fail-open ─────────────────────────────────────
+# #100 made `-F <file>` readable; #101 closes the remaining `-F -` (stdin) gap — git streams that
+# message on its OWN stdin, which a PreToolUse hook cannot read, so for `-F -` ONLY the gate must
+# fail-OPEN (allow) with a logged note rather than false-block a possibly-ticketed commit.
+
+
+# Every readable `-F`/`--file` SPELLING (separate, glued, long, `=`) must actually READ the file and
+# gate on its ticket — the stdin fail-open is ONLY for `-F -`, never for a real file in any spelling.
+@pytest.mark.parametrize("spelling", ["-F {p}", "-F{p}", "--file {p}", "--file={p}"])
+def test_file_spellings_with_ticket_allow(tmp_path, spelling):
+    msg = tmp_path / "COMMIT_MSG.txt"
+    msg.write_text("feat: add export\n\nCloses #321\n", encoding="utf-8")
+    r = _run(f"git commit {spelling.format(p=msg)}")
+    assert r["code"] == 0, f"{spelling!r} with Closes #321 must read the file and allow ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+@pytest.mark.parametrize("spelling", ["-F {p}", "-F{p}", "--file {p}", "--file={p}"])
+def test_file_spellings_without_ticket_block(tmp_path, spelling):
+    msg = tmp_path / "COMMIT_MSG.txt"
+    msg.write_text("feat: add export\n", encoding="utf-8")
+    r = _run(f"git commit {spelling.format(p=msg)}")
+    assert r["code"] == 10, f"{spelling!r} readable file with no ticket must still block ({r['message']})"
+    assert r["decision"] == "block"
+
+
+@pytest.mark.parametrize("command", [
+    "git commit -F -",       # separate stdin sentinel
+    "git commit -F-",        # glued
+    "git commit --file -",   # long form
+    "git commit --file=-",   # long form, glued
+])
+def test_dash_F_stdin_fails_open_with_log(command):
+    r = _run(command)
+    assert r["code"] == 0, f"{command!r} streams the message on stdin (unreadable) — must fail-open"
+    assert r["decision"] == "allow"
+    assert rt.BLOCK_MARKER not in r["message"]
+    assert "stdin" in r["message"].lower(), "the unreadable-message bypass must be logged/visible"
+
+
 # ── EXEMPTIONS still hold under the strict default ──────────────────────────────────────────────
 
 

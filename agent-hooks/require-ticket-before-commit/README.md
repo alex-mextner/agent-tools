@@ -31,11 +31,21 @@ certainly had a ticket anyway. It scans the commit message *and* the branch name
 | full tracker URL              | `github.com/o/r/issues/12`, `linear.app/.../issue/…` | any |
 
 The message is pulled from the argv (`-m`/`--message`, `-mMsg`, and the contents of any
-`-F`/`--file` commit-message file), so a ticket id in any of those counts. A relative
-`-F` path is resolved against the event's `cwd` (the command's working directory), so it
-works even when the harness launches the hook outside the repo. A trailer keyword
-(`Closes`/`Fixes`/`Refs`) only counts when it's followed by a real ref — `fix: null deref`
-is a bugfix subject, not a reference, so in strict mode it correctly still needs a ticket.
+`-F`/`--file` commit-message file — read from disk, separate `-F <path>`, glued `-F<path>`,
+and `--file=<path>` forms all), so a ticket id in any of those counts. A relative `-F` path
+is resolved against the event's `cwd` (the command's working directory), so it works even when
+the harness launches the hook outside the repo. A trailer keyword (`Closes`/`Fixes`/`Refs`)
+only counts when it's followed by a real ref — `fix: null deref` is a bugfix subject, not a
+reference, so in strict mode it correctly still needs a ticket.
+
+**`-F -` (message on stdin) — fails OPEN by design (agent-tools#101).** `git commit -F -` reads
+the message from *git's own stdin*, which a PreToolUse hook **cannot** read (the hook's stdin is
+the JSON event, not git's). The gate genuinely can't ticket-check an unreadable message, so for
+`-F -` *specifically* it **allows** the commit rather than false-block a possibly-ticketed one —
+and emits a loud `allow` note that this is an unreadable-message bypass surface. This is the only
+`-F` form that fails open; `-F <file>` is read and checked normally. Prefer `-m` / `-F <file>` so
+the gate can actually verify the ticket. (An editor commit — `git commit` with no `-m`/`-F` — has
+no message available pre-commit either; it's checked against the branch name only.)
 
 ## What counts as a `git commit` (argv-scoped detection)
 
