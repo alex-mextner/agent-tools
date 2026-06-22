@@ -1,8 +1,12 @@
 # Agent CLI Ecosystem — Roadmap
 
-Status snapshot: **2026-06-19** (latest activity at the end of this file). This is the
+Status snapshot: **2026-06-22** (latest activity at the end of this file). This is the
 handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, `rig-cli`,
 `draw-cli`, `3d-cli`, `task-cli`) + the `agent-tools` umbrella.
+
+> **Status legend:** ✅ = done AND CTO-reviewed · 🔬 = shipped/merged, AWAITING CTO review
+> (the CTO reserves ✅ for after he reviews) · 🔮 = building now (in-flight this turn, not yet
+> merged) · ⏭️ = skipped (with reason). A merged PR is 🔬, never ✅, until the CTO signs off.
 
 > **Reading order:** the AUTHORITATIVE current state is **§Remaining work (prioritized)** and the
 > **§Open-ticket ledger** below — start there. The two collapsed `📜 …` blocks are dated session
@@ -15,6 +19,90 @@ handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, `rig
 > New tools are built in Python on that lib so a new tool spins up fast on one architecture.
 > `rig` is the front door (`rig init` onboarding, `rig apply` reconcile — two distinct commands,
 > interactivity orthogonal). `agent-tools` = WHAT (the catalog), `rig` = HOW (installs it).
+
+---
+
+## 2026-06-22 — shipped this session (🔬 under CTO review)
+
+*Everything below is **MERGED on each repo's `origin/main`** but is marked 🔬 (awaiting CTO
+review), NOT ✅ — the CTO signs off to ✅. The 🔮 block at the end is work building THIS turn
+(not yet merged). Grouped by repo; each line maps to the §Remaining-work / §Open-ticket item it
+advances, which is also annotated `🔬 review (PR #…)` inline below.*
+
+### tg-cli — 🔬 under review (all MERGED)
+
+- 🔬 **#47** — tg-ctl locale fix: force a UTF-8 locale for discovery (the REAL "Claude Code not in
+  tmux" root cause — launchd has no locale → tmux mangles the `\t` pane separator → 0 panes).
+- 🔬 **#48** — `tg` `parse_mode` follows `--format` only; plain text containing a URL / `--` / `:`
+  no longer 400s (the "Only those HTML tags are supported" misfire). Maps to §9 parse_mode bug.
+- 🔬 **#49** — file-excerpt: strip wrapping punctuation so a `path:line` spec in prose attaches its
+  excerpt. Maps to §9 / tg-cli#29.
+- 🔬 **#50** — the OUTBOUND `tg` sender honors `TG_API_BASE` (was hardcoded). Prereq for the
+  review-qa bot-harness Tier-1 mock (review-qa §"bot harness").
+- 🔬 **#54** — forum-topics ROUTING half: topic→pane map + inbound route + outbound
+  `message_thread_id`. Advances the forum-topics mode (CTO 2026-06-18) / tg-cli#27 wiring.
+- 🔬 **#55** — reply-misroute fix: a recognized reply route never loses to the global registration
+  (#53). Pairs with the per-pane registration set (#69).
+- 🔬 **#60** — a SCOPED forwarded question waits INDEFINITELY for its Telegram answer (no idle-exit
+  on a pending question). Maps to the decisions-as-buttons / hanging-question danger (§9, tg-cli#30).
+- 🔬 **#61** — `tg --topic` / `TG_TOPIC` outbound threading (forum-topics increment 2).
+- 🔬 **#62** — `/agent` inline-keyboard picker with distinct cwd labels (closes #59).
+- 🔬 **#64** — `/agent` picker buttons-only (drop the redundant window header + text list).
+- 🔬 **#66** — log every ask-forward attempt + outcome (no silent non-forward).
+- 🔬 **#69** — per-pane registration SET: every live session's questions forward (multi-session
+  forwarding, #67). Pairs with #55.
+- 🔬 **#71** — self-provision the bot command menu via `setMyCommands` on startup.
+
+### review-cli — 🔬 under review (all MERGED) — advances §"review qa — agent-as-tester mode"
+
+- 🔬 **#55** — review-qa **Phase 1**: mode skeleton + no-suites gate (the registry-wiring slice).
+- 🔬 **#59** — board: GLM 5.2 via commandcode as a read-only seat (priority 3, under Opus).
+- 🔬 **#62** — review-qa **Phase 2**: write/exec agentic executor + judge + 2-fixture DoD.
+
+### rig-cli — 🔬 under review (all MERGED)
+
+- 🔬 **#55** — revert the subagents-provisioning category (#53) — CTO decided to SKIP custom agents.
+- 🔬 **#58** — skill conflict-backups (`rig-bak`) land OUTSIDE the natively-scanned skills dir.
+- 🔬 **#60** — drop the dead `mcp.items.review` slot from the shipped template (the `review --mcp`
+  removal residue). Maps to §9 "`review --mcp` broken ecosystem-wide".
+- 🔬 **#62** — test: fake catalog mirrors reality (drop the fabricated removed mcp/review slot).
+- 🔬 **#64** — `rig status` missing-target scan follows the configured settings path, not a
+  hardcoded `~/.claude` (#63). Maps to the error-system v2 *missing-target* heuristic.
+
+### agent-tools — 🔬 under review (MERGED)
+
+- 🔬 **#78** — require-review block message no longer claims "docs-only allowed" unconditionally.
+- 🔬 **#79** — AGENTS doctrine: an unused tool/skill/MCP is a signal to FIX, not delete.
+- 🔬 **#82** — AGENTS doctrine: orchestrator-only — all work runs in subagent swarms.
+- 🔬 **#83** — orchestrator-stays-thin: never block a fully read-only shell chain (orch-hook pipes).
+- 🔬 **#85** — research-cli adopts the shared `agenttools_errors` layer (what/why/how-to-fix +
+  structured exit codes). Maps to §6 research-cli + the error-system v2 generalization (§3 `errors`).
+- 🔬 **#90** — model-freshness CLI adopts the shared `agenttools_errors` layer (#89). Maps to §4
+  model-currency + the error-system v2 generalization.
+- *(ROADMAP refresh PR **#77** is OPEN, not merged — it's the predecessor of THIS docs change, so
+  it is not listed as merged-under-review.)*
+
+### task-cli — 🔬 under review (MERGED) — advances §"1. task-cli"
+
+- 🔬 **#11** — v1: `task new` / `task done` verb aliases (+ clean ruff), usable against GitHub Issues.
+
+### Not a PR — 🔬 under review (machine/config changes this session)
+
+- 🔬 HA dead-MCP + its token removed from `~/.claude.json` (configured-but-inert MCP cleanup).
+- 🔬 `rig apply` re-run (github repo settings reconciled).
+- 🔬 agents-skip decision recorded (SKIP custom sub-agents — cc/oc-only; covered by Task tool +
+  swarms). Codifies rig-cli #55 above.
+
+### 🔮 building NOW (this turn — NOT yet merged; do not read as shipped)
+
+- 🔮 task-cli **rollout** (provision across repos).
+- 🔮 task-cli **enforcement** — `require-ticket-before-commit` via rig (§"1. task-cli" Integrations).
+- 🔮 task-cli **Docker real-agent CI test**.
+- 🔮 task-cli **#10** — close-path source-state-transition validation (OPEN issue).
+- 🔮 review-qa **Phase 3** — SUT env bring-up/health/teardown (review-qa §"Backend SUT…").
+- 🔮 tg `--tag answer` reply-to policy (the answer tag requires `--reply-to`).
+- 🔮 tg ambiguous-target button picker (disambiguate the outbound target via inline buttons).
+- 🔮 research-cli (queued — spin-out / real transport, §6).
 
 ---
 
@@ -246,15 +334,18 @@ before acting — items 1–4 + 6's #18 LANDED later in this same 2026-06-16 ses
 
 Spec SHIPPED (review-cli `docs/specs/review-qa.md`, PR #52, 6-agent workflow design + adversarial critique). Implementation NOT started — the spec's §11 / its own "open issues — resolve before building" list are blocking for an implementer. Phased build:
 
-- **Ship the mode skeleton + suites gate first** because it is the smallest verifiable slice and proves the registry wiring: new `reviewlib/modes/qa.py` (`MODE = ModeSpec(name="qa", diff_policy="none", aliases=("test",))`), one import + one entry in `reviewlib/modes/registry.py:34`, no `cli.py` dispatch surgery. Add `EXIT_QA_NO_SUITES=5` (next free after the verified 3/4) and the no-suites 3-part WHAT/WHY/HOW gate (mirror `_fail_not_a_repo`, `cli.py:104`); a green run with no authored cases is a lie.
-- **Add the write/exec executor next** because qa is the FIRST mode needing a non-read-only agent — it must NOT ride `run_panel`/the board (codex `-s read-only` at `backends.py:74`, opencode deny-all at `backends.py:233`). New `reviewlib/qa/executor.py` spawns ONE backend (claude default; codex `-s workspace-write --full-auto` alternate; opencode out of v1) in an isolated `git worktree add` of the SUT (`--in-place` escape hatch), single-seat. Comment the deliberate exception next to `_READONLY_AGENT_DENIED_PERMISSIONS`; carve out the long timeout (qa is `panel_mode` at `cli.py:1579` → would get the short `PANEL_TIMEOUT_DEFAULT`).
-- **Backend SUT against an existing stage before any harness** because it needs zero new repos: deterministic `reviewlib/qa/env.py` (stage-detect → reuse-if-reachable → never-tear-down-what-you-didn't-bring-up; else `EXIT_QA_NO_ENV=6`), then compose bring-up + health gate (`EXIT_QA_ENV_UNHEALTHY=7`) reusing the `ext-test-projects/e2e/docker-compose.e2e.yml` `-p`-namespaced pattern, guaranteed teardown via `reviewlib/backstop.py`.
+- 🔬 review (review-cli PR #55) — **Ship the mode skeleton + suites gate first** because it is the smallest verifiable slice and proves the registry wiring: new `reviewlib/modes/qa.py` (`MODE = ModeSpec(name="qa", diff_policy="none", aliases=("test",))`), one import + one entry in `reviewlib/modes/registry.py:34`, no `cli.py` dispatch surgery. Add `EXIT_QA_NO_SUITES=5` (next free after the verified 3/4) and the no-suites 3-part WHAT/WHY/HOW gate (mirror `_fail_not_a_repo`, `cli.py:104`); a green run with no authored cases is a lie.
+- 🔬 review (review-cli PR #62) — **Add the write/exec executor next** because qa is the FIRST mode needing a non-read-only agent — it must NOT ride `run_panel`/the board (codex `-s read-only` at `backends.py:74`, opencode deny-all at `backends.py:233`). New `reviewlib/qa/executor.py` spawns ONE backend (claude default; codex `-s workspace-write --full-auto` alternate; opencode out of v1) in an isolated `git worktree add` of the SUT (`--in-place` escape hatch), single-seat. Comment the deliberate exception next to `_READONLY_AGENT_DENIED_PERMISSIONS`; carve out the long timeout (qa is `panel_mode` at `cli.py:1579` → would get the short `PANEL_TIMEOUT_DEFAULT`).
+- 🔮 building (Phase 3, this turn) — **Backend SUT against an existing stage before any harness** because it needs zero new repos: deterministic `reviewlib/qa/env.py` (stage-detect → reuse-if-reachable → never-tear-down-what-you-didn't-bring-up; else `EXIT_QA_NO_ENV=6`), then compose bring-up + health gate (`EXIT_QA_ENV_UNHEALTHY=7`) reusing the `ext-test-projects/e2e/docker-compose.e2e.yml` `-p`-namespaced pattern, guaranteed teardown via `reviewlib/backstop.py`.
 - **web/ext Playwright harness is a SEPARATE prerequisite** because rig cannot clone external repos (`riglib/catalog.py:48` scans only skills/agent_hooks/git_hooks/ci/mcp): create `alex-mextner/vscode-playwright` by selective copy from private `hyperide/hyper-ext-e2e` `e2e/` (generalize `launchVSCode`, drop HyperIDE specifics — needs human curation), ship it as an agent-tools skill via its own `install.sh`. Drive ext via `launchVSCode()`+CDP `window.screenshot` (never `screencapture`), web via the `agent-browser` skill.
-- **bot harness last, Tier-1 hermetic only for v1** because real-Telegram driving needs unprovisioned credentials: a mock Bot-API server the SUT polls via `TG_API_BASE` (verified honored by `tg-ctl:2169`). PREREQUISITE filed against tg-cli: make the `tg` OUTBOUND sender honor `TG_API_BASE` (currently hardcoded at `tg:610`) so captured `sendMessage` works. Tier 2 (Telethon MTProto + agent-browser Telegram Web, dedicated test account, fail-closed on real `TG_CHAT_ID`) deferred until credentials exist.
+- **bot harness last, Tier-1 hermetic only for v1** because real-Telegram driving needs unprovisioned credentials: a mock Bot-API server the SUT polls via `TG_API_BASE` (verified honored by `tg-ctl:2169`). PREREQUISITE filed against tg-cli: make the `tg` OUTBOUND sender honor `TG_API_BASE` (currently hardcoded at `tg:610`) so captured `sendMessage` works — **🔬 review (tg-cli PR #50): this prereq is now MERGED**. Tier 2 (Telethon MTProto + agent-browser Telegram Web, dedicated test account, fail-closed on real `TG_CHAT_ID`) deferred until credentials exist.
 - See docs/specs/review-qa.md §11 for the open CTO decisions (tester backend, isolation default, single-seat, seeding subset, rig Option A vs B, suite format, bot credentials, k3s).
 
 ### 1. task-cli (after foundation lands)
 
+- 🔬 review (task-cli PR #11): v1 verbs (`task new` / `task done`) MERGED, usable against GitHub
+  Issues. 🔮 building this turn: rollout, `require-ticket-before-commit` enforcement via rig, a
+  Docker real-agent CI test, and #10 (close-path source-state-transition validation, OPEN issue).
 - **Phase 1** (foundation, in-flight): Python CLI — backends (GitHub Issues default, Linear per-repo)
   call the provider **API directly** with creds harvested from `gh`/`linear` configs; classification
   `change|justAsk` via `review just-ask` per-provider fallback chain (haiku head); enforcement gates
@@ -267,7 +358,8 @@ Spec SHIPPED (review-cli `docs/specs/review-qa.md`, PR #52, 6-agent workflow des
   **due-date** reminders to the agent (alex-mextner/task-cli#3); task-cli self-hook.
 - **Integrations** (alex-mextner/task-cli#4): tg-cli classify inbound hook (#3645); agent-tools
   `strict-ticket-discipline` skill + `require-ticket-before-commit` guard (+ optional
-  `ci/ticket-required`); rig provisioning (installs linear-cli when backend=linear, for auth only).
+  `ci/ticket-required`) — 🔮 the `require-ticket` guard + rig wiring is building THIS turn (a
+  separate agent owns it); rig provisioning (installs linear-cli when backend=linear, for auth only).
   Needs a NEW `on-inbound` hook point in `agents-hooks/v1`.
 
 ### 2. tg-cli `/tasks` (after task-cli)
@@ -296,7 +388,8 @@ tool migrates to import from the lib.
   role aliases (role `vision` resolves only to vision-capable). Daily-noon **cron checker** that polls
   provider `/models` and opens a bump PR (semi-auto). rig provisions the schedule (launchd/cron),
   check-and-install-if-missing at init/apply. (alex-mextner/rig-cli#8 — rig cron provisioning landed
-  in PR #4, merged.)
+  in PR #4, merged.) — 🔬 review (agent-tools PR #90): the model-freshness CLI now adopts the shared
+  `agenttools_errors` layer (#89).
 
 ### 5. rig
 
@@ -392,7 +485,9 @@ reboot (continuum's last save was 3 weeks old):
 ### 6. research-cli (after lib `providers`)
 
 - Separate Python CLI on the shared lib's panel engine (NOT a review mode). Reuses providers verbatim.
-  (alex-mextner/agent-tools#13)
+  (alex-mextner/agent-tools#13) — 🔬 review (agent-tools PR #85): research-cli adopts the shared
+  `agenttools_errors` layer (what/why/how-to-fix + structured exit codes). 🔮 the rest of research-cli
+  (real transport / spin-out) is queued, building.
 - ✅ **MVP SCAFFOLDED (`tools/research-cli/`)** — a distinct tool (NOT a review mode) that reuses the
   merged `agenttools_providers` CORE (#49) verbatim: registry + `resolve_role`, the failover `Board` /
   pool-reserve split, the key cascade, capability tags, the shared `lib/contracts/models.yaml` manifest.
@@ -476,6 +571,11 @@ Tracking issue: alex-mextner/agent-tools#14.
   LOST/corrupts it. Fix: answers must come through a SEPARATE channel (tg inline buttons → routed
   reply), and while a question is pending tg-ctl must DEFER/queue inbound text injection (detect the
   pending-question state) rather than blast it into the pane. Test + fix. (alex-mextner/tg-cli#30)
+  — 🔬 review (tg-cli PR #60): a SCOPED forwarded question now waits INDEFINITELY for its answer
+  (no idle-exit while pending). Related picker/routing work also under review: PR #62/#64 (`/agent`
+  inline-button picker), PR #69 (per-pane registration set — every live session forwards), PR #55
+  (recognized reply route never loses to the global registration), PR #66 (ask-forward logging).
+  🔮 building: the ambiguous-target outbound button picker + the `--tag answer` reply-to policy.
 - **tg-cli `tg#<id>` message-ref convention** (tg#3715): reference inbound TG messages as `tg#3715`
   (NOT bare `#3715` — collides with PR/issue refs). The inbound inject wrap should render the id as
   `tg#<id>`; the autolink layer must recognize `tg#\d+` as a message reference and link it, **before**
@@ -484,6 +584,8 @@ Tracking issue: alex-mextner/agent-tools#14.
 - **tg-cli file-excerpt attachment** (tg#3715): when a message gives a file **path + line / line-range**
   (in any of the common formats — `path:42`, `path:10-20`, `path#L10-L20`, etc.), attach the actual
   excerpt (the referenced lines) as a quote below. Currently broken — fix. (alex-mextner/tg-cli#29)
+  — 🔬 review (tg-cli PR #49): strip wrapping punctuation so a `path:line` spec in prose attaches its
+  excerpt.
 - **tg-cli `/new` command** (tg#3717): `/new [<model>] [<dir>] name [<task description>]` — spawn a new
   agent session. **Omitted options are chosen interactively via inline buttons.** Directory options =
   the dirs already in use + their `..` parents, all normalized + uniq + ranked LRU/MRU. `name` validated
@@ -511,6 +613,8 @@ Tracking issue: alex-mextner/agent-tools#14.
   sends `OK` (telegram autolinks the domain). Even a correct `<a href="https://…">` tag is rejected by
   tg's OWN pre-send validation (before telegram sees it), confirming it's tg-cli mis-parsing, not the
   Bot API. Workaround in use: send links as bare domains (no scheme).
+  — 🔬 review (tg-cli PR #48): `parse_mode` now follows `--format` only, so plain text with a URL /
+  `--` / `:` sends without 400ing. Workaround no longer needed.
 - tg-cli #25: fix-or-justify the 8 CodeQL TS findings (length-counting helpers + install TOCTOU).
   (alex-mextner/tg-cli#31)
 - tg-cli AGENTS stale "~578 tests" → 997. (alex-mextner/tg-cli#32)
@@ -524,7 +628,9 @@ Tracking issue: alex-mextner/agent-tools#14.
   every rig.yaml `mcp.review.command` still invoke `review --mcp` → `rig apply` registers a dead MCP
   server (and the global review MCP is currently inert). Fix-or-remove: implement a real review MCP
   entrypoint, or drop `mcp.review` from the rig.yaml template + the global registration. Affects all
-  six provisioned tool repos' rig.yaml.
+  six provisioned tool repos' rig.yaml. — 🔬 review (rig-cli PR #60 + #62): the dead `mcp.items.review`
+  slot is dropped from the shipped rig template (+ the fake-catalog test now mirrors reality). The
+  global `~/.claude/mcp/mcp.json` registration still needs the fix-or-remove pass.
 
 ### 10. Third-party skill/tool ecosystem: enable · harmonize · delineate (RESEARCH) (tg#3754)
 
@@ -582,6 +688,13 @@ ToolSearch first) so the agent stays on the zero-friction Bash+grep path. Full t
 
 *Snapshot 2026-06-15. The prose sections above carry the context/detail; THIS list is the completeness index —
 if a ticket exists it must appear here. Details live in the tickets, not here.*
+
+**2026-06-22 delta (all 🔬 under CTO review — MERGED, awaiting review; see the dated section at top):**
+tg-cli #47/#48/#49/#50/#54/#55/#60/#61/#62/#64/#66/#69/#71 · review-cli #55/#59/#62 ·
+rig-cli #55/#58/#60/#62/#64 · agent-tools #78/#79/#82/#83/#85/#90 · task-cli #11.
+**OPEN (🔮 building this turn):** task-cli #10 (close-path validation); agent-tools #77 (the prior
+ROADMAP-refresh PR — predecessor of this docs change). The tg/review/rig/task §Remaining-work and §9
+lines above are annotated `🔬 review (PR #…)` where a shipped PR advanced them.*
 
 **2026-06-16 delta:** MERGED → agent-tools #20 (bridge, +wired+live-proven), #29 (lib-retry), #32 (mcp-policy),
 
@@ -1469,6 +1582,9 @@ Each agent runs in its OWN forum topic (`message_thread_id`):
   clarifying the working **PATH** + **MODEL** for that agent — and **binds topic → agent**.
 - **Routing is per-topic.** Inbound messages in a topic route to that topic's agent; the agent's replies
   post back into the **same** topic. No more phonetic disambiguation — the topic IS the address.
+  — 🔬 review (tg-cli PR #54): the ROUTING half (topic→pane map + inbound route + outbound
+  `message_thread_id`) is MERGED; 🔬 PR #61 adds `tg --topic` / `TG_TOPIC` outbound threading
+  (increment 2). The topic-creation→agent-spawn binding (`forum_topic_created` → `/new`) is still open.
 - **Wiring:** ties into the HOLD `tg /new` feature (interactive PATH/MODEL selection via inline buttons,
   tg-cli#27) and tg-ctl routing (`discover.ts` / `routes.ts` — the topic→agent map lives here).
 - ⚠️ **NEEDS CTO CONFIRMATION before building:** the request referenced an attached screenshot
