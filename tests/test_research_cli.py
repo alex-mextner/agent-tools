@@ -420,6 +420,65 @@ def test_synthesize_attributes_each_answer_and_notes_failures():
     assert "Scout unavailable: no key" in out
 
 
+# --- machine-readable JSON rendering (the --json output path) ----------------------------
+
+
+def test_render_json_serializes_every_seat_with_full_shape():
+    # The structured counterpart of synthesize(): each seat becomes one object carrying the
+    # data a downstream consumer needs (display/lens/model/provider/ok/text/error), and the
+    # top-level run carries the question + the answered/failed counts. No Markdown scraping.
+    import json
+
+    from research_cli.engine import render_json
+
+    answers = [
+        SeatAnswer(
+            seat=BoardSeat("analyst", role="analyst", display="Analyst"),
+            model_id="opus-x",
+            provider="anthropic",
+            ok=True,
+            text="Answer A.",
+        ),
+        SeatAnswer(
+            seat=BoardSeat("scout", role="scout", display="Scout"),
+            model_id="flash-x",
+            provider="gemini",
+            ok=False,
+            error="no key",
+        ),
+    ]
+    payload = json.loads(render_json("Q?", answers))
+
+    assert payload["question"] == "Q?"
+    assert payload["answered"] == 1
+    assert payload["failed"] == 1
+    assert len(payload["seats"]) == 2
+
+    analyst = payload["seats"][0]
+    assert analyst == {
+        "display": "Analyst",
+        "lens": "analyst",
+        "model": "opus-x",
+        "provider": "anthropic",
+        "ok": True,
+        "text": "Answer A.",
+        "error": "",
+    }
+    scout = payload["seats"][1]
+    assert scout["ok"] is False
+    assert scout["error"] == "no key"
+    assert scout["text"] == ""
+
+
+def test_render_json_empty_panel_is_valid_json_with_zero_counts():
+    import json
+
+    from research_cli.engine import render_json
+
+    payload = json.loads(render_json("Q?", []))
+    assert payload == {"question": "Q?", "answered": 0, "failed": 0, "seats": []}
+
+
 # --- CLI dispatcher + ask command -------------------------------------------------------
 
 
@@ -497,6 +556,71 @@ def test_ask_command_empty_question_usage_error(capsys):
     from research_cli.commands.ask import run
 
     assert run([]) == 2  # argparse: nargs="+" requires at least one
+
+
+def test_ask_command_json_flag_emits_valid_json(capsys):
+    # The CLI flag end-to-end: --json swaps the Markdown note for a JSON object. Needs the
+    # real manifest (the command builds its own engine), so it self-skips without pyyaml,
+    # exactly like the Markdown offline smoke test above.
+    import json
+
+    pytest.importorskip("yaml")
+    from research_cli.commands.ask import run
+
+    code = run(["--offline", "--json", "What are the trade-offs of monorepos?"])
+    out = capsys.readouterr().out
+    assert code == 0
+
+    payload = json.loads(out)  # must be parseable, not Markdown
+    assert payload["question"] == "What are the trade-offs of monorepos?"
+    assert payload["answered"] >= 1
+    assert payload["seats"]
+    for seat in payload["seats"]:
+        assert set(seat) == {"display", "lens", "model", "provider", "ok", "text", "error"}
+
+
+def test_ask_command_json_no_seat_answered_still_exits_network_and_prints_json(
+    tmp_path, monkeypatch, capsys
+):
+    # The structured-exit-code contract holds under --json: no reachable seat still exits 7
+    # (EXIT_NETWORK), and a script still gets a parseable object (answered=0) BEFORE the
+    # error block — so it can branch on the exit code AND read the empty payload.
+    import json
+    import os
+
+    pytest.importorskip("yaml")
+    from research_cli.commands.ask import run
+
+    # --offline reaches every seat by default; force "no seat answered" deterministically.
+    # Reachability = the key cascade resolving a key (env vars, then a `.env` file in CWD).
+    # Drop every *_API_KEY from the env AND run from an empty dir (no `.env`), so the cascade
+    # has nothing to resolve and EVERY seat is unreachable — no source-of-key dependence.
+    for key in [k for k in os.environ if k.endswith("_API_KEY")]:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    code = run(["--json", "research question with no backend"])
+    out = capsys.readouterr().out
+    assert code == 7  # EXIT_NETWORK — nothing reachable
+    payload = json.loads(out)
+    assert payload["answered"] == 0
+
+
+def test_ask_command_without_json_is_unchanged_markdown(capsys):
+    # Regression guard: the default (no --json) output stays Markdown, byte-shape unchanged.
+    pytest.importorskip("yaml")
+    from research_cli.commands.ask import run
+
+    code = run(["--offline", "monorepo trade-offs?"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert out.startswith("# Research:")
+    assert "Panel:" in out
+    # Not JSON: a Markdown note does not parse as a JSON object.
+    import json
+
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(out)
 
 
 def test_load_real_manifest_resolves_research_board():

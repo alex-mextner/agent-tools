@@ -57,6 +57,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="use the stub transport (no network) — for demos / CI / wiring checks",
     )
     p.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="emit a machine-readable JSON object instead of the Markdown note",
+    )
+    p.add_argument(
         "--manifest",
         metavar="PATH",
         default=None,
@@ -80,7 +86,7 @@ def _run(args: argparse.Namespace) -> int:
     # `research --help` and discovery stay fast (lazy-heavy-imports skill).
     from pathlib import Path
 
-    from ..engine import ResearchEngine
+    from ..engine import ResearchEngine, render_json
     from ..providers import ProviderError
     from ..transport import StubTransport, SubprocessTransport
 
@@ -111,7 +117,13 @@ def _run(args: argparse.Namespace) -> int:
             fix="see `research ask --help` for the accepted values",
         ) from exc
 
-    print(result.synthesis)
+    # The JSON object is printed BEFORE any error block, so a script gets the (possibly
+    # empty) structured payload even when nothing answered — it branches on the exit code
+    # AND reads the data. The Markdown note is the default human output.
+    if args.as_json:
+        print(render_json(result.question, list(result.answers)))
+    else:
+        print(result.synthesis)
 
     if not result.answered:
         # Nothing reachable answered — the NETWORK class (no key / no backend / offline stub

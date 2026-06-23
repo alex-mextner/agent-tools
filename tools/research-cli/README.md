@@ -14,6 +14,7 @@ CORE (agent-tools#49). Tracking: [agent-tools#13](https://github.com/alex-mextne
 research ask "What are the real trade-offs of a monorepo at 200 engineers?"
 research board          # show the panel resolved against the shared model manifest
 research ask --offline "…"   # run the whole pipeline with no key (stub transport)
+research ask --json "…"      # emit a machine-readable JSON object instead of the note
 ```
 
 ## What it reuses vs what it adds
@@ -72,6 +73,30 @@ Commands **self-register**: drop a `commands/<name>.py` exposing `NAME`, `SUMMAR
 
 The MVP synthesis is **deterministic and offline** (a structured layout, not a model
 call), so the output is testable and never itself a hallucination.
+
+## Output formats
+
+By default `research ask` prints the Markdown synthesis note (human-readable). Pass
+`--json` to get a stable, machine-readable object instead — the structured counterpart of
+the synthesis, so a downstream consumer never has to scrape Markdown:
+
+```json
+{
+  "question": "…",
+  "answered": 2,
+  "failed": 1,
+  "seats": [
+    {"display": "Analyst", "lens": "analyst", "model": "claude-opus-4-8",
+     "provider": "anthropic", "ok": true, "text": "…", "error": ""},
+    {"display": "Scout", "lens": "scout", "model": "gemini-2.5-flash",
+     "provider": "gemini", "ok": false, "text": "", "error": "no key"}
+  ]
+}
+```
+
+The same structured **exit-code** contract applies under `--json`: when no seat answers,
+the JSON object is still printed first (with `answered: 0`) and the command still exits
+`7` (`EXIT_NETWORK`) — so a script branches on the exit code *and* reads the payload.
 
 ## Reachability and keys
 
