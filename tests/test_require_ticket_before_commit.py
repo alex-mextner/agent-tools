@@ -167,14 +167,16 @@ def test_inline_skip_on_sibling_does_not_bypass():
     assert r["decision"] == "block"
 
 
-# ── -F MESSAGE SOURCE: file readable, stdin (-F -) fail-open ─────────────────────────────────────
-# #100 made `-F <file>` readable; #101 closes the remaining `-F -` (stdin) gap — git streams that
-# message on its OWN stdin, which a PreToolUse hook cannot read, so for `-F -` ONLY the gate must
-# fail-OPEN (allow) with a logged note rather than false-block a possibly-ticketed commit.
+# ── -F MESSAGE SOURCE: file readable, stdin (-F -) fail-CLOSED with a hint ───────────────────────
+# #100 made `-F <file>` readable; #102 first handled the `-F -` (stdin) gap by failing OPEN, but
+# agent-tools#104 reverses that: git streams a `-F -` message on its OWN stdin, which a PreToolUse
+# hook cannot read, and silently allowing it made `-F -` a free bypass of the ticket gate. So for
+# `-F -` ONLY the gate now FAILS CLOSED (block, exit 10, the marker) with an actionable hint —
+# unless a readable escape (`[skip-ticket]` / `REQUIRE_TICKET_SKIP=1`) or warn-only mode applies.
 
 
 # Every readable `-F`/`--file` SPELLING (separate, glued, long, `=`) must actually READ the file and
-# gate on its ticket — the stdin fail-open is ONLY for `-F -`, never for a real file in any spelling.
+# gate on its ticket — the stdin fail-closed is ONLY for `-F -`, never for a real file in any spelling.
 @pytest.mark.parametrize("spelling", ["-F {p}", "-F{p}", "--file {p}", "--file={p}"])
 def test_file_spellings_with_ticket_allow(tmp_path, spelling):
     msg = tmp_path / "COMMIT_MSG.txt"
@@ -199,12 +201,64 @@ def test_file_spellings_without_ticket_block(tmp_path, spelling):
     "git commit --file -",   # long form
     "git commit --file=-",   # long form, glued
 ])
-def test_dash_F_stdin_fails_open_with_log(command):
+def test_dash_F_stdin_fails_closed_with_hint(command):
+    # agent-tools#104: a `-F -` stdin message is unreadable, so rather than let it bypass the gate it
+    # now BLOCKS (exit 10, the marker) with an ACTIONABLE hint naming the readable ways + escapes.
     r = _run(command)
-    assert r["code"] == 0, f"{command!r} streams the message on stdin (unreadable) — must fail-open"
+    assert r["code"] == 10, f"{command!r} streams the message on stdin (unreadable) — must fail-closed"
+    assert r["decision"] == "block"
+    assert r["message"].startswith(rt.BLOCK_MARKER)
+    msg = r["message"]
+    assert "stdin" in msg.lower(), "the hint must name the unreadable-stdin cause"
+    assert "-m" in msg and "-F <file>" in msg, "the hint must name the readable ways to satisfy it"
+    assert "branch" in msg.lower(), "the hint must mention the branch-name path"
+    assert "REQUIRE_TICKET_SKIP=1" in msg, "the hint must name the escape that actually works"
+    # the `[skip-ticket: …]` trailer can't work for `-F -` (it lives in the unreadable stdin
+    # message) — the hint must not falsely promise it.
+    assert "skip-ticket" not in msg.lower(), "the hint must not offer the trailer escape for `-F -`"
+
+
+@pytest.mark.parametrize("command", [
+    "REQUIRE_TICKET_SKIP=1 git commit -F -",
+    "REQUIRE_TICKET_SKIP=1 git commit --file=-",
+])
+def test_dash_F_stdin_inline_skip_escape_still_works(command):
+    # the deliberate inline escape still lets a genuine no-ticket `-F -` commit through — it's read
+    # from the command env, not git's unreadable stdin (agent-tools#104).
+    r = _run(command)
+    assert r["code"] == 0, f"{command!r} carries REQUIRE_TICKET_SKIP=1 — must allow"
     assert r["decision"] == "allow"
     assert rt.BLOCK_MARKER not in r["message"]
-    assert "stdin" in r["message"].lower(), "the unreadable-message bypass must be logged/visible"
+
+
+def test_dash_F_stdin_warn_only_downgrades_to_allow():
+    # REQUIRE_TICKET_STRICT=0 downgrades the `-F -` block to a warn-only allow (no marker leaked).
+    r = _run("git commit -F -", strict=False)
+    assert r["code"] == 0
+    assert r["decision"] == "allow"
+    assert rt.BLOCK_MARKER not in r["message"]
+    assert "stdin" in r["message"].lower()
+
+
+def test_dash_F_stdin_on_ticket_branch_allows(tmp_path):
+    # A `-F -` (unreadable stdin message) commit is still ticketed by its BRANCH name, read via
+    # `git -C <repo>` — same as the editor-commit path. The stdin block runs AFTER branch detection,
+    # so this legit workflow passes rather than false-blocking (agent-tools#104 review finding).
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", "-b", "feature/ENG-42-export", str(repo)], check=True)
+    r = _run(f"git -C {repo} commit -F -", strict=True)
+    assert r["code"] == 0, f"branch ENG-42 should satisfy the gate even for `-F -` ({r['message']})"
+    assert r["decision"] == "allow"
+
+
+def test_dash_F_stdin_on_non_ticket_branch_still_blocks(tmp_path):
+    # control: a `-F -` on a branch WITHOUT a ticket id still fails-closed — no branch silently
+    # defeats the gate.
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    r = _run(f"git -C {repo} commit -F -", strict=True)
+    assert r["code"] == 10
+    assert r["decision"] == "block"
 
 
 # ── EXEMPTIONS still hold under the strict default ──────────────────────────────────────────────

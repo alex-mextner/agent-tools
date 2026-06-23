@@ -240,7 +240,8 @@ class MessageExtraction(unittest.TestCase):
 
 class StdinMessageDetection(unittest.TestCase):
     """`git commit -F -` streams the message on GIT's stdin, which a PreToolUse hook cannot read.
-    The detector must recognize every spelling of the stdin sentinel so the gate can fail-open."""
+    The detector must recognize every spelling of the stdin sentinel so the gate can fail-closed
+    with a hint (agent-tools#104)."""
 
     def test_detects_dash_F_dash(self):
         self.assertTrue(mod.commit_reads_stdin_message(_commit_argv("git commit -F -")))
@@ -371,26 +372,74 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(decision, "allow")
 
-    def test_dash_F_dash_fails_open_with_log(self):
-        # `git commit -F -` streams the message on git's stdin, which the hook CANNOT read. It must
-        # fail-OPEN (allow) rather than false-block a possibly-ticketed commit — and LOG the bypass.
+    def test_dash_F_dash_fails_closed_with_hint(self):
+        # agent-tools#104 (reversing #102): `git commit -F -` streams the message on git's stdin,
+        # which the hook CANNOT read. Rather than let `-F -` silently dodge the ticket gate, it now
+        # FAILS CLOSED (block, exit 10, the stable marker) with an ACTIONABLE hint.
         out = _run_hook_raw("git commit -F -")
-        self.assertEqual(out["code"], 0, "-F - is unreadable — must fail-open, not block")
-        self.assertEqual(out["decision"], "allow")
-        self.assertNotIn(mod.BLOCK_MARKER, out["message"])
-        # the allow must be VISIBLE as an unreadable-message bypass, not a silent pass.
-        self.assertIn("stdin", out["message"].lower())
+        self.assertEqual(out["code"], mod.BLOCK_EXIT_CODE, "-F - is unreadable — must fail-closed")
+        self.assertEqual(out["decision"], "block")
+        self.assertIn(mod.BLOCK_MARKER, out["message"])
+        # the hint must name the readable ways to satisfy the gate and the WORKING escape.
+        msg = out["message"]
+        self.assertIn("stdin", msg.lower())
+        self.assertIn("-m", msg)
+        self.assertIn("-F <file>", msg)
+        self.assertIn("branch", msg.lower())  # branch-name path is a valid way to ticket a `-F -`
+        self.assertIn("REQUIRE_TICKET_SKIP=1", msg)  # the only escape that works for stdin
+        # the hint must NOT promise the `[skip-ticket: …]` TRAILER for `-F -` — it lives in the
+        # unreadable stdin message, so it can't work; offering it would mislead.
+        self.assertNotIn("skip-ticket", msg.lower())
         # and the `-` sentinel must NOT have been treated as a file to open (no spurious read warning).
         self.assertNotIn("could not read commit-message file", out["stderr"])
 
-    def test_dash_F_dash_fails_open_even_in_strict_mode(self):
-        # strict default doesn't change it — an unreadable message can't be ticket-checked.
-        code, decision = run_hook("git commit -F -", strict=True)
+    def test_dash_F_dash_every_spelling_fails_closed(self):
+        # all four stdin spellings (`-F -`, `-F-`, `--file -`, `--file=-`) must fail-closed alike.
+        for spelling in ("-F -", "-F-", "--file -", "--file=-"):
+            code, decision = run_hook(f"git commit {spelling}", strict=True)
+            self.assertEqual(code, mod.BLOCK_EXIT_CODE, spelling)
+            self.assertEqual(decision, "block", spelling)
+
+    def test_dash_F_dash_skip_ticket_inline_escape_still_works(self):
+        # the deliberate inline escape must still let a genuine no-ticket `-F -` commit through —
+        # it's read from the command env, not git's unreadable stdin.
+        code, decision = run_hook(
+            "REQUIRE_TICKET_SKIP=1 git commit -F -", strict=True
+        )
         self.assertEqual(code, 0)
         self.assertEqual(decision, "allow")
 
+    def test_dash_F_dash_on_ticket_branch_allows(self):
+        # A `-F -` (unreadable stdin message) commit is still ticketed by its BRANCH name — same as
+        # the editor-commit path. The stdin block must run AFTER branch detection, so this passes
+        # rather than false-blocking a legit workflow (agent-tools#104 review finding).
+        with tempfile.TemporaryDirectory() as repo:
+            subprocess.run(["git", "init", "-q", "-b", "feature/ENG-42-export", repo], check=True)
+            code, decision = run_hook(f"git -C {repo} commit -F -", strict=True, cwd=repo)
+        self.assertEqual(code, 0, "branch ENG-42 should satisfy the gate even for `-F -`")
+        self.assertEqual(decision, "allow")
+
+    def test_dash_F_dash_on_non_ticket_branch_still_blocks(self):
+        # control: a `-F -` on a branch WITHOUT a ticket id still fails-closed (the branch can't
+        # rescue it), so the block isn't silently defeated by any branch.
+        with tempfile.TemporaryDirectory() as repo:
+            subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True)
+            code, decision = run_hook(f"git -C {repo} commit -F -", strict=True, cwd=repo)
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+    def test_dash_F_dash_warn_only_downgrades_to_allow(self):
+        # REQUIRE_TICKET_STRICT=0 downgrades the `-F -` block to a warn-only allow, like every other
+        # no-ticket case — and must NOT leak the BLOCK_MARKER on an allow.
+        out = _run_hook_raw("git commit -F -", env_extra={"REQUIRE_TICKET_STRICT": "0"})
+        self.assertEqual(out["code"], 0)
+        self.assertEqual(out["decision"], "allow")
+        self.assertNotIn(mod.BLOCK_MARKER, out["message"])
+        self.assertIn("stdin", out["message"].lower())
+
     def test_dash_F_real_file_without_ticket_still_blocks(self):
-        # the fail-open is ONLY for `-F -`: a READABLE -F file with no ticket still blocks.
+        # the `-F -` stdin special-case (fail-closed-with-hint) is ONLY for the `-` sentinel: a
+        # READABLE `-F <file>` with no ticket is read and blocks on the normal no-ticket path.
         with tempfile.TemporaryDirectory() as repo:
             msg_path = Path(repo) / "COMMIT_MSG.txt"
             msg_path.write_text("feat: add export\n", encoding="utf-8")

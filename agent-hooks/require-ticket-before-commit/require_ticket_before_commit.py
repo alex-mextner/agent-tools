@@ -37,6 +37,14 @@ on_error is "open": a CRASH in the check still fails open — process discipline
 not a security boundary, so a bug must never make committing impossible. But on a
 SUCCESSFUL run with no ticket reference and no exemption/escape, the default is now
 a hard BLOCK (exit 10). Set REQUIRE_TICKET_STRICT=0 to fall back to warn-only.
+
+The `-F -` (message on git's STDIN) case FAILS CLOSED WITH A HINT (agent-tools#104,
+reversing the #102 fail-open): the hook cannot read git's stdin to verify a ticket, so
+rather than let `-F -` silently dodge the gate it BLOCKS with an actionable message —
+pass the message a readable way (`-m "…Closes #N…"` or `-F <file>`), or use the
+documented escape (`[skip-ticket: <reason>]` / `REQUIRE_TICKET_SKIP=1`). The escapes
+still work on a `-F -` command (they're parsed from the message text / the command env,
+not the unreadable stdin). A readable `-F <file>` is checked normally.
 """
 
 from __future__ import annotations
@@ -501,7 +509,8 @@ def has_inline_skip(segment: CommitSegment) -> bool:
 
 # The `-F -` sentinel: git reads the commit message from its OWN stdin. A PreToolUse hook cannot
 # read that (the hook's stdin is the JSON event, not git's), so a `-F -` value is NOT a file path to
-# open — it's the unreadable-message marker that triggers the fail-open in _evaluate_commit_segment.
+# open — it's the unreadable-message marker that triggers the fail-CLOSED-with-hint block in
+# _evaluate_commit_segment (agent-tools#104; #102 used to fail open here).
 _STDIN_SENTINEL = "-"
 
 
@@ -513,8 +522,8 @@ def commit_message_from_argv(argv: list[str], cwd: str | None = None) -> str:
     commit …` argv. A relative `-F` path is resolved against `cwd` (the command's working directory
     from the event), since the hook may run elsewhere. A `-F -` (stdin) value contributes NO text —
     git streams that message on its own stdin, which the hook can't read; commit_reads_stdin_message
-    detects it separately so the caller fails open. Stops at `--` (the rest are literal pathspecs,
-    never message flags)."""
+    detects it separately so the caller can fail closed with a hint. Stops at `--` (the rest are
+    literal pathspecs, never message flags)."""
     parts: list[str] = []
     i = 0
     while i < len(argv):
@@ -571,7 +580,9 @@ def _file_flag_values(argv: list[str]) -> list[str]:
 def commit_reads_stdin_message(argv: list[str]) -> bool:
     """True when the commit's message comes from git's STDIN via `-F -` (any spelling: `-F -`,
     `-F-`, `--file -`, `--file=-`). That message is on git's own stdin, which a PreToolUse hook
-    cannot read — so the caller must fail OPEN rather than false-block a possibly-ticketed commit."""
+    cannot read — so the caller fails CLOSED with a hint (agent-tools#104), rather than let `-F -`
+    silently dodge the ticket gate. The readable per-commit escapes are honored first, so a genuine
+    no-ticket `-F -` commit still has an out."""
     return any(v == _STDIN_SENTINEL for v in _file_flag_values(argv))
 
 
@@ -709,20 +720,6 @@ def _evaluate_commit_segment(segment: CommitSegment, event_cwd: str | None) -> i
         return None
     # Honor `git -C <repo>`: message-file + branch detection must target the repo the commit acts on.
     cwd = effective_cwd(segment, event_cwd)
-    # `git commit -F -` streams the message on GIT's stdin, which a PreToolUse hook CANNOT read (the
-    # hook's stdin is the JSON event, not git's). We genuinely cannot ticket-check an unreadable
-    # message, so FAIL OPEN (allow) rather than false-block a possibly-ticketed commit — but LOG it
-    # loudly, since `-F -` is a real bypass surface for this gate (agent-tools#101). This is distinct
-    # from `-F <file>`, which IS readable and is ticket-checked normally below.
-    if commit_reads_stdin_message(segment.argv):
-        note = (
-            "commit message is on git's stdin (`-F -`) — a PreToolUse hook cannot read it, so the "
-            "ticket gate is FAILING OPEN and allowing this commit unchecked. This is a known "
-            "`-F -` bypass surface; prefer `-m`/`-F <file>` so the gate can verify the ticket."
-        )
-        warn(note)
-        emit("allow", note)
-        return 0
     message = commit_message_from_argv(segment.argv, cwd)
     # Exemption is judged from the message text only (the real subject line), not the `git commit …`
     # argv — otherwise the command words could mis-trigger it.
@@ -731,6 +728,10 @@ def _evaluate_commit_segment(segment: CommitSegment, event_cwd: str | None) -> i
 
     # Per-commit escapes (the deliberate, documented bypass for a legit ticketless commit):
     # a `[skip-ticket: <reason>]` message trailer, or an inline `REQUIRE_TICKET_SKIP=1`.
+    # `has_inline_skip` reads the COMMAND env (`REQUIRE_TICKET_SKIP=1 git commit …`), so it works even
+    # for a `-F -` commit whose message is on unreadable stdin. `has_skip_trailer` reads the parsed
+    # MESSAGE, so for `-F -` (empty readable message) it is a no-op — only the inline env escape
+    # applies to a stdin-message commit (the hint below says exactly that, no false promise).
     if has_skip_trailer(message):
         return None  # explicit `[skip-ticket: …]` escape
     if has_inline_skip(segment):
@@ -743,8 +744,46 @@ def _evaluate_commit_segment(segment: CommitSegment, event_cwd: str | None) -> i
     # ticket id anywhere on the line (even in a sibling) satisfy the gate. Scoping to the parsed
     # message + branch is both correct and tighter; a `-F` file's contents are already folded into
     # `message`.
+    #
+    # This runs BEFORE the `-F -` stdin block on purpose: a `-F -` commit can still be ticketed via
+    # its BRANCH name (`feature/ABC-12-foo`), which IS readable. Blocking `-F -` ahead of branch
+    # detection would false-block that legit case and diverge from the editor-commit path (a `git
+    # commit` with no `-m`/`-F` is likewise unreadable and is checked against the branch only). So we
+    # only fall through to the stdin block when NEITHER the message NOR the branch yields a ticket.
     if has_ticket_reference(message) or has_ticket_reference(branch):
-        return None  # a ticket reference is present → proceed
+        return None  # a ticket reference is present (in the message or the branch) → proceed
+
+    # `git commit -F -` streams the message on GIT's stdin, which a PreToolUse hook CANNOT read (the
+    # hook's stdin is the JSON event, not git's). Reaching here means the branch carried no ticket
+    # either, so the message is our last chance to verify one — and it's unreadable. Rather than let
+    # `-F -` silently dodge the gate (the #102 fail-open), FAIL CLOSED WITH A HINT (agent-tools#104):
+    # BLOCK with an actionable message. The ONLY escape that works for a stdin-message commit is the
+    # inline `REQUIRE_TICKET_SKIP=1` (already checked above; it's read from the command, not stdin) —
+    # a `[skip-ticket: …]` TRAILER would live in the unreadable stdin message, so the hint does NOT
+    # offer it here. `-F <file>` is readable and is ticket-checked normally (it never reaches here).
+    if commit_reads_stdin_message(segment.argv):
+        hint = (
+            f"{BLOCK_MARKER}. The commit message is on git's stdin (`-F -`), which a PreToolUse hook "
+            "cannot read — so the ticket gate cannot verify a reference (and the branch name carried "
+            "none either) and will not let `-F -` dodge it. Put the ticket somewhere readable: pass "
+            "the message via `-m \"…Closes #123…\"` or `-F <file>` (both are checked), or encode the "
+            "ticket in the branch name (e.g. `feature/ABC-12-foo`). Deliberate no-ticket escape for a "
+            "stdin-message commit: run `REQUIRE_TICKET_SKIP=1 git commit …` (read from the command, "
+            "not stdin); or opt the whole gate back to warn-only with REQUIRE_TICKET_STRICT=0."
+        )
+        if STRICT:
+            warn(hint)
+            emit("block", hint)
+            return BLOCK_EXIT_CODE
+        # Warn-only opt-out: surface the reminder but allow (and DON'T leak the BLOCK_MARKER).
+        advisory = (
+            "commit message is on git's stdin (`-F -`) — unreadable, so the ticket gate cannot "
+            "verify a reference; committing anyway (warn-only). Prefer `-m`/`-F <file>` so the gate "
+            "can check the ticket."
+        )
+        warn(advisory)
+        emit("allow", advisory)
+        return 0
 
     # The shared human-facing guidance — what's wrong and how to satisfy the gate. It carries NO
     # marker: the stable BLOCK_MARKER must appear ONLY on a real block, so an external check that
