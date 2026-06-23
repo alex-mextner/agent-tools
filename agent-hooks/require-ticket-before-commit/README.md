@@ -38,14 +38,21 @@ the harness launches the hook outside the repo. A trailer keyword (`Closes`/`Fix
 only counts when it's followed by a real ref — `fix: null deref` is a bugfix subject, not a
 reference, so in strict mode it correctly still needs a ticket.
 
-**`-F -` (message on stdin) — fails OPEN by design (agent-tools#101).** `git commit -F -` reads
-the message from *git's own stdin*, which a PreToolUse hook **cannot** read (the hook's stdin is
-the JSON event, not git's). The gate genuinely can't ticket-check an unreadable message, so for
-`-F -` *specifically* it **allows** the commit rather than false-block a possibly-ticketed one —
-and emits a loud `allow` note that this is an unreadable-message bypass surface. This is the only
-`-F` form that fails open; `-F <file>` is read and checked normally. Prefer `-m` / `-F <file>` so
-the gate can actually verify the ticket. (An editor commit — `git commit` with no `-m`/`-F` — has
-no message available pre-commit either; it's checked against the branch name only.)
+**`-F -` (message on stdin) — fails CLOSED with a hint (agent-tools#104, reversing #102's
+fail-open).** `git commit -F -` reads the message from *git's own stdin*, which a PreToolUse hook
+**cannot** read (the hook's stdin is the JSON event, not git's). The gate genuinely can't
+ticket-check an unreadable message — and silently allowing it made `-F -` a free bypass of the
+whole ticket requirement, contradicting the strict default. So a `-F -` commit with **no ticket in
+the branch name either** now **blocks** (exit 10, the stable marker) with an actionable hint.
+Because the branch name is still readable, a `-F -` commit on a ticket-encoded branch
+(`feature/ABC-12-foo`) **passes** — same as the editor-commit path (a `git commit` with no `-m`/`-F`
+is likewise unreadable pre-commit and is checked against the branch only). To satisfy the gate, put
+the ticket somewhere readable: pass the message via `-m "…Closes #123…"` or `-F <file>` (both read
+and checked), or encode it in the branch name. The deliberate escape for a *stdin*-message commit is
+`REQUIRE_TICKET_SKIP=1 git commit …` — read from the command, not stdin; a `[skip-ticket: <reason>]`
+**trailer does not work for `-F -`** (it would live in the unreadable stdin message). `-F <file>` is
+read and checked normally; only the `-` (stdin) form blocks. `REQUIRE_TICKET_STRICT=0` downgrades
+this `-F -` block to a warn-only allow, like every other no-ticket case.
 
 ## What counts as a `git commit` (argv-scoped detection)
 
