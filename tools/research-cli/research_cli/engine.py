@@ -21,9 +21,10 @@ a stub transport, no network.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .providers import (
     Board,
@@ -201,3 +202,42 @@ def synthesize(question: str, answers: List[SeatAnswer]) -> str:
         label = a.seat.display or a.model_id
         lines.append(f"- _{label} unavailable: {a.error}_")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _seat_payload(answer: SeatAnswer) -> Dict[str, Any]:
+    """One seat's answer as a JSON-serializable dict (the per-seat shape of render_json).
+
+    Carries everything a downstream consumer needs without scraping Markdown: the seat's
+    display + lens, the concrete model + provider it resolved to, and the outcome (ok with
+    text, or not-ok with the failure reason).
+    """
+    return {
+        "display": answer.seat.display or answer.model_id,
+        "lens": answer.seat.role,
+        "model": answer.model_id,
+        "provider": answer.provider,
+        "ok": answer.ok,
+        "text": answer.text,
+        "error": answer.error,
+    }
+
+
+def render_json(question: str, answers: List[SeatAnswer]) -> str:
+    """Serialize a panel run as a stable JSON object — the machine-readable counterpart of
+    :func:`synthesize`.
+
+    Same inputs as ``synthesize`` (the question + every seat's answer), so a caller renders
+    EITHER the human note OR this structured object from one run. The shape is the contract
+    consumers depend on: a top-level ``question`` + ``answered``/``failed`` counts + a
+    ``seats`` array (one :func:`_seat_payload` per seat, in board order). Deterministic and
+    network-free, exactly like the synthesis — it never itself calls a model.
+    """
+    answered = [a for a in answers if a.ok]
+    failed = [a for a in answers if not a.ok]
+    payload: Dict[str, Any] = {
+        "question": question,
+        "answered": len(answered),
+        "failed": len(failed),
+        "seats": [_seat_payload(a) for a in answers],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False)
