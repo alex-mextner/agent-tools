@@ -1,6 +1,6 @@
 # Agent CLI Ecosystem — Roadmap
 
-Status snapshot: **2026-06-22** (latest activity at the end of this file). This is the
+Status snapshot: **2026-06-23** (latest activity at the end of this file). This is the
 handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, `rig-cli`,
 `draw-cli`, `3d-cli`, `task-cli`) + the `agent-tools` umbrella.
 
@@ -22,14 +22,16 @@ handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, `rig
 
 ---
 
-## 2026-06-22 — shipped this session (🔬 under CTO review)
+## 2026-06-22 / 06-23 — shipped this session (🔬 under CTO review)
 
-*Everything below is **MERGED on each repo's `origin/main`** but is marked 🔬 (awaiting CTO
-review), NOT ✅ — the CTO signs off to ✅. The 🔮 block at the end is work building THIS turn
-(not yet merged). Grouped by repo; each line maps to the §Remaining-work / §Open-ticket item it
-advances, which is also annotated `🔬 review (PR #…)` inline below.*
+*Everything below is **MERGED on each repo's `origin/main`** (verified via `gh pr list --state
+merged`) but is marked 🔬 (awaiting CTO review), NOT ✅ — the CTO signs off to ✅. The 🔮 block at
+the end is work still building / deferred (not merged). Grouped by repo; each line maps to the
+§Remaining-work / §Open-ticket item it advances, which is also annotated `🔬 review (PR #…)`
+inline below. **Tally: 70 merged PRs across 7 repos** — tg-cli 21, rig-cli 14, agent-tools 14,
+review-cli 9, task-cli 6, 3d-cli 4, draw-cli 2.*
 
-### tg-cli — 🔬 under review (all MERGED)
+### tg-cli — 🔬 under review (all MERGED) — multi-agent / forum-topic wave
 
 - 🔬 **#47** — tg-ctl locale fix: force a UTF-8 locale for discovery (the REAL "Claude Code not in
   tmux" root cause — launchd has no locale → tmux mangles the `\t` pane separator → 0 panes).
@@ -39,8 +41,9 @@ advances, which is also annotated `🔬 review (PR #…)` inline below.*
   excerpt. Maps to §9 / tg-cli#29.
 - 🔬 **#50** — the OUTBOUND `tg` sender honors `TG_API_BASE` (was hardcoded). Prereq for the
   review-qa bot-harness Tier-1 mock (review-qa §"bot harness").
+- 🔬 **#51** — defer inbound for an UNSCOPED question too (tg#30 fail-OPEN fix — pairs with #60).
 - 🔬 **#54** — forum-topics ROUTING half: topic→pane map + inbound route + outbound
-  `message_thread_id`. Advances the forum-topics mode (CTO 2026-06-18) / tg-cli#27 wiring.
+  `message_thread_id`. Advances the forum-topics mode / tg-cli#27 wiring.
 - 🔬 **#55** — reply-misroute fix: a recognized reply route never loses to the global registration
   (#53). Pairs with the per-pane registration set (#69).
 - 🔬 **#60** — a SCOPED forwarded question waits INDEFINITELY for its Telegram answer (no idle-exit
@@ -52,24 +55,58 @@ advances, which is also annotated `🔬 review (PR #…)` inline below.*
 - 🔬 **#69** — per-pane registration SET: every live session's questions forward (multi-session
   forwarding, #67). Pairs with #55.
 - 🔬 **#71** — self-provision the bot command menu via `setMyCommands` on startup.
+- 🔬 **#73** — `--tag answer` requires `--reply-to` (hidden terminal-only bypass). Maps to the
+  tg-otvet-requires-reply-to rule.
+- 🔬 **#76** — ambiguous/gone target → an `/agent` button picker, not a text dump.
+- 🔬 **#77** — no-reply inbound auto-binds to the last-active agent + `/agent` picker uses tmux
+  window names. (Superseded in part by #79's simplification.)
+- 🔬 **#79** — no-reply inbound binds to the last-message agent (simplify the MRU machinery).
+- 🔬 **#81** — single-source `tg` version from `package.json` (#80). Maps to the version-bump rule.
+- 🔬 **#83** — ctl-integration test: guarantee + scope daemon teardown to stop process leaks.
+- 🔬 **#85** — spawn an agent on `forum_topic_created` (the `/new` flow trigger; forum-topics incr 3).
 
 ### review-cli — 🔬 under review (all MERGED) — advances §"review qa — agent-as-tester mode"
 
+- 🔬 **#53** — brainstorm fails loud on a MID-RUN dead-panel collapse, not just round 1. Maps to §9
+  "review brainstorm must FAIL LOUD when backends return empty".
 - 🔬 **#55** — review-qa **Phase 1**: mode skeleton + no-suites gate (the registry-wiring slice).
 - 🔬 **#59** — board: GLM 5.2 via commandcode as a read-only seat (priority 3, under Opus).
 - 🔬 **#62** — review-qa **Phase 2**: write/exec agentic executor + judge + 2-fixture DoD.
+- 🔬 **#64** — review-qa **Phase 3**: SUT env bring-up (detect / reuse / health-gate / guaranteed
+  teardown). Advances review-qa §"Backend SUT…".
+- 🔬 **#66** — board resilience under concurrent load: memory cap + slow-seat deprioritize.
+- 🔬 **#68** — review-qa **bot Tier-1** hermetic harness (fake Telegram + inject/capture). Consumes
+  tg-cli #50's `TG_API_BASE` prereq. Advances review-qa §"bot harness".
+- 🔬 **#70** — review-qa **web Tier-1** deterministic harness (Playwright bring-up + DOM-driving
+  driver). Advances review-qa §"web Playwright harness".
+- 🔬 **#72** — `review diff --staged -C <repo>` honors the `-C` repo + strips leaked git env (#71).
+  The git-env-leak cwd-footgun fix.
 
 ### rig-cli — 🔬 under review (all MERGED)
 
+- 🔬 **#53** — provision sub-agents (a `.claude/agents/*.md` category, global + repo-local). REVERTED
+  by #55 — CTO decided to SKIP custom agents (agents-skip decision).
+- 🔬 **#54** — docs(specs): rig provisioning designs (github-settings / subagents / cross-harness).
 - 🔬 **#55** — revert the subagents-provisioning category (#53) — CTO decided to SKIP custom agents.
+- 🔬 **#56** — codex skills → `~/.codex/skills`; opencode auto-loads natively. Maps to §9 multi-harness
+  skill provisioning (rig-cli#9).
 - 🔬 **#58** — skill conflict-backups (`rig-bak`) land OUTSIDE the natively-scanned skills dir.
 - 🔬 **#60** — drop the dead `mcp.items.review` slot from the shipped template (the `review --mcp`
   removal residue). Maps to §9 "`review --mcp` broken ecosystem-wide".
 - 🔬 **#62** — test: fake catalog mirrors reality (drop the fabricated removed mcp/review slot).
 - 🔬 **#64** — `rig status` missing-target scan follows the configured settings path, not a
   hardcoded `~/.claude` (#63). Maps to the error-system v2 *missing-target* heuristic.
+- 🔬 **#67** — `rig apply` installs the personal CLI ecosystem (tg/review/task/draw). The provisioning
+  half of "rig is the front door for the ecosystem".
+- 🔬 **#69** — register the #67 `tools` category in the area/layer registries (so `rig status` reports
+  the CLI ecosystem). Maps to §"rig status must cover ALL reconciled areas".
+- 🔬 **#71** — `rig --version` reads `pyproject` dynamically (no stale literal; 0.2.0). Version-bump rule.
+- 🔬 **#72** — regression-guard test: rig provisions `require-ticket-before-commit` (#65). Pairs with
+  agent-tools #95.
+- 🔬 **#74** — CI runs the real-catalog pytest guards so they actually gate.
+- 🔬 **#76** — docs(spec) fix: correct the false "CC ships no built-in agents" claim (the agents study).
 
-### agent-tools — 🔬 under review (MERGED)
+### agent-tools — 🔬 under review (all MERGED)
 
 - 🔬 **#78** — require-review block message no longer claims "docs-only allowed" unconditionally.
 - 🔬 **#79** — AGENTS doctrine: an unused tool/skill/MCP is a signal to FIX, not delete.
@@ -79,12 +116,40 @@ advances, which is also annotated `🔬 review (PR #…)` inline below.*
   structured exit codes). Maps to §6 research-cli + the error-system v2 generalization (§3 `errors`).
 - 🔬 **#90** — model-freshness CLI adopts the shared `agenttools_errors` layer (#89). Maps to §4
   model-currency + the error-system v2 generalization.
-- *(ROADMAP refresh PR **#77** is OPEN, not merged — it's the predecessor of THIS docs change, so
-  it is not listed as merged-under-review.)*
+- 🔬 **#93** — ROADMAP-mark: record the 2026-06-22 shipped wave as 🔬 under CTO review (predecessor of
+  THIS refresh).
+- 🔬 **#95** — `require-ticket-before-commit` STRICT by default + rig-provisioned (Closes #92). The
+  re-enable+strict opener of the require-ticket saga (pairs with rig-cli #72).
+- 🔬 **#96** — research-cli test: skip the yaml-less NETWORK-class test (hidden PyYAML dep). The
+  research-cli bugfix companion to #85.
+- 🔬 **#99** — `bump-version-on-release` skill + a version-bump `ship.sh` gate. The single-source-version
+  rule the per-tool `--version` PRs implement (tg #81, rig #71, task #23, 3d #10, draw #6).
+- 🔬 **#100** — require-ticket saga: argv-scope detection so a "commit"-mention no longer over-blocks.
+- 🔬 **#102** — require-ticket saga: `-F`/`--file` read parity (`-F -` stdin handled).
+- 🔬 **#103** — research-cli: machine-readable `--json` output for `research ask`.
+- 🔬 **#105** — require-ticket saga: flip `-F -` (stdin) from fail-open to fail-closed-with-hint.
 
-### task-cli — 🔬 under review (MERGED) — advances §"1. task-cli"
+### task-cli — 🔬 under review (all MERGED) — advances §"1. task-cli"
 
 - 🔬 **#11** — v1: `task new` / `task done` verb aliases (+ clean ruff), usable against GitHub Issues.
+- 🔬 **#14** — install writes the SessionStart `.blurbs/task.md` entry too (the rollout/blurb half).
+- 🔬 **#17** — Docker real-agent integration harness: task-cli advertised + usable on a fresh machine.
+- 🔬 **#18** — validate transition legality on all three close paths (#10, the close-path validation).
+- 🔬 **#21** — harden the Docker real-agent leg vs the Task-tool collision + assert require-ticket
+  enforcement.
+- 🔬 **#23** — resolve `--version` dynamically from `pyproject` (0.2.0; version-bump rule).
+
+### 3d-cli — 🔬 under review (all MERGED)
+
+- 🔬 **#10** — read the `3d` version dynamically from `pyproject` (#9; version-bump rule).
+- 🔬 **#12** — gitignore stray `*.log` scratch files (proves the #11 pre-commit hook fix).
+- 🔬 **#14** — bump `starlette` 1.2.1 → 1.3.1 to clear the Dependabot alert.
+- 🔬 **#16** — track + auto-install the repo-dev pre-commit gate (Closes #15).
+
+### draw-cli — 🔬 under review (all MERGED)
+
+- 🔬 **#6** — add `draw --version` reading the version dynamically from `pyproject` (version-bump rule).
+- 🔬 **#8** — resolve the symlink before deriving the repo root for `draw --version` (the live-symlink fix).
 
 ### Not a PR — 🔬 under review (machine/config changes this session)
 
@@ -92,17 +157,24 @@ advances, which is also annotated `🔬 review (PR #…)` inline below.*
 - 🔬 `rig apply` re-run (github repo settings reconciled).
 - 🔬 agents-skip decision recorded (SKIP custom sub-agents — cc/oc-only; covered by Task tool +
   swarms). Codifies rig-cli #55 above.
+- 🔬 agents study (read-only, reported): confirmed CC ships built-in agents (corrected the false spec
+  claim → rig-cli #76); the git-hook near-miss was verified-restored, no loss.
 
-### 🔮 building NOW (this turn — NOT yet merged; do not read as shipped)
+### 🔮 building / deferred — NOT merged (do not read as shipped)
 
-- 🔮 task-cli **rollout** (provision across repos).
-- 🔮 task-cli **enforcement** — `require-ticket-before-commit` via rig (§"1. task-cli" Integrations).
-- 🔮 task-cli **Docker real-agent CI test**.
-- 🔮 task-cli **#10** — close-path source-state-transition validation (OPEN issue).
-- 🔮 review-qa **Phase 3** — SUT env bring-up/health/teardown (review-qa §"Backend SUT…").
-- 🔮 tg `--tag answer` reply-to policy (the answer tag requires `--reply-to`).
-- 🔮 tg ambiguous-target button picker (disambiguate the outbound target via inline buttons).
-- 🔮 research-cli (queued — spin-out / real transport, §6).
+- 🔮 review-qa **ext (VS Code) harness** + **Tier-2** (real-Telegram MTProto / agent-browser web,
+  dedicated test account) — deferred until credentials + repo curation exist (review-qa §"web/ext").
+- 🔮 task-cli **daemon service + webhooks** (task-cli#2) and **deps + Gantt** (task-cli#1) — Phase 2,
+  still open.
+- 🔮 **forum-topics increment-4** (tg-cli#27 `/new` interactive flow remainder beyond #85's spawn-trigger).
+- 🔮 research-cli **real transport / spin-out** to `alex-mextner/research-cli` (queued, §6).
+
+### ⏳ Decisions awaiting the CTO (not work — sign-off needed)
+
+- ⏳ **draw-cli pipx** — whether `draw` ships/installs via pipx (no tracking issue; CTO call).
+- ⏳ **agent-tools #106** (OPEN issue) — `docs/specs/rig-agents-provisioning.md` is an uncommitted
+  orphan in the primary checkout (corrected in place; needs a landing decision given the agents-skip
+  decision above).
 
 ---
 
@@ -689,12 +761,18 @@ ToolSearch first) so the agent stays on the zero-friction Bash+grep path. Full t
 *Snapshot 2026-06-15. The prose sections above carry the context/detail; THIS list is the completeness index —
 if a ticket exists it must appear here. Details live in the tickets, not here.*
 
-**2026-06-22 delta (all 🔬 under CTO review — MERGED, awaiting review; see the dated section at top):**
-tg-cli #47/#48/#49/#50/#54/#55/#60/#61/#62/#64/#66/#69/#71 · review-cli #55/#59/#62 ·
-rig-cli #55/#58/#60/#62/#64 · agent-tools #78/#79/#82/#83/#85/#90 · task-cli #11.
-**OPEN (🔮 building this turn):** task-cli #10 (close-path validation); agent-tools #77 (the prior
-ROADMAP-refresh PR — predecessor of this docs change). The tg/review/rig/task §Remaining-work and §9
-lines above are annotated `🔬 review (PR #…)` where a shipped PR advanced them.*
+**2026-06-22 / 06-23 delta (all 🔬 under CTO review — MERGED, awaiting review; see the dated section
+at top; 70 PRs across 7 repos):**
+tg-cli #47/#48/#49/#50/#51/#54/#55/#60/#61/#62/#64/#66/#69/#71/#73/#76/#77/#79/#81/#83/#85 ·
+review-cli #53/#55/#59/#62/#64/#66/#68/#70/#72 ·
+rig-cli #53/#54/#55/#56/#58/#60/#62/#64/#67/#69/#71/#72/#74/#76 ·
+agent-tools #78/#79/#82/#83/#85/#90/#93/#95/#96/#99/#100/#102/#103/#105 ·
+task-cli #11/#14/#17/#18/#21/#23 · 3d-cli #10/#12/#14/#16 · draw-cli #6/#8.
+**OPEN (🔮 building / deferred or ⏳ CTO-gated):** review-qa ext+Tier-2; task-cli #1/#2/#3 (daemon /
+deps / Gantt / due-notify); forum-topics incr-4; research-cli spin-out; agent-tools #106 (orphan
+rig-agents-provisioning spec — needs a landing decision); draw-cli pipx (CTO call). The
+tg/review/rig/task §Remaining-work and §9 lines above are annotated `🔬 review (PR #…)` where a
+shipped PR advanced them.*
 
 **2026-06-16 delta:** MERGED → agent-tools #20 (bridge, +wired+live-proven), #29 (lib-retry), #32 (mcp-policy),
 
