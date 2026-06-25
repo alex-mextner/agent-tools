@@ -42,10 +42,32 @@ If a mandatory skill has no fresh marker, the **first** work action WARNs (allow
 a **repeat** in the window BLOCKs (tracked by a cwd-keyed marker). The default WARN-first tier
 means the gate never wedges while the marker-writer is still being wired everywhere.
 
-## Not subagent-exempt
+## Subagents: exempt from the orchestration/visual defaults, still gated on project skills
 
-A subagent doing work should also have read its skills, so this gate does **not** exempt
-subagents (unlike the orchestration gates 1–3).
+A subagent doing work should still have read its **project** skills, so this gate is **not** a
+blanket subagent-exempt (unlike the orchestration gates 1–3). But the two default-mandatory
+skills are **structurally N/A for a dispatched subagent** and are dropped from its demanded set:
+
+- `delegate-work-to-subagents` — the subagent **is** the delegated work; demanding it delegate
+  again is wrong (a sub-subagent dispatch hangs).
+- `visual-proof-cycle` — a subagent committing a non-UI file has no visual proof to give.
+
+A subagent is detected by an **`args.agent_id`** forwarded into the v1 event by
+`lib/cc_hook_bridge` (present only inside a dispatched subagent; the bridge fills it from CC's
+authoritative field and drops any model-supplied copy). Any **other** skill named in
+`MANDATORY_SKILLS` (a project-specific rule) still applies to a subagent; only the two
+orchestration/visual defaults are dropped. The orchestrator (no `agent_id`) gets the full gate.
+
+> **Trust surface:** because this gate uses `agent_id` to *relax*, it reads ONLY the sanitized
+> `args.agent_id` — not a top-level `event.agent_id` (which the bridge never writes and would be a
+> trusted-but-unsanitized self-exempt vector). This is a deliberate narrowing vs.
+> `orchestrator-stays-thin`, which still reads the top-level fallback.
+
+> **Footgun:** the two names in `SUBAGENT_NA_SKILLS` (`delegate-work-to-subagents`,
+> `visual-proof-cycle`) are dropped for subagents **by name, regardless of source** — so listing
+> one of them EXPLICITLY in `MANDATORY_SKILLS` does NOT re-enable it for subagents (they are N/A
+> for a subagent by their nature, not by config). If you want a subagent gated on visual proof,
+> add a **differently-named** project skill to `MANDATORY_SKILLS` — that one is not dropped.
 
 ## Escape hatch (controllable, not a hard wall)
 

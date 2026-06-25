@@ -40,14 +40,18 @@ _MANDATORY = "delegate-work-to-subagents,visual-proof-cycle"
 
 
 def _run(command, monkeypatch, *, invoked: Path, tier: Path,
-         env: dict | None = None) -> tuple[str, str, int]:
+         env: dict | None = None, agent_id: str | None = None,
+         mandatory: str = _MANDATORY) -> tuple[str, str, int]:
     out, err = io.StringIO(), io.StringIO()
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"cwd": "/repo", "args": {"command": command}})))
+    args: dict = {"command": command}
+    if agent_id is not None:
+        args["agent_id"] = agent_id  # forwarded by the bridge inside a dispatched subagent
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"cwd": "/repo", "args": args})))
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
     monkeypatch.setattr(srg, "INVOKED_DIR", invoked)
     monkeypatch.setattr(srg, "TIER_DIR", tier)
-    monkeypatch.setenv("MANDATORY_SKILLS", _MANDATORY)
+    monkeypatch.setenv("MANDATORY_SKILLS", mandatory)
     for k in ("ALLOW_SKIP_SKILLS", "ALLOW_SKIP_SKILLS_REASON"):
         monkeypatch.delenv(k, raising=False)
     for k, v in (env or {}).items():
@@ -246,28 +250,138 @@ def test_real_skip_flag_still_exempt_after_parsing(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
 
 
-# ── T1: NOT subagent-exempt — an agent_id present must STILL block (locks the doctrine) ──
+# ── SUBAGENT: exempt from the ORCHESTRATION-ONLY defaults, still gated on project skills ──
 
-def test_blocks_even_with_agent_id_present(tmp_path, monkeypatch):
-    """skills-read-gate is NOT subagent-exempt: a subagent doing work must also have read its
-    skills. An `agent_id` in the event must NOT exempt the work action."""
+def test_subagent_exempt_from_orchestration_only_defaults(tmp_path, monkeypatch):
+    """A dispatched subagent (agent_id present) IS the delegated work and has no UI to prove, so
+    the two orchestration-only defaults (delegate-work-to-subagents, visual-proof-cycle) are N/A
+    for it → dropped. With ONLY those two demanded, a subagent commit ALLOWS even on a repeat —
+    no more forced ALLOW_SKIP_SKILLS overrides (issue #112). Mirrors orchestrator-stays-thin's
+    agent_id detection."""
     invoked, tier = tmp_path / "inv", tmp_path / "tier"
-    out, err = io.StringIO(), io.StringIO()
-    event = {"cwd": "/repo", "agent_id": "sub-x",
-             "args": {"command": "git commit -m x", "agent_id": "sub-x"}}
-    # prime the warn tier, then assert the repeat BLOCKS despite agent_id
-    for _ in range(2):
-        out, err = io.StringIO(), io.StringIO()
-        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
+    # first action (warn tier) then a repeat — for the orchestrator this would BLOCK on the repeat
+    _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier, agent_id="sub-7")
+    out, _e, c = _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier, agent_id="sub-7")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_subagent_exempt_on_build_command_too(tmp_path, monkeypatch):
+    """The drop is shape-INDEPENDENT: it fires on the demanded-skill set, not the command kind. A
+    subagent running a build/test command (not just a commit) is equally exempt from the two
+    orchestration defaults — pin it so the exemption isn't silently commit-only."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _run("npm run build", monkeypatch, invoked=invoked, tier=tier, agent_id="sub-7")
+    out, _e, c = _run("npm run build", monkeypatch, invoked=invoked, tier=tier, agent_id="sub-7")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_orchestrator_still_gated_on_orchestration_defaults(tmp_path, monkeypatch):
+    """The exemption is subagent-ONLY: the orchestrator (no agent_id) with no fresh markers still
+    WARN→BLOCKs on the two defaults. The gate is not weakened for the main thread."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier)  # warn
+    out, _e, c = _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier)
+    assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_subagent_still_gated_on_project_specific_skill(tmp_path, monkeypatch):
+    """The exemption drops ONLY the two orchestration/visual defaults — a PROJECT-specific
+    mandatory skill (set via MANDATORY_SKILLS) still applies to a subagent, because a subagent
+    doing work should also have read the project's real rules. So a subagent with an unmet
+    project skill still WARN→BLOCKs."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    mandatory = "delegate-work-to-subagents,visual-proof-cycle,project-test-discipline"
+    _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier,
+         agent_id="sub-7", mandatory=mandatory)  # warn
+    out, _e, c = _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier,
+                      agent_id="sub-7", mandatory=mandatory)
+    assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block"
+    # For a SUBAGENT the message names the project skill and — crucially — NEVER the two dropped
+    # defaults ANYWHERE (the example tail is suppressed for subagents), so a whole-message check is
+    # both correct and robust to any tail-wording change (no fragile substring slicing).
+    msg = json.loads(out)["message"]
+    assert "project-test-discipline" in msg
+    assert "delegate-work-to-subagents" not in msg
+    assert "visual-proof-cycle" not in msg
+
+
+def test_explicit_listing_of_an_na_skill_is_still_dropped_for_subagent(tmp_path, monkeypatch):
+    """README footgun, pinned: a project that EXPLICITLY sets MANDATORY_SKILLS to an orchestration/
+    visual default (here just `visual-proof-cycle`) does NOT re-enable it for a subagent — it is
+    dropped by NAME regardless of source. So a subagent with that as its only mandatory skill, no
+    marker, ALLOWs even on a repeat (the demanded set is empty after the drop). Guards the
+    documented behavior against a regression that started honoring an explicit listing."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier,
+         agent_id="sub-7", mandatory="visual-proof-cycle")  # warn tier (would-be)
+    out, _e, c = _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier,
+                      agent_id="sub-7", mandatory="visual-proof-cycle")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_subagent_with_only_defaults_and_project_skill_met_allows(tmp_path, monkeypatch):
+    """Completeness: a subagent whose ONLY unmet skills are the two orchestration defaults (its
+    project skill marker IS fresh) ALLOWS — the defaults are dropped, nothing real is missing."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    mandatory = "delegate-work-to-subagents,visual-proof-cycle,project-test-discipline"
+    invoked.mkdir(parents=True, exist_ok=True)
+    (invoked / "project-test-discipline").write_text("x")  # the real skill is satisfied
+    _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier,
+         agent_id="sub-7", mandatory=mandatory)
+    out, _e, c = _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier,
+                      agent_id="sub-7", mandatory=mandatory)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_empty_agent_id_does_not_exempt(tmp_path, monkeypatch):
+    """An EMPTY/whitespace agent_id is NOT a subagent — it must NOT exempt the orchestration
+    defaults (a forged/blank signal can't win). With a blank agent_id the orchestrator gate
+    applies and a repeat commit with no markers still BLOCKs."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier, agent_id="   ")  # warn
+    out, _e, c = _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier, agent_id="   ")
+    assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_only_args_agent_id_is_read_not_other_surfaces(tmp_path, monkeypatch):
+    """TRUST BOUNDARY regression guard. `_is_subagent` reads ONLY `args.agent_id` — the single
+    surface the bridge sanitizes (T2 precedence: it drops any model/tool_input-supplied copy). This
+    pins that a truthy agent_id sitting ANYWHERE ELSE does NOT exempt:
+      - nested under `args.tool_input` (a model-controllable surface), and
+      - at the event TOP LEVEL (the bridge never writes it there; orchestrator-stays-thin reads it,
+        this gate deliberately does NOT — see _is_subagent).
+    If a future edit widened the read to either surface, the orchestrator could self-exempt; this
+    test would catch it. (It does NOT claim a forged `args.agent_id` is rejected — that value IS
+    trusted; its non-forgeability is the bridge's job, verified in cc_hook_bridge's own tests.)"""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    decoys = {"cwd": "/repo", "agent_id": "top-level-decoy",
+              "args": {"command": "git commit -m x", "tool_input": {"agent_id": "nested-decoy"}}}
+    out = None
+    for _ in range(2):  # no real args.agent_id → orchestrator gate applies → repeat BLOCKs
+        out = io.StringIO()
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(decoys)))
         monkeypatch.setattr(sys, "stdout", out)
-        monkeypatch.setattr(sys, "stderr", err)
+        monkeypatch.setattr(sys, "stderr", io.StringIO())
         monkeypatch.setattr(srg, "INVOKED_DIR", invoked)
         monkeypatch.setattr(srg, "TIER_DIR", tier)
         monkeypatch.setenv("MANDATORY_SKILLS", _MANDATORY)
+        # isolate from a developer/CI env that sets the escape hatch (else this would falsely allow).
         for k in ("ALLOW_SKIP_SKILLS", "ALLOW_SKIP_SKILLS_REASON"):
             monkeypatch.delenv(k, raising=False)
         code = srg.main()
     assert code == srg.BLOCK_EXIT_CODE and _decision(out.getvalue()) == "block"
+
+
+def test_every_default_is_dropped_for_subagents():
+    """Invariant pinning the intent: EVERY default-mandatory skill is an orchestration/visual one
+    that is N/A for a subagent, so all of them are in SUBAGENT_NA_SKILLS. If a future edit adds a
+    third skill to DEFAULT_MANDATORY without adding it to SUBAGENT_NA_SKILLS, `defaults <= NA`
+    breaks → this test fails, forcing the author to decide (drop it for subagents too, or
+    deliberately keep it gated for subagents and update this invariant)."""
+    defaults = {s.strip() for s in srg.DEFAULT_MANDATORY.split(",") if s.strip()}
+    assert defaults <= srg.SUBAGENT_NA_SKILLS
+    # and nothing extra is dropped that wasn't a default (the dropped set is exactly the defaults).
+    assert srg.SUBAGENT_NA_SKILLS <= defaults
 
 
 if __name__ == "__main__":  # pragma: no cover

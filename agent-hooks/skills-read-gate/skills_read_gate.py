@@ -19,7 +19,12 @@ the window WARNs (allow + message); a REPEAT BLOCKs (tracked by a marker keyed b
 orchestrator-stays-thin). Default tier is WARN-FIRST so it never wedges while the
 marker-writer is still being wired everywhere.
 
-NOTE: NOT subagent-exempt — a subagent doing work should also have read its skills.
+NOTE: a subagent doing work should still read its PROJECT skills, so this gate is NOT a blanket
+subagent-exempt. BUT the two orchestration/visual defaults (delegate-work-to-subagents,
+visual-proof-cycle) are STRUCTURALLY N/A for a dispatched subagent — the subagent IS the delegate
+(re-delegation hangs), and a non-UI commit has no visual proof — so they are dropped from the
+demanded set when agent_id is present (mirrors orchestrator-stays-thin's subagent detection).
+Any project-specific MANDATORY_SKILLS entry still applies to subagents.
 
 Escape hatch (controllable — mirrors block-raw-pr-merge):
   - env  ALLOW_SKIP_SKILLS=1            — disable the guard for this session
@@ -56,6 +61,20 @@ TIER_DIR = Path(os.path.expanduser(os.environ.get(
 FRESH_WINDOW_S = int(os.environ.get("SKILLS_FRESH_WINDOW_S", "7200"))
 
 DEFAULT_MANDATORY = "delegate-work-to-subagents,visual-proof-cycle"
+
+# Orchestration/visual defaults dropped from a dispatched subagent's demanded set (agent_id
+# present); any OTHER (project-specific) mandatory skill still applies. Rationale + an accepted
+# tradeoff:
+#   - delegate-work-to-subagents — the subagent IS the delegated work; demanding it delegate again
+#     is wrong (a sub-subagent dispatch hangs). Unconditionally N/A for a subagent.
+#   - visual-proof-cycle — this gate fires on the command SHAPE (commit/build/test), not the
+#     commit's content, so it cannot tell a subagent's UI commit from a non-UI one. We drop the
+#     default for ALL subagent commits, which means a subagent doing REAL UI work also bypasses the
+#     visual-proof reminder. That is the accepted cost of fixing the dominant false-block (issue
+#     #112): the prior state forced an ALLOW_SKIP_SKILLS override on EVERY subagent commit. A
+#     project that wants visual proof enforced on subagents can add a project-specific UI skill to
+#     MANDATORY_SKILLS (those are NOT dropped). The orchestrator (no agent_id) still gets both.
+SUBAGENT_NA_SKILLS = frozenset({"delegate-work-to-subagents", "visual-proof-cycle"})
 
 # Work-shaped actions this gate fires on: a commit, or a build/test command.
 # Anchored to a COMMAND invocation (line start, or after a |/&/; separator) with `commit` as
@@ -96,9 +115,36 @@ def warn(msg: str) -> None:
     sys.stderr.write(f"skills-read-gate: {msg}\n")
 
 
-def _mandatory_skills() -> list[str]:
+def _is_subagent(event: dict) -> bool:
+    """True when this tool use fires INSIDE a dispatched subagent (agent_id present).
+
+    TRUST BOUNDARY — this gate uses agent_id to RELAX (drop two mandatory skills), so the read
+    surface must be exactly the one the bridge sanitizes, and no wider. We read ONLY
+    `args.agent_id`: lib/cc_hook_bridge enforces T2 precedence before the event reaches us — it
+    OVERWRITES args.agent_id from CC's authoritative top-level field when CC supplies it and DROPS
+    any model/tool_input-supplied copy when CC does not. So the only way a truthy `args.agent_id`
+    survives is if CC itself dispatched a subagent; a main-thread agent cannot forge it.
+
+    DELIBERATE DIVERGENCE from orchestrator-stays-thin (which also reads a top-level
+    `event.get("agent_id")` fallback): the bridge NEVER writes a top-level `agent_id` (its v1 event
+    has no such key), so that fallback is a DEAD path that is nonetheless a TRUSTED, unsanitized
+    relax-surface — if any non-bridge producer ever set a top-level agent_id from a model-influenced
+    field, the orchestrator would self-exempt. Because this gate relaxes on the signal, we narrow
+    the read to the sanitized `args.agent_id` only. (Follow-up: orchestrator-stays-thin should adopt
+    the same narrowing — agent-tools#115.) An empty/whitespace value is not a subagent."""
+    args = event.get("args") or {}
+    aid = args.get("agent_id")
+    return bool(aid and str(aid).strip())
+
+
+def _mandatory_skills(*, subagent: bool = False) -> list[str]:
     raw = os.environ.get("MANDATORY_SKILLS", DEFAULT_MANDATORY)
-    return [s.strip() for s in raw.split(",") if s.strip()]
+    skills = [s.strip() for s in raw.split(",") if s.strip()]
+    if subagent:
+        # Drop the orchestration/visual defaults that are N/A for a dispatched subagent; keep any
+        # project-specific mandatory skill — a subagent doing work should still read those.
+        skills = [s for s in skills if s not in SUBAGENT_NA_SKILLS]
+    return skills
 
 
 def _strip_shell_comment(command: str) -> str:
@@ -219,8 +265,8 @@ def _fresh(p: Path) -> bool:
         return False
 
 
-def _missing_skills() -> list[str]:
-    return [s for s in _mandatory_skills() if not _fresh(INVOKED_DIR / s)]
+def _missing_skills(*, subagent: bool = False) -> list[str]:
+    return [s for s in _mandatory_skills(subagent=subagent) if not _fresh(INVOKED_DIR / s)]
 
 
 def _override_reason(command: str) -> str | None:
@@ -256,6 +302,32 @@ def _is_repeat(event: dict) -> bool:
     return False
 
 
+_SKILL_EXAMPLE = {
+    "delegate-work-to-subagents": "delegate-work-to-subagents before dispatching",
+    "visual-proof-cycle": "visual-proof-cycle before a UI 'done'",
+}
+
+
+def _block_message(missing: list[str]) -> str:
+    """The WARN/BLOCK message naming the missing skills + how to invoke/override.
+
+    The example tail is derived from the ACTUAL missing set, not a flag: it cites only the
+    orchestration/visual defaults that are genuinely in `missing`. So a subagent (those defaults
+    dropped → not in `missing`) gets no misleading example, and an orchestrator whose project
+    redefined MANDATORY_SKILLS without those defaults likewise won't see a stale example."""
+    head = (
+        f"Mandatory/relevant skills not invoked before this work: {', '.join(missing)}. "
+        "Invoke them (Skill tool) first — they encode the rules this action must follow."
+    )
+    examples = [_SKILL_EXAMPLE[s] for s in missing if s in _SKILL_EXAMPLE]
+    example = f" (e.g. {', '.join(examples)}.)" if examples else ""
+    override = (
+        " Override only with a reason: ALLOW_SKIP_SKILLS=1 + ALLOW_SKIP_SKILLS_REASON='why', or "
+        "append `# skills-ok: why`."
+    )
+    return head + example + override
+
+
 def main() -> int:
     try:
         event = json.load(sys.stdin)
@@ -273,9 +345,12 @@ def main() -> int:
         emit("allow")  # not a work-shaped action → nothing to gate
         return 0
 
-    missing = _missing_skills()
+    # A dispatched subagent IS the delegated work and may have no UI to prove, so the two
+    # orchestration/visual defaults are dropped from its demanded set (project skills still apply).
+    subagent = _is_subagent(event)
+    missing = _missing_skills(subagent=subagent)
     if not missing:
-        emit("allow")  # every mandatory skill has a fresh marker → satisfied
+        emit("allow")  # every demanded skill has a fresh marker → satisfied
         return 0
 
     reason = _override_reason(command)
@@ -284,13 +359,7 @@ def main() -> int:
         emit("allow", f"skills gate skipped via escape hatch ({reason})")
         return 0
 
-    message = (
-        f"Mandatory/relevant skills not invoked before this work: {', '.join(missing)}. "
-        "Invoke them (Skill tool) first — they encode the rules this action must follow. "
-        "(e.g. delegate-work-to-subagents before dispatching, visual-proof-cycle before a "
-        "UI 'done'.) Override only with a reason: ALLOW_SKIP_SKILLS=1 + "
-        "ALLOW_SKIP_SKILLS_REASON='why', or append `# skills-ok: why`."
-    )
+    message = _block_message(missing)
 
     # WARN first, BLOCK on repeat within the window.
     if _is_repeat(event):
