@@ -573,8 +573,21 @@ def _decluster_short_message_flag(tok: str) -> tuple[str, str | None] | None:
 # value is OPTIONAL and only ever GLUED (`-uno`, `-Skeyid`) — a separate `-u -m …`/`-S -m …` is `-u`
 # with no value then a real `-m`, so they must NOT consume the next token (it would eat the message).
 _OTHER_VALUE_SHORT_NEXT = frozenset("Cct")
+# The LONG `git commit` options whose value is a MANDATORY SEPARATE next token (git-parseopt
+# consumes that token even when it starts with `-`). Two groups, both treated identically — skip the
+# flag AND its value so a `-m`/`-F`-looking value is never re-read as a real message/file flag:
+#   - reuse/reedit/fixup/squash/template  : the commit-reference / template-file family.
+#   - author/date/cleanup/trailer/pathspec-from-file (agent-tools#114): each also takes a mandatory
+#     next-token value. They were MISSING before, which let `git commit --author '-m' 'ABC-1: ok'`
+#     (real git: author="-m", "ABC-1: ok" is a PATHSPEC, ticketless) be misparsed as a `-m` message
+#     carrying a ticket → a TICKET-GATE BYPASS. A GLUED `--author=…`/`--cleanup=…` carries its own
+#     value and does NOT consume the next token (handled below by the `tok in _OTHER_VALUE_LONG`
+#     exact-match: a `--author=x` token simply isn't in the set). `--gpg-sign` is OMITTED on purpose:
+#     its value is OPTIONAL and only ever GLUED (`--gpg-sign=keyid`), so a separate `--gpg-sign -m …`
+#     is a bare flag then a real `-m` — it must NOT consume the next token.
 _OTHER_VALUE_LONG = frozenset({
     "--reuse-message", "--reedit-message", "--fixup", "--squash", "--template",
+    "--author", "--date", "--cleanup", "--trailer", "--pathspec-from-file",
 })
 
 
@@ -784,18 +797,31 @@ def effective_cwd(segment: CommitSegment, cwd: str | None) -> str | None:
 
 
 def _takes_following_message_value(tok: str) -> bool:
-    """True when a commit flag token consumes the NEXT token as a VALUE (a message/file path) — so a
-    skip-flag-looking value (`-am '--amend'`) is NOT read as a real flag. Covers `--message`/`--file`
-    (separate value) and a de-clustered short group whose first value letter (`m`/`F`) is the
-    cluster's LAST char (`-m`, `-am`, `-aF`). A GLUED short value (`-mMSG`/`-FPATH`/`-amMSG`/`-amF`/
-    `-aFpath`) carries its value inside the token and does NOT take the next (agent-tools#109). The
-    de-clustering matches git exactly via the shared `_decluster_short_message_flag`, so a value
-    letter in the MIDDLE of a cluster (`-amF` → message "F"; `-aFm` → file "m") is read as glued, not
-    as a next-token consumer."""
+    """True when a commit flag token consumes the NEXT token as a VALUE — so a skip-flag-looking
+    value (`-am '--amend'`, `--author '--amend'`) is NOT misread as a real flag by `is_skip_commit`.
+
+    Covers BOTH families that take a mandatory separate next token, so the value is always skipped:
+      - the MESSAGE/FILE flags `--message`/`--file` and a de-clustered short group whose first value
+        letter (`m`/`F`) is the cluster's LAST char (`-m`, `-am`, `-aF`); and
+      - the NON-message value-consumers via the shared `_nonmessage_flag_consumes_next` — the
+        separate long `--reuse-message`/`--author`/`--cleanup`/… and the short `-C`/`-c`/`-t` whose
+        value is a next token (agent-tools#114: this used to skip ONLY message values, an asymmetry
+        vs the other two parsers — a `--author '--amend'` value could be misread as a real `--amend`).
+    A GLUED value (`-mMSG`/`-FPATH`/`-amMSG`/`-amF`/`-aFpath`/`--author=…`) carries its value inside
+    the token and does NOT take the next (agent-tools#109). The de-clustering matches git exactly via
+    the shared `_decluster_short_message_flag`, so a value letter in the MIDDLE of a cluster (`-amF`
+    → message "F"; `-aFm` → file "m") is read as glued, not as a next-token consumer."""
     if tok.startswith("--"):
-        return tok in ("--message", "--file")
+        return tok in ("--message", "--file") or _nonmessage_flag_consumes_next(tok)
+    # A message/file token is judged ENTIRELY by the de-cluster result: it takes the next token only
+    # when its value is the cluster's LAST char (glued value → does NOT). Only a NON-message token
+    # falls through to _nonmessage_flag_consumes_next, preserving that function's call invariant (it
+    # is never handed an `m`/`F`-led token) — so a glued message ending in `c`/`C`/`t` (`-amFixIt`)
+    # can never be misread as a next-token-consuming `-C`/`-c`/`-t` (review of #114).
     declustered = _decluster_short_message_flag(tok)
-    return declustered is not None and declustered[1] is None
+    if declustered is not None:
+        return declustered[1] is None
+    return _nonmessage_flag_consumes_next(tok)
 
 
 def is_skip_commit(argv: list[str]) -> bool:

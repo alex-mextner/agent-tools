@@ -453,3 +453,104 @@ def test_optional_arg_flag_then_separate_message_with_ticket_allows(command):
     r = _run(command)
     assert r["code"] == 0, f"{command!r} carries a ticket in a real -m — must allow"
     assert r["decision"] == "allow"
+
+
+# ── #114: value-bearing long flags (--author/--date/--cleanup/--trailer/--pathspec-from-file) ──
+# git-parseopt consumes the NEXT token for these (even when it starts with `-`), exactly like the
+# already-handled --reuse-message/--template. If the parser does NOT skip the value, a value that
+# looks like `-m`/`-F` is re-read as a real message flag and DIVERGES from git → ticket-gate bypass.
+
+@pytest.mark.parametrize("flag", [
+    "--author", "--date", "--cleanup", "--trailer", "--pathspec-from-file",
+])
+def test_value_bearing_long_flag_does_not_eat_a_dash_m_looking_value(flag):
+    # THE BYPASS (issue #114 finding 1): `git commit --author '-m' 'TICKET-1: ok'`.
+    # Real git: author="-m", "TICKET-1: ok" is a PATHSPEC, no message in argv → editor opens, the
+    # commit is TICKETLESS. Our old parser skipped --author (i+=1), then de-clustered the value "-m"
+    # into a message flag, ate "TICKET-1: ok" → phantom ticket → gate falsely PASSED. The flag must
+    # consume its value so the de-clustered "-m" is never re-read; the message is empty → BLOCK.
+    r = _run(f"git commit {flag} '-m' 'TICKET-1: ok'")
+    assert r["code"] == 10, f"{flag}: a -m-looking value must not satisfy the gate"
+    assert r["decision"] == "block"
+    assert "on git's stdin" not in r["message"], flag  # not misread as a -F - stdin commit either
+
+
+@pytest.mark.parametrize("flag", [
+    "--author", "--date", "--cleanup", "--trailer", "--pathspec-from-file",
+])
+def test_value_bearing_long_flag_value_is_not_a_dash_F_stdin_block(flag):
+    # `git commit --author '-F' -`: real git reads author="-F" and `-` as a pathspec — it does NOT
+    # read stdin. The parser must skip the flag's value so the `-F` is not re-parsed as a real file
+    # flag (which would falsely BLOCK with the stdin hint). It blocks for NO TICKET, not as stdin.
+    r = _run(f"git commit {flag} '-F' -")
+    assert r["code"] == 10, flag
+    assert "on git's stdin" not in r["message"], f"{flag}: must not be misread as a -F - stdin read"
+
+
+@pytest.mark.parametrize("flag", [
+    "--author", "--date", "--cleanup", "--trailer", "--pathspec-from-file",
+])
+def test_value_bearing_long_flag_then_real_message_with_ticket_allows(flag):
+    # The legit path: the flag consumes ONLY its own value; a following real `-m` with a ticket is
+    # still read → ALLOW. Proves the fix doesn't over-consume.
+    r = _run(f"git commit {flag} 'someone' -m 'Closes #42'")
+    assert r["code"] == 0, f"{flag}: a real -m ticket after the flag must still allow"
+    assert r["decision"] == "allow"
+
+
+def test_value_bearing_long_flag_parser_skips_the_value():
+    # Parser-level pins (argv = tokens AFTER `commit`): the value of each value-bearing long flag
+    # must NOT surface as a phantom message, mirroring the --reuse-message/--template assertions.
+    for flag in ("--author", "--date", "--cleanup", "--trailer", "--pathspec-from-file"):
+        assert rt.commit_message_from_argv([flag, "-m", "x"]) == "", flag
+        assert rt._nonmessage_flag_consumes_next(flag) is True, flag
+    # A glued `--author=…` carries its own value and does NOT consume the next token.
+    assert rt._nonmessage_flag_consumes_next("--author=someone") is False
+    assert rt.commit_message_from_argv(["--author=x", "-m", "Closes #1"]) == "Closes #1"
+
+
+def test_separate_gpg_sign_long_flag_does_not_swallow_a_following_message():
+    # review of #114: `--gpg-sign` is deliberately OMITTED from `_OTHER_VALUE_LONG` — its value is
+    # OPTIONAL and only ever GLUED (`--gpg-sign=keyid`), so a SEPARATE `--gpg-sign -m …` is the flag
+    # with no value then a REAL `-m`. Adding it to the set (a plausible future "completeness" edit)
+    # would be a BUG: it would eat the following `-m` ticket and falsely BLOCK. This pins that mirror
+    # of the short `-S`/`-u` case for the long form, so the regression is caught.
+    assert rt._nonmessage_flag_consumes_next("--gpg-sign") is False
+    assert rt.commit_message_from_argv(["--gpg-sign", "-m", "Closes #1"]) == "Closes #1"
+    r = _run("git commit --gpg-sign -m 'Closes #1'")
+    assert r["code"] == 0, "a separate --gpg-sign must leave the following -m ticket intact"
+    assert r["decision"] == "allow"
+
+
+def test_value_bearing_long_flag_value_named_amend_is_not_a_skip_commit():
+    # finding 2: is_skip_commit must skip a value-bearing long flag's value so a `--amend`-looking
+    # value (`--author '--amend'`) is NOT misread as a real --amend skip flag. The token after the
+    # flag is its VALUE; the commit is a fresh authoring commit, not an amend → not skipped.
+    assert rt.is_skip_commit(["--author", "--amend", "-m", "x"]) is False
+    assert rt.is_skip_commit(["--trailer", "--amend"]) is False
+    assert rt.is_skip_commit(["-C", "--amend", "-m", "x"]) is False  # short next-token form
+    # CLUSTERED short next-token form (`-aC`): the fall-through routes it through
+    # `_nonmessage_flag_consumes_next`, so `is_skip_commit` must also skip its value. Real git reads
+    # `-C`="--amend" (a reuse-message ref, NOT an amend) → not a skip commit. This closes the same
+    # three-parser symmetry that `commit_reads_stdin_message` already pins via `-aC -F -`.
+    assert rt.is_skip_commit(["-aC", "--amend"]) is False
+    # GLUED short value (`-Cabc`) carries its value inside the token → does NOT consume the next, so
+    # a following real `--amend` IS a skip commit (the new path must not over-consume).
+    assert rt._nonmessage_flag_consumes_next("-Cabc") is False
+    assert rt.is_skip_commit(["-Cabc", "--amend"]) is True
+    # control: a REAL --amend is still a skip commit.
+    assert rt.is_skip_commit(["--amend", "-m", "x"]) is True
+
+
+def test_glued_short_message_ending_in_value_letter_is_not_a_next_token_consumer():
+    # review of #114: the broadened `_takes_following_message_value` must judge a message/file token
+    # ENTIRELY by its de-cluster result and NEVER fall through to `_nonmessage_flag_consumes_next`,
+    # or a glued message ending in `c`/`C`/`t` (`-amFixIt`, `-amC`) could be misread as a next-token
+    # consumer → `is_skip_commit` would eat the following `--amend` and miss a real amend (false
+    # BLOCK of a legit ticketless amend). A glued message carries its value inside the token, so the
+    # NEXT token is NOT consumed.
+    for tok in ("-amFixIt", "-amC", "-amc", "-amt", "-aFpath", "-mC"):
+        assert rt._takes_following_message_value(tok) is False, tok
+    # the exact reviewer repro: a real --amend after a glued -am message IS still a skip commit.
+    assert rt.is_skip_commit(["-amFixIt", "--amend"]) is True
+    assert rt.is_skip_commit(["-amC", "--amend"]) is True
