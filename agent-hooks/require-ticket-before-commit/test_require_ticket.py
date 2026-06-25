@@ -867,6 +867,27 @@ class ClusteredShortFlagDecluster(unittest.TestCase):
         self.assertFalse(mod.commit_reads_stdin_message(_commit_argv("git commit -t -F -")))
         self.assertFalse(mod.commit_reads_stdin_message(_commit_argv("git commit -aC -F -")))
 
+    def test_value_bearing_long_flag_value_is_not_a_message_or_stdin(self):
+        # agent-tools#114: --author/--date/--cleanup/--trailer/--pathspec-from-file each take a
+        # MANDATORY next-token value (git-parseopt consumes it even when it starts with `-`). THE
+        # BYPASS: `git commit --author '-m' 'ABC-1: ok'` — real git reads author="-m" and "ABC-1: ok"
+        # as a PATHSPEC (ticketless), but the old parser de-clustered the value "-m" into a message
+        # flag and ate the pathspec → phantom ticket. Both parsers must skip the flag AND its value.
+        for flag in ("--author", "--date", "--cleanup", "--trailer", "--pathspec-from-file"):
+            argv = _commit_argv(f"git commit {flag} '-m' 'ABC-1: ok'")
+            self.assertEqual(mod.commit_message_from_argv(argv), "", flag)
+            self.assertTrue(mod._nonmessage_flag_consumes_next(flag), flag)
+            # the `-F`-looking value must NOT be re-read as a real `-F -` stdin read either.
+            self.assertFalse(
+                mod.commit_reads_stdin_message(_commit_argv(f"git commit {flag} '-F' -")), flag
+            )
+        # a GLUED `--author=…`/`--cleanup=…` carries its own value → does NOT consume the next token.
+        self.assertFalse(mod._nonmessage_flag_consumes_next("--author=someone"))
+        self.assertEqual(
+            mod.commit_message_from_argv(_commit_argv("git commit --author=x -m 'Closes #1'")),
+            "Closes #1",
+        )
+
     def test_optional_arg_flag_does_not_swallow_a_following_message(self):
         # `-S` (gpg keyid) and `-u` (untracked mode) have an OPTIONAL, ONLY-glued value — a SEPARATE
         # `-S -m …` / `-u -m …` is the flag with no value then a REAL `-m`, so the message must still
@@ -893,6 +914,28 @@ class ClusteredShortFlagDecluster(unittest.TestCase):
         # The important contract: `-am "--amend"` (next-token value) must NOT count as a skip flag.
         self.assertFalse(mod.is_skip_commit(_commit_argv('git commit -am "--amend"')))
         self.assertFalse(mod.is_skip_commit(_commit_argv('git commit -aF "--skip"')))
+
+    def test_skip_scan_skips_value_bearing_long_flag_value(self):
+        # agent-tools#114 finding 2: is_skip_commit's `_takes_following_message_value` used to skip
+        # ONLY message/file values, not the non-message value-consumers — an asymmetry vs the other
+        # two parsers. So a value-bearing long flag whose VALUE looks like a skip flag
+        # (`--author '--amend'`) could be misread as a real `--amend`. It must be skipped as a value.
+        self.assertFalse(mod.is_skip_commit(_commit_argv("git commit --author '--amend' -m x")))
+        self.assertFalse(mod.is_skip_commit(_commit_argv("git commit --trailer '--amend'")))
+        self.assertFalse(mod.is_skip_commit(_commit_argv("git commit -C '--amend' -m x")))
+        # control: a REAL --amend is still detected as a skip commit.
+        self.assertTrue(mod.is_skip_commit(_commit_argv("git commit --amend -m x")))
+
+    def test_glued_short_message_ending_in_value_letter_is_not_a_next_token_consumer(self):
+        # review of #114: `_takes_following_message_value` must judge a message/file token ENTIRELY by
+        # its de-cluster result and never fall through to `_nonmessage_flag_consumes_next` — else a
+        # glued message ending in `c`/`C`/`t` (`-amFixIt`) could be misread as a next-token consumer,
+        # making `is_skip_commit` eat the following `--amend` and miss a real amend.
+        for tok in ("-amFixIt", "-amC", "-amc", "-amt", "-aFpath", "-mC"):
+            self.assertFalse(mod._takes_following_message_value(tok), tok)
+        # the exact reviewer repro: a real --amend after a glued -am message IS still a skip commit.
+        self.assertTrue(mod.is_skip_commit(["-amFixIt", "--amend"]))
+        self.assertTrue(mod.is_skip_commit(["-amC", "--amend"]))
 
     # --- end-to-end, the exact repro from issue #109 ---------------------------------------------
     def test_e2e_am_with_ticket_allows(self):
