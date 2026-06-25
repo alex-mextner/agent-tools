@@ -75,6 +75,25 @@ what a `pre-bash` agent-hook does. This is the enforcement counterpart of the
 it **blocks** rather than allows — a bypass slipping through a broken guard is the exact
 failure this hook exists to prevent.
 
+When the precise parse fails on the COMMAND (unbalanced quotes / exotic content), the decision
+is by reason, and the BLOCK message is **actionable** (#113) so the failure reads as fixable, not
+as a broken hook:
+
+- **a plausible `git commit`/`push` with unbalanced quotes** (the common case: an apostrophe or
+  backtick in a single-quoted `-m` message) → **blocked**, with a message that names the
+  *unbalanced quotes* and points at the fix: pass the message from a file (`git commit -F <file>`)
+  or a heredoc, which sidestep shell quoting. The decision can't be safely narrowed to allow — the
+  gate can't rule out a `--no-verify` *outside* the quote, and a quote-recovery heuristic provably
+  reopens that bypass — so it stays a BLOCK; only the wording improved.
+- **an obfuscated `env -S`/`--split-string` form at a COMMAND HEAD** that could conceal a bypass →
+  **blocked**, with a firm refusal (no "fix your quotes" softening — this is a deliberate-evasion
+  shape). The `env -S` detection is anchored to a command head (string start / after a shell
+  separator / behind an inline `VAR=val`), so a benign commit whose *message* merely mentions
+  `env -S` and is unparseable for another reason (an apostrophe) gets the quoting hint above, not
+  this refusal.
+- **an unparseable command that is neither** (no `git`+`commit`/`push`, no obfuscation — e.g. a `tg`
+  report with an unbalanced HTML body) → **allowed** (#40); blocking it was pure over-block.
+
 ## Install
 
 ```bash

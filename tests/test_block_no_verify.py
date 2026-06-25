@@ -63,6 +63,10 @@ def _decision(out: str) -> str:
     return json.loads(out)["decision"]
 
 
+def _message(out: str) -> str:
+    return json.loads(out).get("message", "")
+
+
 # ── ALLOWED: the words appear in a MESSAGE / VALUE / SIBLING, not as a real flag ──────────────
 
 @pytest.mark.parametrize("command", [
@@ -755,6 +759,110 @@ def test_unbalanced_quotes_fail_closed(monkeypatch):
     """An unparseable command that COULD be a git commit/push (has both tokens) still fail-closes."""
     out, code = _run("git commit -m 'unterminated --no-verify", monkeypatch)
     assert code == bnv.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+# ── ACTIONABLE fail-closed message (#113): block stays, but the message stops reading as a
+#    broken hook so the agent fixes its QUOTING instead of suspecting the gate ──────────────────
+
+def test_unbalanced_quote_message_is_actionable_not_generic(monkeypatch):
+    """An apostrophe in a single-quoted commit message (`git commit -m 'don't …'`) is unparseable →
+    STILL BLOCKs (can't rule out a `--no-verify` outside the quote — narrowing it reopens the
+    bypass, verified). But the message must be ACTIONABLE: name 'unbalanced quotes' and point at the
+    fix (`-F <file>` / a heredoc), not the generic 'could not inspect' that reads as a broken hook.
+    The decision is unchanged; only the message text improves."""
+    out, code = _run("git commit -m 'fix: don't bypass the gate'", monkeypatch)
+    assert code == bnv.BLOCK_EXIT_CODE and _decision(out) == "block"
+    msg = _message(out).lower()
+    assert "unbalanced quote" in msg, msg
+    # actionable: tell the agent HOW to fix it (a file-based message avoids the quoting hell)
+    assert "-f" in msg or "heredoc" in msg, msg
+    # NOT the old generic phrasing that reads as the hook itself being broken
+    assert "could not inspect" not in msg
+
+
+def test_obfuscation_fail_closed_message_distinct_from_quoting(monkeypatch):
+    """The obfuscation fail-closed (`env -S '…'` with an unbalanced inner quote) must keep a FIRM
+    'refused' message — it is a deliberate bypass attempt, not innocent quoting. It must NOT be
+    softened into the 'fix your quotes' hint (that would read as if the gate were just confused)."""
+    out, code = _run("env -S 'echo \"unbalanced", monkeypatch)
+    assert code == bnv.BLOCK_EXIT_CODE and _decision(out) == "block"
+    msg = _message(out).lower()
+    assert "could not inspect" not in msg
+    # the obfuscation message should not tell the user to "use -F" — there's no benign quoting to fix
+    assert "heredoc" not in msg
+    # positive: the message must actually NAME the obfuscation refusal (not be empty/degraded)
+    assert "split-string" in msg or "refus" in msg, msg
+
+
+def test_benign_commit_mentioning_env_split_string_gets_quoting_hint_not_obfuscation(monkeypatch):
+    """A benign commit whose MESSAGE merely MENTIONS `env -S`/`--split-string` and happens to be
+    unparseable (an unescaped apostrophe) must get the ACTIONABLE quoting hint — NOT the hard
+    obfuscation refusal. `_looks_obfuscated` anchors `env` to a COMMAND HEAD, so a mid-message
+    mention does not trip it (codex). Decision is still BLOCK; only the right remedy is shown."""
+    cmd = "git commit -m 'docs: explain env -S split-string usage, don't forget it'"
+    assert not bnv._looks_obfuscated(cmd)  # message mention is NOT at a command head
+    out, code = _run(cmd, monkeypatch)
+    assert code == bnv.BLOCK_EXIT_CODE and _decision(out) == "block"
+    msg = _message(out).lower()
+    assert "unbalanced quote" in msg  # the quoting hint, not the obfuscation refusal
+    assert "split-string" not in msg
+
+
+def test_looks_obfuscated_anchors_env_to_command_head(monkeypatch):
+    """`_looks_obfuscated` must catch a real `env -S` wrapper at a command head in every position a
+    shell would actually run it — string start, after a separator, behind an inline assignment, the
+    long `--split-string` form — while NOT matching a mid-string message mention. Pins the anchor so
+    a future tweak can't reopen the false-positive OR drop a real evasion."""
+    # real wrappers at a command head → caught
+    for c in (
+        "env -S 'git commit --no-verify",
+        "x;env -S 'git commit --no-verify",
+        "x && env -S 'git commit --no-verify",
+        "FOO=1 env -S 'git commit --no-verify",
+        "(env -S 'git commit --no-verify",
+        "env --split-string='git commit --no-verify",
+    ):
+        assert bnv._looks_obfuscated(c), c
+    # a mid-message mention (not at a command head) → NOT caught
+    for c in (
+        "git commit -m \"use env -S --split-string carefully; don't\"",
+        "echo 'see env -S docs' && git status",
+    ):
+        assert not bnv._looks_obfuscated(c), c
+
+
+def test_obfuscation_wins_when_both_predicates_true(monkeypatch):
+    """PRIORITY (the reason for the branch ORDER): a command that is BOTH obfuscated AND looks like
+    a git commit — `env -S 'git commit …` with an unbalanced inner quote — must emit the FIRM
+    obfuscation refusal, NOT the softer 'fix your quotes' hint. A future reorder of the two
+    fail-closed branches would silently soften a real evasion attempt; this pins it."""
+    out, code = _run("env -S 'git commit --no-verify", monkeypatch)
+    assert code == bnv.BLOCK_EXIT_CODE and _decision(out) == "block"
+    msg = _message(out).lower()
+    # obfuscation message wins: it names split-string / refusal and does NOT offer the quoting fix
+    assert "split-string" in msg or "refus" in msg, msg
+    assert "heredoc" not in msg
+    assert "-f <file>" not in msg
+    # sanity: this command satisfies BOTH predicates, so the test really exercises the priority
+    assert bnv._looks_obfuscated("env -S 'git commit --no-verify")
+    assert bnv._plausible_git_commit_or_push("env -S 'git commit --no-verify")
+
+
+def test_event_parse_failure_message_unchanged(monkeypatch):
+    """A NON-JSON stdin event is a different fail-closed path (the event itself is broken, not the
+    command's quoting) → it keeps its own message and still BLOCKs. Pinned so the command-level
+    message change doesn't leak into the event-level path."""
+    out, err = io.StringIO(), io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO("not json{"))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    code = bnv.main()
+    assert code == bnv.BLOCK_EXIT_CODE and _decision(out.getvalue()) == "block"
+    # the event-level message must NOT carry the COMMAND-level quoting hint — that would be a leak
+    # of the wrong remedy onto a broken-event failure (this path never inspected a command).
+    msg = _message(out.getvalue()).lower()
+    assert "unbalanced quote" not in msg
+    assert "heredoc" not in msg and "-f <file>" not in msg
 
 
 def test_unparseable_non_git_command_allowed(monkeypatch):
