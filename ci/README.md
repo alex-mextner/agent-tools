@@ -13,6 +13,7 @@ it.
 | [`sast/`](sast/) | Fast pattern-based SAST, broad/custom rules — pair with CodeQL | **semgrep** | pinned GH Action + shell script |
 | [`dependency-review/`](dependency-review/) | Block a PR adding a vulnerable/bad-license dep; audit existing deps | **actions/dependency-review-action** + native audit | PR workflow + multi-ecosystem audit script |
 | [`license-policy/`](license-policy/) | Fail on a dep carrying a deny-listed (GPL/AGPL/…) license — the license half of the GHAS gap | native license reporters (license-checker / pip-licenses / cargo-deny / go-licenses) | workflow + multi-ecosystem license-audit script |
+| [`trivy/`](trivy/) | Filesystem scan for dependency CVEs + secrets + IaC/Dockerfile misconfig in one pass — any repo | **Trivy** (aquasecurity) | SHA-pinned GH Action + shell runner |
 | [`ai-review/`](ai-review/) | Post an AI reviewer's findings on each PR (advisory) — any repo with an AI review CLI + key | **configurable** (codex / review-cli / …) | PR workflow + generic diff-review script |
 | [`copilot-findings/`](copilot-findings/) | Surface (optionally gate) Copilot review comments + Autofix alerts — repos using Copilot | GitHub APIs (review comments + code-scanning) | workflow + aggregation script + honest manual flow |
 | [`review-threads/`](review-threads/) | Block merge while review threads are unresolved — when you lack branch-protection admin or want it in-repo | `gh api` GraphQL `reviewThreads` | workflow + shell script |
@@ -53,6 +54,8 @@ A solid PR gate for a typical front-end-plus-backend repo:
 2. **Security:** [`secret-scan/`](secret-scan/) + [`codeql/`](codeql/) (or its self-gate) +
    [`sast/`](sast/) + [`dependency-review/`](dependency-review/) (dep vulns) +
    [`license-policy/`](license-policy/) (dep licenses). Different bug classes; run them all.
+   Add [`trivy/`](trivy/) for a one-pass dep-CVE + secret + IaC-misconfig net (especially if
+   the repo builds container images or carries IaC).
 3. **Review hygiene:** [`review-threads/`](review-threads/) (resolve comments) +
    [`pr-checklist/`](pr-checklist/) (tick the boxes) + [`leftover-grep/`](leftover-grep/)
    (no debug leftovers).
