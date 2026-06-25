@@ -107,6 +107,36 @@ def test_subagent_exempt_code_write(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
 
 
+def test_empty_agent_id_does_not_exempt(tmp_path, monkeypatch):
+    """An EMPTY/whitespace `args.agent_id` is NOT a subagent — it must NOT exempt the
+    orchestrator. A blank signal can't relax the gate, so a repeat impl write still BLOCKs."""
+    event = {"point": "pre-write", "cwd": "/repo",
+             "args": {"agent_id": "   ", "file_path": "/repo/src/a.ts"}}
+    _run(event, monkeypatch, tmp_path / "m")  # warn
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_only_args_agent_id_exempts_not_top_level_or_tool_input(tmp_path, monkeypatch):
+    """TRUST BOUNDARY regression guard (agent-tools#115). `_is_subagent` reads ONLY
+    `args.agent_id` — the single surface lib/cc_hook_bridge sanitizes (T2 precedence: it drops
+    any model/tool_input-supplied copy and NEVER writes a top-level `agent_id`). This gate uses
+    agent_id to RELAX (exempt a subagent), so a forged agent_id sitting ANYWHERE ELSE must NOT
+    exempt the orchestrator:
+      - at the event TOP LEVEL (the old `or event.get('agent_id')` fallback — an unsanitized
+        relax-surface, now dropped), and
+      - nested under `args.tool_input` (a model-controllable surface).
+    With no real `args.agent_id` the orchestrator gate applies and a repeat impl write BLOCKs.
+    If a future edit widened the read to either surface, the orchestrator could self-exempt and
+    this test would catch it."""
+    event = {"point": "pre-write", "cwd": "/repo", "agent_id": "top-level-decoy",
+             "args": {"file_path": "/repo/src/a.ts",
+                      "tool_input": {"agent_id": "nested-decoy"}}}
+    _run(event, monkeypatch, tmp_path / "m")  # warn (NOT exempted by the decoys)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
 # ── ESCAPE ─────────────────────────────────────────────────────────────────────────────
 
 def test_escape_env_reason_allows(tmp_path, monkeypatch):

@@ -25,11 +25,13 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   (`sed -i ...`, `tee ...`, `npm`/`cargo`/`make` build) counts.
 
 **Subagent-exempt:** a dispatched subagent (`agent_id` present) does the actual work, so it is
-always allowed. This gate governs the orchestrator only. `args.agent_id` must come from a
-**trusted, transport-level** signal — never from model-controlled `tool_input`. `cc_hook_bridge`
-forwards it only from CC's top-level event and drops any `tool_input`-forged copy; a non-CC
-carrier wiring this hook must replicate that filtering or a forged `agent_id` self-exempts the
-orchestrator (see `background-subagent-gate/README.md` for the full contract).
+always allowed. This gate governs the orchestrator only. Because the hook uses `agent_id` to
+**relax**, it reads **only** the sanitized `args.agent_id` — never a top-level `event.agent_id`
+fallback, and never model-controlled `tool_input`. `cc_hook_bridge` forwards `args.agent_id` only
+from CC's authoritative top-level event and drops any `tool_input`-forged copy (T2 precedence), and
+never writes a top-level `agent_id`; a non-CC carrier wiring this hook must replicate that filtering
+or a forged `agent_id` self-exempts the orchestrator (see `background-subagent-gate/README.md` for
+the full contract). This matches the sibling `skills-read-gate`'s narrowed read (agent-tools#115).
 
 ## Tiering — WARN then BLOCK
 

@@ -106,9 +106,25 @@ def warn(msg: str) -> None:
 
 
 def _is_subagent(event: dict) -> bool:
-    """True when this tool use fires INSIDE a dispatched subagent (agent_id present)."""
+    """True when this tool use fires INSIDE a dispatched subagent (agent_id present).
+
+    TRUST BOUNDARY — this gate uses agent_id to RELAX (a subagent is exempt from the
+    thin-orchestrator block), so the read surface must be exactly the one the bridge sanitizes,
+    and no wider. We read ONLY `args.agent_id`: lib/cc_hook_bridge enforces T2 precedence before
+    the event reaches us — it OVERWRITES args.agent_id from CC's authoritative top-level field
+    when CC supplies it and DROPS any model/tool_input-supplied copy when CC does not. So the only
+    way a truthy `args.agent_id` survives is if CC itself dispatched a subagent; a main-thread
+    agent cannot forge it.
+
+    We deliberately DO NOT fall back to a top-level `event.get("agent_id")`: the bridge NEVER
+    writes a top-level `agent_id` (its v1 event has no such key), so that fallback was a DEAD path
+    that was nonetheless a TRUSTED, unsanitized relax-surface — if any non-bridge producer ever set
+    a top-level agent_id from a model-influenced field, the orchestrator would self-exempt. This
+    narrows the read to the sanitized `args.agent_id` only, matching the sibling skills-read-gate
+    (agent-tools#115, bringing the two gates into line per #112/#116). An empty/whitespace value is
+    not a subagent."""
     args = event.get("args") or {}
-    aid = args.get("agent_id") or event.get("agent_id")
+    aid = args.get("agent_id")
     return bool(aid and str(aid).strip())
 
 
