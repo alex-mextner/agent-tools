@@ -283,6 +283,29 @@ def warn(msg: str) -> None:
     sys.stderr.write(f"block-no-verify: {msg}\n")
 
 
+# Fail-closed messages, split by REASON so a benign quoting slip reads as fixable, not as a broken
+# gate (#113). The DECISION is BLOCK in both cases; only the wording differs.
+#   - quoting: the command has unbalanced quotes (e.g. an apostrophe in a single-quoted `-m`
+#     message). It can't be safely parsed, and the gate can't rule out a `--no-verify` outside the
+#     quote, so it stays BLOCKED — but the hint tells the agent to fix the quoting (a file-based
+#     message sidesteps shell quoting entirely), not to suspect the hook.
+#   - obfuscation: an `env -S`/`--split-string` form that could conceal a bypass — a firm refusal,
+#     no "fix your quotes" softening.
+_UNBALANCED_QUOTE_BLOCK_MSG = (
+    "block-no-verify: this git commit/push COULDN'T BE PARSED (likely unbalanced quotes — an "
+    "apostrophe/backtick in a quoted message or arg is the usual cause), so the gate can't verify it "
+    "isn't a `--no-verify` bypass (fail-closed → blocked). This is your COMMAND, not a broken hook. "
+    "Fix it — for a commit, pass the message from a file (`git commit -F <file>`) or a heredoc "
+    "(`git commit -F - <<'EOF' … EOF`), which avoid shell quoting entirely; for a push, balance the "
+    "quotes in the offending argument."
+)
+_OBFUSCATION_BLOCK_MSG = (
+    "block-no-verify: refusing an obfuscated `env -S`/`--split-string` command that could conceal a "
+    "`--no-verify` bypass past inspection (fail-closed). Run the command without the split-string "
+    "wrapper so the gate can verify it."
+)
+
+
 # ── tokenization (mirrors the #59 sibling parser) ────────────────────────────────────────────
 
 def _strip_line_comment(line: str) -> str:
@@ -964,14 +987,28 @@ def _plausible_git_commit_or_push(command: str) -> bool:
     return bool(re.search(r"\bgit\b", low)) and bool(re.search(r"\b(?:commit|push)\b", low))
 
 
+# `env` running as a COMMAND: at the string start, or right after a shell separator (`;`, `&`, `|`,
+# `(`, `{`, newline, or their fused forms) — optionally behind an inline `VAR=val` assignment and
+# leading whitespace. Anchoring here is what keeps a benign commit whose MESSAGE merely MENTIONS
+# `env -S` (`-m 'docs: explain env -S …'`) from being mis-read as an obfuscation wrapper: in that
+# case `env` sits mid-quote, preceded by message words, not at a command head (codex). The
+# separators mirror the tokenizer's `_SHELL_SEP`; this is a RAW scan because we only reach here when
+# the precise parse FAILED, so it is necessarily approximate — but a real `env -S` wrapper always
+# runs at a command head, so this still catches the genuine evasion (`x;env -S '…'` included).
+_ENV_AT_CMD_HEAD = re.compile(
+    r"(?:^|[;&|({\n])\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*env\b[^\n;&|]*(?:-S\b|--split-string)"
+)
+
+
 def _looks_obfuscated(command: str) -> bool:
     """An `env -S '…'` / `--split-string` re-tokenizes an arbitrary string into argv — it can HIDE a
     `git commit --no-verify` inside a form where the raw `_plausible_git_commit_or_push` scan never
-    sees the tokens. So when the precise parse FAILS, the mere presence of that construct means we
-    cannot rule out a concealed bypass and must fail CLOSED, even with no visible `git`/`commit`.
-    This is the obfuscation case the gate must never wave through (codex), kept DISTINCT from a plain
-    command whose quoting is merely awkward (#40)."""
-    return bool(re.search(r"\benv\b[^\n]*(?:-S\b|--split-string)", command))
+    sees the tokens. So when the precise parse FAILS, the mere presence of that construct AT A
+    COMMAND HEAD means we cannot rule out a concealed bypass and must fail CLOSED, even with no
+    visible `git`/`commit`. This is the obfuscation case the gate must never wave through (codex),
+    kept DISTINCT from a plain command whose quoting is merely awkward (#40) and from a benign commit
+    whose message just MENTIONS `env -S` (which is not at a command head — see `_ENV_AT_CMD_HEAD`)."""
+    return bool(_ENV_AT_CMD_HEAD.search(command))
 
 
 def main() -> int:
@@ -997,9 +1034,20 @@ def main() -> int:
         #  • a command that could plausibly be the gated case (`git` + `commit`/`push`) → fail CLOSED.
         # Otherwise the parse failure is just awkward quoting on a benign command (e.g. a `tg` report
         # with an HTML body) → ALLOW; blocking it was pure over-block (#40).
-        if _plausible_git_commit_or_push(command) or _looks_obfuscated(command):
-            warn(f"could not inspect a possible git commit/push or obfuscation: {exc} — blocking (fail-closed)")
-            emit("block", "block-no-verify: could not inspect the command (fail-closed)")
+        #
+        # The DECISION above is unchanged — both cases still BLOCK. What differs is the MESSAGE
+        # (#113): a generic "could not inspect" reads as a BROKEN HOOK, so an agent whose commit
+        # merely has an apostrophe in a single-quoted `-m` message thinks the gate is buggy instead
+        # of fixing its quoting. So split the message by reason. Obfuscation comes FIRST: it is a
+        # deliberate bypass attempt, not innocent quoting, and must keep a firm "refused" message
+        # rather than a "fix your quotes" hint.
+        if _looks_obfuscated(command):
+            warn(f"obfuscated (env -S/--split-string) command could hide a bypass: {exc} — blocking (fail-closed)")
+            emit("block", _OBFUSCATION_BLOCK_MSG)
+            return BLOCK_EXIT_CODE
+        if _plausible_git_commit_or_push(command):
+            warn(f"unbalanced quotes on a possible git commit/push: {exc} — blocking (fail-closed)")
+            emit("block", _UNBALANCED_QUOTE_BLOCK_MSG)
             return BLOCK_EXIT_CODE
         warn(f"unparseable but neither a git commit/push nor obfuscation ({exc}) — allowing")
         emit("allow")
