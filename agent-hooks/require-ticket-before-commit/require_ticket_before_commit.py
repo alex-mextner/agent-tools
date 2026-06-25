@@ -590,16 +590,107 @@ _OTHER_VALUE_LONG = frozenset({
     "--author", "--date", "--cleanup", "--trailer", "--pathspec-from-file",
 })
 
+# The MESSAGE/FILE value-consuming long options — `--message`/`--file`. Their value text IS the
+# commit message (read), not skipped. Kept separate from _OTHER_VALUE_LONG (whose value is skipped).
+_MESSAGE_VALUE_LONG = frozenset({"--message", "--file"})
+
+# git resolves any UNAMBIGUOUS PREFIX of a long option (`--au` → `--author`, `--clea` → `--cleanup`,
+# `--reu` → `--reuse-message`), and REJECTS an ambiguous prefix that matches >1 option (`--t` could be
+# --trailer or --template; `--d` could be --date or --dry-run; `--f` could be --file or --fixup). The
+# exact-match sets above miss the abbreviation, so a value-bearing flag in abbreviated form was not
+# recognized as value-consuming → its value de-clustered into a `-m` message and ate the next token →
+# the same value-misattribution / TICKET-GATE BYPASS #114 closed for the exact spelling came back via
+# the short form (agent-tools#120). The fix: resolve a `--xxx` token to its canonical option the way
+# git does, then test the CANONICAL name against the value-consuming sets.
+#
+# Ambiguity is computed against the FULL `git commit` long-option set (NOT only the value-consuming
+# ones): a prefix unique among value-consumers but ALSO a prefix of a non-value-consumer is ambiguous
+# to git (git errors, the commit never runs), so it must NOT be treated as the value-consuming flag.
+# This list is the canonical `git commit` long options (from `git commit -h` / the completion helper) —
+# including the two first-class `--no-…` options it actually lists (`--no-post-rewrite`, `--no-verify`).
+# The AUTO-negations git derives for every boolean (`--no-edit`, `--no-signoff`, `--no-all`, …) are
+# omitted on purpose — none is value-consuming, they all start with `--no-` so they can't be a prefix
+# of a positive value-consumer (`--au`/`--mess`/…), and the value-consumers we gate on have no boolean
+# auto-negation that could shadow them. So leaving them out cannot turn a real value-consumer
+# abbreviation into a (false) ambiguity. A consequence (safe, see _resolve_long_option's docstring): a
+# prefix this set resolves uniquely but FULL git would call ambiguous gets value-consumed here while
+# git would error — harmless, since git then never commits.
+_ALL_COMMIT_LONG_OPTIONS = frozenset({
+    "--ahead-behind", "--all", "--allow-empty", "--allow-empty-message", "--amend", "--author",
+    "--branch", "--cleanup", "--date", "--dry-run", "--edit", "--file", "--fixup", "--gpg-sign",
+    "--include", "--interactive", "--long", "--message", "--no-post-rewrite", "--no-verify",
+    "--null", "--only", "--patch", "--pathspec-file-nul", "--pathspec-from-file", "--porcelain",
+    "--quiet", "--reedit-message", "--reset-author", "--reuse-message", "--short", "--signoff",
+    "--squash", "--status", "--template", "--trailer", "--untracked-files", "--verbose",
+})
+# Sanity: every value-consuming long option we gate on must be a real `git commit` option (else a
+# typo in the set would silently never resolve). Loud at import, not a silent bypass.
+_KNOWN_VALUE_LONG = _OTHER_VALUE_LONG | _MESSAGE_VALUE_LONG
+if not _KNOWN_VALUE_LONG <= _ALL_COMMIT_LONG_OPTIONS:
+    raise RuntimeError(
+        f"value-consuming long flags not in the git commit option set: "
+        f"{_KNOWN_VALUE_LONG - _ALL_COMMIT_LONG_OPTIONS}"
+    )
+
+
+def _resolve_long_option(name: str) -> str | None:
+    """Resolve a long-option NAME (a `--xxx` token with any `=value` already stripped) to its canonical
+    `git commit` option the way git's parseopt does: an EXACT match wins; otherwise an UNAMBIGUOUS
+    prefix (a prefix of exactly one option) resolves to that option; an AMBIGUOUS prefix (matches >1)
+    or an UNKNOWN token resolves to None. `--` and a bare `--x` shorter than `--` are None.
+
+    Returning None for an ambiguous prefix is correct for the gate: real git ERRORS on it and never
+    commits, so the parser must not over-consume by guessing one of the candidates.
+
+    Not a byte-exact git simulation: because the set omits git's auto-`--no-…` negations, a prefix
+    this resolver finds unique MIGHT be ambiguous to full git (an omitted option shares the prefix).
+    That direction is safe — full git then errors and never commits, so an over-consumed value here
+    just gates a command that wasn't going to run anyway; it can never manufacture a phantom ticket."""
+    if not name.startswith("--") or len(name) <= 2:
+        return None
+    if name in _ALL_COMMIT_LONG_OPTIONS:
+        return name  # exact match (also the canonical fast path)
+    matches = [opt for opt in _ALL_COMMIT_LONG_OPTIONS if opt.startswith(name)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _canonical_long_value_flag(tok: str) -> str | None:
+    """For a long-option token `--xxx` (NO glued `=value`), return its canonical name IF it resolves
+    (exactly or via an unambiguous prefix) to a value-CONSUMING long option whose value is a mandatory
+    SEPARATE next token — `--message`/`--file` or one of `_OTHER_VALUE_LONG`. Else None.
+
+    A glued `--author=…`/`--message=…` carries its own value and never consumes the next token, so a
+    token containing `=` resolves to None here (the caller handles the glued form separately)."""
+    if not tok.startswith("--") or "=" in tok:
+        return None
+    canonical = _resolve_long_option(tok)
+    return canonical if canonical in _KNOWN_VALUE_LONG else None
+
+
+def _glued_message_long_flag(tok: str) -> tuple[str, str] | None:
+    """For a GLUED long-option token `--xxx=value` (`--message=…`/`--file=…` and their unambiguous
+    abbreviations `--mess=…`/`--fil=…`), return ``(canonical, value)`` where `canonical` is
+    `--message` or `--file`; else None. The flag NAME (left of the first `=`) is resolved the way git
+    does, so `--mess=Closes #1` reads as a `--message` and `--fil=path` as a `--file`."""
+    if not tok.startswith("--") or "=" not in tok:
+        return None
+    name, value = tok.split("=", 1)
+    canonical = _resolve_long_option(name)
+    return (canonical, value) if canonical in _MESSAGE_VALUE_LONG else None
+
 
 def _nonmessage_flag_consumes_next(tok: str) -> bool:
     """True when `tok` is a commit flag whose value is a MANDATORY SEPARATE next token but is NOT a
     `-m`/`-F` message/file flag — so both message parsers must SKIP it and its value, never re-read a
-    `-m`/`-F`-looking value as a real flag. Covers separate long `--reuse-message`/`--template`/… and
-    a short cluster whose first value letter is `C`/`c`/`t` and is the cluster's LAST char (`-C`/`-aC`
-    take the next token; a GLUED `-Cabc`/`-aCabc` carries its value inside the token, so it does NOT
-    consume the next)."""
+    `-m`/`-F`-looking value as a real flag. Covers separate long `--reuse-message`/`--template`/… —
+    INCLUDING git's unambiguous abbreviations (`--au` → `--author`, `--clea` → `--cleanup`; an
+    ambiguous prefix like `--t`/`--d` resolves to None and is NOT consumed, matching git's reject) —
+    and a short cluster whose first value letter is `C`/`c`/`t` and is the cluster's LAST char (`-C`/
+    `-aC` take the next token; a GLUED `-Cabc`/`-aCabc` carries its value inside the token, so it does
+    NOT consume the next)."""
     if tok.startswith("--"):
-        return tok in _OTHER_VALUE_LONG  # a glued `--template=x` carries its own value
+        # a glued `--template=x` carries its own value → None here; an abbreviated `--templ` resolves.
+        return _canonical_long_value_flag(tok) in _OTHER_VALUE_LONG
     if not tok.startswith("-") or len(tok) < 2:
         return False
     body = tok[1:]
@@ -626,19 +717,20 @@ def commit_message_from_argv(argv: list[str], cwd: str | None = None) -> str:
         tok = argv[i]
         if tok == "--":
             break
-        # Long forms first: `--message`/`--file` (separate value) and `--message=`/`--file=` (glued).
-        if tok in ("--message", "--file") and i + 1 < len(argv):
+        # Long forms first: `--message`/`--file` (separate value) and `--message=`/`--file=` (glued),
+        # each resolved through git's unambiguous-prefix rule (`--mess` → `--message`, `--fil=…` →
+        # `--file=…`) so an abbreviated message/file flag still has its value read (agent-tools#120).
+        glued = _glued_message_long_flag(tok)
+        if glued is not None:
+            canonical, value = glued
+            parts.append(_read_message_file(value, cwd) if canonical == "--file" else value)
+            i += 1
+            continue
+        canonical_sep = _canonical_long_value_flag(tok)
+        if canonical_sep in _MESSAGE_VALUE_LONG and i + 1 < len(argv):
             value = argv[i + 1]
-            parts.append(_read_message_file(value, cwd) if tok == "--file" else value)
+            parts.append(_read_message_file(value, cwd) if canonical_sep == "--file" else value)
             i += 2
-            continue
-        if tok.startswith("--message="):
-            parts.append(tok.split("=", 1)[1])
-            i += 1
-            continue
-        if tok.startswith("--file="):
-            parts.append(_read_message_file(tok.split("=", 1)[1], cwd))
-            i += 1
             continue
         # Short forms, de-clustered like git: `-m`/`-F`/`-am`/`-aF` (next-token value) and
         # `-mMSG`/`-FPATH`/`-amMSG`/`-aFpath`/`-amF` (glued value) (agent-tools#109).
@@ -680,18 +772,24 @@ def _file_flag_values(argv: list[str]) -> list[str]:
         tok = argv[i]
         if tok == "--":
             break
-        if tok == "--file" and i + 1 < len(argv):
+        # Long `--file`/`--message` resolved through git's unambiguous-prefix rule (`--fil`/`--mess`),
+        # matching commit_message_from_argv so the two stay in lock-step (agent-tools#120).
+        glued = _glued_message_long_flag(tok)
+        if glued is not None:
+            canonical, value = glued
+            if canonical == "--file":
+                values.append(value)  # `--file=path`/`--fil=path` — a file VALUE
+            i += 1  # `--message=…`/`--mess=…` carries its value glued; nothing to collect
+            continue
+        canonical_sep = _canonical_long_value_flag(tok)
+        if canonical_sep == "--file" and i + 1 < len(argv):
             values.append(argv[i + 1])
             i += 2
-            continue
-        if tok.startswith("--file="):
-            values.append(tok.split("=", 1)[1])
-            i += 1
             continue
         # A separate `--message <v>` value is collected by commit_message_from_argv; here it must be
         # SKIPPED (value + flag), or a `--message -F -` would re-parse the `-F` as a real file flag and
         # falsely flag stdin (agent-tools#109 review). `--message=` carries its value glued — no skip.
-        if tok == "--message" and i + 1 < len(argv):
+        if canonical_sep == "--message" and i + 1 < len(argv):
             i += 2
             continue
         # Short forms, de-clustered like git. A cluster's governing value letter is either `F` (a
@@ -807,12 +905,17 @@ def _takes_following_message_value(tok: str) -> bool:
         separate long `--reuse-message`/`--author`/`--cleanup`/… and the short `-C`/`-c`/`-t` whose
         value is a next token (agent-tools#114: this used to skip ONLY message values, an asymmetry
         vs the other two parsers — a `--author '--amend'` value could be misread as a real `--amend`).
-    A GLUED value (`-mMSG`/`-FPATH`/`-amMSG`/`-amF`/`-aFpath`/`--author=…`) carries its value inside
-    the token and does NOT take the next (agent-tools#109). The de-clustering matches git exactly via
-    the shared `_decluster_short_message_flag`, so a value letter in the MIDDLE of a cluster (`-amF`
-    → message "F"; `-aFm` → file "m") is read as glued, not as a next-token consumer."""
+    All long forms are resolved through git's unambiguous-prefix rule via `_canonical_long_value_flag`
+    (`--au '--amend'` → `--author` consumes `'--amend'`; agent-tools#120), so an abbreviated
+    value-bearing flag skips its value here too. A GLUED value (`-mMSG`/`-FPATH`/`-amMSG`/`-amF`/
+    `-aFpath`/`--author=…`) carries its value inside the token and does NOT take the next
+    (agent-tools#109). The de-clustering matches git exactly via the shared
+    `_decluster_short_message_flag`, so a value letter in the MIDDLE of a cluster (`-amF` → message
+    "F"; `-aFm` → file "m") is read as glued, not as a next-token consumer."""
     if tok.startswith("--"):
-        return tok in ("--message", "--file") or _nonmessage_flag_consumes_next(tok)
+        # `_canonical_long_value_flag` covers BOTH the message/file and the other value-consumers,
+        # exact spelling AND unambiguous abbreviation, and returns None for a glued `--xxx=value`.
+        return _canonical_long_value_flag(tok) is not None
     # A message/file token is judged ENTIRELY by the de-cluster result: it takes the next token only
     # when its value is the cluster's LAST char (glued value → does NOT). Only a NON-message token
     # falls through to _nonmessage_flag_consumes_next, preserving that function's call invariant (it
@@ -824,11 +927,23 @@ def _takes_following_message_value(tok: str) -> bool:
     return _nonmessage_flag_consumes_next(tok)
 
 
+def _is_skip_flag(tok: str) -> bool:
+    """True when `tok` is one of the SKIP_FLAGS — by exact spelling OR git's unambiguous abbreviation
+    (`--am` → `--amend`; agent-tools#120). Of the four, only `--amend` is a real `git commit` option
+    so only it is reachable by prefix (the merge/rebase plumbing `--continue/--abort/--skip` aren't
+    `git commit` options — they match by exact string only, which `_resolve_long_option` would not
+    resolve, hence the explicit exact-membership fallback)."""
+    if tok in SKIP_FLAGS:
+        return True
+    return _resolve_long_option(tok) in SKIP_FLAGS
+
+
 def is_skip_commit(argv: list[str]) -> bool:
     """True when the PARSED commit argv carries --continue/--abort/--skip/--amend (merge/rebase
-    plumbing or an amend — not authoring a fresh change). Skips every message/file VALUE so a skip
-    flag named only in the commit MESSAGE (`-m 'support --amend'`, `-am '--amend'`) does NOT falsely
-    exempt a real commit. Stops at `--` (the rest are literal pathspecs, never flags)."""
+    plumbing or an amend — not authoring a fresh change), in any spelling git accepts including an
+    unambiguous abbreviation (`--am` → `--amend`). Skips every message/file VALUE so a skip flag named
+    only in the commit MESSAGE (`-m 'support --amend'`, `-am '--amend'`) does NOT falsely exempt a real
+    commit. Stops at `--` (the rest are literal pathspecs, never flags)."""
     i = 0
     while i < len(argv):
         tok = argv[i]
@@ -837,7 +952,7 @@ def is_skip_commit(argv: list[str]) -> bool:
         if _takes_following_message_value(tok) and i + 1 < len(argv):
             i += 2  # drop the flag AND its value (a `--amend`-looking message can't be read as one)
             continue
-        if tok in SKIP_FLAGS:
+        if _is_skip_flag(tok):
             return True
         i += 1
     return False
