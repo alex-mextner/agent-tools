@@ -977,5 +977,179 @@ class ClusteredShortFlagDecluster(unittest.TestCase):
             self.assertEqual(decision, "allow", cmd)
 
 
+class AbbreviatedLongFlagPrefix(unittest.TestCase):
+    """agent-tools#120 — git resolves any UNAMBIGUOUS PREFIX of a long option (`--au` → `--author`,
+    `--clea` → `--cleanup`, `--reu` → `--reuse-message`), and REJECTS an ambiguous prefix that matches
+    >1 option (`--t` could be --trailer/--template; `--d` --date/--dry-run; `--f` --file/--fixup). #114
+    added the value-bearing long flags to the value-consuming set but by EXACT string, so an
+    abbreviated value flag was NOT recognized → its value de-clustered into a `-m` message and ate the
+    next token → the same value-misattribution / TICKET-GATE BYPASS came back via the short form.
+
+    These reproduce that bypass FIRST (they fail against the exact-match parser, which lets
+    `git commit --au '-m' 'ABC-1: ok'` be misparsed as a `-m` message carrying a ticket) and pass once
+    the parser resolves the prefix the way git does. The exact-prefix resolutions and the ambiguity
+    boundary are VERIFIED against real git (`git commit --au … `, `--t` ambiguous, etc.)."""
+
+    # --- the resolver itself: exact, unambiguous-prefix, ambiguous, unknown ----------------------
+    def test_resolve_exact_match(self):
+        self.assertEqual(mod._resolve_long_option("--author"), "--author")
+        self.assertEqual(mod._resolve_long_option("--message"), "--message")
+
+    def test_resolve_unambiguous_prefix(self):
+        # verified against real git: each abbreviation resolves to exactly one option.
+        self.assertEqual(mod._resolve_long_option("--au"), "--author")
+        self.assertEqual(mod._resolve_long_option("--clea"), "--cleanup")
+        self.assertEqual(mod._resolve_long_option("--reu"), "--reuse-message")
+        self.assertEqual(mod._resolve_long_option("--ree"), "--reedit-message")
+        self.assertEqual(mod._resolve_long_option("--fix"), "--fixup")
+        self.assertEqual(mod._resolve_long_option("--dat"), "--date")
+        self.assertEqual(mod._resolve_long_option("--templ"), "--template")
+        self.assertEqual(mod._resolve_long_option("--mess"), "--message")
+        self.assertEqual(mod._resolve_long_option("--am"), "--amend")
+        self.assertEqual(mod._resolve_long_option("--pathspec-fr"), "--pathspec-from-file")
+
+    def test_resolve_ambiguous_prefix_is_none(self):
+        # git ERRORS on these (matches >1 option) and never commits — so the parser must NOT guess one.
+        for amb in ("--t", "--d", "--f", "--a", "--pathspec-f", "--s"):
+            self.assertIsNone(mod._resolve_long_option(amb), amb)
+
+    def test_resolve_unknown_and_degenerate_is_none(self):
+        for bad in ("--zzz", "--", "-m", "feat", "-", "--xy"):
+            self.assertIsNone(mod._resolve_long_option(bad), bad)
+
+    def test_canonical_value_flag_resolves_value_consumers_only(self):
+        # an abbreviation of a value-consuming option resolves; a non-value option (`--am`/`--ver`) does not.
+        self.assertEqual(mod._canonical_long_value_flag("--au"), "--author")
+        self.assertEqual(mod._canonical_long_value_flag("--mess"), "--message")
+        self.assertEqual(mod._canonical_long_value_flag("--fil"), "--file")
+        self.assertIsNone(mod._canonical_long_value_flag("--am"))     # --amend, not value-consuming
+        self.assertIsNone(mod._canonical_long_value_flag("--ver"))    # --verbose, not value-consuming
+        self.assertIsNone(mod._canonical_long_value_flag("--author=x"))  # glued → caller handles
+
+    # --- the THREE parsers skip an abbreviated value flag + its value (bypass closed) ------------
+    def test_nonmessage_consumes_next_for_abbreviations(self):
+        for flag in ("--au", "--dat", "--clea", "--trail", "--reu", "--ree", "--squ", "--templ"):
+            self.assertTrue(mod._nonmessage_flag_consumes_next(flag), flag)
+        # ambiguous / non-value abbreviations must NOT consume.
+        for flag in ("--t", "--d", "--am", "--ver", "--author=x"):
+            self.assertFalse(mod._nonmessage_flag_consumes_next(flag), flag)
+
+    def test_abbreviated_value_flag_value_is_not_a_message(self):
+        # THE BYPASS: `--au '-m' 'ABC-1: ok'` — real git reads author="-m" and "ABC-1: ok" as a
+        # PATHSPEC (ticketless); the abbreviation must be recognized so the `-m` value is skipped, not
+        # de-clustered into a message that eats the (phantom-ticket) pathspec.
+        for flag in ("--au", "--dat", "--clea", "--trail", "--reu", "--ree", "--squ", "--templ"):
+            argv = _commit_argv(f"git commit {flag} '-m' 'ABC-1: ok'")
+            self.assertEqual(mod.commit_message_from_argv(argv), "", flag)
+            # the `-F`-looking value must NOT be re-read as a real `-F -` stdin read either.
+            self.assertFalse(
+                mod.commit_reads_stdin_message(_commit_argv(f"git commit {flag} '-F' -")), flag
+            )
+
+    def test_is_skip_flag_exact_and_abbreviation(self):
+        # `_is_skip_flag` resolves only `--amend` by prefix (the one SKIP_FLAG that is a real `git
+        # commit` option); the rebase/merge plumbing flags match by EXACT string only — their
+        # abbreviations are NOT `git commit` options, so they must return False (not silently resolve).
+        for exact in ("--amend", "--continue", "--abort", "--skip"):
+            self.assertTrue(mod._is_skip_flag(exact), exact)
+        self.assertTrue(mod._is_skip_flag("--am"))  # --am → --amend, a real git commit option
+        for not_a_skip in ("--con", "--abo", "--ski", "--a", "--au", "--m", "--message"):
+            self.assertFalse(mod._is_skip_flag(not_a_skip), not_a_skip)
+
+    def test_is_skip_commit_skips_abbreviated_value_flag_value(self):
+        # a value-bearing abbreviation whose VALUE looks like a skip flag (`--au '--amend'`) must be
+        # skipped as a value, not misread as a real `--amend`.
+        self.assertFalse(mod.is_skip_commit(_commit_argv("git commit --au '--amend' -m x")))
+        self.assertFalse(mod.is_skip_commit(_commit_argv("git commit --trail '--amend'")))
+        # control: a real --amend (and its own abbreviation `--am`) is still a skip commit.
+        self.assertTrue(mod.is_skip_commit(_commit_argv("git commit --amend -m x")))
+        self.assertTrue(mod.is_skip_commit(_commit_argv("git commit --am -m x")))
+
+    # --- abbreviated MESSAGE/FILE flags still get their value READ (no over-block) ---------------
+    def test_abbreviated_message_flag_value_is_read(self):
+        # `--mess 'Closes #1'` / `--mess=ENG-7` must be read as a message (else a legit abbreviated
+        # ticketed commit would FALSE-BLOCK — the over-block direction).
+        self.assertIn("Closes #1", mod.commit_message_from_argv(_commit_argv("git commit --mess 'Closes #1'")))
+        self.assertIn("ENG-7", mod.commit_message_from_argv(_commit_argv("git commit --mess=ENG-7")))
+
+    def test_abbreviated_file_flag_value_is_read_and_in_parity(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("feat: x\n\nCloses #88\n")
+            path = fh.name
+        try:
+            for spelling in (f"--fil {path}", f"--fil={path}"):
+                argv = _commit_argv(f"git commit {spelling}")
+                self.assertIn("Closes #88", mod.commit_message_from_argv(argv), spelling)
+                self.assertFalse(mod.commit_reads_stdin_message(argv), spelling)
+        finally:
+            os.unlink(path)
+        # `--fil -` (abbreviated stdin) must be detected as stdin, contribute no text.
+        argv = _commit_argv("git commit --fil -")
+        self.assertEqual(mod.commit_message_from_argv(argv).strip(), "")
+        self.assertTrue(mod.commit_reads_stdin_message(argv))
+
+    # --- end-to-end: the bypass is closed, the legit path allows, ambiguity is benign ------------
+    def test_e2e_abbreviated_author_dash_m_pathspec_blocks(self):
+        # THE BYPASS, end-to-end: `git commit --au '-m' 'ABC-1: ok'` is a ticketless commit (the
+        # ABC-1 token is a pathspec to git, not a message) → must BLOCK, not be fooled into ALLOW.
+        code, decision = run_hook("git commit --au '-m' 'ABC-1: ok'", strict=True)
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE, "abbreviated --au bypass must be closed")
+        self.assertEqual(decision, "block")
+
+    def test_e2e_abbreviated_value_flags_no_ticket_block(self):
+        for flag in ("--clea", "--reu", "--dat", "--trail", "--squ", "--templ"):
+            code, decision = run_hook(f"git commit {flag} '-m' 'ABC-1: ok'", strict=True)
+            self.assertEqual(code, mod.BLOCK_EXIT_CODE, flag)
+            self.assertEqual(decision, "block", flag)
+
+    def test_e2e_legit_abbreviated_author_with_real_ticket_allows(self):
+        # `--au 'someone' -m 'Closes #1'` is a properly-ticketed commit (author is "someone", the real
+        # message carries the ticket) → must ALLOW (no over-block).
+        code, decision = run_hook("git commit --au 'someone' -m 'Closes #1'", strict=True)
+        self.assertEqual(code, 0, "a legit ticketed abbreviated-flag commit must allow")
+        self.assertEqual(decision, "allow")
+
+    def test_e2e_abbreviated_message_flag_with_ticket_allows(self):
+        code, decision = run_hook("git commit --mess 'feat: x Closes #2'", strict=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(decision, "allow")
+
+    def test_glued_abbreviated_value_flag_does_not_consume_next_or_leak(self):
+        # a GLUED abbreviated non-message value-consumer (`--au=name`) carries its own value → it must
+        # NOT consume the next token, and its value must NOT leak into the commit message.
+        self.assertFalse(mod._nonmessage_flag_consumes_next("--au=someone"))
+        self.assertIsNone(mod._canonical_long_value_flag("--au=someone"))
+        # `--au=name -m 'Closes #1'`: author is glued, the real `-m` message carries the ticket.
+        self.assertEqual(
+            mod.commit_message_from_argv(_commit_argv("git commit --au=name -m 'Closes #1'")),
+            "Closes #1",
+        )
+
+    def test_import_time_guard_rejects_unknown_value_long(self):
+        # the import-time invariant (_KNOWN_VALUE_LONG <= _ALL_COMMIT_LONG_OPTIONS) must actually fire
+        # on a typo'd value-consuming option — re-execute the module source with a poisoned set.
+        import types
+
+        src = _SCRIPT.read_text(encoding="utf-8").replace(
+            '"--author", "--date", "--cleanup", "--trailer", "--pathspec-from-file",',
+            '"--author", "--date", "--cleanup", "--trailer", "--pathspec-from-file", "--bogus-flag",',
+            1,
+        )
+        self.assertIn("--bogus-flag", src, "test setup: the value-long set line must have been patched")
+        ns = types.ModuleType("rt_poisoned")
+        with self.assertRaises(RuntimeError):
+            exec(compile(src, str(_SCRIPT), "exec"), ns.__dict__)
+
+    def test_e2e_ambiguous_prefix_does_not_overconsume(self):
+        # `--t 'Closes #9'` is an AMBIGUOUS option to git (--trailer/--template) — git would error and
+        # never commit. Our parser must NOT silently resolve `--t` to a value-consumer and swallow the
+        # 'Closes #9' as its value; the token is just an unrecognized flag, the next is a pathspec, no
+        # message → no ticket → BLOCK (the SAFE direction: we don't manufacture a phantom ticket from
+        # an over-consumed value, and we don't crash). This proves ambiguity is handled per git.
+        code, decision = run_hook("git commit --t 'Closes #9'", strict=True)
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
