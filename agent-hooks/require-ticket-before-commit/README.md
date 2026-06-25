@@ -32,7 +32,14 @@ certainly had a ticket anyway. It scans the commit message *and* the branch name
 
 The message is pulled from the argv (`-m`/`--message`, `-mMsg`, and the contents of any
 `-F`/`--file` commit-message file — read from disk, separate `-F <path>`, glued `-F<path>`,
-and `--file=<path>` forms all), so a ticket id in any of those counts. A relative `-F` path
+and `--file=<path>` forms all), so a ticket id in any of those counts. **Clustered short
+flags are de-clustered the way git parses them** (agent-tools#109): `git commit -am "…"` is
+`-a` + `-m "…"`, and the message reader honors that — the first value letter (`m`/`F`) in a
+short group wins, consuming the rest-of-cluster as a glued value (`-amMSG` → message `MSG`;
+`-amF` → message `F`, *not* a separate `-F`; `-aFpath` → file `path`) or, when it's the
+cluster's last char, the next token (`-am MSG`, `-aF file`). Before the fix a `-am "Closes #5"`
+was read as an empty message and false-BLOCKED, and a `-am "chore: …"` lost its exemption. A
+relative `-F` path
 is resolved against the event's `cwd` (the command's working directory), so it works even when
 the harness launches the hook outside the repo. A trailer keyword (`Closes`/`Fixes`/`Refs`)
 only counts when it's followed by a real ref — `fix: null deref` is a bugfix subject, not a

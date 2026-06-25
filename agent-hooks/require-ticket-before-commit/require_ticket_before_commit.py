@@ -513,6 +513,89 @@ def has_inline_skip(segment: CommitSegment) -> bool:
 # _evaluate_commit_segment (agent-tools#104; #102 used to fail open here).
 _STDIN_SENTINEL = "-"
 
+# The short option letters of `git commit` that carry a message/file VALUE: `-m` (literal message)
+# and `-F` (message file). A CLUSTERED short group (`-am`, `-aF`, `-amMSG`) must be de-clustered the
+# way git does (agent-tools#109; the same clustered-short-flag class block-no-verify fixed in
+# #36–#40): git reads a short cluster LEFT-TO-RIGHT and the FIRST value-consuming letter wins — it
+# consumes the REST OF THE CLUSTER as its glued value if any chars follow it (`-amMSG` → `-m MSG`;
+# `-amF` → `-m F`, NOT a separate `-F`; `-aFpath` → `-F path`), else (it is the cluster's last char)
+# it consumes the NEXT token (`-am MSG`, `-aF file`).
+_MESSAGE_VALUE_LETTERS = frozenset("mF")
+# But `m`/`F` are NOT the only value-consuming short letters of `git commit`. `-C`/`-c` (reuse/reedit
+# a commit), `-t` (template file), `-u` (untracked-files mode) and `-S` (optional gpg keyid) ALSO
+# greedily take the rest-of-cluster (or next token) as THEIR value — so a `m`/`F` AFTER one of them is
+# part of that value, not a message flag: git parses `-Cm` as `-C m` (reuse commit "m"), `-um` as the
+# untracked mode "m", `-Sm` as keyid "m" — none of them a `-m` message. The de-cluster scan must
+# therefore stop at the FIRST value-consuming letter of the WHOLE set and only treat it as a message
+# when that letter is `m`/`F`. (Mirrors block-no-verify's `_SHORT_VALUE_LETTERS` = "mFCct" + `-S`
+# optional; kept separate by design — each hook is its own subprocess with no shared import path.)
+_OTHER_VALUE_LETTERS = frozenset("CctuS")
+_ALL_VALUE_LETTERS = _MESSAGE_VALUE_LETTERS | _OTHER_VALUE_LETTERS
+
+
+def _decluster_short_message_flag(tok: str) -> tuple[str, str | None] | None:
+    """De-cluster a `-`-prefixed short option group the way git's commit parser does, for message
+    extraction.
+
+    Returns ``None`` when `tok` is not a single-dash short cluster whose FIRST value-consuming letter
+    is the message/file flag `-m`/`-F` — i.e. a long `--…` flag, a positional, a bare `-`, a cluster
+    with no value letter (`-a`/`-sv`), or a cluster whose first value letter is a NON-message one
+    (`-Cm`/`-um`/`-Sm`: git reads `m` as the value of `-C`/`-u`/`-S`, not a `-m` message).
+
+    Otherwise returns ``(letter, value)`` where ``letter`` is that first value letter (`"m"`/`"F"`):
+
+      - ``value`` is the GLUED value string when chars follow that letter in the cluster
+        (`-amMSG` → ``("m", "MSG")``; `-amF` → ``("m", "F")``; `-aFpath` → ``("F", "path")``);
+      - ``value`` is ``None`` when the value letter is the cluster's LAST char, meaning the value is
+        the NEXT argv token (`-am` → ``("m", None)``; `-aF` → ``("F", None)``).
+
+    A boolean letter BEFORE the first value letter (`-a`/`-s`/`-v`/`-q`/…) is skipped. The scan STOPS
+    at the first value-consuming letter of the whole set — git does not re-parse a value tail as
+    further flags (`-amF` is message ``"F"``, never `-a -m -F`)."""
+    if not tok.startswith("-") or tok.startswith("--") or len(tok) < 2:
+        return None  # a long flag, a bare `-`, or a non-flag positional
+    body = tok[1:]
+    for idx, ch in enumerate(body):
+        if ch in _ALL_VALUE_LETTERS:
+            if ch not in _MESSAGE_VALUE_LETTERS:
+                return None  # `-C`/`-c`/`-t`/`-u`/`-S` swallow the rest — not a `-m`/`-F` message
+            glued = body[idx + 1:]
+            return ch, (glued if glued else None)
+    return None  # no value letter in the cluster — a pure boolean group like `-a`/`-sv`
+
+
+# Non-message commit flags whose value is a MANDATORY SEPARATE token: `-C`/`-c` (reuse/reedit a
+# commit), `-t` (template file), and their long spellings. When that value happens to look like `-m`/
+# `-F`/`-F -` it must NOT be re-read as a real message/file flag (`git commit -t -F -`: `-t` takes
+# `-F` as the template path, `-` is a pathspec, stdin is NOT read; `git commit -C -m x`: `-C` takes
+# `-m` as the reuse-ref, the message is NOT "x"). Both message parsers SKIP this flag AND its value
+# token so they stay in lock-step (agent-tools#109 review). `-u`/`-S` are OMITTED on purpose: their
+# value is OPTIONAL and only ever GLUED (`-uno`, `-Skeyid`) — a separate `-u -m …`/`-S -m …` is `-u`
+# with no value then a real `-m`, so they must NOT consume the next token (it would eat the message).
+_OTHER_VALUE_SHORT_NEXT = frozenset("Cct")
+_OTHER_VALUE_LONG = frozenset({
+    "--reuse-message", "--reedit-message", "--fixup", "--squash", "--template",
+})
+
+
+def _nonmessage_flag_consumes_next(tok: str) -> bool:
+    """True when `tok` is a commit flag whose value is a MANDATORY SEPARATE next token but is NOT a
+    `-m`/`-F` message/file flag — so both message parsers must SKIP it and its value, never re-read a
+    `-m`/`-F`-looking value as a real flag. Covers separate long `--reuse-message`/`--template`/… and
+    a short cluster whose first value letter is `C`/`c`/`t` and is the cluster's LAST char (`-C`/`-aC`
+    take the next token; a GLUED `-Cabc`/`-aCabc` carries its value inside the token, so it does NOT
+    consume the next)."""
+    if tok.startswith("--"):
+        return tok in _OTHER_VALUE_LONG  # a glued `--template=x` carries its own value
+    if not tok.startswith("-") or len(tok) < 2:
+        return False
+    body = tok[1:]
+    for idx, ch in enumerate(body):
+        if ch in _ALL_VALUE_LETTERS:
+            # the first value letter is C/c/t AND it is the cluster's last char → next-token value.
+            return ch in _OTHER_VALUE_SHORT_NEXT and idx == len(body) - 1
+    return False
+
 
 def commit_message_from_argv(argv: list[str], cwd: str | None = None) -> str:
     """Pull the commit message out of the already-parsed commit argv: -m/--message and -F/--file.
@@ -530,22 +613,41 @@ def commit_message_from_argv(argv: list[str], cwd: str | None = None) -> str:
         tok = argv[i]
         if tok == "--":
             break
-        if tok in ("-m", "--message", "-F", "--file") and i + 1 < len(argv):
+        # Long forms first: `--message`/`--file` (separate value) and `--message=`/`--file=` (glued).
+        if tok in ("--message", "--file") and i + 1 < len(argv):
             value = argv[i + 1]
-            if tok in ("-F", "--file"):
-                parts.append(_read_message_file(value, cwd))
-            else:
-                parts.append(value)
+            parts.append(_read_message_file(value, cwd) if tok == "--file" else value)
             i += 2
             continue
         if tok.startswith("--message="):
             parts.append(tok.split("=", 1)[1])
-        elif tok.startswith("--file="):
+            i += 1
+            continue
+        if tok.startswith("--file="):
             parts.append(_read_message_file(tok.split("=", 1)[1], cwd))
-        elif tok.startswith("-m") and len(tok) > 2:
-            parts.append(tok[2:])  # -mMessage (glued)
-        elif tok.startswith("-F") and len(tok) > 2:
-            parts.append(_read_message_file(tok[2:], cwd))  # -FPATH (glued; git accepts both forms)
+            i += 1
+            continue
+        # Short forms, de-clustered like git: `-m`/`-F`/`-am`/`-aF` (next-token value) and
+        # `-mMSG`/`-FPATH`/`-amMSG`/`-aFpath`/`-amF` (glued value) (agent-tools#109).
+        declustered = _decluster_short_message_flag(tok)
+        if declustered is not None:
+            letter, glued = declustered
+            if glued is None:  # next-token value (`-am MSG`/`-aF file`)
+                if i + 1 >= len(argv):
+                    break  # a trailing `-am`/`-aF` with no value — git would error; nothing to read
+                value, i = argv[i + 1], i + 2
+            else:  # glued value (`-amMSG`/`-aFpath`/`-amF`)
+                value, i = glued, i + 1
+            parts.append(_read_message_file(value, cwd) if letter == "F" else value)
+            continue
+        # A non-message mandatory-value flag (`-C`/`-c`/`-t`/`--reuse-message`/…): SKIP it AND its
+        # value token, so a `-m`/`-F`-looking value (`-C -m x`) is not misread as a real message
+        # (agent-tools#109 review). A trailing such flag with no value → git would error; stop.
+        if _nonmessage_flag_consumes_next(tok):
+            if i + 1 >= len(argv):
+                break
+            i += 2
+            continue
         i += 1
     return "\n".join(parts)
 
@@ -565,14 +667,47 @@ def _file_flag_values(argv: list[str]) -> list[str]:
         tok = argv[i]
         if tok == "--":
             break
-        if tok in ("-F", "--file") and i + 1 < len(argv):
+        if tok == "--file" and i + 1 < len(argv):
             values.append(argv[i + 1])
             i += 2
             continue
         if tok.startswith("--file="):
             values.append(tok.split("=", 1)[1])
-        elif tok.startswith("-F") and len(tok) > 2:
-            values.append(tok[2:])  # -FPATH glued (and -F- → "-")
+            i += 1
+            continue
+        # A separate `--message <v>` value is collected by commit_message_from_argv; here it must be
+        # SKIPPED (value + flag), or a `--message -F -` would re-parse the `-F` as a real file flag and
+        # falsely flag stdin (agent-tools#109 review). `--message=` carries its value glued — no skip.
+        if tok == "--message" and i + 1 < len(argv):
+            i += 2
+            continue
+        # Short forms, de-clustered like git. A cluster's governing value letter is either `F` (a
+        # message-FILE value → collect it) or `m` (a literal MESSAGE → NOT a file). Crucially, BOTH
+        # must consume their value token the same way commit_message_from_argv does, so a `-m`/`-am`
+        # whose VALUE happens to look like `-F` (`git commit -am -F -`: message is "-F", `-` is a
+        # pathspec, stdin is NOT read) does not leave that `-F` to be re-parsed here as a real file
+        # flag (agent-tools#109; keeps the two parsers in lock-step — the parity test pins it).
+        declustered = _decluster_short_message_flag(tok)
+        if declustered is not None:
+            letter, glued = declustered
+            if glued is None:  # value is the NEXT token (`-aF file`, `-F -`, `-am MSG`)
+                if i + 1 >= len(argv):
+                    break  # a trailing `-aF`/`-am` with no value — git would error
+                if letter == "F":
+                    values.append(argv[i + 1])
+                i += 2  # skip the consumed value token for BOTH `F` and `m`
+                continue
+            if letter == "F":
+                values.append(glued)  # glued file path (`-aFpath`/`-FPATH`)
+            i += 1
+            continue
+        # A non-message mandatory-value flag (`-C`/`-c`/`-t`/`--reuse-message`/…): skip it AND its
+        # value, so a `-F`-looking value (`-t -F -`) is not re-read here as a real file flag.
+        if _nonmessage_flag_consumes_next(tok):
+            if i + 1 >= len(argv):
+                break
+            i += 2
+            continue
         i += 1
     return values
 
@@ -651,15 +786,16 @@ def effective_cwd(segment: CommitSegment, cwd: str | None) -> str | None:
 def _takes_following_message_value(tok: str) -> bool:
     """True when a commit flag token consumes the NEXT token as a VALUE (a message/file path) — so a
     skip-flag-looking value (`-am '--amend'`) is NOT read as a real flag. Covers `--message`/`--file`
-    and any short cluster ENDING in `m`/`F` (`-m`, `-am`, `-aF`); a GLUED short value (`-mMSG`/`-FX`,
-    where the value letter is not last) carries its value in the token and does not take the next."""
+    (separate value) and a de-clustered short group whose first value letter (`m`/`F`) is the
+    cluster's LAST char (`-m`, `-am`, `-aF`). A GLUED short value (`-mMSG`/`-FPATH`/`-amMSG`/`-amF`/
+    `-aFpath`) carries its value inside the token and does NOT take the next (agent-tools#109). The
+    de-clustering matches git exactly via the shared `_decluster_short_message_flag`, so a value
+    letter in the MIDDLE of a cluster (`-amF` → message "F"; `-aFm` → file "m") is read as glued, not
+    as a next-token consumer."""
     if tok.startswith("--"):
         return tok in ("--message", "--file")
-    if tok.startswith("-") and len(tok) > 1:
-        if len(tok) > 2 and tok[1] in ("m", "F"):
-            return False  # a glued `-mMSG` / `-FPATH`
-        return tok[-1] in ("m", "F")  # `-m` / `-am` / `-aF` takes the next token
-    return False
+    declustered = _decluster_short_message_flag(tok)
+    return declustered is not None and declustered[1] is None
 
 
 def is_skip_commit(argv: list[str]) -> bool:

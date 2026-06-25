@@ -322,3 +322,134 @@ def test_wrapped_no_ticket_commit_still_blocks(command):
     r = _run(command)
     assert r["code"] == 10, f"{command!r} is a real wrapped commit — must block, got exit={r['code']}"
     assert r["decision"] == "block"
+
+
+# ── CLUSTERED SHORT FLAG `-am` (agent-tools#109) ─────────────────────────────────────────────────
+# `git commit -am "…"` is `-a` + `-m "…"`; the message-extraction path must de-cluster combined short
+# option groups the way git's commit parser does (the FIRST value letter `m`/`F` wins — glued tail or
+# next token). The pre-fix code matched only `-m`/`-mMSG`/`-F`/`-FPATH`, so `-am`/`-aF`/`-amMSG` fell
+# through with an EMPTY message → a ticketed `-am "Closes #5"` false-BLOCKED and a `-am "chore: …"`
+# LOST its exemption. Same clustered-short-flag class block-no-verify fixed in #36–#40.
+
+
+def test_am_with_ticket_allows():
+    # THE issue #109 repro: a ticket in a `-am` message must be detected → ALLOW.
+    r = _run('git commit -am "Closes #5 fix"')
+    assert r["code"] == 0, f"a ticketed -am commit must allow, got exit={r['code']}"
+    assert r["decision"] == "allow"
+
+
+def test_am_without_ticket_blocks():
+    r = _run('git commit -am "no ticket"')
+    assert r["code"] == 10
+    assert r["decision"] == "block"
+
+
+def test_am_chore_exemption_is_preserved():
+    # the second half of the bug: an empty message lost the `chore:` exemption too.
+    r = _run('git commit -am "chore: cleanup"')
+    assert r["code"] == 0, f"a chore: -am commit is exempt and must allow, got exit={r['code']}"
+    assert r["decision"] == "allow"
+
+
+def test_am_glued_ticket_allows():
+    # `-amENG-7` — the message is glued onto the cluster.
+    r = _run("git commit -amENG-7")
+    assert r["code"] == 0
+    assert r["decision"] == "allow"
+
+
+@pytest.mark.parametrize("command", [
+    'git commit -am "no ticket [skip-ticket: deliberate]"',  # `[skip-ticket: …]` trailer escape
+    'REQUIRE_TICKET_SKIP=1 git commit -am "no ticket"',      # inline-env escape
+])
+def test_am_escapes_still_work(command):
+    r = _run(command)
+    assert r["code"] == 0, f"{command!r} carries a deliberate escape — must allow"
+    assert r["decision"] == "allow"
+
+
+@pytest.mark.parametrize("sep", [" ", ""])  # `-aF <file>` (next token) and `-aF<file>` (glued)
+def test_am_aF_file_with_ticket_allows(tmp_path, sep):
+    # `-aF` clustered — the message file must be read and its ticket detected, both spellings.
+    msg_file = tmp_path / "msg.txt"
+    msg_file.write_text("feat: big change\n\nCloses #99\n")
+    r = _run(f"git commit -aF{sep}{msg_file}")
+    assert r["code"] == 0, f"a -aF file with a ticket must allow, got exit={r['code']}"
+    assert r["decision"] == "allow"
+
+
+def test_amF_is_a_message_not_a_file_block(tmp_path):
+    # `-amF` is message "F" (git glues F onto -m), NOT a `-F` file read → no ticket → BLOCK.
+    r = _run("git commit -amF")
+    assert r["code"] == 10
+    assert r["decision"] == "block"
+
+
+@pytest.mark.parametrize("command", [
+    "tar -amF archive.tar",          # a clustered short flag on a NON-git command
+    "ls -la",                        # benign cluster, not a commit
+    'grep -rn "git commit -am" src/',  # a grep whose pattern contains `-am`
+])
+def test_benign_clustered_flag_non_commit_allowed(command):
+    # the #37/#40 over-block cautionary tale: de-clustering must not over-match a non-commit command.
+    r = _run(command)
+    assert r["code"] == 0, f"{command!r} is not a git commit — must allow"
+    assert r["decision"] == "allow"
+
+
+def test_am_amend_value_still_blocks():
+    # `git commit -am "--amend"` authors a real ticketless commit (message "--amend") → BLOCK; the
+    # `--amend` is the -m VALUE, not a real skip flag.
+    r = _run('git commit -am "--amend"')
+    assert r["code"] == 10
+    assert r["decision"] == "block"
+
+
+@pytest.mark.parametrize("command", [
+    'git commit -am "-F"',          # `-am "-F"`: message is "-F", the value is not a real -F flag
+    "git commit -am -F -",          # `-am` takes "-F" as the message; `-` is a pathspec, NOT stdin
+    "git commit -m -F -",           # short separate form
+    "git commit --message -F -",    # LONG separate form (re-review #1)
+])
+def test_message_with_dash_F_looking_value_is_not_a_stdin_block(command):
+    # agent-tools#109 review #1: a `-m`/`-am`/`--message` whose VALUE looks like `-F` must NOT be
+    # re-parsed as a real `-F -` stdin read (which would false-BLOCK with the stdin hint). The
+    # message "-F" carries no ticket so the commit still BLOCKS — but with the ordinary no-ticket
+    # marker, NOT the stdin hint; the point is the gate did not misclassify it as a stdin commit.
+    r = _run(command)
+    assert r["code"] == 10, command
+    assert r["decision"] == "block"
+    assert "on git's stdin" not in r["message"], f"must not be the stdin hint: {command!r}"
+
+
+@pytest.mark.parametrize("command", ["git commit -t -F -", "git commit -aC -F -"])
+def test_reuse_template_flag_value_is_not_a_stdin_block(command):
+    # agent-tools#109 re-review #2: a SEPARATE `-C`/`-t` takes its next token as a mandatory value —
+    # `git commit -t -F -` is `-t` template "-F", NOT a `-F -` stdin read. Must not be the stdin hint.
+    r = _run(command)
+    assert r["code"] == 10
+    assert "on git's stdin" not in r["message"], command
+
+
+def test_reuse_message_cluster_is_not_a_dash_m_message():
+    # agent-tools#109 review #2: `git commit -Cm` is `-C m` (reuse commit "m"), NOT a `-m` message.
+    # With no readable message and no ticket, it blocks — and must NOT extract a phantom message.
+    assert rt.commit_message_from_argv(["-Cm"]) == ""
+    assert rt.commit_message_from_argv(["-um"]) == ""
+    assert rt.commit_message_from_argv(["-Sm"]) == ""
+    # SEPARATE `-C`/`-c`/`-t` swallow their next token too — no phantom message from the `-m`.
+    assert rt.commit_message_from_argv(["-C", "-m", "x"]) == ""
+    assert rt.commit_message_from_argv(["-t", "-m", "x"]) == ""
+
+
+@pytest.mark.parametrize("command", [
+    "git commit -S -m 'Closes #5'",   # -S optional keyid (no value) then a REAL -m
+    "git commit -u -m 'Fixes ABC-7'",  # -u optional untracked mode then a REAL -m
+])
+def test_optional_arg_flag_then_separate_message_with_ticket_allows(command):
+    # agent-tools#109 re-review #3: `-S`/`-u` have an OPTIONAL only-glued value, so a separate
+    # `-S -m …` must still read the `-m` ticket → ALLOW (they must NOT consume the next token).
+    r = _run(command)
+    assert r["code"] == 0, f"{command!r} carries a ticket in a real -m — must allow"
+    assert r["decision"] == "allow"
