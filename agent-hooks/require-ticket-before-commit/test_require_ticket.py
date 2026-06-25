@@ -751,5 +751,188 @@ class WrapperClasses(unittest.TestCase):
         self.assertEqual(decision, "allow")
 
 
+class ClusteredShortFlagDecluster(unittest.TestCase):
+    """agent-tools#109 — the message-extraction path must de-cluster combined short option groups the
+    way git's commit parser does, so `git commit -am "…"` (the very common `-a` + `-m`) gets its
+    message read. The old code matched only `-m`/`-mMSG`/`-F`/`-FPATH`, so `-am`/`-aF`/`-amMSG` fell
+    through with an EMPTY message → a ticketed `-am "Closes #5"` false-BLOCKED, and a `-am "chore: …"`
+    LOST its exemption. Same clustered-short-flag class block-no-verify fixed in #36–#40. These
+    reproduce the bug FIRST (they fail against the pre-fix code) and pass once de-clustering lands.
+
+    Git's rule (verified against real git): a short cluster is read LEFT-TO-RIGHT; the FIRST value
+    letter (`m`/`F`) wins — it consumes the rest-of-cluster as a GLUED value if chars follow it
+    (`-amMSG` → message "MSG"; `-amF` → message "F", NOT a separate `-F`; `-aFp` → file "p"), else it
+    is the cluster's last char and consumes the NEXT token (`-am MSG`, `-aF file`)."""
+
+    # --- the unit helper, exact decluster semantics ---------------------------------------------
+    def test_decluster_next_token_forms(self):
+        # value letter is the cluster's LAST char → value is the NEXT argv token.
+        self.assertEqual(mod._decluster_short_message_flag("-m"), ("m", None))
+        self.assertEqual(mod._decluster_short_message_flag("-am"), ("m", None))
+        self.assertEqual(mod._decluster_short_message_flag("-aF"), ("F", None))
+        self.assertEqual(mod._decluster_short_message_flag("-saF"), ("F", None))
+
+    def test_decluster_glued_forms(self):
+        # value letter has chars AFTER it → those chars are the GLUED value; the first letter wins.
+        self.assertEqual(mod._decluster_short_message_flag("-mMSG"), ("m", "MSG"))
+        self.assertEqual(mod._decluster_short_message_flag("-amMSG"), ("m", "MSG"))
+        self.assertEqual(mod._decluster_short_message_flag("-amF"), ("m", "F"))  # NOT a separate -F
+        self.assertEqual(mod._decluster_short_message_flag("-aFpath"), ("F", "path"))
+        self.assertEqual(mod._decluster_short_message_flag("-Fam"), ("F", "am"))
+
+    def test_decluster_non_message_returns_none(self):
+        # a long flag, a positional, a bare `-`, or a boolean-only cluster carries no message value.
+        for tok in ("--message", "--amend", "-a", "-sv", "-", "feat", "--file=x"):
+            self.assertIsNone(mod._decluster_short_message_flag(tok), tok)
+
+    def test_decluster_other_value_letters_are_not_a_message(self):
+        # `-C`/`-c` (reuse/reedit), `-t` (template), `-u` (untracked mode), `-S` (gpg keyid) all
+        # greedily consume the rest-of-cluster as THEIR value — git parses `-Cm` as `-C m`, `-um` as
+        # untracked mode "m", `-Sm` as keyid "m": a trailing `m`/`F` is that value, NOT a `-m`/`-F`
+        # message (agent-tools#109 review finding #2). So de-cluster must return None for them.
+        for tok in ("-Cm", "-cm", "-tm", "-um", "-Sm", "-aCm", "-aSF"):
+            self.assertIsNone(mod._decluster_short_message_flag(tok), tok)
+
+    # --- the message extractor de-clusters --------------------------------------------------------
+    def test_dash_am_next_token_message_is_extracted(self):
+        # THE BUG: `-am "Closes #5 fix"` → the message must be read from the NEXT token.
+        msg = mod.commit_message_from_argv(_commit_argv('git commit -am "Closes #5 fix"'))
+        self.assertIn("Closes #5", msg)
+
+    def test_dash_am_glued_message_is_extracted(self):
+        self.assertIn("ENG-7", mod.commit_message_from_argv(_commit_argv("git commit -amENG-7")))
+
+    def test_dash_amF_is_a_message_not_a_file(self):
+        # `-amF` is message "F" (git glues F onto -m), NOT a `-F` file read → no file open attempt.
+        self.assertEqual(mod.commit_message_from_argv(_commit_argv("git commit -amF")), "F")
+
+    def test_dash_aF_next_token_reads_the_file(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("feat: x\n\nCloses #77\n")
+            path = fh.name
+        try:
+            self.assertIn(
+                "Closes #77", mod.commit_message_from_argv(_commit_argv(f"git commit -aF {path}"))
+            )
+        finally:
+            os.unlink(path)
+
+    def test_dash_aF_glued_reads_the_file(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("feat: x\n\nFixes ABC-12\n")
+            path = fh.name
+        try:
+            self.assertIn(
+                "Fixes ABC-12", mod.commit_message_from_argv(_commit_argv(f"git commit -aF{path}"))
+            )
+        finally:
+            os.unlink(path)
+
+    # --- stdin-sentinel detection through a cluster ----------------------------------------------
+    def test_dash_aF_dash_is_stdin(self):
+        # `-aF -` is the stdin sentinel reached via a cluster — detected, contributes no text.
+        argv = _commit_argv("git commit -aF -")
+        self.assertTrue(mod.commit_reads_stdin_message(argv))
+        self.assertEqual(mod.commit_message_from_argv(argv).strip(), "")
+
+    def test_dash_am_is_not_stdin(self):
+        # `-am -` is a MESSAGE whose value happens to be "-", NOT a stdin file read.
+        self.assertFalse(mod.commit_reads_stdin_message(_commit_argv("git commit -am -")))
+
+    def test_dash_am_dash_F_dash_message_value_is_not_stdin(self):
+        # PARITY (agent-tools#109 review finding #1): `git commit -am -F -` → git reads `-m "-F"`
+        # (message is the literal "-F"), then `-` is a pathspec; stdin is NOT read. The message
+        # reader and the file-value reader must AGREE — the consumed `-F` token must not be
+        # re-parsed by _file_flag_values as a real `-F` flag (which would falsely flag stdin).
+        for command in ("git commit -am -F -", "git commit -m -F -"):
+            argv = _commit_argv(command)
+            self.assertEqual(mod.commit_message_from_argv(argv), "-F", command)
+            self.assertFalse(mod.commit_reads_stdin_message(argv), command)
+
+    def test_long_message_dash_F_dash_value_is_not_stdin(self):
+        # PARITY for the LONG form (agent-tools#109 re-review #1): `git commit --message -F -` → git
+        # reads `--message "-F"`, then `-` is a pathspec; NOT stdin. _file_flag_values must skip the
+        # separate `--message` value so the `-F` token is not re-parsed as a real file flag.
+        argv = _commit_argv("git commit --message -F -")
+        self.assertEqual(mod.commit_message_from_argv(argv), "-F")
+        self.assertFalse(mod.commit_reads_stdin_message(argv))
+
+    def test_reuse_template_flag_value_is_not_a_message_or_stdin(self):
+        # agent-tools#109 re-review #2: a SEPARATE `-C`/`-c`/`-t` (and long forms) takes its next
+        # token as a MANDATORY value — git parses `-C -m x` as `-C` reuse-ref "-m" (NO message), and
+        # `-t -F -` as `-t` template "-F" (NOT a `-F -` stdin read). Both parsers must skip the value.
+        for command in ("git commit -C -m x", "git commit -c -m x", "git commit --template -F -"):
+            argv = _commit_argv(command)
+            self.assertEqual(mod.commit_message_from_argv(argv), "", command)
+        self.assertFalse(mod.commit_reads_stdin_message(_commit_argv("git commit -t -F -")))
+        self.assertFalse(mod.commit_reads_stdin_message(_commit_argv("git commit -aC -F -")))
+
+    def test_optional_arg_flag_does_not_swallow_a_following_message(self):
+        # `-S` (gpg keyid) and `-u` (untracked mode) have an OPTIONAL, ONLY-glued value — a SEPARATE
+        # `-S -m …` / `-u -m …` is the flag with no value then a REAL `-m`, so the message must still
+        # be read (they must NOT consume the next token). The reason _OTHER_VALUE_LETTERS keeps u/S
+        # out of the next-token-consuming set.
+        for command in ("git commit -S -m 'Closes #5'", "git commit -u -m 'Fixes ABC-7'"):
+            self.assertTrue(
+                mod.has_ticket_reference(mod.commit_message_from_argv(_commit_argv(command))), command
+            )
+
+    def test_trailing_message_flag_with_no_value_does_not_warn_or_crash(self):
+        # a degenerate trailing `-aF`/`-F`/`-am` with no following value (an agent typo): the reader
+        # must contribute no text and NOT call _read_message_file("") (agent-tools#109 review #3).
+        for command in ("git commit -aF", "git commit -F", "git commit -am"):
+            argv = _commit_argv(command)
+            self.assertEqual(mod.commit_message_from_argv(argv), "", command)
+            self.assertEqual(mod._file_flag_values(argv), [], command)
+
+    # --- skip-flag scan de-clusters (a value can't be misread as a real flag) --------------------
+    def test_skip_scan_declusters_amF_value(self):
+        # `-amF "--amend"` is message "F" then a positional "--amend" pathspec — the value letter is
+        # glued (F), so the cluster does NOT consume the next token; but the `--amend` is a positional
+        # arg of a real commit, not a SKIP flag, because the message is "F" (no `--` seen, it's argv).
+        # The important contract: `-am "--amend"` (next-token value) must NOT count as a skip flag.
+        self.assertFalse(mod.is_skip_commit(_commit_argv('git commit -am "--amend"')))
+        self.assertFalse(mod.is_skip_commit(_commit_argv('git commit -aF "--skip"')))
+
+    # --- end-to-end, the exact repro from issue #109 ---------------------------------------------
+    def test_e2e_am_with_ticket_allows(self):
+        code, decision = run_hook('git commit -am "Closes #5 fix"', strict=True)
+        self.assertEqual(code, 0, "a ticketed -am commit must be allowed")
+        self.assertEqual(decision, "allow")
+
+    def test_e2e_am_without_ticket_blocks(self):
+        code, decision = run_hook('git commit -am "no ticket"', strict=True)
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+    def test_e2e_am_chore_exemption_is_preserved(self):
+        # the second half of the bug: an empty message lost the `chore:` exemption too.
+        code, decision = run_hook('git commit -am "chore: cleanup"', strict=True)
+        self.assertEqual(code, 0, "a chore: -am commit is exempt and must be allowed")
+        self.assertEqual(decision, "allow")
+
+    def test_e2e_am_skip_trailer_escape_still_works(self):
+        code, decision = run_hook(
+            'git commit -am "no ticket [skip-ticket: deliberate]"', strict=True
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(decision, "allow")
+
+    def test_e2e_am_inline_skip_env_escape_still_works(self):
+        code, decision = run_hook(
+            'REQUIRE_TICKET_SKIP=1 git commit -am "no ticket"', strict=True
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(decision, "allow")
+
+    def test_e2e_benign_clustered_flag_non_commit_passes(self):
+        # the #37/#40 over-block cautionary tale: a benign command with a clustered short flag that
+        # is NOT a git commit must still pass (no false BLOCK from over-eager de-clustering).
+        for cmd in ("tar -amF archive.tar", "ls -la", 'grep -rn "git commit -am" src/'):
+            code, decision = run_hook(cmd, strict=True)
+            self.assertEqual(code, 0, cmd)
+            self.assertEqual(decision, "allow", cmd)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
