@@ -1,0 +1,44 @@
+# OSS license-policy gate — fail a PR/push whose deps carry a DENY-listed copyleft license.
+#
+# WHY: GitHub's actions/dependency-review-action enforces an allow/deny LICENSE policy, but it
+# requires GitHub Advanced Security (GHAS, paid) on PRIVATE repos — the same wall that made us
+# drop it for ci/dependency-review/ (vulns). This gate fills the LICENSE half of that gap for
+# free: license-audit.sh runs each ecosystem's own license reporter (license-checker /
+# pip-licenses / cargo-deny / go-licenses) over the WHOLE dependency tree and fails on a
+# copyleft (GPL/AGPL/LGPL/MPL/…) match, under a DEFAULT-DENY-COPYLEFT policy.
+#
+# INSTALL: copy to .github/workflows/license-policy.yml. Set up the toolchain + install the
+# license reporter for each ecosystem your repo uses (see the commented examples below). Pin
+# every action to a commit SHA. If your repo already enforces licenses (e.g. cargo-deny in its
+# own CI, or you pay for the GHAS action), you don't need this one.
+
+name: license-policy
+
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  license-policy:
+    name: license-policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Install the license reporter(s) license-audit.sh needs for YOUR repo's ecosystems.
+      # Pin each action to a commit SHA. Examples:
+      #   - uses: actions/setup-node@<pinned-sha>      # then: npm install -g license-checker
+      #   - uses: actions/setup-python@<pinned-sha>    # then: pipx install pip-licenses
+      #   - run: rustup default stable && cargo install cargo-deny   # Cargo.toml -> cargo-deny (needs a deny.toml)
+      #   - uses: actions/setup-go@<pinned-sha>        # then: go install github.com/google/go-licenses@latest
+
+      - name: License policy (OSS — whole-tree, default-deny copyleft)
+        # Fails CLOSED if a detected ecosystem's license reporter isn't installed
+        # (set LICENSE_ALLOW_MISSING=1 to intentionally skip a missing ecosystem). Tune the
+        # policy with LICENSE_DENY_PATTERN / LICENSE_ALLOW / LICENSE_UNKNOWN_OK (see the script).
+        run: sh ci/license-policy/license-audit.sh
