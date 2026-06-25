@@ -221,9 +221,11 @@ called out per-repo below.*
 
 ### ⏳ Decisions awaiting the CTO (not work — sign-off needed)
 
-- ⏳ **agent-tools #106** (OPEN issue) — `docs/specs/rig-agents-provisioning.md` is an uncommitted
-  orphan in the primary checkout (corrected in place; needs a landing decision given the agents-skip
-  decision above).
+- ✅ **agent-tools #106** (CLOSED) — the orphan `docs/specs/rig-agents-provisioning.md` (the
+  SKIPPED subagents-provisioning design) was DROPPED, not landed: the feature is dead (rig-cli #53
+  reverted by #55, zero code), the design is preserved in the committed rig-cli spec
+  `docs/specs/rig-subagents-provisioning.md` (#76) + the `agents-skip-decision` memory, and an
+  unmarked "not yet implemented" spec only masquerades as planned work. Removed the untracked file.
 - ⏳ **tg-cli #27** (`/new` interactive flow) — the bigger, daily-critical remainder past #85's
   spawn-trigger + #87's lifecycle polish (an interactive flow, not just a trigger).
 
@@ -239,8 +241,6 @@ real residual.*
   spin-out shape is a CTO call.
 - **draw-cli pipx posture** — pipx packaging SHIPPED (draw-cli #9); whether pipx becomes the SOLE
   sanctioned install path (drop the symlink/dev mode) is the remaining call.
-- **agent-tools #106** — the orphan `docs/specs/rig-agents-provisioning.md`: land it or drop it given the
-  agents-skip decision.
 - **rollout wave-2** (rig-cli #7) — `rig init --yes` + AGENTS/CLAUDE slim across the bots + the tool
   repos themselves. A staged rollout that needs go-ahead per wave.
 - **rig-cli #8 models.yaml consumer capability-wiring** — manifest + cron ~80% real; the remaining ~20%
@@ -865,7 +865,7 @@ task-cli #11/#14/#17/#18/#21/#23/**#26**/**#28**/**#30**/**#31**/**#33**/**#34**
 #74); task-cli **#2 daemon webhooks** (daemon foundation shipped #26/#33/#35) + **#32 status-identity** +
 **#4 integrations**; **tg-cli #27 `/new`** (bigger daily-critical interactive flow) + **#31 CodeQL**;
 research-cli spin-out; rig-cli **#7 rollout wave-2** + **#8 models.yaml** + **#10 clean-room e2e**;
-agent-tools **#106** (orphan rig-agents-provisioning spec) + **#120 flag-abbrev** (require-ticket follow-up);
+agent-tools **#120 flag-abbrev** (require-ticket follow-up);
 review-cli **#60/#61/#75** (qa hardening). The §Remaining-work and §9 lines above are annotated
 `🔬 review (PR #…)` where a shipped PR advanced them.*
 
