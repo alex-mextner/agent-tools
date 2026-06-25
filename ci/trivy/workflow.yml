@@ -1,0 +1,60 @@
+# Trivy — filesystem + dependency vulnerability / misconfig / secret scanner (OSS, Aqua).
+#
+# Standard engine = Trivy (https://trivy.dev). One scanner covering several classes:
+#   - vuln    — OS + language dependency CVEs (the lockfile/manifest tree)
+#   - secret  — hardcoded credentials in the tree
+#   - misconfig — IaC/Dockerfile/k8s misconfigurations
+# This slot runs the FILESYSTEM scan (`trivy fs`) over the checked-out repo — the
+# dependency+secret+misconfig net that a bespoke Trivy step usually provides. It complements
+# the source-code SAST slots (../sast/, ../codeql/) and the credential-only ../secret-scan/.
+#
+# WHY a dedicated slot: many repos carry a hand-rolled Trivy step; this is the portable,
+# rig-provisionable equivalent so every repo gets the same gate instead of copy-pasting one.
+#
+# GATING (block tier, the right CI default): the action exits non-zero when it finds an issue
+# at or above `severity` (default HIGH,CRITICAL) → the job fails. To surface FINDINGS without
+# failing, set `exit-code: '0'` — but note this suppresses ONLY the findings exit code; an
+# OPERATIONAL trivy error (DB unreachable, a bad flag) still fails the step. For a true
+# "never fails the build" warn tier (the shell mirror's TRIVY_WARN=1 guarantee), add
+# `continue-on-error: true` to this step instead.
+#
+# PINNED: aquasecurity/trivy-action pinned to a commit SHA (a moving tag can be repointed).
+#
+# INSTALL: copy to .github/workflows/trivy.yml. Tune `scanners` / `severity` for your repo.
+
+name: trivy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  trivy-fs:
+    name: trivy (fs scan)
+    runs-on: ubuntu-latest
+    # Trivy fetches its vuln DB over the network; cap the job so a hung/unreachable mirror
+    # fails the gate predictably instead of hanging to the global job limit.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Trivy filesystem scan (vuln + secret + misconfig)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          # exit-code 1 = fail the job on a finding at/above `severity` (block tier).
+          # Set to '0' to surface findings without failing the build (warn tier).
+          exit-code: '1'
+          ignore-unfixed: true   # don't fail on a CVE that has no fix available yet
+          # skip-dirs: node_modules,vendor   # skip vendored trees: avoids secret/misconfig
+          #                                  # false positives on committed deps (else the gate
+          #                                  # fails on third-party code and gets bypassed)
+          # trivyignores: .trivyignore   # path(s) to an allow-list of accepted findings (default)
