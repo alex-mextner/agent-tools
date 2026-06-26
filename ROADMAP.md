@@ -1,6 +1,6 @@
 # Agent CLI Ecosystem — Roadmap
 
-Status snapshot: **2026-06-25** (latest activity at the end of this file). This is the
+Status snapshot: **2026-06-26** (latest activity at the end of this file). This is the
 handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, `rig-cli`,
 `draw-cli`, `3d-cli`, `task-cli`) + the `agent-tools` umbrella.
 
@@ -22,14 +22,14 @@ handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, `rig
 
 ---
 
-## 2026-06-22 → 06-25 — shipped this session (🔬 under CTO review)
+## 2026-06-22 → 06-26 — shipped this session (🔬 under CTO review)
 
 *Everything below is **MERGED on each repo's `origin/main`** (verified via `gh pr list --state
 merged --search "merged:>=…"`) but is marked 🔬 (awaiting CTO review), NOT ✅ — the CTO signs off to
 ✅. The 🔮 block at the end is work still building / deferred (not merged). Grouped by repo; each
 line maps to the §Remaining-work / §Open-ticket item it advances, which is also annotated
-`🔬 review (PR #…)` inline below. **Tally: 93 merged PRs across 7 repos** — tg-cli 25, rig-cli 14,
-agent-tools 21, review-cli 11, task-cli 14, 3d-cli 5, draw-cli 3. The 06-24/06-25 post-wave is
+`🔬 review (PR #…)` inline below. **Tally: 102 merged PRs across 7 repos** — tg-cli 27, rig-cli 15,
+agent-tools 21, review-cli 15, task-cli 16, 3d-cli 5, draw-cli 3. The 06-24/06-25/06-26 post-wave is
 called out per-repo below.*
 
 ### tg-cli — 🔬 under review (all MERGED) — multi-agent / forum-topic wave
@@ -72,6 +72,13 @@ called out per-repo below.*
   fix — a hardcoded count went stale; replaced/scoped so it can't drift again).
 - 🔬 **#91** *(06-25)* — dead-letter the backlog stranded by an unscoped-question expiry (Closes #58). Pairs
   with the #51/#60 unscoped-question fail-OPEN saga — a backlog isn't silently lost on expiry.
+- 🔬 **#92** *(06-26)* — `/new` flat-chat command: spawn an agent via inline buttons (Closes #27) — the
+  interactive new-agent flow past #85's spawn-trigger + #87's lifecycle polish. Closes the largest single
+  open tg-cli feature (the prior ⏳ #27 / 🔮 `/new` item).
+- 🔬 **#94** *(06-26)* — `cleanExit` removes the pidfile only when it OWNS it (Closes #93) — a flock-loser no
+  longer deletes the winner's pid-file on exit (the daemon-singleton ownership fix).
+- 🔬 **issue #31** *(06-26, CLOSED)* — **CodeQL JS/TS: all 8 pre-existing TS findings fixed-or-justified**
+  (surfaced by the #25 rig rollout). Clears the prior §"tg-cli #31 CodeQL" residual item.
 
 ### review-cli — 🔬 under review (all MERGED) — advances §"review qa — agent-as-tester mode"
 
@@ -94,6 +101,15 @@ called out per-repo below.*
 - 🔬 **#77** *(06-24)* — the **opus review seat runs via `claude --print`**, not the claude-p TUI-scraper —
   the default board's premium seat no longer silently degrades when the TUI path breaks. Maps to §"review
   resilience" + the board-seat stability lessons.
+- 🔬 **#79** *(06-26)* — board: resolve seats by **capability/role from the shared `models.yaml` manifest**
+  (the rig-cli #8 consumer half) — the board no longer hardcodes model ids; it reads the capability flags.
+  Advances rig-cli #8 models.yaml consumer capability-wiring.
+- 🔬 **#80** *(06-26)* — qa: detect Python Telegram bots in `--kind auto` + document `qa` in help/config
+  (the §"D" `--kind auto` bot-detection follow-up, ex-#61).
+- 🔬 **#81** *(06-26)* — qa: forward the `-m` model suffix to the tester + reap the ephemeral-worktree trust
+  (the §"D" `-m` forward follow-up, ex-#60).
+- 🔬 **#83** *(06-26)* — qa: harden the ext harness — queue-backed stdout reader + isolation warning
+  (the §"D" ext-harness live-runner robustness follow-up, ex-#75).
 
 ### rig-cli — 🔬 under review (all MERGED)
 
@@ -118,6 +134,8 @@ called out per-repo below.*
   agent-tools #95.
 - 🔬 **#74** — CI runs the real-catalog pytest guards so they actually gate.
 - 🔬 **#76** — docs(spec) fix: correct the false "CC ships no built-in agents" claim (the agents study).
+- 🔬 **#78** *(06-26)* — docs(spec): mark `rig-subagents-provisioning` as **SKIPPED** (not planned work) —
+  the canonical spec now carries the skip-marker, pairing with agent-tools #124's orphan-spec removal.
 
 ### agent-tools — 🔬 under review (all MERGED)
 
@@ -155,6 +173,9 @@ called out per-repo below.*
   closes a forged-exemption hole where a faked agent id could dodge the orchestrator-thin gate.
 - 🔬 **#119** *(06-25)* — `require-ticket` skips value-bearing git-commit flags (#114) so a value like
   `--author`/`--date` is no longer mistaken for the commit message — closes the value-flag bypass.
+- 🔬 **#124** *(06-25)* — docs(roadmap): resolve #106 — **drop the orphan `subagents-provisioning` spec**
+  (an unmarked "not yet implemented" spec masquerading as planned work; the design is preserved in rig-cli's
+  canonical spec via #78's skip-marker). Pairs with rig-cli #78.
 
 ### task-cli — 🔬 under review (all MERGED) — advances §"1. task-cli"
 
@@ -180,6 +201,11 @@ called out per-repo below.*
   ps-truncation fix).
 - 🔬 **#37** *(06-25)* — re-sync the vendored require-ticket fixture to the canonical `-am` de-cluster fix
   (agent-tools #111) — the drift-guard's companion re-sync.
+- 🔬 **#39** *(06-26)* — classify: **resolve the classifier model from the shared `models.yaml` by capability**
+  (the rig-cli #8 consumer half) — the auto-classifier no longer hardcodes a model; it reads capability flags.
+  Advances rig-cli #8 models.yaml consumer capability-wiring.
+- 🔬 **#40** *(06-26)* — daemon: make `status` / `start` **PID-identity-aware**, consistent with `stop` (#32) —
+  closes the §"D" task-cli #32 status-identity follow-up to the #33 stop-path guard.
 
 ### 3d-cli — 🔬 under review (all MERGED)
 
@@ -211,58 +237,60 @@ called out per-repo below.*
   (model-freshness → shared `agenttools_errors`); **rig-cli #5** (repo security settings at init/apply),
   **#6** (auto-mode is user-level `auto`, not a committed project bypass — see the line-513 correction).
 
-### 🔮 building / deferred — NOT merged (do not read as shipped)
+### 🔮 IN FLIGHT — building NOW this turn (NOT merged; do not read as shipped)
 
-- 🔮 review-qa **Tier-2** (real-Telegram MTProto / agent-browser web, dedicated test account) — deferred
-  until credentials + repo curation exist (review-qa §"web/ext"). *(Ext Tier-1 SHIPPED — review-cli #74.)*
-- 🔮 task-cli **daemon service + webhooks** (task-cli#2) — Phase 2, daemon FOUNDATION shipped (#26/#33/#35),
-  the webhook/adapter half still open.
-- 🔮 research-cli **real transport / spin-out** to `alex-mextner/research-cli` (queued, §6).
+- 🔮 **research-cli spin-out — strategy B** (standalone CLI) — creating `alex-mextner/research-cli` and
+  vendoring the shared lib with a drift-guard (the same pattern task-cli uses), so the spin-out needs no
+  CTO PyPI account. If the harness-safety layer blocks the repo-CREATE action, it surfaces for a per-action
+  OK. Advances §6 research-cli + the (B) "research-cli spin-out" call below.
+- 🔮 **tg-cli HTML→PDF raw-tags fix** — `tg --format html` (and the file→PDF path) currently dumps the raw
+  HTML report as TEXT — raw `<b>`/`<code>` show up instead of rendered formatting. Root cause: the
+  HTML-report body is emitted as plain text instead of rendering the Telegram-allowed tags. Fixing the
+  render path so a rich report and a `--file *.md` PDF come out formatted, not as tag soup.
+- 🔮 task-cli **daemon service + webhooks** (task-cli#2) — Phase 2, daemon FOUNDATION shipped
+  (#26/#33/#35/#40), the webhook/adapter half still open (queued, not building this turn).
 
 ### ⏳ Decisions awaiting the CTO (not work — sign-off needed)
 
 - ✅ **agent-tools #106** (CLOSED) — the orphan `docs/specs/rig-agents-provisioning.md` (the
   SKIPPED subagents-provisioning design) was DROPPED, not landed: the feature is dead (rig-cli #53
   reverted by #55, zero code), the design is preserved in the committed rig-cli spec
-  `docs/specs/rig-subagents-provisioning.md` (#76) + the `agents-skip-decision` memory, and an
-  unmarked "not yet implemented" spec only masquerades as planned work. Removed the untracked file.
-- ⏳ **tg-cli #27** (`/new` interactive flow) — the bigger, daily-critical remainder past #85's
-  spawn-trigger + #87's lifecycle polish (an interactive flow, not just a trigger).
+  `docs/specs/rig-subagents-provisioning.md` (#76, marked SKIPPED by rig-cli #78) + the
+  `agents-skip-decision` memory. Removed the untracked file (#124).
+- ✅ **tg-cli #27** (`/new` interactive flow) — **SHIPPED** as the `/new` flat-chat command (tg-cli #92):
+  spawn an agent via inline buttons. The largest single open tg-cli feature is now closed (awaiting CTO ✅).
 
-### 🧭 Genuinely-remaining work (re-derived 2026-06-25 — honest, post-wave)
+### 🧭 Genuinely-remaining work (re-derived 2026-06-26 — honest, post-wave)
 
-*What is ACTUALLY left after the 06-22→06-25 wave, grouped by what unblocks it. Nothing here is ✅
+*What is ACTUALLY left after the 06-22→06-26 wave, grouped by what unblocks it. Nothing here is ✅
 (the CTO marks ✅). The big shipped items above already cleared most of the prior backlog; this is the
-real residual.*
+real residual. The two IN-FLIGHT items (research-cli spin-out B, tg HTML→PDF fix) are building NOW —
+see the 🔮 block above.*
 
 **(B) CTO-decision-gated — needs a product/architecture call, not just execution:**
-- **research-cli spin-out** — split `research` into its own `alex-mextner/research-cli` repo (A/B/C
-  variants: A in-place library, B standalone CLI, C MCP). Transport + `--json` (#103) shipped; the
-  spin-out shape is a CTO call.
+- **rollout wave-2** (rig-cli #7) — `rig init --yes` + AGENTS/CLAUDE slim **applied to the bot repos**
+  (and the tool repos themselves). A staged rollout that needs the CTO's go-ahead per wave + which repos
+  to touch (no cross-repo work without a per-repo OK). **The top CTO-gated item.**
+- **research-cli spin-out** — variant DECIDED as **B** (standalone CLI, vendor-lib + drift-guard, no PyPI
+  account); now IN FLIGHT (🔮 block). The remaining CTO touchpoint is per-action approval if harness-safety
+  blocks the repo-CREATE.
 - **draw-cli pipx posture** — pipx packaging SHIPPED (draw-cli #9); whether pipx becomes the SOLE
   sanctioned install path (drop the symlink/dev mode) is the remaining call.
-- **rollout wave-2** (rig-cli #7) — `rig init --yes` + AGENTS/CLAUDE slim across the bots + the tool
-  repos themselves. A staged rollout that needs go-ahead per wave.
-- **rig-cli #8 models.yaml consumer capability-wiring** — manifest + cron ~80% real; the remaining ~20%
-  is wiring CONSUMERS to read the manifest's capability flags (not just the freshness check).
-- **tg-cli #27 `/new`** — the interactive new-agent flow (bigger, daily-critical); past #85 spawn-trigger
-  + #87 lifecycle. The largest single open feature.
 
 **(C) Creds / infra-gated — blocked on credentials or a real environment, not a decision:**
-- **review-qa Tier-2** — real-Telegram MTProto + agent-browser web against a DEDICATED test account.
-  All three Tier-1 harnesses (bot #68, web #70, ext #74) shipped; Tier-2 waits on a test account +
-  curated SUT repos.
+- **review-qa Tier-2** — review-qa LIVE (real-Telegram MTProto + agent-browser web) + **review-cli #82**
+  (window-screenshot visual diffing + more assertion types). All three Tier-1 harnesses (bot #68, web #70,
+  ext #74) shipped; Tier-2 waits on live creds / a dedicated test account + screenshot infra + curated SUT
+  repos. **The infra-gated item.**
 
 **(D) Small / tracked — bounded follow-ups, just need a turn:**
 - **agent-tools #120** — require-ticket parser: value-consuming long flags matched by exact name (the
   flag-abbrev follow-up after #119/#111 closed the `-am` / value-flag bypasses).
-- **task-cli #32** — make `status` / `pid_status` identity-aware too (consistency with the #33 stop-path
-  PID-identity guard).
-- **tg-cli #31** — CodeQL JS/TS: fix-or-justify the pre-existing TS findings.
-- **agent-tools #114 follow-ups** — #114 itself CLOSED (#119/#111); residual require-ticket parser
-  hardening tracked under #120.
-- **review-cli #60/#61/#75** — review-qa hardening: forward `-m` model suffix (#60), `--kind auto`
-  bot-detection for Python projects (#61), ext-harness live-runner robustness (#75).
+- **rig-cli #8 follow-through** — manifest + cron real; the board (review-cli #79), the classifier
+  (task-cli #39) now READ the capability flags. Any remaining non-wired consumer is the residual.
+- *Closed by the 06-26 batch (no longer remaining):* tg-cli #31 (CodeQL — all 8 fixed); task-cli #32
+  (status-identity — review-cli… task-cli #40); review-cli #60/#61/#75 (qa `-m` forward / `--kind auto`
+  bot-detection / ext-harness robustness — #81/#80/#83).
 
 ---
 
