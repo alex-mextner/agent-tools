@@ -28,15 +28,32 @@ The **one** thing we lose is **license-policy enforcement** (deny AGPL/GPL etc.)
 with an OSS license gate (`license-checker` / `cargo-deny` / `pip-licenses`) — see
 `ci/license-policy/` and agent-tools#21.
 
+## Tamper-resistance (agent-tools#129)
+
+This is a merge-**blocking** gate, so it must not run a copy of the script the PR can edit
+(a PR could otherwise weaken the very gate it has to pass). Like `ci/leftover-grep` and
+`ci/review-threads`, `workflow.yml` runs under **`pull_request_target`**: the **base-branch
+(trusted) copy** of both the workflow and `dep-audit.sh` run; the PR's version is ignored.
+The PR's **manifests/lockfiles** are fetched as **DATA** into a side worktree and audited
+there — the native auditors (`npm`/`pnpm`/`yarn`/`bun audit`, `pip-audit`, `cargo-audit`)
+only **read** the lockfile and query an advisory DB; they do **not** run the package's
+install/lifecycle scripts, so no PR-controlled code executes. **Hard rule:** never add an
+`npm install` / `bun install` / build step or check the PR head onto the workspace — that
+would execute PR code under the privileged trigger. Like any base-run gate, it does not run
+on the PR that first introduces it.
+
 ## Quick start
 
 ```bash
 cp ci/dependency-review/workflow.yml .github/workflows/dependency-review.yml
-# add the toolchain setup your ecosystems need (see the comments in workflow.yml);
-# ubuntu-latest already ships node+npm so npm-only repos need nothing extra.
+# `setup-bun` ships ENABLED (bot repos use bun.lock; without it a bun.lock repo fail-CLOSES
+# because dep-audit.sh can't find `bun`). Add the toolchain for your other ecosystems (see
+# the comments in workflow.yml); ubuntu-latest already ships node+npm so npm-only repos need
+# nothing extra — trim setup-bun if you have no bun.lock.
 
-# Run the same audit locally / in any other CI:
-sh ci/dependency-review/dep-audit.sh
+# Run the same audit locally / in any other CI (optional dir arg, default '.'):
+sh ci/dependency-review/dep-audit.sh           # audit the current tree
+sh ci/dependency-review/dep-audit.sh path/to/checkout   # audit another checkout's lockfiles
 ```
 
 > If your repo already has its own dependency-audit job, you don't need this one — don't

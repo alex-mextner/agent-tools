@@ -16,14 +16,27 @@
 #                            ecosystem with no usable scanner is a gate failure, not a silent
 #                            skip — otherwise "no audit ran" masquerades as "no vulns".
 #
-# Usage: sh ci/dependency-review/dep-audit.sh
+# Usage: sh ci/dependency-review/dep-audit.sh [AUDIT_DIR]
+#   AUDIT_DIR (optional, default '.'): the tree whose manifests/lockfiles to audit. The
+#   tamper-resistant workflow (pull_request_target) passes the PR head's side worktree here
+#   so the TRUSTED base copy of this script audits the PR's lockfiles as DATA — the auditors
+#   only read the lockfile, they never run the package's install/lifecycle scripts.
 set -eu
 
 LEVEL="${DEP_AUDIT_LEVEL:-high}"
 ALLOW_MISSING="${DEP_AUDIT_ALLOW_MISSING:-0}"
+AUDIT_DIR="${1:-.}"
 rc=0
 ran=0
 missing=0
+
+# Audit the requested tree (default cwd). Fail closed if it doesn't exist — a vanished
+# audit target must not masquerade as "no manifests, nothing to audit".
+if [ ! -d "$AUDIT_DIR" ]; then
+  echo "[dep-audit] audit dir '$AUDIT_DIR' does not exist — FAILING (cannot audit)." >&2
+  exit 1
+fi
+cd "$AUDIT_DIR"
 
 note() { echo "[dep-audit] $*" >&2; }
 # A detected manifest whose scanner is absent: fail closed unless explicitly allowed.
@@ -57,6 +70,13 @@ fi
 
 if [ -f requirements.txt ] || [ -f pyproject.toml ] || [ -f poetry.lock ]; then
   if command -v pip-audit >/dev/null 2>&1; then
+    # SECURITY (agent-tools#129): under the tamper-resistant pull_request_target workflow this
+    # script audits the PR's tree as DATA. pip-audit is the ONE auditor that can EXECUTE input:
+    # a resolving run (`-r <file>`, `-e .`, or a VCS/local-path requirement) downloads and
+    # BUILDS sdists — running their setup.py — i.e. arbitrary PR code under a privileged trigger
+    # (RCE). The no-argument form audits the already-installed environment and never builds the
+    # PR's packages, so it stays data-safe. HARD RULE: never switch this to a resolving
+    # `-r`/`-e` invocation under pull_request_target without `--no-deps` (+ `--require-hashes`).
     ran=1; note "pip-audit"; pip-audit || rc=1
   else
     miss "python manifest present but pip-audit not installed (pipx install pip-audit)"
