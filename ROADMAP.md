@@ -678,17 +678,21 @@ reboot (continuum's last save was 3 weeks old):
   (alex-mextner/agent-tools#13) — 🔬 review (agent-tools PR #85): research-cli adopts the shared
   `agenttools_errors` layer (what/why/how-to-fix + structured exit codes). 🔮 the rest of research-cli
   (real transport / spin-out) is queued, building.
-- ✅ **MVP SCAFFOLDED (`tools/research-cli/`)** — a distinct tool (NOT a review mode) that reuses the
-  merged `agenttools_providers` CORE (#49) verbatim: registry + `resolve_role`, the failover `Board` /
-  pool-reserve split, the key cascade, capability tags, the shared `lib/contracts/models.yaml` manifest.
-  Adds the half the CORE defers — a `Transport` (reachability via the key cascade + a live call, behind a
-  protocol so the engine is network-free in tests) + the single-round panel pass + deterministic synthesis.
-  Self-registering commands (`ask`, `board`), structured exit codes, 24 deterministic tests (green in the
-  umbrella CI gate, pytest-only), README. **Phased rest** (tracked in the tool README): a real transport
-  (`oc:` router / api|cli mode / parsing), multi-round follow-ups, adversarial cross-examination, citation
-  verification, model-driven synthesis. Scaffolded inside the umbrella (next to `lib/`) for trivial reuse;
-  **spin out to `alex-mextner/research-cli` when CTO provisions the repo** (move `tools/research-cli/`, drop
-  the `sys.path` shim, depend on the published `agenttools-providers`).
+- ✅ **MVP + SPUN OUT** — a distinct tool (NOT a review mode) that reuses the merged
+  `agenttools_providers` CORE (#49) verbatim: registry + `resolve_role`, the failover `Board` /
+  pool-reserve split, the key cascade, capability tags, the shared `models.yaml` manifest. Adds the half
+  the CORE defers — a `Transport` (reachability via the key cascade + a live call, behind a protocol so the
+  engine is network-free in tests) + the single-round panel pass + deterministic synthesis.
+  Self-registering commands (`ask`, `board`, `install-skill`), structured exit codes, deterministic tests,
+  README. **Now lives in its own repo: [`alex-mextner/research-cli`](https://github.com/alex-mextner/research-cli)**
+  — spun out via **strategy B (vendor + drift-guard)**: it vendors `agenttools_providers` +
+  `agenttools_errors` + `models.yaml` under `vendor/` with a pinned-SHA drift-guard
+  (`scripts/resync_vendored_libs.py --check` + a scheduled CI job against this repo's canonical), the proven
+  task-cli pattern. The `tools/research-cli/` scaffold was removed from this umbrella (#125). **Strategy A**
+  (publish `agenttools-providers`/`agenttools-errors` to PyPI and depend on them) is deferred — needs the
+  CTO's PyPI account; when provisioned, the vendored copies swap for declared deps. **Phased rest** (tracked
+  in the new repo): a real transport (`oc:` router / api|cli mode / parsing), multi-round follow-ups,
+  adversarial cross-examination, citation verification, model-driven synthesis.
 
 ### 7. review-cli follow-ups
 
