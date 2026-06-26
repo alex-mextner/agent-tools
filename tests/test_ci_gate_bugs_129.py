@@ -96,6 +96,19 @@ def _run(script: Path, cwd: Path, *args: str, env_extra: dict[str, str] | None =
     return proc.returncode, proc.stdout + proc.stderr
 
 
+def _stub_pip_audit(bin_dir: Path, exit_code: int = 0) -> None:
+    """Fake ``pip-audit`` on PATH that ECHOES its own argv with a distinctive marker (so a test
+    can assert the REAL invocation's flags, not the script's `note` echo) and exits *exit_code*."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    stub = bin_dir / "pip-audit"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'printf "STUB_PIP_AUDIT_ARGV:[%s]\\n" "$*" >&2\n'
+        f"exit {exit_code}\n"
+    )
+    os.chmod(stub, 0o755)
+
+
 # ---------------------------------------------------------------------------
 # 1. dependency-review — tamper-resistant trusted-base model.
 # ---------------------------------------------------------------------------
@@ -199,11 +212,261 @@ def test_dep_audit_pip_audit_is_not_resolving():
     arbitrary PR code under a privileged trigger (RCE). Pin that the invocation never gains a
     resolving flag without `--no-deps`, so a future edit can't silently reopen the hole."""
     code = _executable_lines(DEP_AUDIT.read_text())
-    m = re.search(r"pip-audit\b[^\n|;]*(?:\s-r\b|\s-e\b|--requirement\b)", code)
-    if m:
+    for m in re.finditer(r"pip-audit\b[^\n|;]*(?:\s-r\b|\s-e\b|--requirement\b)", code):
         assert "--no-deps" in m.group(0), (
             f"resolving pip-audit without --no-deps (RCE under pull_request_target): {m.group(0)!r}"
         )
+
+
+def test_dep_audit_python_audits_pinned_requirements_as_data(tmp_path: Path):
+    """COVERAGE (agent-tools#131 / Codex P1): the Python path must audit the audited TREE's
+    requirements*.txt as DATA — `pip-audit --no-deps -r <file>` — not the runner's installed
+    environment via a bare `pip-audit`. We stub pip-audit so the assertion proves the REAL argv
+    the script passed (`--no-deps -r requirements.txt`), distinct from the script's `note` echo."""
+    tree = tmp_path / "pyreq"
+    tree.mkdir()
+    (tree / "requirements.txt").write_text("flask==2.0.0\n")
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 0, out
+    assert "STUB_PIP_AUDIT_ARGV:[--no-deps -r requirements.txt]" in out, out
+    # The bare no-arg form (audits the runner env, misses the PR's deps) must never run.
+    assert "STUB_PIP_AUDIT_ARGV:[]" not in out, f"bare pip-audit (no args) must not run:\n{out}"
+
+
+def test_dep_audit_python_audits_every_requirements_file(tmp_path: Path):
+    """Multiple manifests: each `requirements*.txt` (e.g. `-dev`) is audited as data, so a vuln
+    declared only in a secondary requirements file is not missed."""
+    tree = tmp_path / "pymulti"
+    tree.mkdir()
+    (tree / "requirements.txt").write_text("requests==2.31.0\n")
+    (tree / "requirements-dev.txt").write_text("pytest==7.0.0\n")
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 0, out
+    assert "STUB_PIP_AUDIT_ARGV:[--no-deps -r requirements.txt]" in out, out
+    assert "STUB_PIP_AUDIT_ARGV:[--no-deps -r requirements-dev.txt]" in out, out
+
+
+def test_dep_audit_python_requirements_vuln_fails(tmp_path: Path):
+    """A non-zero pip-audit (a found advisory) on a requirements file must FAIL the gate."""
+    tree = tmp_path / "pyvuln"
+    tree.mkdir()
+    (tree / "requirements.txt").write_text("badpkg==1.0.0\n")
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=1)  # pip-audit exits non-zero when it finds a vuln
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 1, out
+
+
+def test_dep_audit_pyproject_only_fails_closed(tmp_path: Path):
+    """SECURITY/COVERAGE (agent-tools#131): a pyproject.toml/poetry.lock with NO pinned
+    requirements*.txt can be audited only by BUILDING the project (RCE under
+    pull_request_target), so it fails CLOSED rather than falling back to the env-only
+    `pip-audit` (which would audit the runner's packages, not the PR's). pip-audit is present on
+    PATH but must NOT be invoked for a project-only tree. DEP_AUDIT_ALLOW_MISSING=1 is the escape."""
+    tree = tmp_path / "pyproj"
+    tree.mkdir()
+    (tree / "pyproject.toml").write_text("[project]\nname='x'\nversion='0.1.0'\n")
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 1, out
+    assert "no pinned requirements" in out
+    assert "STUB_PIP_AUDIT_ARGV" not in out, "pip-audit must NOT run for a project-only tree"
+    rc_ok, _ = _run(
+        DEP_AUDIT, tmp_path, str(tree),
+        env_extra={"PATH": path, "DEP_AUDIT_ALLOW_MISSING": "1"},
+    )
+    assert rc_ok == 0, "DEP_AUDIT_ALLOW_MISSING=1 must turn the project-only fail-closed into a skip"
+
+
+# A requirements line that forces pip-audit to BUILD the input (RCE under pull_request_target).
+# `--no-deps` does NOT prevent the build of a DIRECT reference, so dep-audit.sh must refuse the
+# file before invoking pip-audit. Each row is a single dangerous line.
+_BUILD_TRIGGER_LINES = [
+    "-e .",                                     # editable local
+    "--editable ./pkg",                         # editable local (long form)
+    "./localpkg",                               # local path
+    "/abs/localpkg",                            # absolute local path
+    "git+https://github.com/evil/pkg",          # VCS
+    "evilpkg @ https://example.com/pkg.tar.gz",  # PEP 508 direct URL
+    "https://example.com/pkg-1.0.tar.gz",       # bare URL
+    "-r other-requirements.txt",                # include (could smuggle any of the above)
+    "-c constraints.txt",                       # constraint include
+    "--index-url https://evil.example/simple",  # foreign package index
+    "flask>=2.0",                               # unpinned (can't audit as data)
+    "flask",                                    # bare name (unpinned)
+    "flask==2.*",                               # prefix pin, not an exact pin (review P3)
+]
+
+
+@pytest.mark.parametrize("danger", _BUILD_TRIGGER_LINES)
+def test_dep_audit_python_refuses_build_triggering_requirement(tmp_path: Path, danger: str):
+    """SECURITY (agent-tools#131 review P1): a PR-controlled requirements file with a DIRECT
+    reference (editable / URL / VCS / `@ url` / local path / `-r` include) or an UNPINNED spec
+    would make pip-audit BUILD it (RCE under pull_request_target). `--no-deps` does not stop a
+    direct-entry build, so dep-audit.sh must fail CLOSED and NOT invoke pip-audit at all."""
+    tree = tmp_path / "pybad"
+    tree.mkdir()
+    (tree / "requirements.txt").write_text(f"# pinned ok\nrequests==2.31.0\n{danger}\n")
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)  # present, but must NOT be called for an unsafe file
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 1, f"a build-triggering line {danger!r} must fail closed:\n{out}"
+    assert "STUB_PIP_AUDIT_ARGV" not in out, (
+        f"pip-audit must NOT run on a file with a build-triggering line {danger!r}:\n{out}"
+    )
+    # The explicit escape hatch downgrades it to a skip.
+    rc_ok, _ = _run(
+        DEP_AUDIT, tmp_path, str(tree),
+        env_extra={"PATH": path, "DEP_AUDIT_ALLOW_MISSING": "1"},
+    )
+    assert rc_ok == 0, f"DEP_AUDIT_ALLOW_MISSING=1 must skip the refused file {danger!r}"
+
+
+def test_dep_audit_python_accepts_hashed_pinned_requirements(tmp_path: Path):
+    """A `pip-compile --generate-hashes` style file (pinned spec + multi-line `--hash`, markers,
+    extras) is data-safe and IS audited — the scan must not false-reject the common pinned form."""
+    tree = tmp_path / "pyhash"
+    tree.mkdir()
+    (tree / "requirements.txt").write_text(
+        "# generated\n"
+        "--require-hashes\n"  # the hardened global option must NOT false-reject the file
+        "requests[security]==2.31.0 \\\n"
+        "    --hash=sha256:aaaa \\\n"
+        "    --hash=sha256:bbbb\n"
+        'jinja2==3.1.2 ; python_version >= "3.7"\n'
+    )
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 0, out
+    assert "STUB_PIP_AUDIT_ARGV:[--no-deps -r requirements.txt]" in out, out
+
+
+def test_dep_audit_python_audits_requirements_dir_layout(tmp_path: Path):
+    """COVERAGE (agent-tools#131 review P3): the `requirements/<env>.txt` layout is audited too,
+    so a Python repo using `requirements/base.txt` isn't silently skipped."""
+    tree = tmp_path / "pydir"
+    (tree / "requirements").mkdir(parents=True)
+    (tree / "requirements" / "base.txt").write_text("flask==2.0.0\n")
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 0, out
+    assert "STUB_PIP_AUDIT_ARGV:[--no-deps -r requirements/base.txt]" in out, out
+
+
+def test_dep_audit_empty_requirements_does_not_mask_pyproject(tmp_path: Path):
+    """SECURITY (agent-tools#131 review): a PR could drop an empty/comment-only `requirements.txt`
+    next to real deps in `pyproject.toml`; if the empty file counted as 'python audited', the
+    pyproject fail-closed would be suppressed and the gate would pass having checked NOTHING. The
+    empty file must not mask the un-auditable pyproject -> still fail closed, pip-audit not run."""
+    tree = tmp_path / "pymask"
+    tree.mkdir()
+    (tree / "requirements.txt").write_text("# only a comment, no pinned spec\n\n")
+    (tree / "pyproject.toml").write_text(
+        "[project]\nname='x'\nversion='0.1.0'\ndependencies=['flask']\n"
+    )
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 1, out
+    assert "no pinned requirements" in out
+    assert "STUB_PIP_AUDIT_ARGV" not in out, "pip-audit must not run when only an empty req + pyproject exist"
+
+
+def test_dep_audit_empty_requirements_alone_passes(tmp_path: Path):
+    """An empty/comment-only `requirements.txt` with NO pyproject/poetry declares no real Python
+    deps anywhere -> nothing to audit -> clean pass (it must not false-fail)."""
+    tree = tmp_path / "pyemptyonly"
+    tree.mkdir()
+    (tree / "requirements.txt").write_text("# nothing pinned here\n")
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 0, out
+    assert "STUB_PIP_AUDIT_ARGV" not in out
+
+
+def test_dep_audit_pinned_requirements_with_pyproject_audits_requirements(tmp_path: Path):
+    """Happy-path coexistence: a pinned `requirements.txt` alongside `pyproject.toml` is the data
+    source (audited via `--no-deps -r`); the pyproject must NOT additionally fail closed."""
+    tree = tmp_path / "pyboth"
+    tree.mkdir()
+    (tree / "requirements.txt").write_text("flask==2.0.0\n")
+    (tree / "pyproject.toml").write_text(
+        "[project]\nname='x'\nversion='0.1.0'\ndependencies=['flask']\n"
+    )
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 0, out
+    assert "STUB_PIP_AUDIT_ARGV:[--no-deps -r requirements.txt]" in out, out
+    assert "no pinned requirements" not in out, "pyproject must not fail closed when a pinned req covers it"
+
+
+def test_dep_audit_python_inline_comment_after_pin_stays_pinned(tmp_path: Path):
+    """A pinned spec with a trailing inline comment (`flask==2.0.0  # note`) must still classify
+    as pinned and be audited — the comment-strip must not turn a valid spec unsafe."""
+    tree = tmp_path / "pycomment"
+    tree.mkdir()
+    (tree / "requirements.txt").write_text("flask==2.0.0  # pin for CVE-x\n")
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 0, out
+    assert "STUB_PIP_AUDIT_ARGV:[--no-deps -r requirements.txt]" in out, out
+
+
+def test_dep_audit_python_pip_audit_not_installed_fails_closed(tmp_path: Path):
+    """A detected python manifest with NO pip-audit on PATH fails CLOSED (the new glob+pyproject
+    detection must still reach the 'pip-audit not installed' miss). DEP_AUDIT_ALLOW_MISSING=1
+    relaxes it."""
+    tree = tmp_path / "pynoaudit"
+    tree.mkdir()
+    (tree / "pyproject.toml").write_text("[project]\nname='x'\nversion='0.1.0'\n")
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": "/usr/bin:/bin"})
+    assert rc == 1, out
+    assert "pip-audit not installed" in out
+    rc_ok, _ = _run(
+        DEP_AUDIT, tmp_path, str(tree),
+        env_extra={"PATH": "/usr/bin:/bin", "DEP_AUDIT_ALLOW_MISSING": "1"},
+    )
+    assert rc_ok == 0, "DEP_AUDIT_ALLOW_MISSING=1 must skip a missing pip-audit"
+
+
+def test_dep_audit_python_mixed_pinned_and_unsafe_fails(tmp_path: Path):
+    """Mixed outcome: a pinned `requirements.txt` is audited while a sibling `requirements-dev.txt`
+    is refused (unsafe). The gate fails (rc 1), the pinned file is still audited, and a sibling
+    pyproject must NOT additionally fail-closed (the refusal already gated it)."""
+    tree = tmp_path / "pymixed"
+    tree.mkdir()
+    (tree / "requirements.txt").write_text("flask==2.0.0\n")
+    (tree / "requirements-dev.txt").write_text("pytest==7.0.0\n-e .\n")  # the -e makes it unsafe
+    (tree / "pyproject.toml").write_text("[project]\nname='x'\nversion='0.1.0'\n")
+    bin_dir = tmp_path / "bin"
+    _stub_pip_audit(bin_dir, exit_code=0)
+    path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    rc, out = _run(DEP_AUDIT, tmp_path, str(tree), env_extra={"PATH": path})
+    assert rc == 1, out
+    assert "STUB_PIP_AUDIT_ARGV:[--no-deps -r requirements.txt]" in out, out  # pinned one still audited
+    assert "requirements-dev.txt has a non-pinned or direct-reference line" in out
+    assert "no pinned requirements" not in out, "the refusal already gated; pyproject must not double-fail"
 
 
 # ---------------------------------------------------------------------------
