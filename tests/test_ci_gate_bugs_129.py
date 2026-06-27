@@ -22,9 +22,12 @@ Three classes of bug were fixed; each is asserted here against the REAL scripts/
    diff via a process substitution that swallowed `git diff` errors -> a block-tier gate could
    silently PASS having scanned nothing. Fixed to materialize the lines + check $? (fail
    closed), fail closed on an explicitly-requested base that doesn't resolve, and the workflow
-   deepens the head fetch + verifies a merge-base. Also the `=======` conflict-marker false
-   positive on a 7-`=` source separator is dropped (start/end markers still catch a real
-   conflict). We exercise the real script for each.
+   deepens the head fetch + verifies a merge-base. agent-tools#130 then closes the remaining
+   gap: rather than fatal-and-block EVERY shallow PR on the unreachable three-dot merge base,
+   the script falls back to the two-dot `base..HEAD` diff (no merge base needed) and keeps
+   scanning; only a truly uncomputable head (a missing object) still fails closed. Also the
+   `=======` conflict-marker false positive on a 7-`=` source separator is dropped (start/end
+   markers still catch a real conflict). We exercise the real script for each.
 
 3. codeql self-gate: the language-detect `git ls-files | grep -qiE` under `pipefail` returns
    141 (SIGPIPE) when grep matches early -> the `if` takes the else branch -> CodeQL silently
@@ -491,22 +494,111 @@ def test_leftover_fails_closed_on_unresolvable_explicit_base(tmp_path: Path):
     assert "does not resolve" in out
 
 
-def test_leftover_fails_closed_on_no_merge_base(tmp_path: Path):
-    """The #129 core bug: a head with no merge-base vs the base makes `git diff base...HEAD`
-    error. That error must FAIL the gate (it used to be swallowed by `done < <(emit_lines)`,
-    so the gate printed PASS having scanned nothing)."""
+def _orphan_repo(tmp_path: Path, head_file_body: str) -> Path:
+    """A repo whose HEAD shares NO merge-base with `main` (orphan branch = unrelated history),
+    modelling a shallow `--depth=1` CI checkout where the merge base is unreachable. `head_file_body`
+    is committed as `b.py` on the orphan branch (plant or omit a leftover via its contents)."""
     repo = _make_repo(tmp_path)
     (repo / "a.py").write_text("a = 1\n")
     _commit(repo, "a")
     _git(repo, "branch", "-M", "main")
-    # Orphan branch = unrelated history = no merge-base.
     _git(repo, "checkout", "-q", "--orphan", "orphan")
     _git(repo, "rm", "-q", "-rf", ".")
-    (repo / "b.py").write_text("b = 2\n")
+    (repo / "b.py").write_text(head_file_body)
     _commit(repo, "orphan")
+    return repo
+
+
+def test_leftover_no_merge_base_falls_back_to_two_dot_and_still_gates(tmp_path: Path):
+    """agent-tools#130: under a shallow checkout the three-dot `base...HEAD` diff has no
+    reachable merge base. The gate must NOT fatal-and-block every such PR — it falls back to the
+    two-dot `base..HEAD` diff (no merge base needed) and KEEPS SCANNING. A planted leftover on the
+    orphan head must still be caught via that two-dot fallback (a real catch, not a silent pass)."""
+    repo = _orphan_repo(tmp_path, "b = 2  # TODO no ticket\n")
     rc, out = _run(LEFTOVER, repo, env_extra={"LEFTOVER_BASE": "main", "LEFTOVER_HEAD": "HEAD"})
     assert rc == 1, out
+    assert "two-dot diff" in out, "must announce the two-dot fallback on an unreachable merge base"
+    assert "untracked-todo" in out, "the planted leftover must still be caught via two-dot"
+
+
+def test_leftover_no_merge_base_clean_diff_passes_via_two_dot(tmp_path: Path):
+    """agent-tools#130 (don't over-fail-closed): a CLEAN orphan head with no merge base must
+    PASS via the two-dot fallback — a legitimate shallow PR with no leftover must not be blocked
+    by a fatal three-dot diff. Proves the fallback keeps the gate USABLE, not just safe."""
+    repo = _orphan_repo(tmp_path, "b = 2\n")
+    rc, out = _run(LEFTOVER, repo, env_extra={"LEFTOVER_BASE": "main", "LEFTOVER_HEAD": "HEAD"})
+    assert rc == 0, out
+    assert "two-dot diff" in out
+    assert "PASS" in out
+
+
+def test_leftover_fails_closed_on_uncomputable_head(tmp_path: Path):
+    """The #129 core bug, post two-dot fallback: a head SHA whose object is missing makes BOTH
+    the three-dot and the two-dot `git diff` error. That error must FAIL the gate (it used to be
+    swallowed by `done < <(emit_lines)`, so the gate printed PASS having scanned nothing), and the
+    fail-closed message must point at the shallow-checkout remedy (fetch-depth: 0)."""
+    repo = _leftover_repo(tmp_path)
+    bogus = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"  # well-formed SHA, no such object
+    rc, out = _run(LEFTOVER, repo, env_extra={"LEFTOVER_BASE": "main", "LEFTOVER_HEAD": bogus})
+    assert rc == 1, out
     assert "could not compute the lines to scan" in out
+    assert "fetch-depth: 0" in out
+
+
+def test_leftover_script_has_two_dot_fallback(tmp_path: Path):
+    """Guard the fix against regression: the script must check for a reachable merge base and,
+    when there is none, switch to the two-dot range — so the diff range can't silently revert to
+    an unconditional three-dot that fatals every shallow PR."""
+    code = "\n".join(
+        ln for ln in LEFTOVER.read_text().splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert "git merge-base" in code, "must probe for a reachable merge base"
+    assert '"$base..$LEFTOVER_HEAD"' in code, "must fall back to the two-dot range"
+
+
+def test_leftover_two_dot_fallback_catches_leftover_in_real_shallow_checkout(tmp_path: Path):
+    """The faithful CI scenario (agent-tools#130), not just an orphan stand-in: an origin with a
+    SHARED ancestor `base0`, `main` advanced past it, and a `pr` branch off `base0` carrying a
+    leftover. A `--depth=1` clone of main + a `--depth=1` fetch of the PR head leaves the shared
+    ancestor unfetched, so the merge base is genuinely unreachable (exactly pull_request_target's
+    shallow checkout) while the histories still OVERLAP. The gate must take the two-dot fallback
+    and still catch the planted leftover — proving the fix works on representative shallow content,
+    where the unconditional three-dot diff would have fataled and (pre-fix) silently passed."""
+    (tmp_path / "origin").mkdir()  # _make_repo appends /repo and mkdirs non-recursively
+    up = _make_repo(tmp_path / "origin")
+    _git(up, "checkout", "-q", "-B", "main")
+    (up / "a.py").write_text("a = 1\n")
+    _commit(up, "base0")  # the shared ancestor / true branch point
+    _git(up, "checkout", "-q", "-b", "pr")
+    (up / "b.py").write_text("c = 3  # TODO no ticket\n")  # the planted leftover on the PR head
+    _commit(up, "pr-with-leftover")
+    pr_sha = subprocess.run(
+        ["git", "rev-parse", "pr"], cwd=up, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    _git(up, "checkout", "-q", "main")
+    (up / "a.py").write_text("a = 1\nd = 4\n")  # main advances past base0
+    _commit(up, "base1")
+
+    work = tmp_path / "work"
+    url = f"file://{up}"  # file:// forces a real shallow clone (no full-history hardlink)
+    subprocess.run(
+        ["git", "clone", "-q", "--depth=1", url, str(work)],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "fetch", "-q", "--depth=1", "origin", pr_sha],
+        cwd=work, check=True, capture_output=True, text=True,
+    )
+    # Sanity: the merge base really is unreachable in the shallow clone.
+    mb = subprocess.run(
+        ["git", "merge-base", "origin/main", pr_sha], cwd=work, capture_output=True, text=True
+    )
+    assert mb.returncode != 0, f"fixture broken: merge base unexpectedly reachable\n{mb.stdout}"
+
+    rc, out = _run(LEFTOVER, work, env_extra={"LEFTOVER_BASE": "origin/main", "LEFTOVER_HEAD": pr_sha})
+    assert rc == 1, out
+    assert "two-dot diff" in out, "an unreachable merge base must trigger the two-dot fallback"
+    assert "untracked-todo" in out, "the PR's leftover must be caught via the two-dot fallback"
 
 
 def test_leftover_empty_diff_passes(tmp_path: Path):
