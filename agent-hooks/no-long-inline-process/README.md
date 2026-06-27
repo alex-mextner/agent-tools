@@ -7,7 +7,12 @@ minutes. This gate **hard-blocks** it (this is the most clear-cut case, so strai
 not warn-first) and tells the orchestrator to dispatch it to a **background subagent**.
 Enforces the "stay responsive" half of `delegate-work-to-subagents`.
 
-Blocked (conservative, anchored at a command start so a substring in a path/word never trips):
+Blocked (argv-aware: the command is shell-tokenized and a long process is flagged only when the
+**real invoked command** — `argv[0]` after peeling inline env + no-op wrappers — is the runner, so a
+substring in a path/word or a keyword inside a normal multi-word quoted argument to a different
+command (`tg --title x "…review…"`, `git commit -m "wire --watch"`) does not trip it. One documented
+residual over-block remains: a quoted argument equal to *exactly* a lone shell separator immediately
+followed by a runner (`tg "(" review`) — see the module docstring's RESIDUAL LIMITATION):
 
 - the **`review`** CLI invoked as a command (multi-model, minutes-long)
 - any **`--watch`** flag (`gh pr checks --watch`, `vitest --watch`, `tsc --watch`, …)

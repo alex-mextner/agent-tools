@@ -57,17 +57,31 @@ def _decision(out: str) -> str:
 @pytest.mark.parametrize("command", [
     "review",
     "review -C /repo",
+    "review diff -C /repo -m claude:claude-opus-4-8",  # the real diff-review invocation
     "gh pr checks 42 --watch",
+    "gh pr checks 42 --watch=true",   # glued `--watch=…` value form is still a watch flag
+    "gh pr checks 42 --watch-poll",   # hyphenated subform on a NON-runner pins the `--watch-` branch
     "vitest --watch",
+    "vitest --watch=src",
+    "vitest --watch-poll",           # hyphenated subform — the old `--watch\\b` caught it; restored
+    "jest --watch-mode",
     "npm test",
     "pnpm build",
     "pytest tests/",
     "cargo test",
     "go build ./...",
     "make all",
+    "make build",
+    "rake test",
+    "msbuild build",
+    "mvn verify",                    # _TEST_BUILD_VERIFY_PACKAGE branch
+    "gradle package",
+    "deno test",                     # deno suite branch
+    "deno run build",
     "sleep 30",
     "sleep 5m",                      # 5 minutes — a bare \\d+ would read this as 5 and pass
     "sleep 1h",                      # 1 hour
+    "sleep 600",                     # 10 minutes
 ])
 def test_block_long_running(command, monkeypatch):
     out, _e, code = _run(command, monkeypatch)
@@ -86,10 +100,46 @@ def test_block_long_running(command, monkeypatch):
     'echo "sleep 100"',              # the word inside a string is not a sleep command
     "cat docs/review-notes.md",      # "review" only as a path substring
     "ls src/review/",                # "review" only in a dir name
+    "tsc --watcher-config x",        # `--watcher-…` is not the `--watch` flag (word char after watch)
     "git status",                    # plain inspection
     "echo done",
+    "make clean",                    # a non-test/build make target is not a suite
+    "mvn dependency:tree",           # an mvn goal that is not test|build|verify|package
+    'cmd "\\"" # foo; npm test',      # POSIX `\\"` keeps in-double balanced → `#` IS a comment →
+                                     # the `npm test` after it is comment text, not a command
+    "find . \\( -name x -o -name y \\)",  # escaped `\\(`/`\\)` de-quote to `(`/`)` segment breaks,
+                                     # but each segment's head is a `find` predicate, not a runner
+    "for review in a b c; do echo $review; done",  # `for`/`case` next token is a loop VAR/word,
+    "case pytest in x) :;; esac",    # not a command — stripping them must NOT make it argv[0]
 ])
 def test_allow_benign(command, monkeypatch):
+    out, _e, code = _run(command, monkeypatch)
+    assert code == 0, command
+    assert _decision(out) == "allow"
+
+
+# ── #60: a long-process KEYWORD inside a QUOTED ARGUMENT to a DIFFERENT command must ALLOW ──
+# The old raw regex anchored on shell-separator chars (`(`/`|`/`;`/`&&`) and a bare `--watch`
+# substring; those chars also appear INSIDE quoted argument strings, so a benign report/commit/
+# echo whose TEXT mentioned review/--watch/npm test/sleep was mis-read as the invocation and
+# BLOCKED. argv-awareness flags only the REAL invoked command (argv[0]), so these now ALLOW.
+
+@pytest.mark.parametrize("command", [
+    'tg --tag report --title x "text with review and review-qa in it"',
+    'tg --tag report --title "x" "we ran review-qa (review) today"',  # `(review` inside quotes
+    'echo "run review later"',
+    'git commit -m "add review gate"',
+    'git commit -m "fix; npm test now green"',          # `;` + suite inside the quoted message
+    'git commit -m "wire --watch flag"',                # `--watch` substring inside the message
+    'git commit -m "--watch-poll: new default"',        # message STARTS with `--watch-` but has spaces
+    'echo "--watch=1 explained"',                       # message STARTS with `--watch=` but has spaces
+    'tg "status: (sleep 600 elapsed) done"',            # `(sleep 600` inside the quoted arg
+    'echo "ci runs | pytest fast"',                     # `|` + runner inside the quoted arg
+    'tg --photo p.png "review the screenshot in review-qa"',
+])
+def test_allow_keyword_in_quoted_argument(command, monkeypatch):
+    """#60: review / --watch / npm test / sleep appearing inside a quoted argument to a DIFFERENT
+    command (tg / echo / git commit -m) must NOT trip the gate — only a real invocation does."""
     out, _e, code = _run(command, monkeypatch)
     assert code == 0, command
     assert _decision(out) == "allow"
@@ -134,10 +184,190 @@ def test_allow_wrapped_benign_command(command, monkeypatch):
     assert _decision(out) == "allow"
 
 
+# ── review finding #1: a long process nested in $(…) / <(…) / a subshell must still BLOCK ──
+# The OLD raw regex caught a runner inside command/process substitution via its `(` anchor
+# (`_CMD_START` matched the literal `(`). The argv rewrite must keep catching it — the substitution
+# opener is now a SEGMENT break, so the inner runner becomes its own argv-inspected segment.
+
+@pytest.mark.parametrize("command", [
+    "RESULT=$(npm test)",                # command substitution assigned to a var
+    "$(review)",                         # bare command substitution
+    "$(sleep 600)",
+    "echo $(npm run build)",             # substitution as an ARG of another command
+    "cat <(playwright test)",            # process substitution
+    "x=$(go build ./...)",
+    "(review -C /repo)",                 # plain subshell
+    "git pull && (npm test)",            # subshell on a non-head segment
+    "git status;(review)",               # GLUED `;(` — shlex merges it; must still break the segment
+    "git fetch&&(npm test)",             # GLUED `&&(`
+    "(echo hi)&&npm test",               # GLUED `)&&` — runner after a glued closer
+    "foo|(pytest)",                      # GLUED `|(`
+])
+def test_block_command_substitution(command, monkeypatch):
+    out, _e, code = _run(command, monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE, command
+    assert json.loads(out)["decision"] == "block"
+
+
+# ── review finding #2: lock in the new parser branches (heredoc / multiline / fail-open / env / path)
+
+def test_block_inline_env_without_env_wrapper(monkeypatch):
+    """A bare `VAR=val runner` (no `env` wrapper) is peeled to the real runner → BLOCK."""
+    out, _e, code = _run("CI=1 pytest", monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_block_path_qualified_runner(monkeypatch):
+    """A path-qualified runner is matched by basename → BLOCK."""
+    out, _e, code = _run("/usr/local/bin/review -C /repo", monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_allow_heredoc_body_that_looks_like_a_command(monkeypatch):
+    """A here-document BODY line that LOOKS like a long process (`npm test`) is data, not a command."""
+    out, _e, code = _run("git commit -F - <<EOF\nnpm test\nreview later\nEOF", monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_allow_glued_metachar_comment(monkeypatch):
+    """A `#` glued right after an unescaped metachar (`;#`) opens a comment in POSIX shell, so the
+    `&& npm test` in `git push ;# note && npm test` is comment text, not a command → ALLOW."""
+    out, _e, code = _run("git push ;# note && npm test", monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_block_real_runner_with_plain_trailing_comment(monkeypatch):
+    """Happy-path of the quote-aware comment strip: a real runner with an ordinary trailing `#`
+    comment still BLOCKS — the comment is cut, `npm test` remains the command."""
+    out, _e, code = _run("npm test  # just a note", monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_block_real_command_after_closed_heredoc(monkeypatch):
+    """A real `review` AFTER a closed heredoc is still a command → BLOCK."""
+    out, _e, code = _run("git commit -F - <<EOF\nmessage body\nEOF\nreview -C /repo", monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_block_multiline_newline_separates_commands(monkeypatch):
+    """A NEWLINE separates commands: `git status` then `npm test` → the suite BLOCKS."""
+    out, _e, code = _run("git status\nnpm test", monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_allow_unbalanced_quotes_fail_open(monkeypatch):
+    """An unparseable command (unbalanced quotes) fails OPEN (allow) — on_error=open policy."""
+    out, _e, code = _run('review "unterminated', monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("command", [
+    'X="$(npm test)"',                   # documented under-block: quoted substitution not re-parsed
+    'result="$(review)"',
+    "bash -c 'npm test'",                # nested shell string not re-parsed (sibling limitation)
+    "sh -c 'review'",                    # same nested-shell-string class as `bash -c`
+    "xargs npm test",                    # `xargs` is not peeled as a wrapper → exe='xargs' (under-block)
+    "`npm test`",                        # backtick substitution not re-parsed (no punctuation_chars break)
+    'webpack --watch="src dir"',         # `--watch=<value with space>` → de-quoted token has whitespace
+                                         # → the `_is_watch_flag` guard rejects it (documented under-block)
+    "git commit -m '$(npm test) is the command to run'",  # single-quoted LITERAL must NOT over-block
+])
+def test_allow_quoted_substitution_documented_limitation(command, monkeypatch):
+    """Boundary pin: a runner inside a QUOTED `$(…)` / backtick / `bash -c '…'` is NOT re-parsed, so
+    it ALLOWS. Posix de-quoting collapses `"$(…)"` and the literal `'$(…)'` to one token, so flagging
+    would re-open the #60 false-positive on the single-quoted literal — under-blocking is the safe
+    direction for this on_error=open discipline gate. (An UNQUOTED `$(…)` IS still blocked, above.)"""
+    out, _e, code = _run(command, monkeypatch)
+    assert code == 0, command
+    assert _decision(out) == "allow"
+
+
+# ── review finding #1: a runner introduced by a CONTROL keyword / fused separator / `&` must BLOCK ──
+# `_LEADING_SHELL_NOISE` peels the brace-group + control keywords (`if`/`then`/`do`/`while`/…) so the
+# real runner under them is recovered; `_segments` splits fused separators (`;`/`&&`/`&`) with no
+# surrounding whitespace. `if` was missing from the noise set (its siblings `while`/`until`/`elif`
+# were present) → `if npm test; then …` under-blocked; it is now peeled symmetrically.
+
+@pytest.mark.parametrize("command", [
+    "if npm test; then echo ok; fi",     # `if`-guarded suite — the finding-#1 regression case
+    "while npm test; do :; done",        # `while`-guarded suite (already worked; locked in)
+    "until pytest; do sleep 1; done",    # `until`-guarded runner
+    "for i in 1 2 3; do review; done",   # `review` in a for-loop body
+    "git status;npm test",               # fused `;` with no surrounding whitespace
+    "git fetch&&pytest",                 # fused `&&`
+    "npm test &",                        # backgrounded suite (the `&` is a segment break)
+])
+def test_block_control_structures_and_fused_separators(command, monkeypatch):
+    out, _e, code = _run(command, monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE, command
+    assert json.loads(out)["decision"] == "block"
+
+
+# ── review finding #2: a `#` INSIDE single quotes guarding a runner mention must ALLOW ──────
+
+def test_allow_hash_in_single_quotes_guarding_runner(monkeypatch):
+    """A `#` inside single quotes is literal (not a comment), and so is the `;` and `npm test`
+    after it — the whole `-m` value is one quoted arg, so nothing is a real command. `in_single`
+    suppresses both the comment-strip and the separator → ALLOW."""
+    out, _e, code = _run("git commit -m 'WIP #5; npm test'", monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+# ── review finding (residual): a QUOTED token EXACTLY equal to a separator/opener over-blocks ──
+# Posix shlex de-quotes a standalone `";"` / `"("` to the bare `;` / `(`, indistinguishable from a
+# real separator without per-token quote provenance, so a runner RIGHT AFTER it is still flagged.
+# This pins the DOCUMENTED residual over-block (see the module docstring's RESIDUAL LIMITATION):
+# the trigger is pathological (a quoted arg equal to a lone separator + a bare runner next), and the
+# reported #60 case — a keyword inside a NORMAL multi-word quoted message — is fully fixed above.
+
+@pytest.mark.parametrize("command", [
+    'echo ";" review',          # quoted `;` de-quotes to a bare separator → `review` its own segment
+    'tg "(" review',            # quoted `(` de-quotes to a bare subshell opener
+    'git fetch ";" npm test',   # quoted `;` then a real suite token
+])
+def test_quoted_token_equal_to_separator_documented_overblock(command, monkeypatch):
+    """DOCUMENTED residual over-block (module docstring RESIDUAL LIMITATION). If a future precise
+    quote-aware separator scan lands, flip these to ALLOW and update the docstring."""
+    out, _e, code = _run(command, monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE, command
+    assert json.loads(out)["decision"] == "block"
+
+
+@pytest.mark.parametrize("command", [
+    'echo "--watch=1"',          # single-word quoted token == a watch flag (no space → guard misses)
+    'echo "--watch-x"',          # single-word quoted `--watch-` subform
+    "pytest --version",          # a DIRECT runner blocks by name even on a benign subcommand/flag
+    "jest --listTests",          # same — name-keyed, not subcommand-aware
+])
+def test_documented_overblocks_pinned(command, monkeypatch):
+    """Pin the over-blocks the docstrings acknowledge (single-word quoted flag token; a direct runner
+    invoked with a benign flag). They block by design given argv[0]/token identity alone; pinned so a
+    future refactor can't silently shift the boundary. Flip + document if a precise fix lands."""
+    out, _e, code = _run(command, monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE, command
+    assert json.loads(out)["decision"] == "block"
+
+
 # ── SUBAGENT-EXEMPT ────────────────────────────────────────────────────────────────────
 
 def test_subagent_exempt_allows_long_process(monkeypatch):
     out, _e, code = _run("npm test", monkeypatch, agent_id="sub-3")
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_subagent_exempt_allows_review(monkeypatch):
+    """The same real `review` that blocks for the orchestrator is allowed inside a subagent."""
+    out, _e, code = _run("review diff -C /repo", monkeypatch, agent_id="sub-7")
     assert code == 0
     assert _decision(out) == "allow"
 

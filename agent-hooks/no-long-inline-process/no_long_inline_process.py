@@ -7,12 +7,47 @@ minutes — a multi-model `review`, a `--watch` loop, a full build/test suite, a
 to a BACKGROUND subagent instead. It enforces the "orchestrator stays responsive" half of
 `delegate-work-to-subagents` (the most clear-cut case → straight block, not warn-first).
 
-Matched (conservative, anchored so a substring in a path/word never trips it):
-  - the `review` CLI invoked as a command (start, or after && / ; / |) — minutes-long
-  - any `--watch` flag (gh pr checks --watch, vitest --watch, tsc --watch, …)
-  - a build/test SUITE: npm/pnpm/yarn/bun test|build, pytest/vitest/jest/cypress/playwright,
-    cargo test|build, go test|build, make test|build|all
-  - `sleep N[unit]` with a duration >= 10s (`sleep 5m` / `sleep 1h` count; `sleep 2` is fine)
+Decided from the PARSED command (argv-aware), NEVER a raw substring of the whole string —
+the #59 doctrine (block-no-verify / require-review / visual-proof / skills-read). The old
+raw-regex anchored its patterns on shell-separator characters (`(`, `|`, `;`, `&&`); those
+same characters appear INSIDE quoted argument strings, so a benign `tg --tag report "…we
+ran review-qa (review) today…"` or `git commit -m "wire --watch flag"` was mis-read as a
+`review`/`--watch` invocation and BLOCKED (agent-tools#60). The command is now shell-
+tokenized (quotes/heredocs honored) and split into segments; a long process is flagged ONLY
+when the REAL invoked command — `argv[0]` after leading shell noise, inline env, and no-op
+wrappers (`timeout`/`env`/`nice`/`time`/…) are peeled off a segment — is the long-running
+runner. A keyword that merely appears inside an argument to a DIFFERENT command (tg/echo/git
+commit -m/…) no longer trips it, while a genuine inline `review`/`npm test`/`--watch`/long
+`sleep` still does.
+
+Flagged, decided per real command SEGMENT (executable parsed, not substring-matched):
+  - the `review` CLI as the invoked command (`argv[0]` is `review`) — multi-model, minutes-long
+  - a `--watch` flag token in the real args (gh pr checks --watch, vitest --watch, tsc --watch)
+  - a build/test SUITE: npm/pnpm/yarn/bun/deno test|build, pytest/vitest/jest/cypress/playwright,
+    cargo/go test|build, make/rake/msbuild test|build|all, mvn/gradle test|build|verify|package
+  - `sleep N[unit]` as the invoked command with a duration >= 10s (`sleep 5m`/`sleep 1h` count)
+
+LIMITATION (documented under-block, the same precision trade as the sibling hooks' nested
+shell-string limit): a runner hidden inside a QUOTED command substitution (`X="$(npm test)"`),
+a backtick (`` `npm test` ``), or a nested shell string (`bash -c 'npm test'`, `sh -c 'review'`)
+is NOT re-parsed and so is NOT flagged; likewise a runner passed to a NON-peeled forwarder
+(`xargs npm test`) keeps that forwarder as argv[0] and is not flagged (`xargs`/`sh`/`bash` are
+not in the no-op wrapper set — unlike `timeout`/`env`/`nice` they change execution semantics). Posix tokenization de-quotes a `"$(…)"` and a `'$(…)'` to the SAME token,
+so the active (double-quoted) form is indistinguishable from a literal (single-quoted) one
+without full quote-context tracking; flagging it would re-open the #60 FALSE-POSITIVE on a
+literal `git commit -m '$(npm test) is the command'`. An UNQUOTED substitution/subshell
+(`$(npm test)`, `(review)`) IS caught — its opener is a real segment break. Under-blocking is the
+safe direction here: this gate is responsiveness discipline (on_error=open), not a boundary.
+
+RESIDUAL LIMITATION (rare OVER-block, same de-quoting collision): a QUOTED token whose value is
+EXACTLY a shell separator/opener (`echo ";" review`, `tg "(" review`) de-quotes under posix shlex to
+a token equal to the bare `;` / `(`, indistinguishable from a real unquoted separator without
+per-token quote-provenance tracking. So such a quoted break still splits the segment and a runner
+RIGHT AFTER it (`tg "(" review`) is flagged. The trigger is pathological (a quoted argument equal to
+a lone separator, immediately followed by a bare runner token), and the reported #60 case (a keyword
+inside a NORMAL multi-word quoted message, `tg --title x "...review..."`) is fully fixed. A precise
+fix means a quote-aware separator scan replacing punctuation_chars across this and the sibling hooks'
+shared parser (follow-up, not this change). Pinned by `test_quoted_token_equal_to_separator_*`.
 
 Subagent-exempt: a dispatched subagent (``agent_id`` present) is EXPECTED to run these in
 the background, so it is always allowed — this gate governs the orchestrator only.
@@ -28,7 +63,8 @@ Contract (agents-hooks/v1):
   stdout : protocol JSON only       exit 0 : allow   exit 10 : BLOCK   other : error
 
 on_error is "open": responsiveness discipline, not a security boundary — a crash must never
-wedge the ability to run a command.
+wedge the ability to run a command. An UNPARSEABLE command (unbalanced quotes) likewise
+ALLOWS (fail-open), the opposite of the fail-closed sibling block-no-verify.
 """
 
 from __future__ import annotations
@@ -36,50 +72,83 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
-# A command starts at the line start or right after a &&/;/|/( separator. We anchor the
-# long-process patterns on this so `review` inside a path (`/src/review/x`) or as a flag
-# value never trips the guard — only an actual command invocation does.
-_CMD_START = r"(?:^|&&|\|\||;|\||\()\s*"
-
-# The `review` CLI invoked as a command (multi-model, minutes-long).
-REVIEW = re.compile(_CMD_START + r"review\b")
-# Any --watch flag anywhere (gh pr checks --watch, vitest --watch, tsc --watch, …).
-WATCH = re.compile(r"--watch\b")
-# A build/test SUITE (each anchored at a command start to avoid substring false hits).
-SUITE = re.compile(
-    _CMD_START + r"(?:npm|pnpm|yarn|bun|deno)\b[^&;|]*\b(?:test|build)\b"
-    r"|" + _CMD_START + r"(?:pytest|vitest|jest|cypress|playwright)\b"
-    r"|" + _CMD_START + r"cargo\b[^&;|]*\b(?:test|build)\b"
-    r"|" + _CMD_START + r"go\b[^&;|]*\b(?:test|build)\b"
-    r"|" + _CMD_START + r"(?:make|rake|msbuild)\b[^&;|]*\b(?:test|build|all)\b"
-    r"|" + _CMD_START + r"(?:mvn|gradle)\b[^&;|]*\b(?:test|build|verify|package)\b"
-)
-# `sleep N[unit]` invoked as a command (>= 10s is "long"). Anchored at a command start so
-# `echo "sleep 100"` (the word inside a string) never trips it. The optional unit suffix
-# (s/m/h/d) is parsed to seconds, so `sleep 5m` / `sleep 1h` are correctly seen as long —
-# a bare `\d+` would read `5m` as 5 and wave a five-minute sleep through.
-SLEEP = re.compile(_CMD_START + r"sleep\s+(\d+(?:\.\d+)?)([smhd]?)\b")
-_SLEEP_UNIT_S = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 INLINE_SENTINEL = re.compile(r"#\s*inline-process-ok:\s*(\S.*)")
+# Unescaped shell metachars that, like whitespace, are a word boundary at which a `#` opens a comment
+# (`cmd ;# note`, `a |# note`) — used by `_strip_line_comment` to match POSIX comment semantics.
+_COMMENT_BOUNDARY_METACHARS = frozenset(";&|()")
 
-# Leading command WRAPPERS that prefix the real command without changing what it does
-# (`timeout 600 npm test`, `env CI=1 pytest`, `nice -n10 review`, `time make build`). The
-# real runner sits AFTER the wrapper + its args, so the `_CMD_START`-anchored patterns above
-# miss it unless we peel the wrapper off first. ``_unwrap_segment`` knows how to skip each
-# wrapper's OWN args before the wrapped command begins:
-#   - timeout DURATION cmd…           → the duration positional + -s/-k/--signal/--kill-after
-#   - env [NAME=val…|-i|-u N] cmd…    → flags + KEY=VALUE assignments skipped
-#   - nice [-n N] cmd… / time cmd…    → nice's -n N skipped; time takes no positional
-#   - stdbuf -oL cmd… / nohup cmd… / setsid cmd… / unbuffer cmd… → flags-only, no positional
-# Deliberately conservative: wrappers with a POSITIONAL arg we don't model (chrt's RTPRIO,
-# ionice's `-c CLASS`) are LEFT OUT — peeling them only partway would leave that positional at
-# the head and silently MISS the long process (a false-negative is worse than not unwrapping).
-_WRAPPERS = re.compile(r"^(?:timeout|env|nice|time|stdbuf|nohup|setsid|unbuffer)$")
+# ── what counts as a long-running runner (argv-keyed, not substring) ─────────────────────────
+# Test/CI runners that are a long process by the NAME ALONE — `pytest`, `vitest`, … as argv[0].
+_DIRECT_RUNNERS = frozenset({"pytest", "vitest", "jest", "cypress", "playwright"})
+# Runners that are a suite only WITH a build/test subcommand. The word-boundary patterns mirror
+# the original SUITE regex (`\btest\b` matches `test`, `test:unit`, `test-helper`; not `tests`),
+# now applied per real arg TOKEN so a quoted multi-word arg of a DIFFERENT command can't match.
+_TEST_BUILD = re.compile(r"\b(?:test|build)\b")
+_TEST_BUILD_ALL = re.compile(r"\b(?:test|build|all)\b")
+_TEST_BUILD_VERIFY_PACKAGE = re.compile(r"\b(?:test|build|verify|package)\b")
+_SUITE_RUNNERS: dict[str, re.Pattern[str]] = {
+    "npm": _TEST_BUILD, "pnpm": _TEST_BUILD, "yarn": _TEST_BUILD, "bun": _TEST_BUILD,
+    "deno": _TEST_BUILD, "cargo": _TEST_BUILD, "go": _TEST_BUILD,
+    "make": _TEST_BUILD_ALL, "rake": _TEST_BUILD_ALL, "msbuild": _TEST_BUILD_ALL,
+    "mvn": _TEST_BUILD_VERIFY_PACKAGE, "gradle": _TEST_BUILD_VERIFY_PACKAGE,
+}
+_SLEEP_UNIT_S = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+# `sleep N[unit]` operand — the optional unit is parsed to seconds so `sleep 5m` reads as 300s,
+# not 5 (a bare \d+ would wave a five-minute sleep through).
+_SLEEP_OPERAND = re.compile(r"^(\d+(?:\.\d+)?)([smhd]?)$")
+
+# ── shell tokenization (SYNC: adapted from block-no-verify/block_no_verify.py, itself adapted
+# from require-review / visual-proof-gate / skills-read-gate). Each hook is a standalone script
+# run as its own subprocess (no shared import path), so the parser is duplicated by design — keep
+# the separator/quote/comment/heredoc handling in step with the siblings when changing it. ──────
+_SHELL_SEP = frozenset({"&&", "||", ";", "|", "&", ";;", "|&", ";&", ";;&"})
+# Command/process-substitution & subshell opener/closer tokens. The OLD raw regex recognized a
+# command START right after a bare `(` (its `_CMD_START` anchor), so a long process nested in
+# `$(…)`, `<(…)`, or a subshell `( … )` was caught. Tokenized, `$(npm test)` →
+# `['$', '(', 'npm', 'test', ')']` and `<(playwright test)` → `['<(', 'playwright', 'test', ')']`,
+# so treating these as SEGMENT BREAKS makes the inner runner its OWN segment, inspected by argv[0] —
+# restoring the true positives the #60 argv rewrite would otherwise drop (review finding #1). A `(`
+# INSIDE quotes stays part of its quoted token (one token, no break) — exactly the #60 false-pos fix.
+_SUBSTITUTION_BREAKS = frozenset({"(", ")", "<(", ">("})
+_SEGMENT_BREAKS = _SHELL_SEP | _SUBSTITUTION_BREAKS
+# shlex(punctuation_chars=True) MERGES consecutive punctuation chars (its default set `();<>|&`) into
+# ONE token, so a separator GLUED to a subshell/substitution opener (`git status;(review)` → `;(`,
+# `git fetch&&(npm test)` → `&&(`, `(echo hi)&&npm test` → `)&&`) yields a composite token absent from
+# _SEGMENT_BREAKS — and the inner runner then never becomes its own segment (an UNDER-block the old
+# `\(`-anchored regex did NOT have). `_decompose_punct_token` greedily re-splits an all-punctuation
+# token into known break tokens (longest-match first) so each real break is recovered.
+_PUNCT_CHARS = frozenset("();<>|&")
+_BREAKS_LONGEST_FIRST = sorted(_SEGMENT_BREAKS, key=len, reverse=True)
+# Leading tokens that INTRODUCE a command but are not it — the brace-group opener and the control
+# keywords whose next token IS a command (a condition: `if`/`elif`/`while`/`until`; a body opener:
+# `then`/`do`/`else`). Stripping them recovers the real runner: `if x; then npm test` → (the `then`
+# segment) `npm test`. (A `(` subshell opener is handled as a segment break above, not here.)
+# `for`/`case` are DELIBERATELY EXCLUDED: their next token is a loop VARIABLE (`for VAR in …`) or a
+# selector WORD (`case WORD in …`), NOT a command — stripping them would make that name argv[0] and
+# false-block `for review in a b c; …`. Their loop/case BODY is still recovered via the `do`/`then`
+# that remain in the set, so excluding them loses no true positive.
+_LEADING_SHELL_NOISE = frozenset({
+    "{", "!", "if", "then", "do", "else", "elif", "while", "until",
+})
+# A `VAR=value` token before the executable in a segment is an inline env assignment.
+_INLINE_ENV = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
+# No-op leading WRAPPERS that prefix the real command without changing what it does
+# (`timeout 600 npm test`, `env CI=1 pytest`, `nice -n10 review`, `time make build`). The real
+# runner sits AFTER the wrapper + its own args, so it is peeled off before inspecting argv[0].
+_WRAPPERS = frozenset({"timeout", "env", "nice", "time", "stdbuf", "nohup", "setsid", "unbuffer"})
+# A wrapper flag that takes its value as a SEPARATE token (`-k 5`, `--signal SIGTERM`); a glued
+# form (`-n10`, `--kill-after=5`) consumes no extra token.
+_WRAPPER_VALUE_FLAGS = frozenset({"-s", "-k", "--signal", "--kill-after", "-n", "-u"})
+_MAX_WRAPPER_NESTING = 16
+# Cap on leading shell-noise tokens peeled from one segment (its own concept, not the wrapper cap) —
+# named so the literal can't silently desync from the bound it represents.
+_MAX_LEADING_NOISE = 16
 
 
 def emit(decision: str, message: str | None = None) -> None:
@@ -112,26 +181,218 @@ def _override_reason(command: str) -> str | None:
     return None
 
 
-def _unwrap_segment(segment: str) -> str:
-    """Strip leading no-op wrappers (`timeout 600`, `env CI=1`, `nice -n10`, `time`) from one
-    command segment, returning the wrapped command. Peels repeatedly (`time timeout 5m review`).
+def _strip_line_comment(line: str) -> str:
+    """Cut a `#` shell comment to end-of-line, RESPECTING quotes (the `#` is found in the RAW text,
+    before shlex de-quotes). A `#` starts a comment only at a WORD boundary and only OUTSIDE quotes,
+    so a quoted `-m 'fix #42'` keeps its `#`. POSIX backslash-escaping is honored to stay in step with
+    shlex (`posix=True` ⇒ `escape='\\'`, `escapedquotes='"'`): outside single quotes a `\\` escapes
+    the next char, so a `\\"` does NOT toggle the double-quote state and a `\\#` is not a comment — the
+    old loop ignored `\\` and so diverged from shlex, over-blocking `cmd "\\"" # foo; npm test`."""
+    in_single = in_double = False
+    prev_ws = True  # start-of-line counts as a word boundary
+    i, n = 0, len(line)
+    while i < n:
+        ch = line[i]
+        if ch == "\\" and not in_single:
+            i += 2  # escaped char: skip it so `\"`/`\\`/`\#` can't toggle quoting or open a comment
+            prev_ws = False
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and prev_ws and not in_single and not in_double:
+            return line[:i]
+        # A `#` opens a comment at a word boundary: after whitespace / line start, but in POSIX shell
+        # ALSO right after an unescaped metachar (`;& |()`) outside quotes — `git push ;# note && npm
+        # test` is `git push` + a comment in bash. Treating a metachar as a boundary stops the glued
+        # `;#` comment from surviving and false-blocking the runner mentioned in the comment text.
+        prev_ws = ch.isspace() or (
+            ch in _COMMENT_BOUNDARY_METACHARS and not in_single and not in_double
+        )
+        i += 1
+    return line
 
-    Skips, for a recognized wrapper: its option flags (`-k`, `--signal`, and their separate
-    values), and — for `env` — leading `KEY=VALUE` assignments. A flag joined to its value
-    (`-n10`, `--kill-after=5`) consumes no extra token. A non-wrapper segment is returned
-    unchanged (the while-guard below never fires)."""
-    tokens = segment.split()
-    changed = True
-    while changed and tokens and _WRAPPERS.match(tokens[0]):
-        changed = False
-        wrapper, rest = tokens[0], tokens[1:]
+
+def _tokenize_line(line: str) -> list[str] | None:
+    """Tokenize ONE physical line: drop a word-boundary `#` comment (quote-aware) then split GLUED
+    separators (`x;npm`, `a&&pytest`) into standalone tokens. `punctuation_chars=True` emits
+    `; & | && ||` as their own tokens while honoring quotes. Returns None on unbalanced quotes →
+    the caller fails open."""
+    lex = shlex.shlex(_strip_line_comment(line), posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""  # comment already stripped from the raw line (quote-aware)
+    try:
+        return list(lex)
+    except ValueError:
+        return None
+
+
+def _heredoc_terminators(line: str) -> list[tuple[str, bool]]:
+    """The here-documents opened on `line` as (terminator-word, dash-form) pairs, FIFO. Detection
+    runs on the TOKENIZED line so a `<<WORD` inside a quoted string is absorbed, not a false opener.
+    `dash-form` is True for `<<-WORD` (leading TABS allowed on the terminator line)."""
+    toks = _tokenize_line(line)
+    if toks is None:
+        return []
+    terms: list[tuple[str, bool]] = []
+    for idx, tok in enumerate(toks):
+        if tok == "<<" and idx + 1 < len(toks):
+            raw = toks[idx + 1]
+            dash = raw.startswith("-")
+            word = raw.lstrip("-") if dash else raw
+            if word:
+                terms.append((word, dash))
+    return terms
+
+
+def _heredoc_body_ended(line: str, term: str, dash: bool) -> bool:
+    """True when `line` is the here-document terminator. A plain `<<WORD` needs an exact match; only
+    `<<-WORD` strips leading TABS."""
+    candidate = line.lstrip("\t") if dash else line
+    return candidate == term
+
+
+def _strip_heredocs(lines: list[str]) -> list[str]:
+    """Drop here-document BODY lines (data between `<<WORD` and its terminator) so a body line that
+    LOOKS like a command (`npm test` inside an `-F -` heredoc message) is not parsed as a segment.
+    The opener line is kept; only body + terminator lines are removed. Multiple heredocs on one line
+    are consumed FIFO; an unterminated heredoc consumes to EOF."""
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        terminators = _heredoc_terminators(line)
+        i += 1
+        for term, dash in terminators:
+            while i < len(lines) and not _heredoc_body_ended(lines[i], term, dash):
+                i += 1  # a body (data) line — drop it
+            if i < len(lines):
+                i += 1  # drop the terminator line too
+    return out
+
+
+def _tokenize(command: str) -> list[str] | None:
+    """Shell-tokenize a whole (possibly MULTI-LINE) command into a flat token stream where a NEWLINE
+    is a command separator (a `;` token between lines). Here-document bodies are stripped first. A
+    line that fails to tokenize on its own (a quoted string spanning a newline) is re-joined with
+    following lines until it balances. Returns None only if a chunk can never balance → fail open."""
+    joined = command.replace("\r\n", "\n").replace("\r", "\n")
+    # Honor backslash-newline line continuations. NOTE (diverges from bash, safe direction): this is a
+    # global raw-text join done BEFORE heredoc stripping and quote tracking, so a literal trailing `\`
+    # inside single quotes or inside a quoted-delimiter heredoc body (`<<'EOF'`) is joined as a
+    # continuation when bash would not. Worst case it swallows a heredoc terminator → the body is read
+    # as data (UNDER-block) — the safe direction for this on_error=open gate; the case is marginal.
+    joined = joined.replace("\\\n", "")
+    lines = _strip_heredocs(joined.split("\n"))
+    out: list[str] = []
+    first = True
+    i = 0
+    while i < len(lines):
+        chunk = lines[i]
+        toks = _tokenize_line(chunk)
+        while toks is None and i + 1 < len(lines):
+            i += 1
+            chunk = f"{chunk}\n{lines[i]}"
+            toks = _tokenize_line(chunk)
+        if toks is None:
+            return None  # never balances → fail open
+        if not first:
+            out.append(";")  # the newline that started this chunk ends the previous command
+        first = False
+        out.extend(toks)
+        i += 1
+    return out
+
+
+def _decompose_punct_token(tok: str) -> list[str]:
+    """Re-split an ALL-punctuation token (every char in `_PUNCT_CHARS`) into known break tokens by
+    greedy longest-match (`;(` → `[';', '(']`, `&&(` → `['&&', '(']`, `)&&` → `[')', '&&']`); a
+    recognized break passes through unchanged (`&&` → `['&&']`), an unknown leftover punct char is
+    emitted as-is. A token that is NOT all-punctuation is returned as `[tok]` untouched — a redirect
+    like `2>` or a quoted word keeps its shape. (A QUOTED token that de-quotes to glued separators,
+    `tg ";(" review`, is the documented RESIDUAL over-block class, same as a lone quoted separator.)"""
+    if not tok or any(ch not in _PUNCT_CHARS for ch in tok):
+        return [tok]
+    pieces: list[str] = []
+    i = 0
+    while i < len(tok):
+        for br in _BREAKS_LONGEST_FIRST:
+            if tok.startswith(br, i):
+                pieces.append(br)
+                i += len(br)
+                break
+        else:
+            pieces.append(tok[i])  # unknown lone punct char — keep it, it is not a break
+            i += 1
+    return pieces
+
+
+def _segments(tokens: list[str]) -> list[list[str]]:
+    """Split a token list on shell command separators (&&, ||, ;, |, &, fused forms) AND on
+    command/process-substitution & subshell breaks (`(`, `)`, `<(`, `>(`), so a long process nested
+    in `$(…)` / `<(…)` / a subshell becomes its own argv-inspectable segment. A composite punctuation
+    token (a separator GLUED to an opener, `;(`/`&&(`/`)&&`) is first decomposed into its real breaks."""
+    segs: list[list[str]] = []
+    cur: list[str] = []
+    for tok in tokens:
+        for piece in _decompose_punct_token(tok):
+            if piece in _SEGMENT_BREAKS:
+                segs.append(cur)
+                cur = []
+            else:
+                cur.append(piece)
+    segs.append(cur)
+    return segs
+
+
+def _strip_leading_shell_noise(segment: list[str]) -> list[str]:
+    """Drop leading brace-group openers (`{`, `!`) and control keywords (`then`/`do`/…) so a command
+    introduced by them is recovered: `if x; then npm test` → `npm test`. (A `(` subshell opener is
+    handled as a segment break in `_segments`.) Capped so an all-noise segment can't loop."""
+    i = 0
+    while i < len(segment) and i < _MAX_LEADING_NOISE and segment[i] in _LEADING_SHELL_NOISE:
+        i += 1
+    return segment[i:]
+
+
+def _split_inline_env(segment: list[str]) -> list[str]:
+    """Peel leading `VAR=value` assignments off a segment, returning the rest starting at the real
+    executable (`CI=1 pytest` → `pytest`). The env values themselves don't affect this gate, so only
+    the remainder is returned."""
+    i = 0
+    while i < len(segment) and _INLINE_ENV.match(segment[i]):
+        i += 1
+    return segment[i:]
+
+
+def _basename(tok: str) -> str:
+    """The executable name without a leading path — `/usr/bin/timeout` → `timeout`."""
+    return tok.rsplit("/", 1)[-1]
+
+
+def _strip_wrappers(argv: list[str]) -> list[str]:
+    """Peel leading no-op wrapper executables (`timeout 600`, `env CI=1`, `nice -n10`, `time`, …) so
+    the REAL command beneath is what argv[0] inspection sees. Peels repeatedly (`time timeout 5m
+    review`). For a recognized wrapper, its option flags (and their separate values), `env`'s leading
+    `VAR=value` operands, and `timeout`'s leading DURATION positional are skipped; a bare wrapper with
+    no args of its own (`time make build`, `nohup cargo build`) is dropped to expose the next token.
+
+    Deliberately conservative: a wrapper with a POSITIONAL operand we don't model is NOT in the set, so
+    we never peel one only partway and leave a non-command at the head. A non-wrapper head is returned
+    unchanged. Guarded against a pathological wrapper chain by a nesting cap (then returned as-is →
+    allow, the fail-open default for this discipline gate)."""
+    guard = 0
+    while argv and _basename(argv[0]) in _WRAPPERS and guard < _MAX_WRAPPER_NESTING:
+        guard += 1
+        wrapper, rest = _basename(argv[0]), argv[1:]
         i = 0
         while i < len(rest):
             tok = rest[i]
             if tok.startswith("-"):
-                # `--signal SIGTERM` / `-k 5` take a separate value; `-n10` / `--kill=5` don't.
-                if "=" not in tok and tok in ("-s", "-k", "--signal", "--kill-after", "-n", "-u"):
-                    i += 1
+                if "=" not in tok and tok in _WRAPPER_VALUE_FLAGS:
+                    i += 1  # `--signal SIGTERM` / `-k 5` take a separate value token
                 i += 1
                 continue
             if wrapper == "env" and "=" in tok and not tok.startswith("-"):
@@ -140,50 +401,90 @@ def _unwrap_segment(segment: str) -> str:
             if wrapper == "timeout":
                 i += 1  # the DURATION positional (the wrapped command follows)
             break
-        if i:  # we consumed at least the wrapper's own args → real command starts at rest[i:]
-            tokens = rest[i:]
-            changed = True
-        elif rest:  # bare wrapper with no args of its own (e.g. `time make build`, `nohup cmd`)
-            tokens = rest
-            changed = True
-    return " ".join(tokens)
+        if i:  # consumed the wrapper's own args → real command starts at rest[i:]
+            argv = rest[i:]
+        elif rest:  # bare wrapper with no args of its own (`time make build`, `nohup cargo build`)
+            argv = rest
+        else:
+            break  # wrapper with nothing after it
+    return argv
 
 
-def _unwrap_command(command: str) -> str:
-    """The command with leading wrappers peeled off EACH `&&`/`;`/`|`-separated segment, so a
-    wrapped runner (`timeout 600 npm test`, `x && env CI=1 pytest`) is exposed at the segment
-    head where the `_CMD_START`-anchored patterns can see it."""
-    parts = re.split(r"(\s*(?:&&|\|\||;|\|)\s*)", command)
-    return "".join(
-        seg if i % 2 else _unwrap_segment(seg.strip())
-        for i, seg in enumerate(parts)
-    )
+def _is_suite(exe: str, rest: list[str]) -> bool:
+    """True when the segment is a build/test suite: a direct runner by name, or a package/build tool
+    with a build/test subcommand token in its real args."""
+    if exe in _DIRECT_RUNNERS:
+        return True
+    pat = _SUITE_RUNNERS.get(exe)
+    if pat is None:
+        return False
+    return any(pat.search(tok) for tok in rest)
+
+
+def _sleep_label(exe: str, rest: list[str]) -> str | None:
+    """Label for a long `sleep` (>= 10s) invoked as the command, else None. The first operand is the
+    duration; its unit suffix is parsed to seconds (`sleep 5m` = 300s)."""
+    if exe != "sleep" or not rest:
+        return None
+    m = _SLEEP_OPERAND.match(rest[0])
+    if not m:
+        return None
+    seconds = float(m.group(1)) * _SLEEP_UNIT_S[m.group(2)]
+    if seconds >= 10:
+        return f"sleep {m.group(1)}{m.group(2)} (long sleep)"
+    return None
+
+
+def _is_watch_flag(tok: str) -> bool:
+    """True for a real `--watch` flag token: `--watch`, `--watch=…`, or a hyphenated subform
+    `--watch-poll`/`--watch-mode`. This mirrors the old `--watch\\b` word-boundary match (a `-` is a
+    boundary) WITHOUT its substring leak: applied per real ARG TOKEN, a quoted argument that merely
+    CONTAINS `--watch` mid-string (`git commit -m 'wire --watch flag'`) is one token unequal to any of
+    these. A real flag token has NO whitespace, so a de-quoted MULTI-WORD message that happens to START
+    with `--watch-`/`--watch=` (`git commit -m '--watch-poll: new default'`) is rejected by the
+    whitespace guard — without it the prefix checks would re-open the #60 false-positive on such a
+    message. `--watcher`/`--watchAll` (a word char after `watch`, no boundary) are not flags, as before.
+    Residual (same quote-provenance class as the module docstring's RESIDUAL LIMITATION): a SINGLE-word
+    quoted arg that is exactly a flag (`echo "--watch=1"`) is indistinguishable from the real flag; and
+    conversely the whitespace guard UNDER-blocks a genuine `--watch="src dir"` value that contains a
+    space (de-quoted to one token WITH whitespace). Under-block is the safe direction for this
+    on_error=open discipline gate, and a watch flag taking a space-bearing value is rare."""
+    if any(ch.isspace() for ch in tok):  # de-quoted multi-word message, not a flag token
+        return False
+    return tok == "--watch" or tok.startswith("--watch=") or tok.startswith("--watch-")
+
+
+def _segment_long_process(segment: list[str]) -> str | None:
+    """Inspect one already-split command segment and return a long-process label, or None. Leading
+    shell noise, inline env assignments, and no-op wrappers are peeled so argv[0] is the REAL
+    invoked command before any keyword check runs."""
+    argv = _strip_wrappers(_split_inline_env(_strip_leading_shell_noise(segment)))
+    if not argv:
+        return None
+    exe = _basename(argv[0])
+    rest = argv[1:]
+    if exe == "review":
+        return "review (multi-model, minutes-long)"
+    if any(_is_watch_flag(tok) for tok in rest):
+        return "--watch (a watch loop never exits)"
+    if _is_suite(exe, rest):
+        return "a build/test suite"
+    return _sleep_label(exe, rest)
 
 
 def _matched_long_process(command: str) -> str | None:
-    """Return a short label of the matched long-running process, or None.
-
-    Each anchored pattern is tried against BOTH the raw command AND an unwrapped form (leading
-    wrappers like `timeout`/`env`/`nice`/`time` peeled off each segment). Unwrapping can only ADD
-    matches it would otherwise miss (`timeout 600 npm test`, `env CI=1 pytest`, `timeout 5m
-    review`) — never remove one the raw string would have caught, so wrapper-parsing slips or
-    whitespace normalization can't open a hole."""
-    unwrapped = _unwrap_command(command)
-
-    def hit(pat: re.Pattern[str]) -> bool:
-        return bool(pat.search(command) or pat.search(unwrapped))
-
-    if hit(REVIEW):
-        return "review (multi-model, minutes-long)"
-    if hit(WATCH):  # --watch can appear anywhere; raw is enough but unwrapped is harmless
-        return "--watch (a watch loop never exits)"
-    if hit(SUITE):
-        return "a build/test suite"
-    m = SLEEP.search(command) or SLEEP.search(unwrapped)
-    if m:
-        seconds = float(m.group(1)) * _SLEEP_UNIT_S[m.group(2)]
-        if seconds >= 10:
-            return f"sleep {m.group(1)}{m.group(2)} (long sleep)"
+    """Return a short label of the matched long-running process, or None. The command is shell-
+    tokenized (quotes/heredocs honored) and split into segments; each segment is inspected by its
+    REAL invoked command (`argv[0]` after peeling). A keyword inside a quoted argument to a different
+    command never trips the guard. An unparseable command (unbalanced quotes) returns None →
+    fail-open, consistent with this hook's on_error=open policy."""
+    tokens = _tokenize(command)
+    if tokens is None:
+        return None
+    for segment in _segments(tokens):
+        label = _segment_long_process(segment)
+        if label:
+            return label
     return None
 
 
