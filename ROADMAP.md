@@ -1,17 +1,19 @@
 # Agent CLI Ecosystem — Roadmap
 
-Status snapshot: **2026-06-26** (latest activity at the end of this file). This is the
-handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, `rig-cli`,
+Status snapshot: **2026-06-28** (newest session block first, right below the north-star). This is
+the handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, `rig-cli`,
 `draw-cli`, `3d-cli`, `task-cli`) + the `agent-tools` umbrella.
 
 > **Status legend:** ✅ = done AND CTO-reviewed · 🔬 = shipped/merged, AWAITING CTO review
 > (the CTO reserves ✅ for after he reviews) · 🔮 = building now (in-flight this turn, not yet
 > merged) · ⏭️ = skipped (with reason). A merged PR is 🔬, never ✅, until the CTO signs off.
 
-> **Reading order:** the AUTHORITATIVE current state is **§Remaining work (prioritized)** and the
-> **§Open-ticket ledger** below — start there. The two collapsed `📜 …` blocks are dated session
-> transcript (2026-06-15 → 06-17), kept for history; anything still open from them lives in the
-> ledger, so a folded section is not an assertion that it shipped.
+> **Reading order:** the AUTHORITATIVE current state is the **newest dated session block at the very
+> top** (currently **2026-06-27 → 06-28**), then **§Remaining work (prioritized)** and the **§Open-ticket
+> ledger** below. ⚠️ The dated session blocks lead; the lower §Remaining-work / §Open-ticket ledger lag
+> behind the newest block and may still list items the top block has since shipped — when they disagree,
+> the newest dated block wins. The two collapsed `📜 …` blocks are older dated transcript (2026-06-15 →
+> 06-17), kept for history; a folded section is not an assertion that it shipped.
 
 > **North-star architecture (DECIDED — do not re-litigate):** the whole CLI ecosystem is
 > **Python-only**. `tg-cli` (currently Bun/TS) migrates to Python **LAST**. The shared
@@ -19,6 +21,91 @@ handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, `rig
 > New tools are built in Python on that lib so a new tool spins up fast on one architecture.
 > `rig` is the front door (`rig init` onboarding, `rig apply` reconcile — two distinct commands,
 > interactivity orthogonal). `agent-tools` = WHAT (the catalog), `rig` = HOW (installs it).
+
+---
+
+## 2026-06-27 → 06-28 — shipped this session (🔬 under CTO review)
+
+*Every **PR** below is **MERGED on each repo's `origin/main`** and is marked 🔬 (awaiting CTO review),
+NOT ✅ — the CTO signs off to ✅ (the "Not a PR" subsection is non-PR machine/config changes, not merges).
+The 🔮 / REMAINING blocks at the end are work still in flight or gated. Grouped by area; ~20 PRs across
+the ecosystem. Headline of the session: the **q&a forwarding
+bridge is fixed and LIVE end-to-end**, the **tg HTML→PDF render path is fixed + hardened**, and the
+**agent-tools CI gates + a NEW anti-wedge agent-hook** landed and are live on the machine.*
+
+### tg-cli — 🔬 under review (all MERGED) — q&a bridge LIVE + HTML/PDF render
+
+- 🔬 **#98** — q&a bridge: stop the **duplicate `AskUserQuestion` card** (a forwarded question rendered
+  twice). Part of getting the q&a forwarding bridge correct end-to-end.
+- 🔬 **#101** — q&a bridge: fix the **120s tap-loss** — a button tap arriving after the idle window is no
+  longer dropped; **pane-inject + lossless daemon restart** so an in-flight answer survives a restart.
+  With #98 this makes the q&a forwarding bridge **fixed and LIVE**.
+- 🔬 **#96** — `tg --format html` + the `--file *.md` → **PDF render path** emits RENDERED Telegram-allowed
+  tags / a formatted PDF instead of raw tag-soup text. Closes the prior 🔮 "tg HTML→PDF raw-tags" item.
+- 🔬 **#105** — md→PDF **security hardening**: **DNS-blackhole** the renderer's network + drop
+  `--embed-resources` so a malicious `.md` can't exfiltrate or pull remote assets during PDF render.
+
+### agent-tools — 🔬 under review (all MERGED) — CI gates + NEW anti-wedge hook
+
+- 🔬 **#131** *(resolves #129)* — CI-gate fixes wave.
+- 🔬 **#133** — leftover-marker grep: **two-dot fallback** so the leftover-grep gate works where the
+  three-dot diff range is unavailable.
+- 🔬 **#134** — **re-run the review-threads check on `review`-type events** so resolving a thread refreshes
+  the status (the stale review-threads-status footgun).
+- 🔬 **#132** — `no-long-inline-process` made **argv-aware** (parse the command, don't raw-match) so it
+  scopes the long-process block correctly.
+- 🔬 **#135** — **NEW `subagent-no-bg-longproc` anti-wedge agent-hook**: blocks a subagent backgrounding
+  `review` / a long process (the exact wedge that strands a subagent mid-turn). **Live on the machine.**
+
+### rig-cli — 🔬 under review (all MERGED) — rig-init redesign + install UX
+
+- 🔬 **#80** — `uv` install hints + a **condensed plan** output (clearer apply UX).
+- 🔬 **#82** *(v0.3.0)* — **`rig init` redesign**: bare `rig init` = **PREVIEW, non-destructive**;
+  `--yes` scaffolds; `--yes --apply` scaffolds **and** applies. The non-destructive-by-default front door.
+
+### review-cli — 🔬 under review (all MERGED) — OpenRouter + review-qa Tier-1 (catches the q&a bug class)
+
+- 🔬 **#89** — **OpenRouter backend** (a new board transport / model source).
+- 🔬 **#85 / #87** — **review-qa Tier-1**: the qa suite + the **agent-side driver**, RED→GREEN — it
+  reproduces and catches the **q&a bug class** that tg-cli #98/#101 fixed (the harness now guards the
+  forwarding bridge against regression).
+
+### bots — 🔬 under review (all MERGED) — real-fixes wave (un-provisioned bots SKIPPED per CTO)
+
+- 🔬 **ExpenseSyncBot #104**, **garage-band #3**, **HyperSummaryBot #8**, **HyperCalendarBot #100** — real
+  bug-fixes on the live bot repos. ⏭️ **4 un-provisioned bots SKIPPED** per the CTO (no rollout without a
+  per-repo OK).
+
+### research-cli — 🔬 under review (MERGED) — spin-out populated
+
+- 🔬 **#5** — the **standalone `research-cli` spin-out is populated** (the strategy-B standalone CLI now has
+  its content). Unblocks the research-cli env-desync follow-ups (#2 / #6). Closes the prior 🔮 spin-out item.
+
+### Not a PR — 🔬 under review (machine/config changes this session)
+
+- 🔬 **Activation done** — the personal CLIs + the machine agent-hooks are **live** (the new
+  `subagent-no-bg-longproc` hook fires), **rig is at 0.3.0**, and the **egg-info version-shadow** that masked
+  the live `--version` is fixed.
+
+### 🔮 / REMAINING — still in flight or gated (NOT shipped this session)
+
+**In flight:**
+- 🔮 **rig-cli #68** — `rig` **TUI auto-install** (in flight).
+
+**(C) Creds / infra-gated — the one CTO-blocker:**
+- ⛔ **review-qa Tier-2 LIVE tier is BLOCKED on CTO MTProto creds** — needs `TG_TEST_API_ID`,
+  `TG_TEST_API_HASH`, `TG_TEST_SESSION`, `TG_TEST_CHAT_ID` (a dedicated test Telegram account). Tier-1 is
+  green; Tier-2 cannot run without these. **The key CTO-gated action for live q&a regression testing** (the
+  06-22→06-26 "(C)" block also tracks the rest of the Tier-2 surface — review-cli #82 visual diffing,
+  screenshot infra, curated SUT repos).
+
+**(D) Small / tracked — bounded follow-ups, just need a turn:**
+- **ship.sh `-R` flag** — let `gh ship` target a repo explicitly.
+- **research-cli #2 / #6** — env-desync follow-ups (unblocked now that #5 populated the spin-out).
+- **worktree / daemon-stray hygiene** — sweep orphan worktrees + stray daemons.
+- **rig egg-info-shadows-version** — the editable-install egg-info that can shadow `--version` (fixed on
+  this machine; needs to be guarded so it can't recur).
+- **tg-ctl forum-topics** — the remaining forum-topics wiring.
 
 ---
 
@@ -237,16 +324,18 @@ called out per-repo below.*
   (model-freshness → shared `agenttools_errors`); **rig-cli #5** (repo security settings at init/apply),
   **#6** (auto-mode is user-level `auto`, not a committed project bypass — see the line-513 correction).
 
-### 🔮 IN FLIGHT — building NOW this turn (NOT merged; do not read as shipped)
+### 🔮 IN FLIGHT — building NOW this turn (as of 06-26; first two now SHIPPED — see the 06-28 block at top)
 
-- 🔮 **research-cli spin-out — strategy B** (standalone CLI) — creating `alex-mextner/research-cli` and
-  vendoring the shared lib with a drift-guard (the same pattern task-cli uses), so the spin-out needs no
-  CTO PyPI account. If the harness-safety layer blocks the repo-CREATE action, it surfaces for a per-action
-  OK. Advances §6 research-cli + the (B) "research-cli spin-out" call below.
-- 🔮 **tg-cli HTML→PDF raw-tags fix** — `tg --format html` (and the file→PDF path) currently dumps the raw
-  HTML report as TEXT — raw `<b>`/`<code>` show up instead of rendered formatting. Root cause: the
-  HTML-report body is emitted as plain text instead of rendering the Telegram-allowed tags. Fixing the
-  render path so a rich report and a `--file *.md` PDF come out formatted, not as tag soup.
+> **SUPERSEDED (2026-06-28):** the first two 🔮 items below **SHIPPED** in the 06-27→06-28 wave — do NOT
+> resume them. research-cli spin-out B → research-cli **#5** (spin-out populated); tg HTML→PDF raw-tags →
+> tg-cli **#96** (render path) + **#105** (md-pdf security). Both are recorded as 🔬 in the top 06-28 block.
+
+- 🔬 **research-cli spin-out — strategy B** (standalone CLI) — **SHIPPED (research-cli #5)**: the
+  standalone `alex-mextner/research-cli` is populated (vendored shared lib + drift-guard, the task-cli
+  pattern, no CTO PyPI account). Advances §6 research-cli + the (B) "research-cli spin-out" call below.
+- 🔬 **tg-cli HTML→PDF raw-tags fix** — **SHIPPED (tg-cli #96, hardened by #105)**: `tg --format html`
+  and the `--file *.md`→PDF path now emit RENDERED Telegram-allowed tags / a formatted PDF instead of raw
+  tag soup; #105 adds md-pdf security (DNS-blackhole + drop `--embed-resources`).
 - 🔮 task-cli **daemon service + webhooks** (task-cli#2) — Phase 2, daemon FOUNDATION shipped
   (#26/#33/#35/#40), the webhook/adapter half still open (queued, not building this turn).
 
