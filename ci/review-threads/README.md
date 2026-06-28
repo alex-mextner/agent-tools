@@ -70,6 +70,15 @@ trigger, so the check won't auto-flip back to green on its own. Push a commit, r
 re-counts at merge time. Staying red until then is conservative — it never lets an unresolved
 thread merge, it only delays the green.
 
+**The vacuous-pass gap (questions that never had time to form):** this check counts *unresolved*
+threads, so "0 unresolved" is also true when **no review has posted yet**. On its own it can't
+stop a PR opened and merged within seconds, before any async (multi-model / CI-AI / human) review
+forms its questions. The [ship preflight](../ship/) closes that with a **review-dwell window**
+(`SHIP_REVIEW_DWELL`, default 600s): it refuses to merge until enough time has elapsed since the
+last push for review to land — at which point whatever it posts becomes a thread this gate then
+forces resolved. The two compose: dwell gives comments **time to form**, this gate forces them
+**resolved**.
+
 ## Security note — tamper-resistant
 
 A merge-BLOCKING gate must not run a script the PR can edit (a PR could weaken its own

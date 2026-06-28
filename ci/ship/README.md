@@ -19,6 +19,7 @@ that isn't actually ready even with a one-liner.
 | Any CI check failing | The green-CI gate (gates on ALL checks). |
 | CI still running | Ship **watches** pending checks to completion (polls every `SHIP_CI_POLL`s up to `SHIP_CI_WAIT`s) instead of refusing — you don't babysit. |
 | Unresolved review threads | Same check as [`../review-threads/`](../review-threads/). |
+| **PR younger than the review-dwell window** | Closes the premature-merge gap: the unresolved-threads check above only fails when threads *already exist*, so "0 unresolved threads" is **vacuously true** before any review has posted — a PR opened and shipped within seconds passes it without a single question forming. The dwell gate refuses until at least `SHIP_REVIEW_DWELL` seconds (default **600 / 10 min**) have elapsed since the PR's last code push, giving async review (multi-model / CI-AI / human) time to form its comments (which then become threads the check above forces resolved). Runs **independently of `--skip-ci`**. Window starts at `max(createdAt, head-commit committedDate)` so a new push restarts it. Disable with `SHIP_REVIEW_DWELL=0`; override one ship with `--no-review-dwell-ok <reason>` (logged). Fail-closed: unreadable/unparseable timestamps refuse. |
 | UI-touching PR with no screenshot | Same check as [`../screenshots/`](../screenshots/); override with `--no-screenshot-ok`. |
 | **Shippable source changed but the version is UNCHANGED** | A ship of source is a release; the declared version (`pyproject.toml` `version`/`package.json` `"version"`) must be bumped so `--version` stays a real freshness signal (skill: `bump-version-on-release`). Docs-only / pure test/CI PRs are exempt. Override a genuine no-release ship with `--no-version-bump-ok <reason>` (or `SHIP_SKIP_VERSION_BUMP=1`). |
 | Local branch has unpushed/diverged commits, or dirty worktree | Avoids merging stale/uncommitted local state. |
@@ -58,6 +59,7 @@ Nothing org-/tracker-/layout-specific is hard-coded. Configure via env:
 | `SHIP_IMAGE_UPLOAD_CMD` | (unset) | Optional uploader for `--screenshot`: a command that takes the image (`{FILE}` token or `$1`) and prints a public URL. Without it, `--screenshot` just embeds a local-path note. |
 | `SHIP_SKIP_VERSION_BUMP` | (unset) | `=1` overrides the version-bump gate (env equivalent of `--no-version-bump-ok`). |
 | `SHIP_VERSION_FILES` | auto-detect | Space-separated version files to check (relative to repo root). Default: `pyproject.toml` then `package.json` at the root. Set for a non-standard layout. |
+| `SHIP_REVIEW_DWELL` | `600` | Minimum seconds since the PR's last code push before a merge is allowed, so async review has time to **form** its comments. `0` disables the gate. |
 
 ## Flags
 
@@ -67,6 +69,8 @@ Nothing org-/tracker-/layout-specific is hard-coded. Configure via env:
 - `--no-screenshot-ok <reason>` — override the UI screenshot requirement, logged.
 - `--no-version-bump-ok <reason>` — override the version-bump requirement for a genuine
   no-release ship (docs-only, pure test/CI, a revert), logged.
+- `--no-review-dwell-ok <reason>` — fast-track past the review-dwell window for a genuine
+  trivial/urgent merge, logged (the reason is printed to the ship log).
 - `--screenshot <path> [desc]` — upload (via `SHIP_IMAGE_UPLOAD_CMD`) and post a screenshot
   as a PR comment; repeatable.
 
@@ -81,6 +85,6 @@ want tracker integration back, set `SHIP_IMAGE_UPLOAD_CMD` to your tracker's att
 ## When to use
 
 When you merge PRs from the CLI and want the merge to be impossible unless the PR is green,
-its threads resolved, and (for UI) its screenshot present — without trusting yourself to
-remember. The CI workflows in this directory are the server-side backstop; `ship` is the
-client-side gate.
+its threads resolved, a review-dwell window elapsed (so review questions had time to form),
+and (for UI) its screenshot present — without trusting yourself to remember. The CI workflows
+in this directory are the server-side backstop; `ship` is the client-side gate.
