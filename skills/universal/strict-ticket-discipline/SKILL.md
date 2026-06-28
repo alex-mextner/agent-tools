@@ -1,6 +1,6 @@
 ---
 name: strict-ticket-discipline
-description: Use before starting any non-trivial change — a feature, a bugfix, a refactor — and whenever you file a ticket or tracked task. Every change starts from a ticket (task-cli / GitHub Issue / Linear) written before work and referenced from the commit. The ticket must be self-explanatory cold: what is concretely wrong, evidence captured FIRST (a Playwright/Docker screenshot of the broken state, never screencapture; a failing run; a repro), where it came from, the user-facing consequence of not fixing it, provable acceptance criteria, and pseudocode when the fix is non-obvious.
+description: Use before starting any non-trivial change — a feature, a bugfix, a refactor — and whenever you file a ticket or tracked task, and before closing a ticket or checking off an acceptance criterion. Every change starts from a ticket (task-cli / GitHub Issue / Linear) written before work and referenced from the commit. The ticket must be self-explanatory cold: what is concretely wrong, evidence captured FIRST (a Playwright/Docker screenshot of the broken state, never screencapture; a failing run; a repro), where it came from, the user-facing consequence of not fixing it, provable acceptance criteria, and pseudocode when the fix is non-obvious. Plus five documentation rules: links-not-bare-ids, no close with unchecked acceptance boxes, no checked box without a visual proof, at least 2 criteria, and a plain-language user-impact.
 ---
 
 # Every non-trivial change starts from a ticket
@@ -70,6 +70,117 @@ thing. A vague ticket gets rejected. Write these sections, **in this order**:
 
 This standard applies to Linear tickets, `TaskCreate` / `task` tasks, GitHub issues,
 and any other tracked work item.
+
+## The five documentation rules
+
+The evidence-first standard above is *what to write*. These five rules are the
+*enforced shape* of that writing — they make a sloppy ticket rejectable instead of
+relying on goodwill. The mechanical checks are being added to the ticket CLI (task-cli)
+as the companion change to this skill; once wired, task-cli runs them at
+create / update / close / check time. Until then — and on any harness without that CLI —
+this skill is the discipline you hold yourself to, and the
+`require-ticket-before-commit` agent-hook still enforces the commit-side half of rule 1
+(a commit must reference a ticket). Rules 1–4 are
+**mechanically checkable** (a link is present, every box is checked, each box has an
+attached proof, the criterion count is ≥2). Rule 5 is qualitative: the CLI can enforce
+its *presence and minimum substance* (a non-empty user-impact that isn't a one-line
+title-restate), but whether the prose is genuinely plain-language and full-context is a
+review judgment — treat rule 5 as a guideline the reviewer holds, not a hard machine
+verdict. Four rules carry a deliberate `--force "<reason>"` escape, for two different
+reasons: for rule 1 it clears a *false positive* (the matcher fired on text that isn't
+really an entity); for rules 3, 4, and 5 it records a *legitimate exception* where the
+check fired correctly but there's an honest reason to proceed (a criterion with no visual
+surface; a genuinely atomic single-criterion change; a genuinely one-line internal-only
+user-impact). Rule 2 has no `--force`; instead a criterion is explicitly struck with a
+recorded reason. Either way the reason is mandatory and recorded, so every escape is
+auditable, not silent.
+
+1. **Every related entity is a LINK, never a bare reference.** Every ticket, PR,
+   commit, or repo a ticket body mentions must be a real clickable link — a full URL or
+   a markdown link — never bare plain text. The tooling flags anything in the body
+   that *reads as* a related-entity reference — a ticket key, an issue/PR number, a commit
+   SHA, a repo — when it is not already a link, and blocks until each bare one is wrapped in
+   a link. Text already wrapped as a markdown link or a bare URL is left alone, so a
+   correctly-linked entity never re-triggers. An entity-shaped token anywhere else still
+   flags — *including inside backticks*, so a bare `` `HYP-789` `` is not a silent loophole.
+   The match deliberately errs toward flagging, so genuine false matches happen — a version
+   or build id that reads like a SHA, a slash-word (`and/or`, a `path/like` token) that reads
+   like a repo, an acronym that reads like a ticket key, a file path caught as an `org/repo`.
+   `--force "<reason>"` clears exactly those — with a recorded reason, never by hiding the
+   token in code — and the reason names which one it is. **Why:** a bare `HYP-789` in a ticket body is a dead
+   end — the reader has to guess the tracker, copy the string, and search. A link is one
+   tap, and it carries live state (open / closed / merged) the bare id can never show.
+
+2. **A ticket cannot be CLOSED while any acceptance-criterion box is unchecked.**
+   Closing *is* the assertion "every acceptance criterion is met." An unchecked box
+   makes that assertion false, so the close is refused until the box is checked (or the
+   criterion is explicitly struck with a recorded reason). **Why:** a ticket closed with
+   unchecked boxes silently drops scope — the unmet criterion vanishes the moment the
+   ticket closes, and nobody notices until the user hits the gap.
+
+3. **A box cannot be CHECKED without an attached visual proof.** Checking an
+   acceptance box is a claim that the criterion is *verifiably* met; the claim needs a
+   **visual** artifact — a screenshot, a screen recording, or rendered output — attached
+   to or linked from that criterion. `--force "<reason>"` covers the case where a visual
+   proof is genuinely impossible or impractical (a pure-logic criterion proven by a named
+   passing test, an infra change with no rendered surface), and the reason must name the
+   alternative proof — so a non-visual proof like a named test passes *through the
+   escape*, not the default path. **Why:** a checked box with no proof is just an assertion, and
+   assertions regress. This is `visual-proof-cycle` / `adversarial-verification` applied
+   per criterion: prove it with an artifact, not "correct by construction".
+
+4. **A ticket must have at least 2 acceptance criteria.** One criterion is almost
+   always an under-specified ticket that restates its own title as a single "make it
+   work" box. Two or more forces you to split *done* into separately verifiable
+   conditions — the happy path **and** its boundary, the new behavior **and** the thing
+   it must not break. `--force "<reason>"` covers the rare genuinely atomic change with
+   one honest criterion. **Why:** a single criterion hides the edges; the bug always
+   lives in the edge the one-liner never named.
+
+5. **User-impact is plain-language, detailed, full-context.** Write the user-impact
+   for someone only *weakly* familiar with the product. Describe the consequence in the
+   user's-world terms — what they see, do, or lose — not in internal jargon, component
+   names, or ticket-speak. Give the full context: what the user was trying to do, what
+   happens instead, and why it matters to them. The CLI checks that the section is
+   present and substantive (not empty, not a one-line restate of the title); `--force
+   "<reason>"` covers a flagged-but-acceptable case (e.g. an internal-only change whose
+   honest impact really is one line). The quality itself — *is this actually
+   plain-language?* — is the reviewer's call. **Why:** the user-impact is read by the
+   people who set priority and who do *not* live in the code — a PM, a support lead, the
+   CTO on a phone. Jargon tells them nothing; a concrete scenario tells them everything.
+
+### Good vs bad (the `HYP-789` ticket)
+
+**Bad** — bare references, unprovable boxes, one criterion, jargon impact:
+
+> **Related:** Blocked by HYP-789, see #4321, regressed by a1b2c3d, all in acme/api.
+> **Acceptance:** [ ] reconciler no longer skips a tick.
+> **User-impact:** Debounce race in the canvas reducer drops the trailing patch → stale vnode.
+
+Four bare references the matcher flags (`HYP-789`, `#4321`, `a1b2c3d`, `acme/api`) — none
+is stored as an explicit link (platform auto-linking, where it happens at all, is not
+enough — rule 1 wants the link written in); a single box with no proof and no way to
+verify; an impact line only the author understands.
+
+**Good** — links, ≥2 provable boxes with proof, plain-language impact:
+
+> **Related:** Blocked by [HYP-789](https://linear.app/acme/issue/HYP-789); see
+> [#4321](https://github.com/acme/api/pull/4321); regressed by
+> [a1b2c3d](https://github.com/acme/api/commit/a1b2c3d), all in
+> [acme/api](https://github.com/acme/api).
+> **Acceptance:**
+> - [x] Typing fast then immediately clicking Save persists the last keystroke — proof: a before-and-after screenshot from e2e `save-debounce.spec.ts`.
+> - [x] An existing slow-typed save still works unchanged — no rendered surface; proven by the named regression run `save-existing.spec.ts`.
+> **User-impact:** When you edit a component and hit Save quickly, the last edit
+> sometimes doesn't get saved. You see no error — the file just silently keeps the old
+> content, so you lose work and don't find out until later, when you reopen the file and
+> your change is gone.
+
+The `--force "<reason>"` escapes are **arguments to the ticket CLI's commands**
+(create / update / close / check) — the tool records the reason on the action. You do not write the literal
+`--force …` string into the ticket body. The second box above has a test, not a visual,
+as its proof, so it was checked *through* that escape — the body states the proof, the
+CLI records the `--force` reason.
 
 ## What counts as "non-trivial"
 

@@ -106,6 +106,37 @@ command (`REQUIRE_TICKET_SKIP=1 echo x; git commit …`) does **not** bypass the
 - `REQUIRE_TICKET_EXEMPT_TYPES="chore,docs"` — override the exempt commit-type set
   (comma-separated; replaces the default list).
 
+## Relationship to the five ticket-documentation rules
+
+The `strict-ticket-discipline` skill defines five documentation rules. This
+hook owns exactly **one half of one of them**; the rest are not reachable from a
+`pre-bash` commit gate. Stated plainly so nobody expects this hook to do more than it can:
+
+- **Rule 1 (every related entity is a LINK) — commit-side only, and already covered.**
+  This hook enforces the part of rule 1 that *is* visible at commit time: a non-chore
+  commit must carry at least one resolvable ticket/PR reference. It deliberately accepts
+  the **bare canonical refs** (`#123`, `ENG-456`, `org/repo#12`, a full URL) and does
+  **not** demand a literal hyperlink in the commit subject. The commit-side and body-side
+  halves of rule 1 differ because of the *medium*, not auto-linking: a commit subject is
+  plain text by git convention, where a markdown hyperlink is non-idiomatic and a bare URL
+  is noise, so the canonical short ref *is* the accepted linkable form (the platform
+  resolves it on render). A ticket body is authored rich text, where a real link is both
+  expected and a single keystroke away — so there a bare id is a dead end, and rule 1's
+  *in-body* form (below) demands an actual link. Forcing a full URL into every commit
+  subject would fight git convention and override the chore exemptions for zero added
+  clickability — over-reach.
+- **Rules 2–5 are CLI-side, by construction.** A `pre-bash` hook sees only the commit
+  *command* (its message and the branch name). It has **no access to the ticket body** —
+  it cannot read acceptance-criterion checkboxes, the proofs attached to them, the
+  criterion count, or the user-impact prose. So rule 2 (no close with an unchecked box),
+  rule 3 (no checked box without a visual proof), rule 4 (≥2 acceptance criteria), rule 5
+  (plain-language user-impact) — and rule 1's in-body link rendering — belong to the
+  **ticket CLI (task-cli)**, which checks them at ticket create / update / close / check
+  time where the structured body is actually available. Those CLI checks are the companion
+  change to the skill; until task-cli is wired (and on any harness without it) the skill
+  carries the discipline. This hook is just the commit-time tripwire that a change
+  references a ticket at all.
+
 ## Why an agent-hook
 
 The check has to happen *before* the commit, mid-session, while you can still add the
