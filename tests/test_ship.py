@@ -1199,5 +1199,194 @@ def test_core_bare_fix_command_is_paste_safe_for_special_path(tmp_path):
     )
 
 
+# ---------------------------------------------------------------------------------------
+# CI-down detection and local fallback gate (task #75)
+#
+# ship.sh can detect when ALL (or ≥ 80%) CI checks fail due to a structural GitHub Actions
+# outage and run a local fallback gate instead of blocking the merge. Tests here use:
+#   SHIP_TEST_CI_DOWN=1  — force-trigger ci_appears_structurally_down() without network
+#   SHIP_LOCAL_TEST_CMD  — override the auto-detected test runner command
+#   SHIP_TEST_DIFF       — inject custom diff text for the leftover-marker check
+#
+# The fake gh for these tests returns two FAILED checks (100% failure rate), answers
+# the local-gate sub-queries (review threads → 0, PR body → empty, diff → configurable),
+# and the GraphQL review-threads gate (→ 0 unresolved).
+# ---------------------------------------------------------------------------------------
+
+# Fake gh that returns two failed CI checks + clean local-gate answers.
+# SHIP_TEST_DIFF controls what `gh pr diff` returns (defaults to a clean line).
+_FAKE_GH_CIDOWN = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          # Two checks, both FAILED — 100% failure rate.
+          printf '[{"name":"pytest","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"codeql","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"}]'
+        elif printf '%s ' "$@" | grep -q reviewThreads; then
+          # _local_review_threads_check uses --jq (not processed by fake); output the count.
+          echo "0"
+        elif printf '%s ' "$@" | grep -q body; then
+          echo ""
+        else
+          echo '[]'
+        fi ;;
+      diff)
+        if printf '%s ' "$@" | grep -q -- --name-only; then
+          printf 'src/a.py'
+        else
+          printf '%s\\n' "${SHIP_TEST_DIFF:-+new line without markers}"
+        fi ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged" ;;
+      *) : ;;
+    esac ;;
+  api) echo 0 ;;
+  *) : ;;
+esac
+"""
+
+# Fake gh that returns ONE failed + ONE passing check (50% failure — below 80% threshold).
+_FAKE_GH_PARTIAL_FAIL = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          printf '[{"name":"pytest","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"lint","conclusion":"SUCCESS","status":"COMPLETED","state":"SUCCESS"}]'
+        else
+          echo '[]'
+        fi ;;
+      diff)
+        if printf '%s ' "$@" | grep -q -- --name-only; then printf 'src/a.py'; else printf '+ok'; fi ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged" ;;
+      *) : ;;
+    esac ;;
+  api) echo 0 ;;
+  *) : ;;
+esac
+"""
+
+
+def _fake_gh_cidown_dir(tmp_path: Path) -> Path:
+    bindir = tmp_path / "bincd"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_CIDOWN, encoding="utf-8")
+    gh.chmod(0o755)
+    return bindir
+
+
+def _fake_gh_partial_fail_dir(tmp_path: Path) -> Path:
+    bindir = tmp_path / "binpf"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_PARTIAL_FAIL, encoding="utf-8")
+    gh.chmod(0o755)
+    return bindir
+
+
+def _run_ship_cidown(main: Path, bindir: Path, env_extra: dict | None = None):
+    """Run ship.sh without --skip-ci (CI gate fires) but with --no-screenshot-ok."""
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    if env_extra:
+        env.update(env_extra)
+    return _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        cwd=main, env=env,
+    )
+
+
+def test_cidown_local_gate_passes_merges(repo_with_pr_worktree, tmp_path):
+    """CI-down path: all checks fail, SHIP_TEST_CI_DOWN=1 forces detection, local tests
+    pass (SHIP_LOCAL_TEST_CMD=true) → ship falls through to merge."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",  # trivially-passing stand-in for the test suite
+    })
+
+    assert r.returncode == 0, (
+        f"ship must succeed when CI-down gate passes\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    # The detection path must have fired — proves we took the right branch.
+    assert "CI infrastructure appears structurally unavailable" in r.stderr, r.stderr
+    # The local gate must have reported success (success message goes to stdout).
+    assert "ALL gates passed" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_tests_fail_blocks(repo_with_pr_worktree, tmp_path):
+    """CI-down path: SHIP_TEST_CI_DOWN=1, but local tests FAIL → ship refuses."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "false",  # always fails
+    })
+
+    assert r.returncode != 0, (
+        f"ship must refuse when local tests fail\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "Local CI fallback: FAILED" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_leftover_markers_block(repo_with_pr_worktree, tmp_path):
+    """CI-down path: local tests pass but PR diff has a TODO leftover → local gate fails."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        # Inject a diff addition with a TODO leftover marker
+        "SHIP_TEST_DIFF": "+new code  # TODO: clean this up later",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must refuse when leftover markers found\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_partial_ci_failure_below_threshold_blocks_normally(repo_with_pr_worktree, tmp_path):
+    """One of two checks failed (50%): below the 80% threshold, so ci_appears_structurally_down
+    returns false and ship blocks with the normal CI-failure message (no local fallback)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_partial_fail_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir)
+
+    assert r.returncode != 0, (
+        f"ship must refuse on a genuine partial CI failure\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    # Normal CI-failure block: no local gate or CI-down messaging.
+    assert "CI infrastructure appears structurally unavailable" not in r.stderr, r.stderr
+    assert "local fallback" not in r.stderr.lower(), r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
