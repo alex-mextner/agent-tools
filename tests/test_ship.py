@@ -86,7 +86,7 @@ def repo_with_two_worktrees(tmp_path):
         pytest.skip("bash/git required")
 
     origin = tmp_path / "origin.git"
-    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
 
     main = tmp_path / "main"
     main.mkdir()
@@ -182,7 +182,7 @@ def test_worktree_path_with_space_is_collected(tmp_path):
         pytest.skip("bash/git required")
 
     origin = tmp_path / "origin.git"
-    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
 
     main = tmp_path / "main"
     main.mkdir()
@@ -219,7 +219,7 @@ def repo_with_pr_worktree(tmp_path):
         pytest.skip("bash/git required")
 
     origin = tmp_path / "origin.git"
-    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
 
     main = tmp_path / "main"
     main.mkdir()
@@ -390,7 +390,7 @@ def repo_with_pyproject(tmp_path):
         pytest.skip("bash/git required")
 
     origin = tmp_path / "origin.git"
-    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
 
     main = tmp_path / "main"
     main.mkdir()
@@ -572,7 +572,7 @@ def repo_with_package_json(tmp_path):
         pytest.skip("bash/git required")
 
     origin = tmp_path / "origin.git"
-    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
     main = tmp_path / "main"
     main.mkdir()
     _git("init", "-q", "-b", "main", cwd=main)
@@ -671,7 +671,7 @@ def test_ship_version_files_override_locates_nested_manifest(tmp_path):
         pytest.skip("bash/git required")
 
     origin = tmp_path / "origin.git"
-    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
     main = tmp_path / "main"
     (main / "pkg").mkdir(parents=True)
     _git("init", "-q", "-b", "main", cwd=main)
@@ -1468,7 +1468,7 @@ def repo_with_stash_conflict(tmp_path):
 
     # --- bare origin ---
     origin = tmp_path / "origin.git"
-    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
 
     # --- main checkout seeded at origin/main ---
     main = tmp_path / "main"
