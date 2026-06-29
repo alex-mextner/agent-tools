@@ -177,6 +177,36 @@ only) and still runs the other preflights.
 
 ---
 
+## Client-side vs. server-side enforcement (and why `ship` is not enough)
+
+`ship.sh` and the `block-raw-pr-merge` agent-hook are **client-side** gates: they re-check
+green-CI / unresolved-threads / screenshot / version-bump *in the session*, before merging.
+They are **bypassable** — a merge from the **GitHub web UI**, a raw `gh pr merge` from an
+**uninstrumented shell** (no agent-hooks loaded), or any tool that isn't `gh ship` never runs
+them, so nothing is checked. That is not a hypothetical: hyper-saas **#543** squash-merged
+through **red CI, an open review thread, and no screenshot** precisely because the client gate
+was bypassed and there was **no server-side** enforcement behind it.
+
+**Durable enforcement is server-side**, on the merge button itself: GitHub **branch
+protection** with the `tier: block` gate contexts listed as **required status checks**, plus
+**require-conversation-resolution**, required reviews, and `enforce_admins`. A `tier: block`
+CI workflow alone only goes **red** — it does **not** block the merge until its check is
+promoted to *required*. That promotion is a server-side admin action this catalog documents
+but cannot itself perform; **rig-cli#5** provisions it from a `github:` block in `rig.yaml`
+(required_status_checks derived from the enabled block-tier gates,
+`required_conversation_resolution`, `enforce_admins`, required reviews — see the
+[Client-side vs. server-side enforcement](README.md#client-side-vs-server-side-enforcement-the-543-gap)
+section in the README for the schema/example). The catalog is the **what** (gates + this
+policy); the reconciler that flips the server-side switches lives in rig-cli (#5).
+
+The block-tier merge-gate READMEs in [`ci/`](ci/) — `tests`, `review-threads`,
+`leftover-grep`, `pr-checklist`, `dependency-review`, `screenshots` — now carry this note: a
+`tier: block` workflow is a red light, not a merge block, until it is a **required status
+check under server-side branch protection** (the same applies to the security gates —
+secret-scan, sast, codeql, trivy, license-policy — when you run them as required).
+
+---
+
 ## The universal skills layer: where mandatory behavior lives (don't restate it here)
 
 `skills/universal/*` are the cross-project skills, and the global `rig` config selects them by
