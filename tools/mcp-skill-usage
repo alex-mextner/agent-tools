@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""MCP and skill usage analytics — parse Claude Code session transcripts."""
+import argparse
+import datetime
+import glob
+import json
+import os
+import sys
+
+WORK_TOOLS = {"Bash", "Edit", "MultiEdit", "Write", "Agent", "Task"}
+LOOK_AHEAD = 10  # window to check for productive follow-up
+
+
+def _parse_date(ts):
+    return ts[:10] if ts and len(ts) >= 10 else ""
+
+
+def _display_name(name, inp):
+    if name.startswith("mcp__"):
+        return name
+    if name == "Skill":
+        skill = inp.get("skill", "")
+        return f"Skill:{skill}" if skill else None
+    return None
+
+
+def iter_session_tools(jsonl_path):
+    """Yield (date_str, raw_name, display_name) for each relevant tool_use."""
+    try:
+        with open(jsonl_path, errors="ignore") as fh:
+            for line in fh:
+                if '"tool_use"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "assistant":
+                    continue
+                date = _parse_date(obj.get("timestamp", ""))
+                for item in obj.get("message", {}).get("content", []):
+                    if isinstance(item, dict) and item.get("type") == "tool_use":
+                        raw = item.get("name", "")
+                        disp = _display_name(raw, item.get("input") or {})
+                        yield date, raw, disp
+    except OSError:
+        return
+
+
+def _process_session(jf, cutoff, stats):
+    tools = list(iter_session_tools(jf))
+    if not tools:
+        return
+    all_raws = [r for _, r, _ in tools]
+    for pos, (date, raw, disp) in enumerate(tools):
+        if (cutoff and date < cutoff) or disp is None:
+            continue
+        lookahead = all_raws[pos + 1: pos + 1 + LOOK_AHEAD]
+        effective = any(n in WORK_TOOLS for n in lookahead)
+        e = stats.setdefault(disp, {"calls": 0, "sessions": set(), "last": "", "hits": 0, "total": 0})
+        e["calls"] += 1
+        e["sessions"].add(jf)
+        if date > e["last"]:
+            e["last"] = date
+        e["hits"] += int(effective)
+        e["total"] += 1
+
+
+def collect_stats(projects_dir, cutoff):
+    stats = {}
+    try:
+        dirs = os.listdir(projects_dir)
+    except OSError:
+        return stats
+    for proj in dirs:
+        pp = os.path.join(projects_dir, proj)
+        if os.path.isdir(pp):
+            for jf in glob.glob(os.path.join(pp, "*.jsonl")):
+                _process_session(jf, cutoff, stats)
+    return stats
+
+
+def format_table(stats, top_n):
+    if not stats:
+        return "No data found."
+    rows = sorted(
+        ((s["calls"], d, len(s["sessions"]), s["last"],
+          round(100 * s["hits"] / s["total"]) if s["total"] else 0)
+         for d, s in stats.items()),
+        key=lambda r: -r[0],
+    )[:top_n]
+    col = 52
+    hdr = f"{'Tool':<{col}} {'Calls':>5}  {'Sessions':>8}  {'Last used':>10}  {'Eff%':>5}"
+    lines = [hdr, "─" * len(hdr)]
+    for calls, disp, sessions, last, eff in rows:
+        lines.append(f"{disp:<{col}} {calls:>5}  {sessions:>8}  {last:>10}  {eff:>4}%")
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="MCP / skill usage from Claude Code transcripts.")
+    ap.add_argument("--days", type=int, default=30, help="Last N days (0=all time)")
+    ap.add_argument("--top", type=int, default=50, help="Show top N entries")
+    args = ap.parse_args()
+
+    projects_dir = os.path.expanduser("~/.claude/projects")
+    if not os.path.isdir(projects_dir):
+        print(f"error: {projects_dir} not found", file=sys.stderr)
+        sys.exit(1)
+
+    cutoff = ""
+    if args.days > 0:
+        cutoff = (datetime.date.today() - datetime.timedelta(days=args.days)).strftime("%Y-%m-%d")
+
+    period = f"last {args.days} days" if args.days > 0 else "all time"
+    print(f"Scanning {projects_dir} ...", file=sys.stderr)
+    stats = collect_stats(projects_dir, cutoff)
+
+    print(f"\nMCP / Skill usage report ({period})")
+    print(format_table(stats, args.top))
+
+
+if __name__ == "__main__":
+    main()
