@@ -1388,5 +1388,197 @@ def test_partial_ci_failure_below_threshold_blocks_normally(repo_with_pr_worktre
     assert "merged #1" not in r.stdout, r.stdout
 
 
+# ---------------------------------------------------------------------------------------
+# -R/--repo flag gives a clear error (#53)
+#
+# ship.sh previously fell through to the generic "Unknown flag" handler when invoked with
+# `-R owner/repo` (a gh CLI flag for a remote repo).  Now it emits a targeted message
+# explaining that ship.sh does not support -R and how to work around it.
+# ---------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("repo_flag", [
+    "-R",
+    "--repo",
+    "-R=owner/repo",
+    "--repo=owner/repo",
+    "-Rowner/repo",
+])
+def test_repo_flag_gives_clear_error(repo_with_pr_worktree, tmp_path, repo_flag):
+    """Any form of -R/--repo emits a targeted error (not the generic 'Unknown flag') and
+    exits 1.  ship.sh does not support -R because mapping owner/repo to a local checkout
+    path is not generally knowable; the fix message tells the user what to do instead."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    # Build args: for bare -R/--repo the next token is the value; for attached forms there
+    # is no separate value token.
+    if repo_flag in ("-R", "--repo"):
+        args = ("1", repo_flag, "owner/repo", "--skip-ci", "--no-screenshot-ok", "test")
+    else:
+        args = ("1", repo_flag, "--skip-ci", "--no-screenshot-ok", "test")
+
+    r = _sh("bash", str(_SHIP), *args, cwd=main, env={
+        **os.environ,
+        "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
+        "SHIP_TEST_BRANCH": "feat",
+        "SHIP_DEFAULT_BRANCH": "main",
+        "SHIP_MAIN_CHECKOUT": str(main),
+    })
+
+    assert r.returncode != 0, (
+        f"ship must refuse {repo_flag!r} with a non-zero exit; got 0\n{r.stdout}\n{r.stderr}"
+    )
+    assert "does not support -R/--repo" in r.stderr, (
+        f"expected targeted -R error for {repo_flag!r}:\n{r.stderr}"
+    )
+    # Must NOT use the generic "Unknown flag" message.
+    assert "Unknown flag" not in r.stderr, (
+        f"generic 'Unknown flag' fired for {repo_flag!r} — targeted handler did not catch it:\n"
+        + r.stderr
+    )
+    # Merge must NOT have been attempted.
+    assert "merged #1" not in r.stdout, (
+        f"ship merged despite {repo_flag!r} argument:\n{r.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------------------
+# Stash-pop conflict detection after main-checkout refresh (#77)
+#
+# ship.sh now uses `git pull --ff-only --autostash` for the main-checkout refresh.
+# --autostash is a no-op on a clean tree; when the checkout has uncommitted changes and
+# those conflict with the incoming pull, git stash pop exits non-zero and the index
+# contains UU-class unmerged files.  ship.sh must detect that and exit 1 with a clear
+# diagnostic (naming the conflicting files and the PR merge status), not silently leave
+# the main checkout broken.
+# ---------------------------------------------------------------------------------------
+
+@pytest.fixture
+def repo_with_stash_conflict(tmp_path):
+    """A repo where the main checkout will have a stash-pop conflict after the post-merge
+    pull.  Setup:
+      - origin/main has a file `shared.py` with content "origin\n"
+      - the main checkout has an uncommitted change to the same line ("local\n")
+      - the incoming pull changes the same line to "incoming\n"
+    When `git pull --autostash` runs it stashes the local edit, fast-forwards, then tries
+    to pop — but "local" conflicts with "incoming" on the same line, producing a UU
+    unmerged entry."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    # --- bare origin ---
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+
+    # --- main checkout seeded at origin/main ---
+    main = tmp_path / "main"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "shared.py").write_text("origin\n", encoding="utf-8")
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+
+    # --- push a conflicting commit to origin/main ---
+    # We push via a sibling clone so the main checkout stays at the old SHA.
+    sibling = tmp_path / "sibling"
+    sibling.mkdir()
+    _git("clone", "-q", str(origin), str(sibling), cwd=tmp_path)
+    _git("config", "user.email", "t@t", cwd=sibling)
+    _git("config", "user.name", "t", cwd=sibling)
+    (sibling / "shared.py").write_text("incoming\n", encoding="utf-8")
+    _git("add", "-A", cwd=sibling)
+    _git("commit", "-qm", "advance origin/main", cwd=sibling)
+    _git("push", "-q", "origin", "main", cwd=sibling)
+
+    # --- dirty the main checkout with a conflicting local edit ---
+    # This is uncommitted — autostash will stash it, pull advances, pop conflicts.
+    (main / "shared.py").write_text("local\n", encoding="utf-8")
+
+    # --- PR branch (`feat`) — diverges from init via an unrelated file, pushed ---
+    _git("fetch", "-q", "origin", cwd=main)
+    # Start feat from the init commit (before origin/main advanced).
+    _git("checkout", "-q", "-b", "feat", "HEAD", cwd=main)
+    (main / "feat.py").write_text("# feat work\n", encoding="utf-8")
+    _git("add", "feat.py", cwd=main)
+    _git("commit", "-qm", "feat: add feature", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+
+    # --- go back to main and apply the conflicting uncommitted edit ---
+    _git("checkout", "-q", "main", cwd=main)
+    # main is still at the init commit (origin/main is now one ahead via sibling).
+    # Dirty shared.py with local content — autostash will stash it, pull advances, pop conflicts.
+    (main / "shared.py").write_text("local\n", encoding="utf-8")
+    # Leave it uncommitted so autostash picks it up.
+
+    # Add a linked worktree for `feat` so ship.sh can run its preflight checks.
+    wt = tmp_path / "wt-feat"
+    _git("worktree", "add", "-q", str(wt), "feat", cwd=main)
+
+    return main
+
+
+def test_stash_pop_conflict_exits_nonzero_with_diagnostic(repo_with_stash_conflict, tmp_path):
+    """When git pull --autostash produces a stash-pop conflict in the main checkout, ship
+    must exit 1 with a diagnostic that:
+      - confirms the PR IS merged (so the user doesn't re-run ship and double-merge),
+      - names the conflicting files,
+      - tells the user how to resolve manually.
+    The conflict must NOT be silently swallowed."""
+    main = repo_with_stash_conflict
+    bindir = _fake_gh_dir(tmp_path)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    r = _sh(
+        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test",
+        cwd=main, env=env,
+    )
+
+    # The merge itself succeeded — only the post-merge stash-pop conflicted.
+    assert "merged #1" in r.stdout, (
+        f"expected fake merge to report merged #1:\n{r.stdout}\n{r.stderr}"
+    )
+    # ship must exit non-zero to signal that the main checkout needs manual attention.
+    assert r.returncode != 0, (
+        f"ship should exit non-zero on a stash-pop conflict; got 0\n{r.stdout}\n{r.stderr}"
+    )
+    # Diagnostic confirms the merge is done (so the user doesn't double-merge).
+    assert "IS merged" in r.stderr, (
+        f"diagnostic must confirm PR is merged:\n{r.stderr}"
+    )
+    # Diagnostic names the conflicting file.
+    assert "shared.py" in r.stderr, (
+        f"diagnostic must name the conflicting file(s):\n{r.stderr}"
+    )
+    # Diagnostic tells the user how to resolve.
+    assert "stash drop" in r.stderr, (
+        f"diagnostic must mention stash drop for resolution:\n{r.stderr}"
+    )
+
+
+def test_stash_pop_no_conflict_clean_tree_passes(repo_with_pr_worktree, tmp_path):
+    """Happy path: a clean main checkout → --autostash is a no-op, pull fast-forwards,
+    ship exits 0.  Proves --autostash doesn't break the normal case."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(main, bindir)
+
+    assert r.returncode == 0, (
+        f"clean main checkout should not trigger stash-pop conflict\n{r.stdout}\n{r.stderr}"
+    )
+    assert "merged #1" in r.stdout, r.stdout
+    assert "stash-pop" not in r.stderr.lower(), (
+        f"unexpected stash-pop error on a clean checkout:\n{r.stderr}"
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
