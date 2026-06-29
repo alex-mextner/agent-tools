@@ -30,6 +30,18 @@ ci:
 
 then `rig apply`.
 
+## Enforcement — a REQUIRED check, or it does not block the merge button
+
+`tier: block` makes the workflow **go red** on a failing suite — but a red workflow by itself
+does **not** block the merge button. To actually ENFORCE it, the `tests` context must be a
+**REQUIRED status check** under **server-side branch protection**. The client-side
+[`gh ship`](../ship/) gate *does* refuse to merge over red `tests`, but a GitHub-UI merge or a
+raw `gh pr merge` bypasses ship entirely — exactly how hyper-saas #543 merged through red CI.
+rig-cli#5 provisions the required-check from the `github:` block in `rig.yaml` (it lifts every
+`tier: block` gate, including `tests`, into `required_status_checks`). See
+**[Client-side vs. server-side enforcement](../../README.md#client-side-vs-server-side-enforcement-the-543-gap)**
+in the repo README.
+
 ## Knobs
 
 | env | default | purpose |
