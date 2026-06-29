@@ -77,6 +77,13 @@ while [ "$i" -lt "$n" ]; do
         while [ "$j" -lt "$n" ]; do [ "${args[$j]:0:1}" != "-" ] && rest_bare=$((rest_bare+1)); j=$((j+1)); done
         if [ -z "$PR" ] && [ "$rest_bare" -eq 0 ]; then SHOT_DESCS+=(""); else SHOT_DESCS+=("$nxt"); i=$((i+1)); fi
       else SHOT_DESCS+=(""); fi ;;
+    -R|--repo|-R=*|--repo=*|-R?*)
+      # -R/--repo is a gh CLI flag for specifying a remote repo — ship.sh does not support
+      # it because it would need to map owner/repo to a local checkout path, which is not
+      # generally knowable.  cd into the target repo's checkout and run `gh ship <PR>` there.
+      echo "ship.sh does not support -R/--repo — run gh ship <PR-number> from inside the repo checkout instead." >&2
+      echo "  cd /path/to/your/checkout && gh ship $PR" >&2
+      exit 1 ;;
     -*) echo "Unknown flag: $a"$'\n'"$USAGE" >&2; exit 1 ;;
     *) [ -n "$PR" ] && { echo "Multiple PR numbers ($PR, $a) — pass one." >&2; exit 1; }; PR="$a" ;;
   esac
@@ -726,6 +733,35 @@ fi
 # made a clean squash-merge look like a failed ship). So the whole cleanup runs in a
 # function whose result is REPORTED, not propagated — `set -e` is relaxed inside it and
 # every step is allowed to fail with a warning.
+
+# Pull the main checkout with --autostash so a dirty-but-clean-merge WIP doesn't block
+# the refresh.  Autostash is a no-op on a clean tree; it only matters when the checkout
+# has uncommitted changes that conflict with the incoming pull.  If the stash-pop
+# produces unmerged files (UU/AA/DD in the index) we print a clear diagnostic and EXIT 1
+# so the broken state doesn't sneak past as a silent "all good".
+# Called only when DRY_RUN != 1, always inside cleanup() where set +e is active.
+_refresh_main_checkout() {
+  local dir="$1" branch="$2" pull_rc unmerged
+  git -C "$dir" pull --ff-only --autostash origin "$branch"; pull_rc=$?
+  # `git pull --autostash` exits 0 even when the stash-pop conflicts — the conflict is
+  # indicated only on stderr.  Check unmerged files unconditionally after every pull so a
+  # silent stash-pop conflict is never left undetected.
+  unmerged=$(git -C "$dir" ls-files --unmerged 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${unmerged:-0}" -gt 0 ]; then
+    echo "[ship] PR #$PR IS merged. However, the stash-pop after the main-checkout" \
+         "refresh conflicted — $unmerged unmerged path(s) in $dir." >&2
+    echo "[ship]   Unmerged files:" >&2
+    git -C "$dir" ls-files --unmerged 2>/dev/null | awk '{print $4}' | sort -u | \
+      sed 's/^/[ship]     /' >&2
+    echo "[ship]   Resolve manually:" \
+         "git -C $(printf '%q' "$dir") add <files> && git -C $(printf '%q' "$dir") stash drop" >&2
+    exit 1
+  fi
+  if [ "$pull_rc" -ne 0 ]; then
+    echo "[ship] WARNING: could not fast-forward $branch — pull manually." >&2
+  fi
+}
+
 cleanup() {
   set +e  # local to this function's subshell-free body: warn, don't abort
   if [ "${CROSS_REPO:-false}" = "true" ]; then
@@ -805,7 +841,9 @@ cleanup() {
     echo "[ship] refreshing main checkout at ${MAIN_CHECKOUT} ..."
     [ "$(git -C "$MAIN_CHECKOUT" symbolic-ref --quiet --short HEAD 2>/dev/null || echo)" = "$DEFAULT_BRANCH" ] || run git -C "$MAIN_CHECKOUT" checkout "$DEFAULT_BRANCH"
     run git -C "$MAIN_CHECKOUT" fetch origin
-    [ "$DRY_RUN" = "1" ] || git -C "$MAIN_CHECKOUT" pull --ff-only origin "$DEFAULT_BRANCH" || echo "[ship] WARNING: could not fast-forward $DEFAULT_BRANCH — pull manually." >&2
+    if [ "$DRY_RUN" != "1" ]; then
+      _refresh_main_checkout "$MAIN_CHECKOUT" "$DEFAULT_BRANCH"
+    fi
   fi
 
   # CALLER CONTRACT: if we removed the worktree the SESSION was launched from, the parent
