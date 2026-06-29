@@ -217,13 +217,43 @@ def test_inline_sentinel_without_reason_blocks(monkeypatch):
     assert _decision(out) == "block"
 
 
+# ── Path-qualified and subshell forms — should BLOCK ───────────────────────────────────────
+
+def test_block_path_qualified_gh(monkeypatch):
+    """/opt/homebrew/bin/gh pr merge 5 must still be blocked (basename check)."""
+    out, _err, code = _run("/opt/homebrew/bin/gh pr merge 5 --squash", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_block_subshell_gh_pr_merge(monkeypatch):
+    """( gh pr merge 5 ) — subshell grouping must not bypass detection."""
+    out, _err, code = _run("( gh pr merge 5 )", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_block_brace_group_gh_pr_merge(monkeypatch):
+    """{ gh pr merge 5; } — brace grouping must not bypass detection."""
+    out, _err, code = _run("{ gh pr merge 5; }", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
 # ── Fail-closed paths ──────────────────────────────────────────────────────────────────────
 
-def test_unbalanced_quotes_block(monkeypatch):
-    """A command with unbalanced quotes cannot be parsed safely → fail closed."""
+def test_unbalanced_quotes_merge_blocks(monkeypatch):
+    """Unbalanced quote on a command containing a merge pattern → fail closed (block)."""
     out, _err, code = _run("gh pr merge 5 --body 'unclosed", monkeypatch)
     assert code == hook.BLOCK_EXIT_CODE
     assert _decision(out) == "block"
+
+
+def test_unbalanced_quotes_unrelated_allows(monkeypatch):
+    """Unbalanced quote on an unrelated command → allow (not a merge attempt)."""
+    out, _err, code = _run("grep won't file", monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
 
 
 def test_malformed_event_blocks(monkeypatch):
