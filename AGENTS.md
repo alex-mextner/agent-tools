@@ -280,3 +280,36 @@ them to *every* project and user. If you want the catalog of always-apply behavi
 See [`README.md`](README.md) for the full catalog reference, inventory, and the carrier-decision
 guide ([`docs/carrier-decision-guide.md`](docs/carrier-decision-guide.md): skill vs. agent-hook
 vs. git-hook).
+
+---
+
+## Review-thread resolution authority
+
+A shipping agent **may** autonomously resolve a review thread on a PR it created when ALL
+four conditions hold:
+
+1. **Quorum review passed**: `review diff` (or `review quorum`) produced an `[ok]` marker for
+   the current diff — multi-model consensus cleared.
+2. **Finding is P2 / advisory / suggestion / nit** — explicitly NOT P0, P1, critical, or
+   security-tagged.
+3. **Commenter is an automated bot** — `author.login` ends in `[bot]` (e.g.
+   `codex-review-bot`, `github-actions[bot]`). Human reviewer threads always require explicit
+   CTO instruction.
+4. **The PR was created by the agent in this session** — not resolving threads on someone
+   else's pre-existing PR.
+
+The mutation is `resolveReviewThread(input: {threadId: "PRRT_..."})` via `gh api graphql`.
+
+**Current enforcement gap**: the harness auto-mode classifier treats this mutation as
+"permission laundering" when conditions are passed only in prompt text. To make autonomous
+resolution work, one of the following must be in place:
+
+- A Bash permission rule in `~/.claude/settings.json` allowing `gh api graphql` mutations
+  on PR review threads matching the above conditions; OR
+- An `agent-hooks/resolve-review-thread/` gate (a `pre-bash` hook) that validates the four
+  conditions before allowing the `gh api graphql resolveReviewThread` call — verified against
+  the actual PR data, not prompt-text claims.
+
+Until one of those mechanisms exists, an agent that meets all four conditions should still
+attempt the resolution; if the harness blocks it, escalate to the CTO with the thread ID
+and evidence that all four conditions are met.
