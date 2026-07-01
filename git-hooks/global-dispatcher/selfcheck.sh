@@ -184,6 +184,16 @@ git -C "$R5" -c core.hooksPath= commit -q --no-verify -m "add lefthook lint"
 GLOBAL_HOOKS_DIR="$GHD" "$INSTALLER" "$R5" >/dev/null
 LABEL="no local secret scan => no .githooks-skip (global runs here)"
 assert_not test -f "$R5/.githooks-skip"
+# Lefthook only forwards the pushed-refs stdin to a pre-push command that sets
+# `use_stdin: true`; without it protect-main reads empty stdin and FAILS OPEN.
+LABEL="lefthook pre-push wiring dispatches the pre-push event"
+assert sh -c "awk '/^[^ \t#]/{inblock = (\$0 ~ /^pre-push:/)} inblock && /run-global-hooks.*pre-push/{found=1} END{exit !found}' '$R5/lefthook.yml'"
+LABEL="lefthook pre-push wiring carries use_stdin: true (refs reach protect-main)"
+# bind the option to the DISPATCHER command: use_stdin must directly follow its run line
+assert sh -c "grep -A1 -- \"run-global-hooks.* pre-push'\" '$R5/lefthook.yml' | grep -q 'use_stdin: true'"
+# the SHIPPED template must carry the same guarantee (copy-template path, no injection)
+LABEL="shipped lefthook template: pre-push block carries use_stdin: true"
+assert sh -c "awk '/^[^ \t#]/{inblock = (\$0 ~ /^pre-push:/)} inblock && /use_stdin: true/{found=1} END{exit !found}' '$HERE/templates/lefthook.yml'"
 
 # --- 5. --commit commits the tracked wiring --------------------------------------
 R6="$TMP/r6"; mk_repo "$R6"
@@ -670,6 +680,12 @@ EOF
 GLOBAL_HOOKS_DIR="$GHD" "$INSTALLER" "$RHA" >/dev/null
 LABEL="husky-active repo wires .husky/pre-commit (not the stale lefthook.yml)"
 assert test -f "$RHA/.husky/pre-commit"
+# Husky's core.hooksPath bypasses the global composer, so pre-push must ALWAYS be
+# created (like pre-commit) — otherwise protect-main never fires in a husky repo.
+LABEL="husky-active repo always creates .husky/pre-push (protect-main coverage)"
+assert test -f "$RHA/.husky/pre-push"
+LABEL=".husky/pre-push dispatches the pre-push event"
+assert grep -q 'pre-push "\$@"' "$RHA/.husky/pre-push"
 LABEL="husky-active repo does NOT inject the dispatcher into the stale lefthook.yml"
 assert_not grep -q 'global-git-hooks-dispatcher' "$RHA/lefthook.yml"
 
@@ -908,6 +924,33 @@ LABEL="blocked multi-ref message names BOTH protected branches"
 assert sh -c 'printf %s "$1" | grep -q "refs/heads/main" && printf %s "$1" | grep -q "refs/heads/master"' _ "$BLOCK_OUT"
 LABEL="blocked message points to the PR flow"
 assert sh -c 'printf %s "$1" | grep -q "Land it via a PR"' _ "$BLOCK_OUT"
+
+# --- 36. protect-main END-TO-END through a HUSKY-managed repo -----------------------
+# Husky sets core.hooksPath to its own dir, bypassing the global composer entirely —
+# coverage comes from the installer ALWAYS creating .husky/pre-push. Prove the whole
+# chain live, not just the file's existence: git push -> husky shim -> .husky/pre-push
+# -> dispatcher stdin spool -> protect-main `read` (the husky twin of the lefthook
+# `use_stdin: true` guarantee — args carry remote/url, the REFS arrive on stdin).
+RHPP="$TMP/rhuskypp"; mk_repo "$RHPP"
+git -C "$RHPP" branch -M main
+mkdir -p "$RHPP/.husky/_"
+git -C "$RHPP" config core.hooksPath .husky/_
+# fake husky v9 shim: run the same-named user hook, args + stdin pass through
+cat > "$RHPP/.husky/_/pre-push" <<'EOF'
+#!/bin/sh
+h="$(dirname "$0")/../pre-push"
+[ -f "$h" ] && exec sh "$h" "$@"
+exit 0
+EOF
+chmod +x "$RHPP/.husky/_/pre-push"
+GLOBAL_HOOKS_DIR="$GHD_PP" "$INSTALLER" "$RHPP" >/dev/null
+git init -q --bare "$TMP/rhuskypp-origin.git"
+git -C "$RHPP" remote add origin "$TMP/rhuskypp-origin.git"
+hpp_push() { ( cd "$RHPP" && GLOBAL_HOOKS_DIR="$GHD_PP" git push "$@" >/dev/null 2>&1 ); }
+LABEL="husky repo: direct push to main is BLOCKED (refs reach protect-main via stdin)"
+assert_not hpp_push origin main
+LABEL="husky repo: feature-branch push passes"
+assert hpp_push origin main:feat-h
 
 echo
 if [ "$fail" -eq 0 ]; then

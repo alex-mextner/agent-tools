@@ -33,5 +33,9 @@ pre-push:
   commands:
     global-git-hooks-dispatcher:
       run: '"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" pre-push'
+      # use_stdin is REQUIRED: lefthook only forwards the pushed-refs stdin with it
+      # (https://lefthook.dev/configuration/use_stdin/); without it protect-main
+      # reads empty stdin and fails open on a direct push to main.
+      use_stdin: true
     # tests:
     #   run: npm test
