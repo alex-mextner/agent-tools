@@ -292,9 +292,10 @@ four conditions hold:
    the current diff — multi-model consensus cleared.
 2. **Finding is P2 / advisory / suggestion / nit** — explicitly NOT P0, P1, critical, or
    security-tagged.
-3. **Commenter is an automated bot** — `author.login` ends in `[bot]` (e.g.
-   `codex-review-bot`, `github-actions[bot]`). Human reviewer threads always require explicit
-   CTO instruction.
+3. **Commenter is an automated bot and no human replied** — the original commenter's
+   `author.login` ends in `[bot]` OR is a known automated reviewer (`chatgpt-codex-connector`,
+   `codex-review-bot`), AND every other comment in the thread also passes this check. If any
+   human commented anywhere in the thread, CTO instruction is required.
 4. **The PR was created by the agent in this session** — not resolving threads on someone
    else's pre-existing PR.
 
