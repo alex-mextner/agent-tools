@@ -8,10 +8,15 @@
 #
 # Blocks a commit whose staged diff has not been reviewed. Bypass with
 #   REVIEW_SKIP=1 git commit ...   or   git commit --no-verify
+#
+# `command git` bypasses shell aliases and functions (e.g. an rtk-style wrapper that
+# rewrites `git diff` output), so the hash matches the one written by review-cli, which
+# also calls the real git binary directly. Without this, a shell alias rewriting `git diff`
+# could produce a different hash and block a legitimately-reviewed commit.
 [ -n "$REVIEW_SKIP" ] && exit 0
-[ -z "$(git diff --cached --name-only)" ] && exit 0
-h=$(git diff --no-ext-diff --cached | shasum -a 256 | cut -d' ' -f1)
-stamp=$(git rev-parse --git-path review-stamp)
+[ -z "$(command git diff --cached --name-only)" ] && exit 0
+h=$(command git diff --no-ext-diff --cached | shasum -a 256 | cut -d' ' -f1)
+stamp=$(command git rev-parse --git-path review-stamp)
 if [ -f "$stamp" ] && grep -q "$h" "$stamp"; then exit 0; fi
 echo "review-before-commit: staged changes have not been reviewed." >&2
 echo "  run:  review --staged      (then commit)" >&2
