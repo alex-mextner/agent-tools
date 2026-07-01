@@ -300,21 +300,17 @@ fi
 #
 # Runs INDEPENDENTLY of --skip-ci: a premature merge is premature regardless of CI billing.
 #
-# The window starts at max(createdAt, head-commit pushedDate, head-commit committedDate):
+# The window starts at max(createdAt, pushedDate, committedDate, forcePushedAt):
 #   • createdAt — the floor; a reviewer can't review before the PR exists, so even a PR built
 #     from an old commit waits from PR-open.
-#   • pushedDate — GitHub-CONTROLLED head-update time (when GitHub received the push). This is
-#     the signal that restarts the window on a force-push to an already-open PR, which a commit's
-#     own embedded date would miss. GitHub does not always populate it (it can be null), so it is
-#     used only when present.
-#   • committedDate — the reliable fallback when pushedDate is null. It moves to ~now on the normal
-#     commit→push / rebase→push, so it covers the common "open PR then immediately ship" case.
-# Residual limit: if pushedDate is null AND a head is force-pushed to a genuinely OLD committedDate
-# (a cherry-picked old commit, or a GIT_COMMITTER_DATE-backdated one), the window can read as
-# already-elapsed. That is narrow and not an ACCIDENTAL premature merge (the common case this gate
-# targets); the unresolved-threads + CI gates still apply, and --no-review-dwell-ok is the
-# sanctioned fast-track anyway. Override with --no-review-dwell-ok <reason> (logged) or disable
-# with SHIP_REVIEW_DWELL=0.
+#   • pushedDate — GitHub-CONTROLLED head-update time (when GitHub received the push). Reliable
+#     for normal pushes but can be null (deprecated on the Commit object) and stale on force-pushes
+#     to an already-on-GitHub commit.
+#   • committedDate — the embedded commit date. Reliable fallback for pushedDate==null on the common
+#     commit→push / rebase→push path.
+#   • forcePushedAt — HeadRefForcePushedEvent.createdAt (last event); the authoritative signal
+#     that the PR head was force-pushed to an old commit where pushedDate would be stale.
+# Override with --no-review-dwell-ok <reason> (logged) or SHIP_REVIEW_DWELL=0 to disable.
 # Fail-CLOSED: if the timestamps can't be read or parsed, refuse rather than merge un-waited.
 
 # Convert an ISO-8601 UTC timestamp (GitHub's `2026-06-28T12:34:56Z`) to a Unix epoch, portably
@@ -336,26 +332,34 @@ if [ -n "$NO_DWELL_OK" ]; then
 elif [ "$DWELL" = "0" ]; then
   echo "[ship] review-dwell gate disabled (SHIP_REVIEW_DWELL=0)."
 else
-  # GraphQL (not `gh pr view --json commits`) because pushedDate — the GitHub-controlled head-
-  # update time — is only exposed on the Commit object here, not in gh's pr-view commit JSON.
-  DWELL_Q='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){createdAt commits(last:1){nodes{commit{committedDate pushedDate}}}}}}'
+  # Fetch four timestamp signals from GitHub:
+  #   createdAt        — PR open time (floor: dwell must pass from at least this point)
+  #   pushedDate       — GitHub-controlled head-update time (when GitHub received the push);
+  #                      reliable for normal pushes but can be null and is deprecated on Commit.
+  #   committedDate    — embedded in the commit; reliable fallback for pushedDate==null.
+  #   forcePushedAt    — HeadRefForcePushedEvent.createdAt (last entry); the authoritative signal
+  #                      for "PR was force-pushed to an already-on-GitHub commit" that makes
+  #                      pushedDate stale. Empty when there has been no force-push.
+  # Window start = max(createdAt, pushedDate, committedDate, forcePushedAt).
+  DWELL_Q='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){createdAt commits(last:1){nodes{commit{committedDate pushedDate}}} timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{__typename ... on HeadRefForcePushedEvent{createdAt}}}}}}'
   if DWELL_RAW=$(gh api graphql -F owner='{owner}' -F name='{repo}' -F pr="$PR" -f query="$DWELL_Q" \
-       --jq '.data.repository.pullRequest | [.createdAt, (.commits.nodes[0].commit.pushedDate // ""), (.commits.nodes[0].commit.committedDate // "")] | @tsv' 2>/dev/null); then
+       --jq '.data.repository.pullRequest | [.createdAt, (.commits.nodes[0].commit.pushedDate // ""), (.commits.nodes[0].commit.committedDate // ""), (.timelineItems.nodes[0].createdAt // "")] | @tsv' 2>/dev/null); then
     PR_CREATED=$(printf '%s' "$DWELL_RAW" | awk -F'\t' 'NR==1{print $1}')
     PR_PUSHED=$(printf '%s' "$DWELL_RAW" | awk -F'\t' 'NR==1{print $2}')
     PR_COMMITTED=$(printf '%s' "$DWELL_RAW" | awk -F'\t' 'NR==1{print $3}')
+    PR_FORCE_PUSHED=$(printf '%s' "$DWELL_RAW" | awk -F'\t' 'NR==1{print $4}')
   else
     echo "Refusing: could not read PR #$PR timestamps for the review-dwell gate (gh api failed) — refusing rather than merge un-waited. Fix gh access, or override with --no-review-dwell-ok <reason>." >&2
     exit 1
   fi
-  # Window start = the LATEST of the three signals (each may be empty if unparseable/null).
+  # Window start = the LATEST of the four signals (each may be empty if unparseable/null).
   START=""
-  for ts in "$PR_CREATED" "$PR_PUSHED" "$PR_COMMITTED"; do
+  for ts in "$PR_CREATED" "$PR_PUSHED" "$PR_COMMITTED" "$PR_FORCE_PUSHED"; do
     e=$(iso_to_epoch "$ts")
     if [ -n "$e" ] && { [ -z "$START" ] || [ "$e" -gt "$START" ]; }; then START="$e"; fi
   done
   if [ -z "$START" ]; then
-    echo "Refusing: could not parse PR #$PR review-window timestamps ('$PR_CREATED' / '$PR_PUSHED' / '$PR_COMMITTED') for the review-dwell gate — refusing rather than merge un-waited. Override with --no-review-dwell-ok <reason> if intended." >&2
+    echo "Refusing: could not parse PR #$PR review-window timestamps ('$PR_CREATED' / '$PR_PUSHED' / '$PR_COMMITTED' / '$PR_FORCE_PUSHED') for the review-dwell gate — refusing rather than merge un-waited. Override with --no-review-dwell-ok <reason> if intended." >&2
     exit 1
   fi
   NOW=$(date +%s); ELAPSED=$(( NOW - START ))
