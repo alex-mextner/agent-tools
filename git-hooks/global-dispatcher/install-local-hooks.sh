@@ -187,15 +187,19 @@ inject_lefthook() {
   # run line as two separate prints.
   rgh='"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks"'
   keyline="    $MARKER:"
+  # pre-push MUST carry `use_stdin: true`: lefthook only forwards the pushed-refs stdin
+  # to a pre-push command with that option (https://lefthook.dev/configuration/use_stdin/).
+  # Without it protect-main reads empty stdin and FAILS OPEN on a direct push to main.
   awk -v keyline="$keyline" \
       -v run_pc="      run: '$rgh pre-commit'" \
       -v run_cm="      run: '$rgh commit-msg {1}'" \
-      -v run_pp="      run: '$rgh pre-push'" '
+      -v run_pp="      run: '$rgh pre-push'" \
+      -v stdin_pp="      use_stdin: true" '
     function emit(ev) {
       print keyline
       if (ev == "pre-commit") print run_pc
       else if (ev == "commit-msg") print run_cm
-      else if (ev == "pre-push") print run_pp
+      else if (ev == "pre-push") { print run_pp; print stdin_pp }
     }
     BEGIN {
       split("pre-commit commit-msg pre-push", order, " ")
@@ -253,8 +257,14 @@ inject_husky() {
   wired_any=0
   for ev in $EVENTS; do
     f="$REPO/.husky/$ev"
-    # Only wire events that already have a husky script, plus always-create pre-commit.
-    if [ ! -f "$f" ] && [ "$ev" != "pre-commit" ]; then continue; fi
+    # Only wire events that already have a husky script, plus always-create pre-commit
+    # AND pre-push: husky sets core.hooksPath, which bypasses the global composer, so a
+    # husky repo with no .husky/pre-push would never dispatch the protected protect-main
+    # fragment — direct pushes to main would fail open.
+    case "$ev" in
+      pre-commit|pre-push) ;;
+      *) [ -f "$f" ] || continue ;;
+    esac
     if [ -f "$f" ] && grep -q "$MARKER" "$f"; then
       log "husky $ev already wired — no-op"; wired_any=1; continue
     fi

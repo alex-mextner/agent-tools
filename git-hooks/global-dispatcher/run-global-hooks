@@ -88,6 +88,18 @@ event="$1"
 [ -n "$event" ] || { echo "run-global-hooks: missing <event> argument" >&2; exit 2; }
 shift
 
+# Positive dispatched-signal for the composers (hooks/*): a composer exports a marker
+# path before running the shadowed repo-local hook; if that hook's chain reaches THIS
+# runner, we touch the marker so the composer KNOWS dispatch really happened and skips
+# its own dispatcher stage (no double-run). Touch it FIRST — even for an empty event
+# dir — the signal means "the runner ran", not "fragments matched". A composer paired
+# with an OLD runner (no touch) just falls back to the old double-run: fail-SAFE, the
+# gates still fire. (A repo hook could forge the touch — but a repo whose hooks run is
+# already executing arbitrary code; see THREAT BOUNDARY.)
+if [ -n "${GLOBAL_HOOKS_DISPATCH_MARKER:-}" ]; then
+  : > "$GLOBAL_HOOKS_DISPATCH_MARKER" 2>/dev/null || true
+fi
+
 DIR="${GLOBAL_HOOKS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/git/global-hooks.d}/$event"
 
 # Empty / absent event dir => nothing to do.

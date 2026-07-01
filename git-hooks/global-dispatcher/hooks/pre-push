@@ -20,7 +20,12 @@ if [ ! -t 0 ]; then
   stdin_spool="$(mktemp "${TMPDIR:-/tmp}/global-prepush-stdin.XXXXXX")" || stdin_spool=""
   [ -n "$stdin_spool" ] && cat > "$stdin_spool"
 fi
-cleanup() { [ -n "$stdin_spool" ] && rm -f "$stdin_spool"; }
+# Dispatched-marker: exported to stage 1; a NEW run-global-hooks touches it when the
+# local hook's chain reaches the runner, so stage 2 knows dispatch already happened.
+dispatch_marker="${TMPDIR:-/tmp}/global-hooks-dispatched.pre-push.$$"
+rm -f "$dispatch_marker"
+
+cleanup() { [ -n "$stdin_spool" ] && rm -f "$stdin_spool"; rm -f "$dispatch_marker"; }
 trap cleanup EXIT INT TERM
 
 feed() {
@@ -28,14 +33,22 @@ feed() {
 }
 
 # --- 1. repo-local pre-push (shadowed by the global hooksPath; run it explicitly).
+# A template-shim (init.templateDir) or retrofit-injected local hook CALLS the
+# dispatcher itself; if we then ran our own dispatcher stage too, every fragment would
+# fire TWICE (duplicate protect-main override-log lines). The marker is a POSITIVE
+# runtime signal (the runner touches it when it actually executes) — a shim whose
+# runner path is missing leaves it untouched, so stage 2 still dispatches (fail-safe).
 local_hook="$git_dir/hooks/pre-push"
+# NOTE: `feed` is a FUNCTION — POSIX leaves a prefix assignment's export into a
+# function's children unspecified, so use an explicit subshell export instead.
 if [ -x "$local_hook" ] && [ "$local_hook" != "$0" ]; then
-  feed "$local_hook" "$@" || exit $?
+  ( export GLOBAL_HOOKS_DISPATCH_MARKER="$dispatch_marker"; feed "$local_hook" "$@" ) || exit $?
 fi
 
-# --- 2. global-hooks dispatcher (pre-push event).
-if [ -x "$HOOK_DIR/../run-global-hooks" ]; then
-  feed "$HOOK_DIR/../run-global-hooks" pre-push "$@" || exit $?
+# --- 2. global-hooks dispatcher (pre-push event) — unless stage 1 provably dispatched.
+# The marker env is UNSET here so a nested composer chain can't touch OUR marker.
+if [ ! -e "$dispatch_marker" ] && [ -x "$HOOK_DIR/../run-global-hooks" ]; then
+  ( unset GLOBAL_HOOKS_DISPATCH_MARKER; feed "$HOOK_DIR/../run-global-hooks" pre-push "$@" ) || exit $?
 fi
 
 exit 0
