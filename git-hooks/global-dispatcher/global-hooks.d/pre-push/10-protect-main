@@ -24,7 +24,9 @@
 
 ZEROS=0000000000000000000000000000000000000000
 blocked=""
-while read -r _local_ref local_sha remote_ref _remote_sha; do
+# `|| [ -n "$remote_ref" ]` — paranoia against fail-open: process a final line even if
+# it somehow lacks the trailing newline (git always sends one; belt and braces).
+while read -r _local_ref local_sha remote_ref _remote_sha || [ -n "$remote_ref" ]; do
   [ -n "$remote_ref" ] || continue
   case "$remote_ref" in refs/heads/main|refs/heads/master) ;; *) continue ;; esac
   case "$local_sha" in "$ZEROS"*) continue ;; esac  # deletion, not a code push
