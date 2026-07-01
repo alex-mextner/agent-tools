@@ -8,10 +8,11 @@
 # gate is the enforcement: land changes via a PR (gh ship), never a direct push.
 #
 # Refs arrive on stdin, one line per ref: "<local-ref> <local-sha> <remote-ref> <remote-sha>".
-# Non-main refs and branch DELETIONS (local sha = all zeros) pass untouched — deleting
-# the DEFAULT branch is already refused server-side by git/GitHub on every plan
-# (receive.denyDeleteCurrent / "refusing to delete the current branch"), so gating
-# deletions here would only duplicate an enforcement that actually exists remotely.
+# Non-main refs and branch DELETIONS (local sha = all zeros) pass untouched — this gate
+# targets CODE pushes; deleting the DEFAULT branch is already refused server-side by
+# git/GitHub on every plan (receive.denyDeleteCurrent / "refusing to delete the current
+# branch"), and deleting a protected NON-default branch (a master that is not the
+# default) is deliberately out of scope.
 #
 # PROTECTED: a cloned repo's .githooks-skip / env cannot silently disable this gate
 # (see run-global-hooks DEDUP/TRUST). Your own `git config hooks.skipGlobal protect-main`
@@ -37,19 +38,21 @@ if [ "${PUSH_MAIN_OK:-}" = "1" ]; then
   log_dir="${XDG_CACHE_HOME:-$HOME/.cache}/agent-tools"
   mkdir -p "$log_dir" 2>/dev/null || true
   repo="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-  logged=1
+  total=0; failed=0
   for ref in $blocked; do    # one audit line PER protected ref (refs contain no spaces)
+    total=$((total + 1))
     printf '%s protect-main OVERRIDE repo=%s ref=%s reason=%s\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo" \
-      "$ref" "${PUSH_MAIN_REASON:-<none>}" >> "$log_dir/overrides.log" 2>/dev/null || logged=0
+      "$ref" "${PUSH_MAIN_REASON:-<none>}" >> "$log_dir/overrides.log" 2>/dev/null || failed=$((failed + 1))
   done
-  if [ "$logged" = 1 ]; then
+  if [ "$failed" -eq 0 ]; then
     echo "protect-main: PUSH_MAIN_OK=1 — allowing push to $blocked (logged to $log_dir/overrides.log)" >&2
   else
     # Never CLAIM an audit line that was not written; the push is still allowed (a
-    # read-only cache must not break releases), but the miss is loud, not silent.
+    # read-only cache must not break releases), but the miss is loud, not silent —
+    # and the count stays honest when only SOME of several refs got logged.
     echo "protect-main: PUSH_MAIN_OK=1 — allowing push to $blocked" >&2
-    echo "protect-main: WARNING — could NOT append to $log_dir/overrides.log; this override is UNAUDITED." >&2
+    echo "protect-main: WARNING — could NOT append to $log_dir/overrides.log; $failed of $total override line(s) are UNAUDITED." >&2
   fi
   exit 0
 fi
