@@ -10,10 +10,10 @@ repo_local="${toplevel:+$toplevel/ci/ship/ship.sh}"
 if [[ -n "$repo_local" && -f "$repo_local" ]]; then
   exec "$repo_local" "$@"
 fi
-canonical=/Users/ultra/xp/agent-tools/ci/ship/ship.sh
-if [[ -f "$canonical" ]]; then
+canonical="${AGENT_TOOLS_ROOT:+$AGENT_TOOLS_ROOT/ci/ship/ship.sh}"
+if [[ -n "$canonical" && -f "$canonical" ]]; then
   exec "$canonical" "$@"
 fi
-echo "pr-ship.sh: canonical ship.sh not found (repo-local $repo_local nor $canonical)." >&2
-echo "Re-run 'rig apply' against a current agent-tools checkout to refresh it." >&2
+echo "pr-ship.sh: canonical ship.sh not found (tried repo-local $repo_local and AGENT_TOOLS_ROOT=${AGENT_TOOLS_ROOT:-<unset>})." >&2
+echo "Set AGENT_TOOLS_ROOT to your agent-tools checkout, or re-run 'rig apply'." >&2
 exit 127
