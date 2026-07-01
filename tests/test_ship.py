@@ -1338,6 +1338,7 @@ def test_cidown_local_gate_passes_merges(repo_with_pr_worktree, tmp_path):
     r = _run_ship_cidown(main, bindir, {
         "SHIP_TEST_CI_DOWN": "1",
         "SHIP_LOCAL_TEST_CMD": "true",  # trivially-passing stand-in for the test suite
+        "SHIP_REVIEW_DWELL": "0",  # disable dwell gate: fake PR has no review timestamps
     })
 
     assert r.returncode == 0, (
