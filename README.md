@@ -181,6 +181,72 @@ the standard engine, knobs, and escape hatch. Copy the workflow into `.github/wo
 or call the shell script from a pipeline step. Start at [`ci/README.md`](ci/README.md) and
 the [`ci-gate-suite`](skills/universal/ci-gate-suite/SKILL.md) skill.
 
+## Client-side vs. server-side enforcement (the #543 gap)
+
+**A gate that only runs on the client is bypassable; durable enforcement is server-side.**
+This is the single most misunderstood thing about the catalog, and the reason a real PR
+(hyper-saas **#543**) squash-merged through **red CI, an unresolved review thread, and no
+screenshot**. Know which half you're relying on:
+
+| Layer | What it is | What bypasses it |
+| --- | --- | --- |
+| **Client-side** | The [`ship`](ci/ship/) gate (`gh ship`) and the `block-raw-pr-merge` agent-hook — they re-check green-CI / threads / screenshot / version **before** merging, in the session. | A merge from the **GitHub web UI**, a raw `gh pr merge` from an **uninstrumented shell** (no agent-hooks), or any tool that isn't `gh ship`. The client gate never runs, so nothing is checked. |
+| **Server-side** | GitHub **branch protection**: **required status checks** (a `tier: block` gate's context listed as *required*) + **require-conversation-resolution** + required reviews + `enforce_admins`. Enforced by GitHub itself, on the merge button. | Nothing short of an admin turning protection off. This is the durable boundary. |
+
+**A `tier: block` CI workflow is NOT enforcement by itself.** It only makes a check go
+**red**; the merge button stays clickable until that check is promoted to a **required
+status check** under branch protection. Promoting it is a **server-side** admin action — and
+historically a *manual* one the catalog could not perform, which is precisely the #543 gap:
+the gates were all present and red, but advisory, so the merge went through anyway.
+
+**rig-cli#5** closes the gap: it makes branch protection a *reconciled, config-driven*
+artifact (declared in `rig.yaml`, applied by `rig apply`) the same way skills/hooks/CI are —
+so the required-checks set is provisioned, not hand-toggled. agent-tools is the **what**
+(the gates + this policy); the reconciler that flips the server-side switches lives in
+[rig-cli](https://github.com/alex-mextner/rig-cli) (#5).
+
+### The `github:` block in `rig.yaml` (provisioned by rig-cli#5)
+
+`rig.yaml` declares the repo's GitHub settings the same way it declares CI; `rig apply`
+reconciles them via `gh api` (branch-protection / rulesets) — secure defaults ON, so a fresh
+`rig init` lands the guardrails with zero hand-toggling. The illustrative shape below is the
+**classic branch-protection** model (`required_status_checks.contexts`, `enforce_admins`,
+`required_pull_request_reviews`); the newer *rulesets* API expresses the same intent with a
+different field layout. Either way the authoritative schema and the chosen backend live in
+[rig-cli](https://github.com/alex-mextner/rig-cli) (#5) — this is the concept, not the wire
+format:
+
+```yaml
+github:
+  branch_protection:
+    branch: main
+    # Promote each tier:block CI gate to a REQUIRED status check. rig derives this set from
+    # the enabled tier:block ci.items; list extra contexts explicitly if you vendor a gate.
+    # A context is the check-RUN name (the job's `name:`), NOT the workflow filename — a
+    # required context that never reports (typo'd/nonexistent) stays forever `pending` and
+    # blocks ALL merges (independent of `strict`, which only governs up-to-date-with-base),
+    # so keep these in sync with each workflow's actual check name.
+    required_status_checks:
+      strict: true            # PR must be up to date with base before merge
+      contexts:
+        - tests
+        - review-threads
+        - leftover-grep
+        - dependency-review
+        - PR Checklist
+        - screenshots
+    required_conversation_resolution: true   # native "resolve threads before merge"
+    required_pull_request_reviews:
+      required_approving_review_count: 1
+      dismiss_stale_reviews: true
+    enforce_admins: true       # the rules apply to admins too — no quiet override
+    allow_force_pushes: false
+    required_linear_history: true
+```
+
+Without the `github:` block (or its equivalent set by hand), every gate above is a red light
+that nobody is required to stop at — see #543.
+
 ## Inventory
 
 - **Universal skills:** 39 — shell-timeouts, exit-codes-through-pipes, dead-code-

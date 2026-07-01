@@ -23,6 +23,17 @@ cp ci/leftover-grep/leftover-grep.sh .github/scripts/leftover-grep.sh
 bash ci/leftover-grep/leftover-grep.sh
 ```
 
+## Enforcement — a REQUIRED check, or it does not block the merge button
+
+A `tier: block` workflow **only goes red** — by itself it does **not** block the merge
+button. To actually ENFORCE this gate its `leftover-grep` context must be a **REQUIRED status
+check** under **server-side branch protection** (Settings -> Branches -> required checks ->
+add `leftover-grep`). rig-cli#5 provisions exactly that from the `github:` block in
+`rig.yaml` — it lifts every `tier: block` gate into `required_status_checks`. Without it, a
+GitHub-UI merge or a raw `gh pr merge` lands the PR over a red check — the same client-side
+bypass that let hyper-saas #543 merge over a red check. See **[Client-side vs. server-side enforcement](../../README.md#client-side-vs-server-side-enforcement-the-543-gap)**
+in the repo README.
+
 ## Knobs
 
 - `LEFTOVER_INCLUDE` / `LEFTOVER_EXCLUDE` — ERE of paths to scan / skip. Defaults cover

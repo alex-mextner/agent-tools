@@ -30,11 +30,27 @@ cp ci/review-threads/workflow.yml .github/workflows/review-threads.yml
 # present at that path in your repo — vendor the ci/ dir, or copy the script and adjust
 # the `run:` path (e.g. to .github/scripts/):
 cp ci/review-threads/review-threads.sh .github/scripts/review-threads.sh   # then edit the run: path
-# Optional hard block: Settings -> Branches -> required checks -> add "review-threads".
+# REQUIRED to actually block (not optional — see "Enforcement" below):
+#   Settings -> Branches -> required checks -> add "review-threads"
+#   AND enable "Require conversation resolution before merging".
 
 # Standalone / ship preflight:
 sh ci/review-threads/review-threads.sh 123
 ```
+
+## Enforcement — a REQUIRED check, or it does not block the merge button
+
+A `tier: block` workflow **only goes red** — by itself it does **not** block the merge
+button. To actually ENFORCE this gate its `review-threads` context must be a **REQUIRED
+status check** under **server-side branch protection**, and you should *also* turn on the
+native **"Require conversation resolution before merging"** toggle (the two are
+complementary: the toggle blocks on unresolved threads server-side; the required check keeps
+the in-repo count honest and ship-preflight-reusable). rig-cli#5 provisions both from the
+`github:` block in `rig.yaml` (`required_status_checks` + `required_conversation_resolution`).
+Without server-side enforcement a GitHub-UI merge or a raw `gh pr merge` lands the PR over an
+unresolved thread — exactly how hyper-saas #543 merged through an open thread (and red CI, and
+no screenshot). See **[Client-side vs. server-side enforcement](../../README.md#client-side-vs-server-side-enforcement-the-543-gap)**
+in the repo README.
 
 ## Knobs
 

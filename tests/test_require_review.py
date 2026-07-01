@@ -448,6 +448,99 @@ def test_relative_dash_C_target_resolves_against_cwd(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
 
 
+# ── (76) docs-only via `cd <worktree> && git commit` ─────────────────────────────────────
+#
+# CC's PreToolUse fires BEFORE the shell command runs: the event `cwd` is the SESSION
+# default (main repo root), not the post-cd directory. The hook must detect a preceding
+# `cd <dir>` in the chain and use it as the effective cwd for staging classification so
+# `cd /worktree && git commit` reads the WORKTREE's index, not the main repo's (empty).
+
+def test_allow_docs_only_via_cd_worktree(tmp_path, monkeypatch):
+    """`cd <worktree> && git commit` — cwd is main (nothing staged), worktree has only .md
+    staged → the docs-only fast-path must activate from the cd-dir, not from main → allow."""
+    worktree = _init_repo(tmp_path / "worktree", "SKILL.md", "docs/guide.md")
+    main_repo = _init_repo(tmp_path / "main")  # nothing staged
+    cmd = f"cd {worktree} && git commit -m 'fix: add SKILL.md'"
+    out, _e, c = _run(cmd, main_repo, monkeypatch, marker=tmp_path / "m")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_cd_worktree_with_code_staged_is_gated(tmp_path, monkeypatch):
+    """The converse: worktree has CODE staged — the cd-dir lookup still finds code → gate."""
+    worktree = _init_repo(tmp_path / "worktree", "src/app.py")
+    main_repo = _init_repo(tmp_path / "main")  # nothing staged
+    cmd = f"cd {worktree} && git commit -m 'feat: new module'"
+    out, _e, c = _run(cmd, main_repo, monkeypatch, marker=tmp_path / "m")
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_cd_then_git_add_then_commit_forfeits_docs_fastpath(tmp_path, monkeypatch):
+    """`cd <worktree> && git add file && git commit` — a staging op after the cd forfeits the
+    docs-only fast-path (`staging_before=True`) even though the cd-dir is a docs-only repo."""
+    worktree = _init_repo(tmp_path / "worktree", "SKILL.md")
+    main_repo = _init_repo(tmp_path / "main")  # nothing staged
+    cmd = f"cd {worktree} && git add SKILL.md && git commit -m 'docs'"
+    out, _e, c = _run(cmd, main_repo, monkeypatch, marker=tmp_path / "m")
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_relative_cd_dir_resolves_against_event_cwd(tmp_path, monkeypatch):
+    """A RELATIVE `cd sub` in the chain resolves against the event cwd — same as `-C sub`."""
+    base = tmp_path / "base"
+    base.mkdir()
+    _init_repo(base / "sub", "README.md")  # docs-only repo at base/sub
+    out, _e, c = _run("cd sub && git commit -m docs", base, monkeypatch, marker=tmp_path / "m")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_is_cd_segment_unit():
+    """Unit-level coverage of `_is_cd_segment` edge cases."""
+    assert rr._is_cd_segment(["cd", "/abs/path"]) == "/abs/path"
+    assert rr._is_cd_segment(["cd", "relative/path"]) == "relative/path"
+    assert rr._is_cd_segment(["cd"]) is None          # bare cd → $HOME, can't resolve statically
+    assert rr._is_cd_segment(["cd", "-"]) is None     # cd - → prev dir, can't resolve statically
+    assert rr._is_cd_segment(["cd", "--help"]) is None
+    assert rr._is_cd_segment(["git", "commit"]) is None
+    assert rr._is_cd_segment([]) is None
+
+
+def test_cd_dir_not_propagated_across_pipe(tmp_path, monkeypatch):
+    """`cd /docs_repo | git commit` — pipe creates a subshell for `cd`; the cwd of `git commit`
+    is the event cwd (main repo), not `/docs_repo`. The docs-only fast-path must NOT fire from
+    the pipe-left `cd` dir; the main repo has code staged → gate."""
+    docs_repo = _init_repo(tmp_path / "docs", "README.md")  # docs-only if we looked here
+    main_repo = _init_repo(tmp_path / "main", "src/app.py")  # code staged — this is the real cwd
+    cmd = f"cd {docs_repo} | git commit -m x"
+    out, _e, c = _run(cmd, main_repo, monkeypatch, marker=tmp_path / "m")
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_cd_dir_not_propagated_across_or_separator(tmp_path, monkeypatch):
+    """`cd /docs_repo || git commit` — `||` only runs the right side when the left FAILED; if `cd`
+    succeeds the commit never runs, and if `cd` fails the commit runs in the original cwd.
+    Either way the cd-dir must NOT be used to classify staged files → gate on code in main repo."""
+    docs_repo = _init_repo(tmp_path / "docs", "README.md")  # docs-only if we looked here
+    main_repo = _init_repo(tmp_path / "main", "src/app.py")  # code staged — this is the real cwd
+    cmd = f"cd {docs_repo} || git commit -m x"
+    out, _e, c = _run(cmd, main_repo, monkeypatch, marker=tmp_path / "m")
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_relative_dash_C_after_cd_resolves_against_cd_dir(tmp_path, monkeypatch):
+    """`cd /worktree && git -C sub commit` — the relative `-C sub` resolves against the post-cd
+    effective cwd (`/worktree/sub`), not against the event cwd. If `/worktree/sub` is docs-only
+    and the event cwd has code staged, the docs-only fast-path should activate → allow."""
+    base = tmp_path / "base"
+    base.mkdir()
+    worktree = base / "worktree"
+    worktree.mkdir()
+    _init_repo(worktree / "sub", "SKILL.md")          # docs-only at /worktree/sub
+    main_repo = _init_repo(tmp_path / "main", "src/app.py")  # code staged — the event cwd
+    cmd = f"cd {worktree} && git -C sub commit -m docs"
+    out, _e, c = _run(cmd, main_repo, monkeypatch, marker=tmp_path / "m")
+    assert c == 0 and _decision(out) == "allow"
+
+
 # ── (A) per-commit skip the hook reads from the COMMAND ──────────────────────────────────
 
 def test_allow_inline_review_skip_env(tmp_path, monkeypatch):
