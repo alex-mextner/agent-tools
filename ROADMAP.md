@@ -239,10 +239,8 @@ called out per-repo below.*
 
 ### 🔮 IN FLIGHT — building NOW this turn (NOT merged; do not read as shipped)
 
-- 🔮 **research-cli spin-out — strategy B** (standalone CLI) — creating `alex-mextner/research-cli` and
-  vendoring the shared lib with a drift-guard (the same pattern task-cli uses), so the spin-out needs no
-  CTO PyPI account. If the harness-safety layer blocks the repo-CREATE action, it surfaces for a per-action
-  OK. Advances §6 research-cli + the (B) "research-cli spin-out" call below.
+- 🔬 **research-cli spin-out — strategy B** ✔ MERGED — `alex-mextner/research-cli` created with
+  vendored shared lib + drift-guard; `tools/research-cli/` scaffold removed from agent-tools (PR #128).
 - 🔮 **tg-cli HTML→PDF raw-tags fix** — `tg --format html` (and the file→PDF path) currently dumps the raw
   HTML report as TEXT — raw `<b>`/`<code>` show up instead of rendered formatting. Root cause: the
   HTML-report body is emitted as plain text instead of rendering the Telegram-allowed tags. Fixing the
@@ -264,16 +262,14 @@ called out per-repo below.*
 
 *What is ACTUALLY left after the 06-22→06-26 wave, grouped by what unblocks it. Nothing here is ✅
 (the CTO marks ✅). The big shipped items above already cleared most of the prior backlog; this is the
-real residual. The two IN-FLIGHT items (research-cli spin-out B, tg HTML→PDF fix) are building NOW —
-see the 🔮 block above.*
+real residual. The one remaining IN-FLIGHT item (tg HTML→PDF fix) is still building; research-cli
+spin-out is DONE (PR #128 merged) — see the 🔮 block above.*
 
 **(B) CTO-decision-gated — needs a product/architecture call, not just execution:**
 - **rollout wave-2** (rig-cli #7) — `rig init --yes` + AGENTS/CLAUDE slim **applied to the bot repos**
   (and the tool repos themselves). A staged rollout that needs the CTO's go-ahead per wave + which repos
   to touch (no cross-repo work without a per-repo OK). **The top CTO-gated item.**
-- **research-cli spin-out** — variant DECIDED as **B** (standalone CLI, vendor-lib + drift-guard, no PyPI
-  account); now IN FLIGHT (🔮 block). The remaining CTO touchpoint is per-action approval if harness-safety
-  blocks the repo-CREATE.
+- ~~**research-cli spin-out**~~ — **DONE** (PR #128): `alex-mextner/research-cli` created, `tools/research-cli/` removed from agent-tools. Awaiting CTO ✅.
 - **draw-cli pipx posture** — pipx packaging SHIPPED (draw-cli #9); whether pipx becomes the SOLE
   sanctioned install path (drop the symlink/dev mode) is the remaining call.
 
