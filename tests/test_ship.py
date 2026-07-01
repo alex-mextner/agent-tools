@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -52,7 +53,16 @@ case "$sub" in
         echo "[fake gh] merged" ;;
       *) : ;;
     esac ;;
-  api) echo 0 ;;                          # graphql review-threads -> 0 unresolved
+  api)
+    # ship makes two graphql calls: review-threads (unresolved count) and the review-dwell
+    # window ([createdAt, pushedDate, committedDate] TSV). Route by query content (--jq ignored).
+    if printf '%s ' "$@" | grep -q committedDate; then
+      # Defaults OLD so the dwell window is satisfied; a dwell test injects fresh timestamps.
+      # SHIP_TEST_PUSHED defaults EMPTY (GitHub pushedDate is often null) → committedDate fallback.
+      printf '%s\\t%s\\t%s\\n' "${SHIP_TEST_CREATED:-2020-01-01T00:00:00Z}" "${SHIP_TEST_PUSHED:-}" "${SHIP_TEST_LASTCOMMIT:-2020-01-01T00:00:00Z}"
+    else
+      echo "${SHIP_TEST_UNRESOLVED:-0}"   # review-threads -> unresolved count
+    fi ;;
   *) : ;;
 esac
 """
@@ -367,7 +377,12 @@ case "$sub" in
       merge) echo "[fake gh] merged" ;;
       *) : ;;
     esac ;;
-  api) echo 0 ;;
+  api)
+    if printf '%s ' "$@" | grep -q committedDate; then
+      printf '%s\\t%s\\t%s\\n' "${SHIP_TEST_CREATED:-2020-01-01T00:00:00Z}" "${SHIP_TEST_PUSHED:-}" "${SHIP_TEST_LASTCOMMIT:-2020-01-01T00:00:00Z}"
+    else
+      echo "${SHIP_TEST_UNRESOLVED:-0}"
+    fi ;;
   *) : ;;
 esac
 """
@@ -1578,6 +1593,138 @@ def test_stash_pop_no_conflict_clean_tree_passes(repo_with_pr_worktree, tmp_path
     assert "stash-pop" not in r.stderr.lower(), (
         f"unexpected stash-pop error on a clean checkout:\n{r.stderr}"
     )
+
+
+# ── review-dwell gate ──────────────────────────────────────────────────────────────────────
+# The gate that closes the "merged before review questions could form" gap: a PR younger than
+# SHIP_REVIEW_DWELL seconds (since its last push) is refused so async review has time to post.
+# Measured from max(createdAt, head-commit committedDate); the fake gh emits both as a TSV.
+
+
+def _now_iso() -> str:
+    """An ISO-8601 UTC timestamp for 'right now' — a fresh PR the dwell gate must refuse."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _run_ship_dwell(main, bindir, *, created=None, lastcommit=None, pushed=None, dwell=None,
+                    extra_args=()):
+    """Run ship from the main checkout, injecting the dwell-gate timestamps (createdAt /
+    committedDate / pushedDate) + window. Keeps --skip-ci (the dwell gate runs INDEPENDENTLY of
+    --skip-ci) and --no-screenshot-ok."""
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    if created is not None:
+        env["SHIP_TEST_CREATED"] = created
+    if lastcommit is not None:
+        env["SHIP_TEST_LASTCOMMIT"] = lastcommit
+    if pushed is not None:
+        env["SHIP_TEST_PUSHED"] = pushed
+    if dwell is not None:
+        env["SHIP_REVIEW_DWELL"] = str(dwell)
+    return _sh(
+        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", *extra_args,
+        cwd=main, env=env,
+    )
+
+
+def test_review_dwell_blocks_a_fresh_pr(repo_with_two_worktrees, tmp_path):
+    """A PR whose last push is 'now' is younger than the window — ship must REFUSE (this is the
+    premature-merge gap: 0 unresolved threads is vacuous before any review posts)."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    now = _now_iso()
+    r = _run_ship_dwell(main, bindir, created=now, lastcommit=now)
+    assert r.returncode != 0, f"fresh PR must be blocked by the dwell gate\n{r.stdout}\n{r.stderr}"
+    assert "review-dwell window" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout, "fresh PR must NOT have merged"
+
+
+def test_review_dwell_passes_an_aged_pr(repo_with_two_worktrees, tmp_path):
+    """A PR pushed long ago is past the window — ship proceeds and reports the gate OK."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    r = _run_ship_dwell(main, bindir, created="2020-01-01T00:00:00Z", lastcommit="2020-01-01T00:00:00Z")
+    assert r.returncode == 0, f"aged PR should pass the dwell gate\n{r.stdout}\n{r.stderr}"
+    assert "review-dwell gate OK" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_review_dwell_override_flag_allows_fresh_pr(repo_with_two_worktrees, tmp_path):
+    """--no-review-dwell-ok <reason> fast-tracks a fresh PR, logging the reason."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    now = _now_iso()
+    r = _run_ship_dwell(main, bindir, created=now, lastcommit=now,
+                        extra_args=("--no-review-dwell-ok", "urgent hotfix"))
+    assert r.returncode == 0, f"override must allow a fresh PR\n{r.stdout}\n{r.stderr}"
+    assert "review-dwell gate OVERRIDDEN" in r.stdout and "urgent hotfix" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_review_dwell_zero_disables_gate(repo_with_two_worktrees, tmp_path):
+    """SHIP_REVIEW_DWELL=0 disables the gate entirely (a fresh PR merges)."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    now = _now_iso()
+    r = _run_ship_dwell(main, bindir, created=now, lastcommit=now, dwell=0)
+    assert r.returncode == 0, f"dwell=0 must disable the gate\n{r.stdout}\n{r.stderr}"
+    assert "review-dwell gate disabled" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_review_dwell_uses_pr_open_when_commit_is_stale(repo_with_two_worktrees, tmp_path):
+    """A stale-authored commit on a freshly-OPENED PR still waits: the window starts at the
+    later of createdAt / committedDate, so a fresh createdAt blocks even with an old commit."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    r = _run_ship_dwell(main, bindir, created=_now_iso(), lastcommit="2020-01-01T00:00:00Z")
+    assert r.returncode != 0, f"a freshly-opened PR must be blocked even with an old commit\n{r.stdout}\n{r.stderr}"
+    assert "review-dwell window" in r.stderr, r.stderr
+
+
+def test_review_dwell_blocks_on_fresh_pushed_date_with_old_commit(repo_with_two_worktrees, tmp_path):
+    """The force-push case (codex review finding): an already-open PR (old createdAt) whose head
+    was just force-pushed — old committedDate, but GitHub's pushedDate is FRESH — must still be
+    blocked. The window keys off pushedDate (GitHub-controlled), not the commit's embedded date."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    r = _run_ship_dwell(
+        main, bindir,
+        created="2020-01-01T00:00:00Z",      # PR opened long ago
+        lastcommit="2020-01-01T00:00:00Z",   # head commit's embedded date is old
+        pushed=_now_iso(),                    # ...but GitHub received the (force-)push just now
+    )
+    assert r.returncode != 0, f"a fresh force-push must restart the window\n{r.stdout}\n{r.stderr}"
+    assert "review-dwell window" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_dwell_fails_closed_on_unparseable_timestamps(repo_with_two_worktrees, tmp_path):
+    """If the timestamps can't be parsed, ship REFUSES rather than merging un-waited."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    r = _run_ship_dwell(main, bindir, created="not-a-date", lastcommit="not-a-date")
+    assert r.returncode != 0, f"unparseable timestamps must fail closed\n{r.stdout}\n{r.stderr}"
+    assert "could not parse" in r.stderr and "review-dwell" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_dwell_rejects_non_numeric_window(repo_with_two_worktrees, tmp_path):
+    """A malformed SHIP_REVIEW_DWELL is refused outright (no silent fall-through to merge)."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_REVIEW_DWELL"] = "ten-minutes"
+    r = _sh("bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode != 0, f"non-numeric window must be refused\n{r.stdout}\n{r.stderr}"
+    assert "must be a non-negative integer" in r.stderr, r.stderr
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@
 #   • PR is not OPEN / is CONFLICTING / is BEHIND its base (ruleset wants up-to-date).
 #   • Required status checks aren't all passing (green-CI gate).
 #   • There are unresolved review threads (see ci/review-threads/).
+#   • The PR is younger than the review-dwell window (async review hasn't had time to form
+#     its questions yet — "0 unresolved threads" is vacuous if no review has posted).
 #   • A UI-touching PR has no embedded screenshot (see ci/screenshots/) — unless overridden.
 #   • The local branch has unpushed/diverged commits, or its worktree is dirty.
 #
@@ -26,6 +28,8 @@
 #   --no-screenshot-ok R   override the UI screenshot requirement with a logged reason R.
 #   --no-version-bump-ok R override the version-bump requirement with a logged reason R
 #                          (genuine no-release ship: docs-only, pure test/CI, a revert).
+#   --no-review-dwell-ok R override the review-dwell window with a logged reason R (a genuine
+#                          fast-track: a trivial/urgent merge that doesn't need review latency).
 #   --screenshot P [D]     attach a local screenshot P (desc D) via SHIP_IMAGE_UPLOAD_CMD,
 #                          then post it as a PR comment. Repeatable.
 #
@@ -47,12 +51,15 @@
 #   SHIP_VERSION_FILES     space-separated list of version files to check (relative to the repo
 #                          root). Default: auto-detect pyproject.toml then package.json at the
 #                          root. Set it for a non-standard layout (e.g. a nested package).
+#   SHIP_REVIEW_DWELL      minimum seconds since the PR's last code push before a merge is
+#                          allowed, so asynchronous review (multi-model / CI-AI / human) has
+#                          time to FORM its comments. Default 600 (10 min). 0 disables the gate.
 set -euo pipefail
 
 ORIG_PWD=$(pwd -P)
-PR=""; SKIP_CI=0; DRY_RUN=0; NO_SHOT_OK=""; NO_VBUMP_OK=""
+PR=""; SKIP_CI=0; DRY_RUN=0; NO_SHOT_OK=""; NO_VBUMP_OK=""; NO_DWELL_OK=""
 SHOT_PATHS=(); SHOT_DESCS=()
-USAGE='Usage: ship.sh <PR-number> [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--screenshot <path> [desc]]...'
+USAGE='Usage: ship.sh <PR-number> [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--screenshot <path> [desc]]...'
 
 # --- arg parse (PR number is the lone bare arg; --screenshot takes path + optional desc) --
 args=("$@"); i=0; n=${#args[@]}
@@ -67,6 +74,9 @@ while [ "$i" -lt "$n" ]; do
     --no-version-bump-ok)
       i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "--no-version-bump-ok needs a <reason>." >&2; exit 1; }
       NO_VBUMP_OK=${args[$i]}; [ -n "$NO_VBUMP_OK" ] || { echo "--no-version-bump-ok reason empty." >&2; exit 1; } ;;
+    --no-review-dwell-ok)
+      i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "--no-review-dwell-ok needs a <reason>." >&2; exit 1; }
+      NO_DWELL_OK=${args[$i]}; [ -n "$NO_DWELL_OK" ] || { echo "--no-review-dwell-ok reason empty." >&2; exit 1; } ;;
     --screenshot|--shot)
       i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "$a needs a <path>." >&2; exit 1; }
       p=${args[$i]}; case "$p" in /*) : ;; *) p="$ORIG_PWD/$p" ;; esac
@@ -477,6 +487,89 @@ else
   exit 1
 fi
 [ "${UNRESOLVED:-0}" = "0" ] || { echo "Refusing: PR #$PR has $UNRESOLVED unresolved review thread(s) — resolve them, then re-run." >&2; exit 1; }
+
+# --- review-dwell gate: give async review time to FORM its comments before merging ---------
+# WHY this exists (the gap it closes): the unresolved-threads gate above only fails when threads
+# ALREADY EXIST. "0 unresolved threads" is ALSO true when no review has POSTED yet — so a PR
+# opened and shipped within seconds passes that gate vacuously, before any multi-model / CI-AI /
+# human review could form its questions. This gate enforces a minimum DWELL window since the PR's
+# last code push, so a review has time to land; whatever it then posts becomes a thread the gate
+# above forces resolved. Together they mean: comments get TIME to form AND must be resolved.
+#
+# Runs INDEPENDENTLY of --skip-ci: a premature merge is premature regardless of CI billing.
+#
+# The window starts at max(createdAt, pushedDate, committedDate, forcePushedAt):
+#   • createdAt — the floor; a reviewer can't review before the PR exists, so even a PR built
+#     from an old commit waits from PR-open.
+#   • pushedDate — GitHub-CONTROLLED head-update time (when GitHub received the push). Reliable
+#     for normal pushes but can be null (deprecated on the Commit object) and stale on force-pushes
+#     to an already-on-GitHub commit.
+#   • committedDate — the embedded commit date. Reliable fallback for pushedDate==null on the common
+#     commit→push / rebase→push path.
+#   • forcePushedAt — HeadRefForcePushedEvent.createdAt (last event); the authoritative signal
+#     that the PR head was force-pushed to an old commit where pushedDate would be stale.
+# Override with --no-review-dwell-ok <reason> (logged) or SHIP_REVIEW_DWELL=0 to disable.
+# Fail-CLOSED: if the timestamps can't be read or parsed, refuse rather than merge un-waited.
+
+# Convert an ISO-8601 UTC timestamp (GitHub's `2026-06-28T12:34:56Z`) to a Unix epoch, portably
+# across GNU date (`-d`) and BSD/macOS date (`-j -f`). Drops fractional seconds and tolerates a
+# missing trailing `Z`. Prints the epoch on success, nothing on failure (caller fails closed).
+iso_to_epoch() {  # $1 = ISO-8601 timestamp -> prints epoch seconds, or nothing
+  [ -n "${1:-}" ] || return 0
+  local ts="${1%%.*}"                              # strip any fractional seconds
+  case "$ts" in *Z) : ;; *) ts="${ts}Z" ;; esac    # normalize to a trailing Z
+  date -u -d "$ts" +%s 2>/dev/null && return 0                         # GNU date
+  date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null && return 0 # BSD/macOS date
+  return 0
+}
+
+DWELL="${SHIP_REVIEW_DWELL:-600}"
+case "$DWELL" in *[!0-9]*|'') echo "Refusing: SHIP_REVIEW_DWELL='$DWELL' must be a non-negative integer (seconds)." >&2; exit 1 ;; esac
+if [ -n "$NO_DWELL_OK" ]; then
+  echo "[ship] review-dwell gate OVERRIDDEN — reason: $NO_DWELL_OK"
+elif [ "$DWELL" = "0" ]; then
+  echo "[ship] review-dwell gate disabled (SHIP_REVIEW_DWELL=0)."
+else
+  # Fetch four timestamp signals from GitHub:
+  #   createdAt        — PR open time (floor: dwell must pass from at least this point)
+  #   pushedDate       — GitHub-controlled head-update time (when GitHub received the push);
+  #                      reliable for normal pushes but can be null and is deprecated on Commit.
+  #   committedDate    — embedded in the commit; reliable fallback for pushedDate==null.
+  #   forcePushedAt    — HeadRefForcePushedEvent.createdAt (last entry); the authoritative signal
+  #                      for "PR was force-pushed to an already-on-GitHub commit" that makes
+  #                      pushedDate stale. Empty when there has been no force-push.
+  # Window start = max(createdAt, pushedDate, committedDate, forcePushedAt).
+  DWELL_Q='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){createdAt commits(last:1){nodes{commit{committedDate pushedDate}}} timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{__typename ... on HeadRefForcePushedEvent{createdAt}}}}}}'
+  if DWELL_RAW=$(gh api graphql -F owner='{owner}' -F name='{repo}' -F pr="$PR" -f query="$DWELL_Q" \
+       --jq '.data.repository.pullRequest | [.createdAt, (.commits.nodes[0].commit.pushedDate // ""), (.commits.nodes[0].commit.committedDate // ""), (.timelineItems.nodes[0].createdAt // "")] | @tsv' 2>/dev/null); then
+    PR_CREATED=$(printf '%s' "$DWELL_RAW" | awk -F'\t' 'NR==1{print $1}')
+    PR_PUSHED=$(printf '%s' "$DWELL_RAW" | awk -F'\t' 'NR==1{print $2}')
+    PR_COMMITTED=$(printf '%s' "$DWELL_RAW" | awk -F'\t' 'NR==1{print $3}')
+    PR_FORCE_PUSHED=$(printf '%s' "$DWELL_RAW" | awk -F'\t' 'NR==1{print $4}')
+  else
+    echo "Refusing: could not read PR #$PR timestamps for the review-dwell gate (gh api failed) — refusing rather than merge un-waited. Fix gh access, or override with --no-review-dwell-ok <reason>." >&2
+    exit 1
+  fi
+  # Window start = the LATEST of the four signals (each may be empty if unparseable/null).
+  START=""
+  for ts in "$PR_CREATED" "$PR_PUSHED" "$PR_COMMITTED" "$PR_FORCE_PUSHED"; do
+    e=$(iso_to_epoch "$ts")
+    if [ -n "$e" ] && { [ -z "$START" ] || [ "$e" -gt "$START" ]; }; then START="$e"; fi
+  done
+  if [ -z "$START" ]; then
+    echo "Refusing: could not parse PR #$PR review-window timestamps ('$PR_CREATED' / '$PR_PUSHED' / '$PR_COMMITTED' / '$PR_FORCE_PUSHED') for the review-dwell gate — refusing rather than merge un-waited. Override with --no-review-dwell-ok <reason> if intended." >&2
+    exit 1
+  fi
+  NOW=$(date +%s); ELAPSED=$(( NOW - START ))
+  if [ "$ELAPSED" -lt "$DWELL" ]; then
+    WAIT=$(( DWELL - ELAPSED ))
+    { echo "Refusing: PR #$PR is only ${ELAPSED}s old since its last push — the review-dwell window is ${DWELL}s, so async review has not had time to form its questions yet."
+      echo "  Wait ${WAIT}s and re-run (meanwhile, request/run the review so comments can land). Tune with SHIP_REVIEW_DWELL=<seconds> (0 disables)."
+      echo "  Genuine fast-track (trivial/urgent): override with --no-review-dwell-ok <reason> (logged)."; } >&2
+    exit 1
+  fi
+  echo "[ship] review-dwell gate OK — PR #$PR is ${ELAPSED}s past its last push (window ${DWELL}s)."
+fi
 
 # --- local branch sanity (no unpushed/diverged commits; clean worktree) ----------------
 # A branch can be checked out in MORE THAN ONE worktree (git permits it; a stray/leftover
