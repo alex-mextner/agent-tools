@@ -808,6 +808,107 @@ LABEL="no-local-scan repo with read-only .githooks-skip => install succeeds (no 
 assert test "$rc_c" = 0
 chmod 0644 "$RON/.githooks-skip" 2>/dev/null || true
 
+# --- 35. protect-main: the SHIPPED pre-push fragment blocks direct pushes to main ---
+# Uses the real fragment + the real composers (core.hooksPath) end-to-end through a
+# real `git push` to a local bare origin, so the stdin ref-forwarding chain
+# (git -> composer spool -> dispatcher spool -> fragment `read`) is what is proven.
+GHD_PP="$TMP/ghd-prepush"
+mkdir -p "$GHD_PP/pre-push"
+cp "$HERE/global-hooks.d/pre-push/10-protect-main" "$GHD_PP/pre-push/"
+chmod +x "$GHD_PP/pre-push/10-protect-main"
+# Keep the override log inside $TMP — explicit path, NOT $HOME-derived, so a future
+# reshuffle of the HOME sandbox can never point this at the user's real audit log.
+export XDG_CACHE_HOME="$TMP/home/.cache"
+OVLOG="$XDG_CACHE_HOME/agent-tools/overrides.log"
+RPM="$TMP/rpm"; mk_repo "$RPM"
+git -C "$RPM" branch -M main
+git init -q --bare "$TMP/rpm-origin.git"
+git -C "$RPM" remote add origin "$TMP/rpm-origin.git"
+git -C "$RPM" config core.hooksPath "$HERE/hooks"
+pp_push() { ( cd "$RPM" && GLOBAL_HOOKS_DIR="$GHD_PP" git push "$@" >/dev/null 2>&1 ); }
+
+LABEL="protect-main blocks a direct push to main"
+assert_not pp_push origin main
+LABEL="protect-main allows a feature-branch push"
+assert pp_push origin main:feat-x
+rm -f "$OVLOG"
+LABEL="PUSH_MAIN_OK=1 allows the push to main"
+assert env PUSH_MAIN_OK=1 PUSH_MAIN_REASON=selfcheck sh -c \
+  'cd "$1" && GLOBAL_HOOKS_DIR="$2" git push origin main >/dev/null 2>&1' _ "$RPM" "$GHD_PP"
+have "$(wc -l < "$OVLOG" | tr -d ' ')" 1 "override appended exactly ONE overrides.log line"
+# NOTE: match the repo by basename — `git rev-parse --show-toplevel` returns the
+# RESOLVED path (macOS: /var/folders -> /private/var/folders), not $RPM verbatim.
+LABEL="overrides.log line carries repo + ref + reason"
+assert grep -q "/$(basename "$RPM") ref=refs/heads/main reason=selfcheck" "$OVLOG"
+
+# dispatch-once: a template-shim local pre-push (as written by init.templateDir) already
+# calls the dispatcher; the composer must NOT dispatch a second time (no duplicate audit
+# lines, no double secret scans).
+cp "$HERE/template/hooks/pre-push" "$RPM/.git/hooks/pre-push"
+chmod +x "$RPM/.git/hooks/pre-push"
+# the template shim resolves the runner via XDG_CONFIG_HOME — point it at the real one
+mkdir -p "$XDG_CONFIG_HOME/git"
+cp "$HERE/run-global-hooks" "$XDG_CONFIG_HOME/git/run-global-hooks"
+chmod +x "$XDG_CONFIG_HOME/git/run-global-hooks"
+( cd "$RPM" && echo pm >> seed.txt && git add seed.txt \
+    && git -c core.hooksPath= commit -q --no-verify -m pm )
+rm -f "$OVLOG"
+LABEL="template-shim repo: override push still allowed"
+assert env PUSH_MAIN_OK=1 PUSH_MAIN_REASON=once sh -c \
+  'cd "$1" && GLOBAL_HOOKS_DIR="$2" git push origin main >/dev/null 2>&1' _ "$RPM" "$GHD_PP"
+have "$(wc -l < "$OVLOG" | tr -d ' ')" 1 "dispatch-once: template-shim repo logs ONE line, not two"
+
+# a local hook that only MENTIONS run-global-hooks in a comment does NOT count as
+# dispatching — the composer must still run the dispatcher (fragment still blocks).
+cat > "$RPM/.git/hooks/pre-push" <<'EOF'
+#!/bin/sh
+# run-global-hooks is handled elsewhere (comment only — no dispatch here)
+exit 0
+EOF
+chmod +x "$RPM/.git/hooks/pre-push"
+( cd "$RPM" && echo pm2 >> seed.txt && git add seed.txt \
+    && git -c core.hooksPath= commit -q --no-verify -m pm2 )
+LABEL="comment-only run-global-hooks mention: composer still dispatches (push blocked)"
+assert_not pp_push origin main
+
+# fail-open guard: a shim that REFERENCES the runner but whose runner path is missing
+# executes nothing — the dispatch marker stays untouched, so the composer must STILL
+# run its own dispatcher (fragment blocks). A static text-match heuristic would have
+# been fooled here into skipping every global gate.
+cat > "$RPM/.git/hooks/pre-push" <<EOF
+#!/bin/sh
+DISP="$TMP/does-not-exist/run-global-hooks"
+[ -x "\$DISP" ] && { "\$DISP" pre-push "\$@" || exit \$?; }
+exit 0
+EOF
+chmod +x "$RPM/.git/hooks/pre-push"
+LABEL="shim with MISSING runner: composer still dispatches (push blocked, no fail-open)"
+assert_not pp_push origin main
+
+# deletion of main passes the fragment — the server owns that gate (git refuses
+# deleting the current branch by default; relaxed here to isolate the fragment).
+git -C "$TMP/rpm-origin.git" config receive.denyDeleteCurrent ignore
+LABEL="protect-main lets a DELETION of main pass (server-side owns that gate)"
+assert pp_push origin :main
+
+# multi-ref: a push hitting BOTH protected branches must audit each ref, and a blocked
+# multi-ref push must name each ref in the refusal.
+rm -f "$OVLOG"
+LABEL="multi-ref override push (main + master) allowed"
+assert env PUSH_MAIN_OK=1 PUSH_MAIN_REASON=multi sh -c \
+  'cd "$1" && GLOBAL_HOOKS_DIR="$2" git push origin main main:master >/dev/null 2>&1' _ "$RPM" "$GHD_PP"
+have "$(wc -l < "$OVLOG" | tr -d ' ')" 2 "multi-ref override logs one audit line PER protected ref"
+LABEL="master audit line present in overrides.log"
+assert grep -q "ref=refs/heads/master reason=multi" "$OVLOG"
+
+( cd "$RPM" && echo mr >> seed.txt && git add seed.txt \
+    && git -c core.hooksPath= commit -q --no-verify -m mr )
+BLOCK_OUT="$( cd "$RPM" && GLOBAL_HOOKS_DIR="$GHD_PP" git push origin main main:master 2>&1 || true )"
+LABEL="blocked multi-ref message names BOTH protected branches"
+assert sh -c 'printf %s "$1" | grep -q "refs/heads/main" && printf %s "$1" | grep -q "refs/heads/master"' _ "$BLOCK_OUT"
+LABEL="blocked message points to the PR flow"
+assert sh -c 'printf %s "$1" | grep -q "Land it via a PR"' _ "$BLOCK_OUT"
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "selfcheck: ALL PASS"

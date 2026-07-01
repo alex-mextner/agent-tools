@@ -15,14 +15,22 @@ git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" || exit 0
 [ -n "$git_dir" ] || exit 0
 
 # --- 1. repo-local commit-msg (shadowed by the global hooksPath; run it explicitly).
+# A template-shim (init.templateDir) or retrofit-injected local hook CALLS the
+# dispatcher itself; if we then ran our own dispatcher stage too, every fragment would
+# fire TWICE. The marker is a POSITIVE runtime signal (the runner touches it when it
+# actually executes) — a shim whose runner path is missing leaves it untouched, so
+# stage 2 still dispatches (fail-safe).
 local_hook="$git_dir/hooks/commit-msg"
+dispatch_marker="${TMPDIR:-/tmp}/global-hooks-dispatched.commit-msg.$$"
+rm -f "$dispatch_marker"
+trap 'rm -f "$dispatch_marker"' EXIT INT TERM
 if [ -x "$local_hook" ] && [ "$local_hook" != "$0" ]; then
-  "$local_hook" "$@" || exit $?
+  GLOBAL_HOOKS_DISPATCH_MARKER="$dispatch_marker" "$local_hook" "$@" || exit $?
 fi
 
-# --- 2. global-hooks dispatcher (commit-msg event).
-if [ -x "$HOOK_DIR/../run-global-hooks" ]; then
-  "$HOOK_DIR/../run-global-hooks" commit-msg "$@" || exit $?
+# --- 2. global-hooks dispatcher (commit-msg event) — unless stage 1 provably dispatched.
+if [ ! -e "$dispatch_marker" ] && [ -x "$HOOK_DIR/../run-global-hooks" ]; then
+  GLOBAL_HOOKS_DISPATCH_MARKER= "$HOOK_DIR/../run-global-hooks" commit-msg "$@" || exit $?
 fi
 
 exit 0

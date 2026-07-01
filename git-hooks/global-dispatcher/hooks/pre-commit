@@ -31,14 +31,23 @@ git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" || exit 0
 # repo-local gate would never fire. Resolve against the absolute git dir instead, which
 # is correct for normal repos, worktrees, and submodules (where .git is a file).
 local_hook="$git_dir/hooks/pre-commit"
+# A template-shim (init.templateDir) or retrofit-injected local hook CALLS the
+# dispatcher itself; if we then ran our own dispatcher stage too, every fragment would
+# fire TWICE (double secret scans). The marker is a POSITIVE runtime signal (the runner
+# touches it when it actually executes) — a shim whose runner path is missing leaves it
+# untouched, so stage 2 still dispatches (fail-safe).
+dispatch_marker="${TMPDIR:-/tmp}/global-hooks-dispatched.pre-commit.$$"
+rm -f "$dispatch_marker"
+trap 'rm -f "$dispatch_marker"' EXIT INT TERM
 # Guard: don't recurse into ourselves if hooksPath happens to point at the git dir.
 if [ -x "$local_hook" ] && [ "$local_hook" != "$0" ]; then
-  "$local_hook" "$@" || exit $?
+  GLOBAL_HOOKS_DISPATCH_MARKER="$dispatch_marker" "$local_hook" "$@" || exit $?
 fi
 
-# --- 2. global-hooks dispatcher (the extensible set; secret-scan + future hooks).
-if [ -x "$HOOK_DIR/../run-global-hooks" ]; then
-  "$HOOK_DIR/../run-global-hooks" pre-commit "$@" || exit $?
+# --- 2. global-hooks dispatcher (the extensible set; secret-scan + future hooks) —
+# skipped when stage 1 provably dispatched.
+if [ ! -e "$dispatch_marker" ] && [ -x "$HOOK_DIR/../run-global-hooks" ]; then
+  GLOBAL_HOOKS_DISPATCH_MARKER= "$HOOK_DIR/../run-global-hooks" pre-commit "$@" || exit $?
 fi
 
 # --- 3. review-before-commit gate.
