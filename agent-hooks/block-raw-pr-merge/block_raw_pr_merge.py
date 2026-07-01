@@ -11,10 +11,21 @@ This is the enforcement counterpart of the doc-only "use `gh ship`, never a raw 
 rule: advice in AGENTS.md cannot stop an autonomous (auto-mode) agent from running
 `gh pr merge`, so the rule only becomes real as a mid-session guard.
 
+Detection is ARGV-BASED, not a raw substring match.  The command is parsed via shlex
+into shell segments (`;` / `&&` / `||` / `|` separated), and each segment is inspected
+for `basename(argv[0])=="gh" && argv[1]=="pr" && argv[2]=="merge"` after stripping
+leading inline VAR=value assignments and shell grouping tokens (`(`, `{`).  Using
+basename handles path-qualified invocations (`/usr/local/bin/gh pr merge`).  This
+prevents a false positive where the body of an unrelated command (e.g. `gh pr create
+--body "run gh pr merge to land it"`) triggers the guard — with a raw regex that body
+text would match and the command would be blocked even though no actual merge is
+occurring.
+
 Allowed (let through):
   - `gh ship <PR>` / a `gh alias` that runs ship
   - `pr-ship.sh` / `ship.sh` (the script the ship alias points at)
   - any non-merge `gh pr` subcommand (view, list, checkout, create, comment, ...)
+  - commands whose body/arguments merely contain the text "gh pr merge" as a string
 
 Escape hatch (controllable, not a hard wall — mirrors enforce-timeout / block-process-env):
   - env  ALLOW_RAW_PR_MERGE=1            — disable the guard for this session
@@ -39,21 +50,35 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
-# `gh pr merge` in any argv spacing (e.g. `gh   pr   merge`), --admin included implicitly.
-GH_PR_MERGE = re.compile(r"\bgh\b\s+pr\s+merge\b")
-# The sanctioned ship paths — never block these even though they ultimately merge.
-SHIP_ALLOW = re.compile(r"\bgh\b\s+ship\b|\bpr-ship\.sh\b|\bship\.sh\b")
-# Inline, self-documenting per-command override.
+# Shell operators that separate independent command segments in a compound command line.
+_SHELL_SEPS = frozenset({"&&", "||", ";", "|", "&", ";;", "|&", ";&", ";;&"})
+
+# Shell grouping/control-flow tokens that may precede the real command name in a segment.
+# E.g. `( gh pr merge 5 )` or `{ gh pr merge 5; }`.
+_LEADING_SHELL_NOISE = frozenset({"(", "{", "!", "then", "do", "else", "elif"})
+
+# A VAR=value inline environment assignment that may precede the executable.
+_INLINE_ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# Merge-hint pattern: used to gate fail-closed on unbalanced-quote parse errors so that
+# a benign command with an unbalanced quote (e.g. `grep won't file`) is NOT blocked just
+# because shlex can't parse it.  Only if the raw string plausibly contains a merge
+# invocation do we treat a parse error as fail-closed.
+_MERGE_HINT = re.compile(r"\bgh\b.*\bpr\b.*\bmerge\b", re.DOTALL)
+
+# Inline, self-documenting per-command override (checked on the raw string so a
+# comment stripped by shlex is still found).
 INLINE_SENTINEL = re.compile(r"#\s*no-ship-guard:\s*(\S.*)")
 
 
 def emit(decision: str, message: str | None = None) -> None:
-    out = {"hook_api": HOOK_API, "decision": decision}
+    out: dict[str, str] = {"hook_api": HOOK_API, "decision": decision}
     if message:
         out["message"] = message
     sys.stdout.write(json.dumps(out))
@@ -62,6 +87,84 @@ def emit(decision: str, message: str | None = None) -> None:
 
 def warn(msg: str) -> None:
     sys.stderr.write(f"block-raw-pr-merge: {msg}\n")
+
+
+def _split_segments(command: str) -> list[list[str]]:
+    """Tokenize `command` via shlex and split into per-segment token lists.
+
+    Uses ``punctuation_chars=True`` so that `;`, `&&`, `||`, `|` etc. are
+    returned as standalone separator tokens rather than being glued to adjacent
+    words (the default shlex.split() behaviour leaves `done;` as one token,
+    missing the `;` separator entirely).
+
+    Each segment is one independent command (the shell atoms between separators).
+    Returns a list of token lists; raises ValueError on unbalanced quotes
+    (caller treats this as fail-closed).
+    """
+    lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lex.whitespace_split = False
+    tokens = list(lex)  # raises ValueError on unbalanced quotes
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for tok in tokens:
+        if tok in _SHELL_SEPS:
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(tok)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _segment_argv(segment: list[str]) -> list[str]:
+    """Return the real argv by stripping leading shell noise and VAR=value assignments.
+
+    Strips leading grouping/control tokens (`(`, `{`, `!`, …) so that
+    `( gh pr merge 5 )` or `{ gh pr merge 5; }` are correctly detected.
+    Then strips leading VAR=value inline env assignments so that
+    `GH_TOKEN=x gh pr merge 5` is correctly detected.
+    """
+    i = 0
+    while i < len(segment) and segment[i] in _LEADING_SHELL_NOISE:
+        i += 1
+    while i < len(segment) and _INLINE_ENV.match(segment[i]):
+        i += 1
+    return segment[i:]
+
+
+def _is_gh_pr_merge(segment: list[str]) -> bool:
+    """Return True iff this segment's argv is a `gh pr merge` invocation.
+
+    Uses ``os.path.basename`` on argv[0] so that path-qualified invocations
+    such as ``/opt/homebrew/bin/gh pr merge 5`` are correctly detected.
+    """
+    argv = _segment_argv(segment)
+    return (
+        len(argv) >= 3
+        and os.path.basename(argv[0]) == "gh"
+        and argv[1] == "pr"
+        and argv[2] == "merge"
+    )
+
+
+def _command_contains_gh_pr_merge(command: str) -> bool | None:
+    """Return True if any parsed segment of `command` is a `gh pr merge` call.
+
+    Returns None (fail-closed) when the command cannot be parsed AND the raw
+    text looks like a merge invocation.  Commands whose parse fails but contain
+    no merge-like pattern (e.g. ``grep won't file`` with an unbalanced quote)
+    return False so they are not spuriously blocked.
+    """
+    try:
+        segments = _split_segments(command)
+    except ValueError:
+        # Fail-closed ONLY if the raw text plausibly contains a merge attempt.
+        if _MERGE_HINT.search(command):
+            return None
+        return False
+    return any(_is_gh_pr_merge(seg) for seg in segments)
 
 
 def _override_reason(command: str) -> str | None:
@@ -94,8 +197,18 @@ def main() -> int:
     if not isinstance(command, str):
         command = str(command)
 
-    # not a raw merge → nothing to do (covers gh ship, gh pr view/list/checkout, etc.)
-    if not GH_PR_MERGE.search(command) or SHIP_ALLOW.search(command):
+    is_merge = _command_contains_gh_pr_merge(command)
+
+    if is_merge is None:
+        warn("could not parse command (unbalanced quotes) — blocking (fail-closed)")
+        emit(
+            "block",
+            "block-raw-pr-merge: command has unbalanced quotes — cannot verify "
+            "it is not a raw merge, blocking (fail-closed).",
+        )
+        return BLOCK_EXIT_CODE
+
+    if not is_merge:
         emit("allow")
         return 0
 

@@ -30,11 +30,27 @@ cp ci/review-threads/workflow.yml .github/workflows/review-threads.yml
 # present at that path in your repo — vendor the ci/ dir, or copy the script and adjust
 # the `run:` path (e.g. to .github/scripts/):
 cp ci/review-threads/review-threads.sh .github/scripts/review-threads.sh   # then edit the run: path
-# Optional hard block: Settings -> Branches -> required checks -> add "review-threads".
+# REQUIRED to actually block (not optional — see "Enforcement" below):
+#   Settings -> Branches -> required checks -> add "review-threads"
+#   AND enable "Require conversation resolution before merging".
 
 # Standalone / ship preflight:
 sh ci/review-threads/review-threads.sh 123
 ```
+
+## Enforcement — a REQUIRED check, or it does not block the merge button
+
+A `tier: block` workflow **only goes red** — by itself it does **not** block the merge
+button. To actually ENFORCE this gate its `review-threads` context must be a **REQUIRED
+status check** under **server-side branch protection**, and you should *also* turn on the
+native **"Require conversation resolution before merging"** toggle (the two are
+complementary: the toggle blocks on unresolved threads server-side; the required check keeps
+the in-repo count honest and ship-preflight-reusable). rig-cli#5 provisions both from the
+`github:` block in `rig.yaml` (`required_status_checks` + `required_conversation_resolution`).
+Without server-side enforcement a GitHub-UI merge or a raw `gh pr merge` lands the PR over an
+unresolved thread — exactly how hyper-saas #543 merged through an open thread (and red CI, and
+no screenshot). See **[Client-side vs. server-side enforcement](../../README.md#client-side-vs-server-side-enforcement-the-543-gap)**
+in the repo README.
 
 ## Knobs
 
@@ -42,21 +58,45 @@ sh ci/review-threads/review-threads.sh 123
 - `IGNORE_OUTDATED=1` — don't count threads GitHub marked *outdated* (default counts them;
   an unresolved thread is unresolved even if the line moved).
 
-## Caveat — resolving a thread emits no webhook
+## Re-evaluation — closing the stale-green gap (agent-tools#65)
 
-Toggling *Resolved* does **not** fire a `pull_request` event, so the check won't auto-rerun
-the instant you resolve the last thread. Push a commit, re-run the job, or rely on the
-ship-time preflight ([`../ship/`](../ship/)) which always re-counts at merge time. The
-workflow re-runs on `synchronize` (new commits) and `workflow_dispatch` (manual).
+`pull_request_target` only fires on PR lifecycle (open/synchronize/...), so a review thread
+**added after an earlier green check** used to leave the required `review-threads` status
+**dishonestly green** — a PR could be merged via the GitHub UI over a fresh unresolved thread
+(the [ship gate](../ship/) re-checks at merge time, but the required *status* lied). The
+workflow now **also re-runs when a review is submitted or a review comment is
+created/edited/deleted** (`pull_request_review`, `pull_request_review_comment`) — exactly when
+an unresolved thread appears — so the gate re-counts and reds the check. Both events run on
+the PR **merge ref** (`GITHUB_REF = refs/pull/N/merge`, per the GitHub Actions event docs),
+exactly like `pull_request` — so GitHub attaches their check-run to the PR and branch
+protection's required `review-threads` context is refreshed on the PR head. (That merge-ref
+behavior is also why the checkout below must pin to the trusted base — see the security note.)
+
+Deliberately **not** triggered on (each would be a false-coverage no-op):
+
+- `issue_comment` — runs on the **default-branch** SHA, so its check-run never attaches to the
+  PR head where branch protection looks; it would re-run but never update the required status.
+  (A plain PR comment also doesn't change thread state.)
+- `pull_request_review_thread` (resolved/unresolved) — **not a supported Actions trigger** (it
+  exists only as a webhook), so listing it would silently never fire.
+
+**Residual gap (the safe direction):** *resolving* the last thread fires no supported Actions
+trigger, so the check won't auto-flip back to green on its own. Push a commit, re-run via
+`workflow_dispatch`, or rely on the ship-time preflight ([`../ship/`](../ship/)) which always
+re-counts at merge time. Staying red until then is conservative — it never lets an unresolved
+thread merge, it only delays the green.
 
 ## Security note — tamper-resistant
 
 A merge-BLOCKING gate must not run a script the PR can edit (a PR could weaken its own
-gate). So the workflow uses `pull_request_target` and runs the **base-branch (trusted)**
-copy of the script; it reads only the **PR number** from the event payload (data), never
-checks out or executes PR-head code, and keeps a read-only token. The standalone
-`review-threads.sh` is for local / ship-preflight use. `workflow_dispatch` takes a
-`pr_number` input (a manual run has no PR in the event payload).
+gate). So the workflow uses `pull_request_target` and pins the checkout to the PR **base
+branch (trusted)**, running that copy of the script; it reads only the **PR number** from the
+event payload (data), never checks out or executes PR-head code, and keeps a read-only token.
+The pinned base checkout matters for the review/comment triggers: their *default* checkout ref
+is the PR **merge** ref (which contains the PR's edits to the gate script), so pinning to
+`base.ref` keeps the trusted copy running. The standalone `review-threads.sh` is for local /
+ship-preflight use. `workflow_dispatch` takes a `pr_number` input (a manual run has no PR in
+the event payload).
 
 ## When to use
 

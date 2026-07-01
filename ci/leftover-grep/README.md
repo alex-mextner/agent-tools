@@ -9,7 +9,7 @@ Fail a PR on the classic "oops, left it in" leftovers — scanned on the lines t
 | `debugger` | `debugger;` | A breakpoint that ships freezes a real browser session. |
 | `console` | `console.log` / `console.debug` | Debug noise in production logs (block by default; `ALLOW_CONSOLE=1` to warn). |
 | `untracked-todo` | `TODO`/`FIXME` with **no** issue ref | A TODO with no ticket is a TODO that never gets done. `TODO(ABC-123)` / `TODO #45` / a URL passes. |
-| `merge-marker` | `<<<<<<<` / `=======` / `>>>>>>>` | A botched merge committed raw. |
+| `merge-marker` | `<<<<<<<` / `>>>>>>>` | A botched merge committed raw. Only the unambiguous start/end markers are matched — a bare `=======` is also a common decorative source separator (agent-tools#129), and the surrounding markers already catch the conflict. |
 
 ## Quick start
 
@@ -18,9 +18,21 @@ cp ci/leftover-grep/workflow.yml .github/workflows/leftover-grep.yml
 # The workflow runs `bash ci/leftover-grep/leftover-grep.sh`, so the script must be present
 # at that path — vendor the ci/ dir, or copy the script and adjust the run: path:
 cp ci/leftover-grep/leftover-grep.sh .github/scripts/leftover-grep.sh
-# Local pre-push:
-sh ci/leftover-grep/leftover-grep.sh
+# Local pre-push (the script is bash — `set -o pipefail`/`IFS=$'\t'` — so run it with bash,
+# not a POSIX `sh`/dash, which would die on `set -o pipefail`):
+bash ci/leftover-grep/leftover-grep.sh
 ```
+
+## Enforcement — a REQUIRED check, or it does not block the merge button
+
+A `tier: block` workflow **only goes red** — by itself it does **not** block the merge
+button. To actually ENFORCE this gate its `leftover-grep` context must be a **REQUIRED status
+check** under **server-side branch protection** (Settings -> Branches -> required checks ->
+add `leftover-grep`). rig-cli#5 provisions exactly that from the `github:` block in
+`rig.yaml` — it lifts every `tier: block` gate into `required_status_checks`. Without it, a
+GitHub-UI merge or a raw `gh pr merge` lands the PR over a red check — the same client-side
+bypass that let hyper-saas #543 merge over a red check. See **[Client-side vs. server-side enforcement](../../README.md#client-side-vs-server-side-enforcement-the-543-gap)**
+in the repo README.
 
 ## Knobs
 
@@ -44,6 +56,15 @@ A merge-blocking gate must not run a script the PR can edit. This gate also need
 (`LEFTOVER_HEAD=<pr-head-sha>`). `git diff` never executes the PR code. **Hard rule:** do not
 add a build/test/install step to that workflow — that would execute PR code under the
 privileged trigger.
+
+**Fail-closed on a missing diff base (agent-tools#129).** The added-lines diff is the
+three-dot `base...HEAD`, which needs a real **merge-base**. A `--depth=1` head shares no
+common ancestor with the base, so the workflow now fetches enough head history and
+**verifies a merge-base exists**, failing the gate if it can't — a blocking gate must not
+silently scan nothing. The script likewise fails closed: it computes the lines into a temp
+file and checks the exit status instead of reading them through a process substitution that
+swallowed `git diff` errors, and it refuses an explicitly-requested base that doesn't
+resolve (rather than falling back to a full-tree flood).
 
 ## Diff-scoped by default
 

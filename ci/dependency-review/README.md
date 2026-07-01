@@ -28,19 +28,69 @@ The **one** thing we lose is **license-policy enforcement** (deny AGPL/GPL etc.)
 with an OSS license gate (`license-checker` / `cargo-deny` / `pip-licenses`) — see
 `ci/license-policy/` and agent-tools#21.
 
+## Tamper-resistance (agent-tools#129)
+
+This is a merge-**blocking** gate, so it must not run a copy of the script the PR can edit
+(a PR could otherwise weaken the very gate it has to pass). Like `ci/leftover-grep` and
+`ci/review-threads`, `workflow.yml` runs under **`pull_request_target`**: the **base-branch
+(trusted) copy** of both the workflow and `dep-audit.sh` run; the PR's version is ignored.
+The PR's **manifests/lockfiles** are fetched as **DATA** into a side worktree and audited
+there — the native auditors (`npm`/`pnpm`/`yarn`/`bun audit`, `pip-audit`, `cargo-audit`)
+only **read** the lockfile and query an advisory DB; they do **not** run the package's
+install/lifecycle scripts, so no PR-controlled code executes. **Hard rule:** never add an
+`npm install` / `bun install` / build step or check the PR head onto the workspace — that
+would execute PR code under the privileged trigger. Like any base-run gate, it does not run
+on the PR that first introduces it.
+
+**Python (pip-audit) is the one auditor that can execute its input** — a *resolving* run
+(`-r` without `--no-deps`, `-e .`, a project path) downloads and **builds** the PR's sdists
+(runs `setup.py`), i.e. RCE under the privileged trigger. So `dep-audit.sh` audits Python
+deps **as data, never building**:
+
+- Each `requirements*.txt` (and the `requirements/<env>.txt` layout) is audited with
+  `pip-audit --no-deps -r <file>` — **but only after a scan confirms every line is a pinned
+  `name==version` spec** (plus benign `#` comments / blanks / `--hash` / `--require-hashes` /
+  `; markers`). `--no-deps` suppresses *transitive* resolution; the scan rejects any *direct*
+  reference (editable `-e`, a URL/VCS `git+…`/`://`, a PEP 508 `name @ url`, a local
+  path/archive, an `-r`/`-c` include, a foreign-index option, or an unpinned/prefix spec) —
+  because pip-audit must **build** such an entry to read its metadata, which is the RCE. A file
+  with any such line **fails closed** (pin every line, or set `DEP_AUDIT_ALLOW_MISSING=1`). The
+  result audits the PR's *declared, pinned* deps against the advisory DB with no build.
+- A `pyproject.toml`/`poetry.lock` with **no** pinned `requirements*.txt` can only be audited
+  by building it, so it **fails closed** here (pin a `requirements*.txt`, or
+  `DEP_AUDIT_ALLOW_MISSING=1`). An **empty/stub `requirements.txt` does not mask this** — a
+  Python source tree must have a real pinned spec to be audited as data.
+
+A bare no-arg `pip-audit` would instead audit the *runner's* installed packages and silently
+miss the PR's deps — never reintroduce it (agent-tools#131).
+
 ## Quick start
 
 ```bash
 cp ci/dependency-review/workflow.yml .github/workflows/dependency-review.yml
-# add the toolchain setup your ecosystems need (see the comments in workflow.yml);
-# ubuntu-latest already ships node+npm so npm-only repos need nothing extra.
+# `setup-bun` ships ENABLED (bot repos use bun.lock; without it a bun.lock repo fail-CLOSES
+# because dep-audit.sh can't find `bun`). Add the toolchain for your other ecosystems (see
+# the comments in workflow.yml); ubuntu-latest already ships node+npm so npm-only repos need
+# nothing extra — trim setup-bun if you have no bun.lock.
 
-# Run the same audit locally / in any other CI:
-sh ci/dependency-review/dep-audit.sh
+# Run the same audit locally / in any other CI (optional dir arg, default '.'):
+sh ci/dependency-review/dep-audit.sh           # audit the current tree
+sh ci/dependency-review/dep-audit.sh path/to/checkout   # audit another checkout's lockfiles
 ```
 
 > If your repo already has its own dependency-audit job, you don't need this one — don't
 > double up.
+
+## Enforcement — a REQUIRED check, or it does not block the merge button
+
+A `tier: block` workflow **only goes red** — by itself it does **not** block the merge
+button. To actually ENFORCE this gate its `dependency-review` context must be a **REQUIRED
+status check** under **server-side branch protection** (Settings -> Branches -> required
+checks -> add `dependency-review`). rig-cli#5 provisions exactly that from the `github:`
+block in `rig.yaml` — it lifts every `tier: block` gate into `required_status_checks`.
+Without it, a GitHub-UI merge or a raw `gh pr merge` lands the PR over a red check — the same
+client-side bypass that let hyper-saas #543 merge over a red check. See **[Client-side vs. server-side enforcement](../../README.md#client-side-vs-server-side-enforcement-the-543-gap)**
+in the repo README.
 
 ## Knobs (`dep-audit.sh`)
 

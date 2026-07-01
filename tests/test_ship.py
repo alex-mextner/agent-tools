@@ -86,7 +86,7 @@ def repo_with_two_worktrees(tmp_path):
         pytest.skip("bash/git required")
 
     origin = tmp_path / "origin.git"
-    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
 
     main = tmp_path / "main"
     main.mkdir()
@@ -182,7 +182,7 @@ def test_worktree_path_with_space_is_collected(tmp_path):
         pytest.skip("bash/git required")
 
     origin = tmp_path / "origin.git"
-    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
 
     main = tmp_path / "main"
     main.mkdir()
@@ -219,7 +219,7 @@ def repo_with_pr_worktree(tmp_path):
         pytest.skip("bash/git required")
 
     origin = tmp_path / "origin.git"
-    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
 
     main = tmp_path / "main"
     main.mkdir()
@@ -390,7 +390,7 @@ def repo_with_pyproject(tmp_path):
         pytest.skip("bash/git required")
 
     origin = tmp_path / "origin.git"
-    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
 
     main = tmp_path / "main"
     main.mkdir()
@@ -572,7 +572,7 @@ def repo_with_package_json(tmp_path):
         pytest.skip("bash/git required")
 
     origin = tmp_path / "origin.git"
-    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
     main = tmp_path / "main"
     main.mkdir()
     _git("init", "-q", "-b", "main", cwd=main)
@@ -671,7 +671,7 @@ def test_ship_version_files_override_locates_nested_manifest(tmp_path):
         pytest.skip("bash/git required")
 
     origin = tmp_path / "origin.git"
-    _sh("git", "init", "--bare", "-q", str(origin), cwd=tmp_path)
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
     main = tmp_path / "main"
     (main / "pkg").mkdir(parents=True)
     _git("init", "-q", "-b", "main", cwd=main)
@@ -1196,6 +1196,387 @@ def test_core_bare_fix_command_is_paste_safe_for_special_path(tmp_path):
     assert repaired == "false", (
         f"the pasted fix did not repair the special-char-path repo (is-bare={repaired!r})\n"
         f"cmd: {fix_line}"
+    )
+
+
+# ---------------------------------------------------------------------------------------
+# CI-down detection and local fallback gate (task #75)
+#
+# ship.sh can detect when ALL (or ≥ 80%) CI checks fail due to a structural GitHub Actions
+# outage and run a local fallback gate instead of blocking the merge. Tests here use:
+#   SHIP_TEST_CI_DOWN=1  — force-trigger ci_appears_structurally_down() without network
+#   SHIP_LOCAL_TEST_CMD  — override the auto-detected test runner command
+#   SHIP_TEST_DIFF       — inject custom diff text for the leftover-marker check
+#
+# The fake gh for these tests returns two FAILED checks (100% failure rate), answers
+# the local-gate sub-queries (review threads → 0, PR body → empty, diff → configurable),
+# and the GraphQL review-threads gate (→ 0 unresolved).
+# ---------------------------------------------------------------------------------------
+
+# Fake gh that returns two failed CI checks + clean local-gate answers.
+# SHIP_TEST_DIFF controls what `gh pr diff` returns (defaults to a clean line).
+_FAKE_GH_CIDOWN = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          # Two checks, both FAILED — 100% failure rate.
+          printf '[{"name":"pytest","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"codeql","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"}]'
+        elif printf '%s ' "$@" | grep -q reviewThreads; then
+          # _local_review_threads_check uses --jq (not processed by fake); output the count.
+          echo "0"
+        elif printf '%s ' "$@" | grep -q body; then
+          echo ""
+        else
+          echo '[]'
+        fi ;;
+      diff)
+        if printf '%s ' "$@" | grep -q -- --name-only; then
+          printf 'src/a.py'
+        else
+          printf '%s\\n' "${SHIP_TEST_DIFF:-+new line without markers}"
+        fi ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged" ;;
+      *) : ;;
+    esac ;;
+  api) echo 0 ;;
+  *) : ;;
+esac
+"""
+
+# Fake gh that returns ONE failed + ONE passing check (50% failure — below 80% threshold).
+_FAKE_GH_PARTIAL_FAIL = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          printf '[{"name":"pytest","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"lint","conclusion":"SUCCESS","status":"COMPLETED","state":"SUCCESS"}]'
+        else
+          echo '[]'
+        fi ;;
+      diff)
+        if printf '%s ' "$@" | grep -q -- --name-only; then printf 'src/a.py'; else printf '+ok'; fi ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged" ;;
+      *) : ;;
+    esac ;;
+  api) echo 0 ;;
+  *) : ;;
+esac
+"""
+
+
+def _fake_gh_cidown_dir(tmp_path: Path) -> Path:
+    bindir = tmp_path / "bincd"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_CIDOWN, encoding="utf-8")
+    gh.chmod(0o755)
+    return bindir
+
+
+def _fake_gh_partial_fail_dir(tmp_path: Path) -> Path:
+    bindir = tmp_path / "binpf"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_PARTIAL_FAIL, encoding="utf-8")
+    gh.chmod(0o755)
+    return bindir
+
+
+def _run_ship_cidown(main: Path, bindir: Path, env_extra: dict | None = None):
+    """Run ship.sh without --skip-ci (CI gate fires) but with --no-screenshot-ok."""
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    if env_extra:
+        env.update(env_extra)
+    return _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        cwd=main, env=env,
+    )
+
+
+def test_cidown_local_gate_passes_merges(repo_with_pr_worktree, tmp_path):
+    """CI-down path: all checks fail, SHIP_TEST_CI_DOWN=1 forces detection, local tests
+    pass (SHIP_LOCAL_TEST_CMD=true) → ship falls through to merge."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",  # trivially-passing stand-in for the test suite
+    })
+
+    assert r.returncode == 0, (
+        f"ship must succeed when CI-down gate passes\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    # The detection path must have fired — proves we took the right branch.
+    assert "CI infrastructure appears structurally unavailable" in r.stderr, r.stderr
+    # The local gate must have reported success (success message goes to stdout).
+    assert "ALL gates passed" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_tests_fail_blocks(repo_with_pr_worktree, tmp_path):
+    """CI-down path: SHIP_TEST_CI_DOWN=1, but local tests FAIL → ship refuses."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "false",  # always fails
+    })
+
+    assert r.returncode != 0, (
+        f"ship must refuse when local tests fail\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "Local CI fallback: FAILED" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_leftover_markers_block(repo_with_pr_worktree, tmp_path):
+    """CI-down path: local tests pass but PR diff has a TODO leftover → local gate fails."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        # Inject a diff addition with a TODO leftover marker
+        "SHIP_TEST_DIFF": "+new code  # TODO: clean this up later",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must refuse when leftover markers found\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_partial_ci_failure_below_threshold_blocks_normally(repo_with_pr_worktree, tmp_path):
+    """One of two checks failed (50%): below the 80% threshold, so ci_appears_structurally_down
+    returns false and ship blocks with the normal CI-failure message (no local fallback)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_partial_fail_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir)
+
+    assert r.returncode != 0, (
+        f"ship must refuse on a genuine partial CI failure\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    # Normal CI-failure block: no local gate or CI-down messaging.
+    assert "CI infrastructure appears structurally unavailable" not in r.stderr, r.stderr
+    assert "local fallback" not in r.stderr.lower(), r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+# ---------------------------------------------------------------------------------------
+# -R/--repo flag gives a clear error (#53)
+#
+# ship.sh previously fell through to the generic "Unknown flag" handler when invoked with
+# `-R owner/repo` (a gh CLI flag for a remote repo).  Now it emits a targeted message
+# explaining that ship.sh does not support -R and how to work around it.
+# ---------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("repo_flag", [
+    "-R",
+    "--repo",
+    "-R=owner/repo",
+    "--repo=owner/repo",
+    "-Rowner/repo",
+])
+def test_repo_flag_gives_clear_error(repo_with_pr_worktree, tmp_path, repo_flag):
+    """Any form of -R/--repo emits a targeted error (not the generic 'Unknown flag') and
+    exits 1.  ship.sh does not support -R because mapping owner/repo to a local checkout
+    path is not generally knowable; the fix message tells the user what to do instead."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    # Build args: for bare -R/--repo the next token is the value; for attached forms there
+    # is no separate value token.
+    if repo_flag in ("-R", "--repo"):
+        args = ("1", repo_flag, "owner/repo", "--skip-ci", "--no-screenshot-ok", "test")
+    else:
+        args = ("1", repo_flag, "--skip-ci", "--no-screenshot-ok", "test")
+
+    r = _sh("bash", str(_SHIP), *args, cwd=main, env={
+        **os.environ,
+        "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
+        "SHIP_TEST_BRANCH": "feat",
+        "SHIP_DEFAULT_BRANCH": "main",
+        "SHIP_MAIN_CHECKOUT": str(main),
+    })
+
+    assert r.returncode != 0, (
+        f"ship must refuse {repo_flag!r} with a non-zero exit; got 0\n{r.stdout}\n{r.stderr}"
+    )
+    assert "does not support -R/--repo" in r.stderr, (
+        f"expected targeted -R error for {repo_flag!r}:\n{r.stderr}"
+    )
+    # Must NOT use the generic "Unknown flag" message.
+    assert "Unknown flag" not in r.stderr, (
+        f"generic 'Unknown flag' fired for {repo_flag!r} — targeted handler did not catch it:\n"
+        + r.stderr
+    )
+    # Merge must NOT have been attempted.
+    assert "merged #1" not in r.stdout, (
+        f"ship merged despite {repo_flag!r} argument:\n{r.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------------------
+# Stash-pop conflict detection after main-checkout refresh (#77)
+#
+# ship.sh now uses `git pull --ff-only --autostash` for the main-checkout refresh.
+# --autostash is a no-op on a clean tree; when the checkout has uncommitted changes and
+# those conflict with the incoming pull, git stash pop exits non-zero and the index
+# contains UU-class unmerged files.  ship.sh must detect that and exit 1 with a clear
+# diagnostic (naming the conflicting files and the PR merge status), not silently leave
+# the main checkout broken.
+# ---------------------------------------------------------------------------------------
+
+@pytest.fixture
+def repo_with_stash_conflict(tmp_path):
+    """A repo where the main checkout will have a stash-pop conflict after the post-merge
+    pull.  Setup:
+      - origin/main has a file `shared.py` with content "origin\n"
+      - the main checkout has an uncommitted change to the same line ("local\n")
+      - the incoming pull changes the same line to "incoming\n"
+    When `git pull --autostash` runs it stashes the local edit, fast-forwards, then tries
+    to pop — but "local" conflicts with "incoming" on the same line, producing a UU
+    unmerged entry."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    # --- bare origin ---
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+
+    # --- main checkout seeded at origin/main ---
+    main = tmp_path / "main"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "shared.py").write_text("origin\n", encoding="utf-8")
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+
+    # --- push a conflicting commit to origin/main ---
+    # We push via a sibling clone so the main checkout stays at the old SHA.
+    sibling = tmp_path / "sibling"
+    sibling.mkdir()
+    _git("clone", "-q", str(origin), str(sibling), cwd=tmp_path)
+    _git("config", "user.email", "t@t", cwd=sibling)
+    _git("config", "user.name", "t", cwd=sibling)
+    (sibling / "shared.py").write_text("incoming\n", encoding="utf-8")
+    _git("add", "-A", cwd=sibling)
+    _git("commit", "-qm", "advance origin/main", cwd=sibling)
+    _git("push", "-q", "origin", "main", cwd=sibling)
+
+    # --- dirty the main checkout with a conflicting local edit ---
+    # This is uncommitted — autostash will stash it, pull advances, pop conflicts.
+    (main / "shared.py").write_text("local\n", encoding="utf-8")
+
+    # --- PR branch (`feat`) — diverges from init via an unrelated file, pushed ---
+    _git("fetch", "-q", "origin", cwd=main)
+    # Start feat from the init commit (before origin/main advanced).
+    _git("checkout", "-q", "-b", "feat", "HEAD", cwd=main)
+    (main / "feat.py").write_text("# feat work\n", encoding="utf-8")
+    _git("add", "feat.py", cwd=main)
+    _git("commit", "-qm", "feat: add feature", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+
+    # --- go back to main and apply the conflicting uncommitted edit ---
+    _git("checkout", "-q", "main", cwd=main)
+    # main is still at the init commit (origin/main is now one ahead via sibling).
+    # Dirty shared.py with local content — autostash will stash it, pull advances, pop conflicts.
+    (main / "shared.py").write_text("local\n", encoding="utf-8")
+    # Leave it uncommitted so autostash picks it up.
+
+    # Add a linked worktree for `feat` so ship.sh can run its preflight checks.
+    wt = tmp_path / "wt-feat"
+    _git("worktree", "add", "-q", str(wt), "feat", cwd=main)
+
+    return main
+
+
+def test_stash_pop_conflict_exits_nonzero_with_diagnostic(repo_with_stash_conflict, tmp_path):
+    """When git pull --autostash produces a stash-pop conflict in the main checkout, ship
+    must exit 1 with a diagnostic that:
+      - confirms the PR IS merged (so the user doesn't re-run ship and double-merge),
+      - names the conflicting files,
+      - tells the user how to resolve manually.
+    The conflict must NOT be silently swallowed."""
+    main = repo_with_stash_conflict
+    bindir = _fake_gh_dir(tmp_path)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    r = _sh(
+        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test",
+        cwd=main, env=env,
+    )
+
+    # The merge itself succeeded — only the post-merge stash-pop conflicted.
+    assert "merged #1" in r.stdout, (
+        f"expected fake merge to report merged #1:\n{r.stdout}\n{r.stderr}"
+    )
+    # ship must exit non-zero to signal that the main checkout needs manual attention.
+    assert r.returncode != 0, (
+        f"ship should exit non-zero on a stash-pop conflict; got 0\n{r.stdout}\n{r.stderr}"
+    )
+    # Diagnostic confirms the merge is done (so the user doesn't double-merge).
+    assert "IS merged" in r.stderr, (
+        f"diagnostic must confirm PR is merged:\n{r.stderr}"
+    )
+    # Diagnostic names the conflicting file.
+    assert "shared.py" in r.stderr, (
+        f"diagnostic must name the conflicting file(s):\n{r.stderr}"
+    )
+    # Diagnostic tells the user how to resolve.
+    assert "stash drop" in r.stderr, (
+        f"diagnostic must mention stash drop for resolution:\n{r.stderr}"
+    )
+
+
+def test_stash_pop_no_conflict_clean_tree_passes(repo_with_pr_worktree, tmp_path):
+    """Happy path: a clean main checkout → --autostash is a no-op, pull fast-forwards,
+    ship exits 0.  Proves --autostash doesn't break the normal case."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(main, bindir)
+
+    assert r.returncode == 0, (
+        f"clean main checkout should not trigger stash-pop conflict\n{r.stdout}\n{r.stderr}"
+    )
+    assert "merged #1" in r.stdout, r.stdout
+    assert "stash-pop" not in r.stderr.lower(), (
+        f"unexpected stash-pop error on a clean checkout:\n{r.stderr}"
     )
 
 

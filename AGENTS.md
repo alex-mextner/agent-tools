@@ -108,7 +108,7 @@ The shipped hooks and their points:
 | Point | Hooks |
 | --- | --- |
 | `pre-agent` **(bridge-ready; NOT yet live in CC — needs the rig-cli `Agent\|Task` matcher)** | `background-subagent-gate` (orchestration doctrine: block a non-trivial FOREGROUND subagent dispatch; subagent-exempt) |
-| `pre-bash` | `block-no-verify` (fail-closed), `block-raw-pr-merge`, `require-review-before-commit`, `require-ticket-before-commit`, `enforce-timeout-on-bash`, `orchestrator-stays-thin` (impl-bash, warn→block, subagent-exempt), `no-long-inline-process` (review/--watch/build-test/long-sleep, subagent-exempt), `no-shell-file-edit` (block `sed -i`/`perl -i`/`gawk -i inplace` or a `> file` redirect editing a tracked source file; parsed not raw-matched; NOT subagent-exempt), `skills-read-gate` (mandatory skills before work, warn→block), `visual-proof-gate` (block a UI commit with no looked-at screenshot), `decision-request-format` (ADVISORY, never blocks: on a `tg --tag decision` send, self-check the body for Context/Options/Recommendation per the `decision-request-discipline` skill; parsed not raw-matched; NOT subagent-exempt) |
+| `pre-bash` | `block-no-verify` (fail-closed), `block-raw-pr-merge`, `require-review-before-commit`, `require-ticket-before-commit`, `enforce-timeout-on-bash`, `orchestrator-stays-thin` (impl-bash, warn→block, subagent-exempt), `no-long-inline-process` (review/--watch/build-test/long-sleep, subagent-exempt), `subagent-no-bg-longproc` (the INVERSE: block a SUBAGENT from BACKGROUNDING a long process — `run_in_background:true`/`&`/`setsid` on review/--watch/build-test/long-sleep — since a subagent is never re-invoked by a background-completion notification and would wedge forever; subagent-ONLY), `no-shell-file-edit` (block `sed -i`/`perl -i`/`gawk -i inplace` or a `> file` redirect editing a tracked source file; parsed not raw-matched; NOT subagent-exempt), `skills-read-gate` (mandatory skills before work, warn→block), `visual-proof-gate` (block a UI commit with no looked-at screenshot), `decision-request-format` (ADVISORY, never blocks: on a `tg --tag decision` send, self-check the body for Context/Options/Recommendation per the `decision-request-discipline` skill; parsed not raw-matched; NOT subagent-exempt) |
 | `pre-write` | `block-secrets-write`, `block-raw-process-env`, `orchestrator-stays-thin` (non-docs code Edit/Write, warn→block, subagent-exempt) |
 | `post-write` | `format-on-write` (reacts to the completed write; never blocks — see the bridge note: not carried to CC yet) |
 | `stop` | `stop-completion-selfcheck` |
@@ -174,6 +174,36 @@ repo-agnostic: nothing about an org/tracker/path layout is hard-coded, and knobs
 to the first `git worktree list` entry), plus `SHIP_DEFAULT_BRANCH`, `SHIP_MERGE_METHOD`,
 `SHIP_UI_PATH_REGEX`, `SHIP_IMAGE_UPLOAD_CMD`. `--skip-ci` admin-merges (CI billing-blocked
 only) and still runs the other preflights.
+
+---
+
+## Client-side vs. server-side enforcement (and why `ship` is not enough)
+
+`ship.sh` and the `block-raw-pr-merge` agent-hook are **client-side** gates: they re-check
+green-CI / unresolved-threads / screenshot / version-bump *in the session*, before merging.
+They are **bypassable** — a merge from the **GitHub web UI**, a raw `gh pr merge` from an
+**uninstrumented shell** (no agent-hooks loaded), or any tool that isn't `gh ship` never runs
+them, so nothing is checked. That is not a hypothetical: hyper-saas **#543** squash-merged
+through **red CI, an open review thread, and no screenshot** precisely because the client gate
+was bypassed and there was **no server-side** enforcement behind it.
+
+**Durable enforcement is server-side**, on the merge button itself: GitHub **branch
+protection** with the `tier: block` gate contexts listed as **required status checks**, plus
+**require-conversation-resolution**, required reviews, and `enforce_admins`. A `tier: block`
+CI workflow alone only goes **red** — it does **not** block the merge until its check is
+promoted to *required*. That promotion is a server-side admin action this catalog documents
+but cannot itself perform; **rig-cli#5** provisions it from a `github:` block in `rig.yaml`
+(required_status_checks derived from the enabled block-tier gates,
+`required_conversation_resolution`, `enforce_admins`, required reviews — see the
+[Client-side vs. server-side enforcement](README.md#client-side-vs-server-side-enforcement-the-543-gap)
+section in the README for the schema/example). The catalog is the **what** (gates + this
+policy); the reconciler that flips the server-side switches lives in rig-cli (#5).
+
+The block-tier merge-gate READMEs in [`ci/`](ci/) — `tests`, `review-threads`,
+`leftover-grep`, `pr-checklist`, `dependency-review`, `screenshots` — now carry this note: a
+`tier: block` workflow is a red light, not a merge block, until it is a **required status
+check under server-side branch protection** (the same applies to the security gates —
+secret-scan, sast, codeql, trivy, license-policy — when you run them as required).
 
 ---
 

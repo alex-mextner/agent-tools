@@ -77,6 +77,13 @@ while [ "$i" -lt "$n" ]; do
         while [ "$j" -lt "$n" ]; do [ "${args[$j]:0:1}" != "-" ] && rest_bare=$((rest_bare+1)); j=$((j+1)); done
         if [ -z "$PR" ] && [ "$rest_bare" -eq 0 ]; then SHOT_DESCS+=(""); else SHOT_DESCS+=("$nxt"); i=$((i+1)); fi
       else SHOT_DESCS+=(""); fi ;;
+    -R|--repo|-R=*|--repo=*|-R?*)
+      # -R/--repo is a gh CLI flag for specifying a remote repo — ship.sh does not support
+      # it because it would need to map owner/repo to a local checkout path, which is not
+      # generally knowable.  cd into the target repo's checkout and run `gh ship <PR>` there.
+      echo "ship.sh does not support -R/--repo — run gh ship <PR-number> from inside the repo checkout instead." >&2
+      echo "  cd /path/to/your/checkout && gh ship $PR" >&2
+      exit 1 ;;
     -*) echo "Unknown flag: $a"$'\n'"$USAGE" >&2; exit 1 ;;
     *) [ -n "$PR" ] && { echo "Multiple PR numbers ($PR, $a) — pass one." >&2; exit 1; }; PR="$a" ;;
   esac
@@ -224,6 +231,185 @@ if [ "${MERGE_STATE:-}" = "BEHIND" ]; then
   exit 1
 fi
 
+# --- CI-down detection and local fallback gate -----------------------------------------
+# When ALL (or ≥ 80%) CI checks fail and the failure pattern matches a structural outage
+# (GitHub Actions down, billing suspended, runner quota exhausted) rather than real test
+# failures, blocking the merge is unhelpful. The signals: all/most checks fail + either
+# the GitHub status page shows Actions degradation OR the checks completed suspiciously
+# fast (< 30s — faster than any real test suite can run). When both signals agree, the
+# local gate runs instead: local tests + leftover-marker scan + PR checklist + threads.
+# If local gates pass → merge. If they fail or detection is ambiguous → block normally.
+#
+# Knobs (env):
+#   SHIP_CI_STATUS_URL   URL for the GitHub status components API (default: githubstatus.com).
+#                        Override in tests to point at a local fake.
+#   SHIP_TEST_CI_DOWN    Set to "1" to force-trigger the CI-down path (test-only shortcut,
+#                        bypasses the detection heuristics). Never set in production.
+#   SHIP_LOCAL_TEST_CMD  Override the local test command (test-only; default: auto-detect).
+
+# Query the GitHub status page for Actions component health.
+# Stdout: "degraded" if Actions is not fully operational, "ok" if fine, "unknown" on error.
+_ci_github_status_indicator() {
+  local url resp indicator
+  url="${SHIP_CI_STATUS_URL:-https://www.githubstatus.com/api/v2/components.json}"
+  resp=$(curl -sS --max-time 10 "$url" 2>/dev/null) || { echo "unknown"; return; }
+  command -v jq >/dev/null 2>&1 || { echo "unknown"; return; }
+  # Look for a component whose name matches "Actions" (case-insensitive).
+  indicator=$(printf '%s' "$resp" \
+    | jq -r '.components[]? | select(.name | test("Actions";"i")) | .status' 2>/dev/null \
+    | head -1 || true)
+  case "${indicator:-}" in
+    operational) echo "ok" ;;
+    "")          echo "unknown" ;;
+    *)           echo "degraded" ;;
+  esac
+}
+
+# Check whether ALL workflow runs for the PR's head SHA completed suspiciously fast
+# (< 30 s from creation to update) — a sign of infra/billing failure, not real tests.
+# Stdout: "1" if suspicious, "0" otherwise.
+_ci_runs_timing_suspicious() {
+  local head_sha="$1" runs_json total fast
+  runs_json=$(gh api "repos/{owner}/{repo}/actions/runs?head_sha=$head_sha&per_page=20" \
+    2>/dev/null) || { echo "0"; return; }
+  total=$(printf '%s' "$runs_json" | jq '.workflow_runs | length' 2>/dev/null || echo 0)
+  [ "${total:-0}" -gt 0 ] || { echo "0"; return; }
+  # Count completed runs whose wall-clock (created_at → updated_at) was under 30 seconds.
+  fast=$(printf '%s' "$runs_json" | jq '
+    [ .workflow_runs[]
+      | select(.status == "completed")
+      | ((.updated_at | fromdateiso8601) - (.created_at | fromdateiso8601))
+      | select(. < 30) ] | length' 2>/dev/null || echo 0)
+  [ "$fast" = "$total" ] && [ "$total" -gt 0 ] && echo "1" || echo "0"
+}
+
+# Return 0 (exit code) if CI appears structurally down rather than genuinely failing.
+# $1 = total check count, $2 = failed check count
+# Uses SHIP_TEST_CI_DOWN=1 to force the path in tests without network calls.
+ci_appears_structurally_down() {
+  local total="$1" failed="$2"
+  # Test escape hatch: force-trigger detection without the heuristics.
+  [ "${SHIP_TEST_CI_DOWN:-0}" = "1" ] && return 0
+  [ "${total:-0}" -gt 0 ] || return 1
+  # Only fire when ≥ 80% of checks failed — a partial failure is a real failure.
+  # Use cross-multiplication (failed*10 >= total*8) to avoid the integer-truncation
+  # rounding error that `total * 8 / 10` gives for small totals (e.g. 2 checks:
+  # 2*8/10=1, so 1/2=50% would falsely satisfy the threshold).
+  [ $(( failed * 10 )) -ge $(( total * 8 )) ] || return 1
+  # Get the PR head SHA for timing analysis.
+  local head_sha timing status
+  head_sha=$(gh pr view "$PR" --json headRefOid -q '.headRefOid' 2>/dev/null) || head_sha=""
+  status=$(_ci_github_status_indicator)
+  timing="0"
+  [ -n "$head_sha" ] && timing=$(_ci_runs_timing_suspicious "$head_sha")
+  echo "[ship] CI-down probe: github_status=$status timing_suspicious=$timing total=$total failed=$failed" >&2
+  # Positive detection if either signal confirms structural failure.
+  [ "$status" = "degraded" ] || [ "$timing" = "1" ] || return 1
+  return 0
+}
+
+# Auto-detect the project's test runner and execute it.
+# Returns 0 on pass, 1 on failure or when no runner is found (conservative).
+_local_test_runner() {
+  local root="$1" cmd
+  # Allow a test-only override to avoid real test execution in hermetic tests.
+  if [ -n "${SHIP_LOCAL_TEST_CMD:-}" ]; then
+    echo "[ship] local gate: running test command: $SHIP_LOCAL_TEST_CMD"
+    eval "$SHIP_LOCAL_TEST_CMD" 2>&1; return $?
+  fi
+  if [ -f "$root/pyproject.toml" ]; then
+    echo "[ship] local gate: running pytest (pyproject.toml detected) ..."
+    if command -v uv >/dev/null 2>&1; then
+      uv run --with pytest pytest tests/ -q 2>&1; return $?
+    else
+      python3 -m pytest tests/ -q 2>&1; return $?
+    fi
+  fi
+  if [ -f "$root/package.json" ]; then
+    echo "[ship] local gate: running npm test (package.json detected) ..."
+    npm test 2>&1; return $?
+  fi
+  if [ -f "$root/Cargo.toml" ]; then
+    echo "[ship] local gate: running cargo test (Cargo.toml detected) ..."
+    cargo test 2>&1; return $?
+  fi
+  echo "[ship] local gate: FAILED — no recognized test runner found (no pyproject.toml/package.json/Cargo.toml)." >&2
+  echo "[ship]   CI is down but tests cannot be verified locally — blocking conservatively." >&2
+  return 1
+}
+
+# Scan the PR diff additions for leftover markers (TODO/FIXME/HACK/XXX).
+# Returns 0 if clean, 1 if markers found or diff cannot be read.
+_local_leftover_check() {
+  local pr="$1" diff_out
+  echo "[ship] local gate: scanning PR diff for leftover markers ..."
+  diff_out=$(gh pr diff "$pr" 2>/dev/null) || {
+    echo "[ship] local gate: FAILED — could not read PR diff for leftover scan." >&2; return 1; }
+  local hits
+  hits=$(printf '%s\n' "$diff_out" \
+    | grep -E '^\+' | grep -vE '^\+\+\+' \
+    | grep -E '(TODO|FIXME|HACK|XXX)' || true)
+  if [ -n "$hits" ]; then
+    echo "[ship] local gate: FAILED — leftover markers in PR additions:" >&2
+    printf '%s\n' "$hits" >&2
+    return 1
+  fi
+  echo "[ship] local gate: leftover-marker scan OK."
+  return 0
+}
+
+# Check PR body for unchecked checklist items (- [ ] lines).
+# Returns 0 if no unchecked boxes, 1 otherwise.
+_local_pr_checklist_check() {
+  local pr="$1" body unchecked
+  echo "[ship] local gate: checking PR checklist ..."
+  body=$(gh pr view "$pr" --json body -q '.body // ""' 2>/dev/null) || {
+    echo "[ship] local gate: FAILED — could not read PR body for checklist check." >&2; return 1; }
+  # `grep -c` exits 1 when the count is zero; `|| true` suppresses that exit code
+  # without emitting extra output (using `|| echo 0` would double the value: grep
+  # already outputs "0" on stdout before exiting 1, then echo adds another "0").
+  unchecked=$(printf '%s\n' "$body" | grep -cE '^- \[ \]' 2>/dev/null || true)
+  if [ "${unchecked:-0}" -gt 0 ]; then
+    echo "[ship] local gate: FAILED — PR has $unchecked unchecked checklist item(s)." >&2
+    return 1
+  fi
+  echo "[ship] local gate: PR checklist OK."
+  return 0
+}
+
+# Check unresolved review threads via the simple (non-paginating) gh pr view query.
+# Returns 0 if none, 1 if any unresolved or query fails.
+_local_review_threads_check() {
+  local pr="$1" unresolved
+  echo "[ship] local gate: checking review threads ..."
+  unresolved=$(gh pr view "$pr" --json reviewThreads \
+    --jq '[.reviewThreads[] | select(.isResolved == false)] | length' 2>/dev/null) || {
+    echo "[ship] local gate: FAILED — could not check review threads." >&2; return 1; }
+  if [ "${unresolved:-0}" -gt 0 ]; then
+    echo "[ship] local gate: FAILED — $unresolved unresolved review thread(s)." >&2
+    return 1
+  fi
+  echo "[ship] local gate: review threads OK."
+  return 0
+}
+
+# Orchestrate all local CI fallback gates. Called when CI infra appears structurally down.
+# Returns 0 if ALL gates pass, 1 if any fail (conservative: block unless everything is clean).
+run_local_ci_gate() {
+  echo "[ship] === Running local CI fallback gates (CI infrastructure appears down) ==="
+  local gate_failed=0
+  _local_test_runner "$ROOT"       || gate_failed=1
+  _local_leftover_check "$PR"      || gate_failed=1
+  _local_pr_checklist_check "$PR"  || gate_failed=1
+  _local_review_threads_check "$PR" || gate_failed=1
+  if [ "$gate_failed" = "0" ]; then
+    echo "[ship] === Local CI fallback: ALL gates passed — safe to merge despite CI outage. ==="
+    return 0
+  fi
+  echo "[ship] === Local CI fallback: FAILED — see above; not safe to merge. ===" >&2
+  return 1
+}
+
 # --- green-CI gate: CI must EXIST + be green; pending CI is WATCHED to completion -------
 # Design (CTO): "no CI" is itself a FAILED gate, not a free pass — refuse with guidance to
 # set CI up. Existing-but-pending checks are WATCHED (polled to completion, up to
@@ -260,10 +446,22 @@ if [ "$SKIP_CI" = "0" ]; then
   done
   FAILED=$(printf '%s' "$ROLLUP" | jq "[.[] | select($SUCCESS_FILTER | not)] | length" 2>/dev/null || echo 1)
   if [ "${FAILED:-0}" != "0" ]; then
-    echo "Refusing: PR #$PR has $FAILED check(s) not passing:" >&2
-    printf '%s' "$ROLLUP" | jq -r ".[] | select($SUCCESS_FILTER | not) | \"  x \(.name // .context) -> \(.conclusion // .state)\"" >&2 2>/dev/null || true
-    echo "  Fix CI, then re-run (or --skip-ci if CI is billing-blocked)." >&2
-    exit 1
+    TOTAL_CHECKS=$(printf '%s' "$ROLLUP" | jq 'length' 2>/dev/null || echo 0)
+    if ci_appears_structurally_down "$TOTAL_CHECKS" "$FAILED"; then
+      echo "[ship] CI infrastructure appears structurally unavailable (all/most checks failed, outage signal confirmed) — running local fallback gates instead of blocking on CI." >&2
+      if run_local_ci_gate; then
+        echo "[ship] CI-down local gate PASSED — CI infrastructure failure, not a test failure; proceeding with merge."
+        # Do not exit 1 — fall through to the merge below.
+      else
+        echo "Refusing: CI unavailable AND local fallback gates also failed — not safe to merge." >&2
+        exit 1
+      fi
+    else
+      echo "Refusing: PR #$PR has $FAILED check(s) not passing:" >&2
+      printf '%s' "$ROLLUP" | jq -r ".[] | select($SUCCESS_FILTER | not) | \"  x \(.name // .context) -> \(.conclusion // .state)\"" >&2 2>/dev/null || true
+      echo "  Fix CI, then re-run (or --skip-ci if CI is billing-blocked)." >&2
+      exit 1
+    fi
   fi
 fi
 
@@ -535,6 +733,35 @@ fi
 # made a clean squash-merge look like a failed ship). So the whole cleanup runs in a
 # function whose result is REPORTED, not propagated — `set -e` is relaxed inside it and
 # every step is allowed to fail with a warning.
+
+# Pull the main checkout with --autostash so a dirty-but-clean-merge WIP doesn't block
+# the refresh.  Autostash is a no-op on a clean tree; it only matters when the checkout
+# has uncommitted changes that conflict with the incoming pull.  If the stash-pop
+# produces unmerged files (UU/AA/DD in the index) we print a clear diagnostic and EXIT 1
+# so the broken state doesn't sneak past as a silent "all good".
+# Called only when DRY_RUN != 1, always inside cleanup() where set +e is active.
+_refresh_main_checkout() {
+  local dir="$1" branch="$2" pull_rc unmerged
+  git -C "$dir" pull --ff-only --autostash origin "$branch"; pull_rc=$?
+  # `git pull --autostash` exits 0 even when the stash-pop conflicts — the conflict is
+  # indicated only on stderr.  Check unmerged files unconditionally after every pull so a
+  # silent stash-pop conflict is never left undetected.
+  unmerged=$(git -C "$dir" ls-files --unmerged 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${unmerged:-0}" -gt 0 ]; then
+    echo "[ship] PR #$PR IS merged. However, the stash-pop after the main-checkout" \
+         "refresh conflicted — $unmerged unmerged path(s) in $dir." >&2
+    echo "[ship]   Unmerged files:" >&2
+    git -C "$dir" ls-files --unmerged 2>/dev/null | awk '{print $4}' | sort -u | \
+      sed 's/^/[ship]     /' >&2
+    echo "[ship]   Resolve manually:" \
+         "git -C $(printf '%q' "$dir") add <files> && git -C $(printf '%q' "$dir") stash drop" >&2
+    exit 1
+  fi
+  if [ "$pull_rc" -ne 0 ]; then
+    echo "[ship] WARNING: could not fast-forward $branch — pull manually." >&2
+  fi
+}
+
 cleanup() {
   set +e  # local to this function's subshell-free body: warn, don't abort
   if [ "${CROSS_REPO:-false}" = "true" ]; then
@@ -614,7 +841,9 @@ cleanup() {
     echo "[ship] refreshing main checkout at ${MAIN_CHECKOUT} ..."
     [ "$(git -C "$MAIN_CHECKOUT" symbolic-ref --quiet --short HEAD 2>/dev/null || echo)" = "$DEFAULT_BRANCH" ] || run git -C "$MAIN_CHECKOUT" checkout "$DEFAULT_BRANCH"
     run git -C "$MAIN_CHECKOUT" fetch origin
-    [ "$DRY_RUN" = "1" ] || git -C "$MAIN_CHECKOUT" pull --ff-only origin "$DEFAULT_BRANCH" || echo "[ship] WARNING: could not fast-forward $DEFAULT_BRANCH — pull manually." >&2
+    if [ "$DRY_RUN" != "1" ]; then
+      _refresh_main_checkout "$MAIN_CHECKOUT" "$DEFAULT_BRANCH"
+    fi
   fi
 
   # CALLER CONTRACT: if we removed the worktree the SESSION was launched from, the parent

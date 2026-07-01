@@ -121,6 +121,13 @@ def marker_path() -> Path:
 # bash compounds `|&` (pipe+stderr) and `;&`/`;;&` (case fall-through). Missing one would weld the
 # following `git commit` into the previous segment and hide it from the gate.
 _SHELL_SEP = frozenset({"&&", "||", ";", "|", "&", ";;", "|&", ";&", ";;&"})
+# Separators where the preceding segment's cwd effects carry to the next segment.
+# `&&` and `;`/`;;`/`;;&`/`;&` (incl. case fall-through) all run in the SAME shell process,
+# so a preceding `cd <dir>` does change the shell's cwd for the following command.
+# `|`/`|&` create subshells (both sides), `&` backgrounds the left side into a subshell,
+# and `||` only runs the right side when the LEFT side failed — so `cd` either did not
+# execute (the side is skipped) or ran in a subshell and cannot change the parent cwd.
+_CD_CARRY_SEP = frozenset({"&&", ";", ";;", ";;&", ";&"})
 _GIT_GLOBAL_VALUE_FLAGS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace"})
 # A `VAR=value` token before the `git` executable in a segment is an inline env assignment.
 _INLINE_ENV = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
@@ -403,6 +410,7 @@ class CommitSegment(NamedTuple):
     target_dir: str | None  # the `git -C <dir>` directory, if any (else None → use event cwd)
     alt_repo: bool        # uses `--git-dir`/`--work-tree` → the cwd index may not be this commit's
     staging_before: bool  # an index-mutating op (`git add`/…) preceded it in the chain
+    cd_dir: str | None = None  # the last `cd <dir>` seen BEFORE this commit in the chain
 
 
 # git subcommands that MUTATE the index before a later commit in the same chain. If one precedes a
@@ -469,6 +477,20 @@ def _uses_alt_repo(segment: list[str], env: dict[str, str]) -> bool:
     return False
 
 
+def _is_cd_segment(segment: list[str]) -> str | None:
+    """Return the target directory from a simple `cd <dir>` segment, or None.
+
+    Only the common positional form ``cd /path/to/dir`` (exactly one non-flag argument) is
+    recognised — the typical pattern agents use to enter a worktree before committing.
+    Bare ``cd`` (→ $HOME), ``cd -`` (→ prev dir), and any flag-style argument are left as
+    None because they cannot be statically resolved to an absolute path."""
+    if not segment or segment[0] != "cd":
+        return None
+    if len(segment) == 2 and not segment[1].startswith("-"):
+        return segment[1]
+    return None
+
+
 def _commit_segments(command: str) -> list[CommitSegment]:
     """Every real `git commit` segment in `command` (a chain may hold more than one, e.g.
     `git commit … && git commit …`). Empty list when there are none / on a tokenization failure.
@@ -476,6 +498,10 @@ def _commit_segments(command: str) -> list[CommitSegment]:
     Parses the argv after stripping shell comments, splits on separators (GLUED ones too, via
     ``_tokenize``), peels inline env, and keeps each segment whose executable IS git (see
     ``_is_git_executable``) and subcommand is `commit`.
+
+    Also tracks the last simple `cd <dir>` segment seen before a commit in the chain, so that
+    ``cd /worktree && git commit`` correctly resolves the effective cwd for docs-only
+    classification (the CC PreToolUse event carries the SESSION cwd, not the post-cd cwd).
 
     LIMITATION: a WRAPPED commit run through another program — `time git commit`, `sudo git
     commit`, `bash -c 'git commit …'`, a `(git commit …)` subshell, `env VAR=1 git commit` — is not
@@ -489,15 +515,37 @@ def _commit_segments(command: str) -> list[CommitSegment]:
         return []
     out: list[CommitSegment] = []
     staging_seen = False
-    for raw_seg in _segments(tokens):
+    cd_dir_seen: str | None = None
+
+    # Inline the token iteration (rather than calling _segments) so we can inspect the
+    # separator token BETWEEN segments and decide whether to carry `cd_dir_seen` forward.
+    # Only `&&` / `;` / case fall-through separators run the next segment in the same shell
+    # process; pipes and `&` use subshells, so a preceding `cd` cannot affect the next cwd.
+    def _flush(raw_seg: list[str]) -> None:
+        nonlocal staging_seen, cd_dir_seen
         seg = _strip_redirects(raw_seg)  # drop `> log` etc. so they don't leak into the argv
         env, rest = _split_inline_env(seg)
         argv = _commit_argv(rest)
         if argv is not None:
             out.append(CommitSegment(env, argv, _git_dir_flag(rest),
-                                     _uses_alt_repo(rest, env), staging_seen))
+                                     _uses_alt_repo(rest, env), staging_seen, cd_dir_seen))
         elif _is_staging_segment(rest):
             staging_seen = True  # a later commit's index will differ from the one we'd query now
+        else:
+            cd = _is_cd_segment(rest)
+            if cd is not None:
+                cd_dir_seen = cd  # propagate to subsequent commit segments in this chain
+
+    cur: list[str] = []
+    for tok in tokens:
+        if tok in _SHELL_SEP:
+            _flush(cur)
+            if tok not in _CD_CARRY_SEP:
+                cd_dir_seen = None  # pipe/background/|| can't propagate a preceding `cd`
+            cur = []
+        else:
+            cur.append(tok)
+    _flush(cur)
     return out
 
 
@@ -759,12 +807,25 @@ def _is_docs_only_commit(seg: CommitSegment, cwd: str) -> bool:
     (`git commit -m docs && git add app.py && git commit …`)."""
     if commit_extends_index(seg.argv) or seg.alt_repo or seg.staging_before:
         return False
-    # Classify docs-only in the repo the commit TARGETS — `git -C <dir> commit` stages in <dir>,
-    # not necessarily the event cwd (resolve a relative -C against cwd).
-    git_cwd = cwd
+    # Classify docs-only in the repo the commit TARGETS.
+    # Priority: explicit `git -C <dir>` flag > preceding `cd <dir>` in the chain > event cwd.
+    # The CC PreToolUse event fires BEFORE the shell command runs, so its `cwd` is the SESSION
+    # default (main repo root), not the post-cd directory.  A `cd /worktree && git commit`
+    # chain means the commit's effective cwd is /worktree — use it for index classification.
+    #
+    # Effective-cwd resolution order:
+    # 1. The post-cd effective cwd (from a preceding `cd` in the chain; may be relative to event cwd).
+    # 2. The event cwd (if no cd preceded this commit).
+    # Then, if `git -C <dir>` is present, it is applied ON TOP of the effective cwd — so a
+    # relative `-C sub` after `cd /worktree` targets `/worktree/sub`, not `<event-cwd>/sub`.
+    effective_cwd = cwd
+    if seg.cd_dir:
+        effective_cwd = (seg.cd_dir if os.path.isabs(seg.cd_dir)
+                         else os.path.join(cwd, seg.cd_dir))
+    git_cwd = effective_cwd
     if seg.target_dir:
         git_cwd = (seg.target_dir if os.path.isabs(seg.target_dir)
-                   else os.path.join(cwd, seg.target_dir))
+                   else os.path.join(effective_cwd, seg.target_dir))
     files = staged_files(git_cwd)
     if files is not None and is_docs_only(files):
         warn("docs-only commit — review not required")
