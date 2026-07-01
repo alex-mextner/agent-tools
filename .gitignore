@@ -16,3 +16,7 @@ dist/
 
 # Claude Code personal settings slot (per-machine overrides) — never committed.
 .claude/settings.local.json
+
+# Visual proof screenshots / PDFs from agent work — local artifacts, not committed.
+*.png
+*.pdf
