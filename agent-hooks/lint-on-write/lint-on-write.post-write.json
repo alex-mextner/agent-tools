@@ -1,0 +1,9 @@
+{
+  "id": "lint-on-write",
+  "point": "post-write",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/lint-on-write/lint_on_write.py",
+  "priority": 70,
+  "timeout_ms": 10000,
+  "on_error": "open",
+  "description": "After the agent writes/edits a source file, runs the repo's CONFIGURED linter on just that file (oxlint → biome → eslint for JS/TS; ruff for py; repo-local tool preferred over global; detection keys on the repo's own config files — including the ones rig's linters area provisions — never a hardcoded command) and, on findings, exits 10 so the bridge feeds the linter output straight back to the agent as PostToolUse feedback. No linter configured / tool error / timeout → clean allow; priority 70 so format-on-write (60) runs first and the linter sees the formatted file. Escape hatch: NO_LINT_HOOK=1."
+}

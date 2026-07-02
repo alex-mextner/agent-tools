@@ -66,16 +66,17 @@ These are the *logical* points; map them to your harness's actual tool-use event
 
 > **Claude Code:** CC does NOT run these descriptors directly — it only runs hooks declared
 > in `settings.json`. The `lib/cc_hook_bridge` dispatcher is the carrier that makes them
-> fire: rig wires it into `settings.json` (PreToolUse for `pre-bash`/`pre-write`, Stop for
-> `stop`) and translates the exit-10 BLOCK into CC's `permissionDecision: "deny"` /
-> `decision: "block"`. Without that bridge these hooks are inert in CC (agent-tools#18).
+> fire: rig wires it into `settings.json` (PreToolUse for `pre-bash`/`pre-write`, PostToolUse
+> for `post-write`, Stop for `stop`) and translates the exit-10 BLOCK into CC's
+> `permissionDecision: "deny"` / `decision: "block"`. Without that bridge these hooks
+> are inert in CC (agent-tools#18).
 
 | point          | fires when…                                  | hooks                                   |
 | -------------- | -------------------------------------------- | --------------------------------------- |
 | `pre-agent` **(bridge-ready; NOT yet live in CC — needs the rig-cli `Agent\|Task` matcher)** | before a subagent dispatch (Agent/Task tool) | background-subagent-gate                 |
 | `pre-bash`     | before a shell command runs                  | block-no-verify, block-raw-pr-merge, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash, orchestrator-stays-thin, no-long-inline-process, subagent-no-bg-longproc, no-shell-file-edit, skills-read-gate, visual-proof-gate |
 | `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env, orchestrator-stays-thin |
-| `post-write`   | after a file write/edit has landed on disk   | format-on-write                         |
+| `post-write`   | after a file write/edit has landed on disk   | format-on-write, lint-on-write          |
 | `stop`         | when the agent is about to end its turn      | stop-completion-selfcheck               |
 
 ### `pre-agent` — gate a subagent dispatch (bridge-ready; NOT yet live in CC — needs the rig-cli `Agent|Task` matcher)
@@ -97,9 +98,11 @@ right point for anything that must operate on the real file: reformatting it, re
 a sibling, re-indexing it. The event payload still carries the written path (`args.path` /
 `args.file_path`) plus `event.cwd`; there is no "proposed content" to inspect because the
 content is already on disk. Hooks on this point should be `on_error: open` and treat the
-work as advisory — the write already happened, so blocking after the fact is meaningless.
-Map it to your harness's "file was written" event (e.g. a `PostToolUse` matcher on the
-Write/Edit tools).
+work as advisory — the write already happened, so a *veto* after the fact is meaningless;
+an exit-10 on this point is **feedback** (the bridge surfaces the hook's message to the
+model via PostToolUse `{"decision": "block", "reason": …}`), which is how lint-on-write
+reports findings. In CC it is live via the bridge's `PostToolUse` mapping (matcher
+`Edit|Write|MultiEdit|NotebookEdit`, wired by rig).
 
 ## Installing
 
