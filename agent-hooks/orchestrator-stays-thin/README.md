@@ -37,8 +37,21 @@ an implementation chain (`sed -i ... && gh ship`, `npm run build && gh ship`, an
 block). Build/edit tokens **and `$()`/backtick substitutions anywhere in the line** veto the
 carve-out wholesale (a substitution can smuggle any mutation into a benign-looking segment), so
 `gh ship 605 | tee ship.log` does **not** ride it — log a ship with a bare redirect instead
-(`gh ship 605 > ship.log 2>&1`, allowed as a plain redirect). Only `gh ship` rides this — no
-other gh subcommand, no `tg`, nothing else.
+(`gh ship 605 > ship.log 2>&1`, allowed as a plain redirect). Only `gh ship` rides the *release*
+carve-out — no other gh subcommand rides *that* one.
+
+**Report / verify carve-out — `tg` + read-only gh reads (coordinator):** the orchestrator's role is
+literally *verify + report*, so reporting to the user and read-only PR/CI verification must **not**
+require a subagent. A line whose every segment head is `tg`, a read-only gh read
+(`gh pr list/view/checks/status/diff`, `gh run list/view`), read-only inspection (incl. system-info
+`df`/`du`/`lsblk`/`free`/`ps`/… and filters `jq`/`sort`/`cut`/…), or `cd` — with at least one `tg`/
+gh-read head — is never warned or blocked, of **any** length: `tg --format html '…' | tail -3 | grep
+merged`, `gh pr view 5 | jq .title | head`, `tg done; gh pr view 5; gh run list`. Same per-segment
+discipline as the release carve-out — a build/edit, heredoc, substitution, bare-`&`, or mutating
+companion forfeits it (`tg done && sed -i …`, `gh pr view && git push` are still implementation).
+**`curl` and `ssh` are deliberately NOT sanctioned** — `curl -X POST`/`-d` mutates and `ssh host
+'…'` runs any remote command, so neither can be reliably classified read-only; use the escape hatch
+or a subagent for those.
 
 **Subagent-exempt:** a dispatched subagent (`agent_id` present) does the actual work, so it is
 always allowed. This gate governs the orchestrator only. Because the hook uses `agent_id` to

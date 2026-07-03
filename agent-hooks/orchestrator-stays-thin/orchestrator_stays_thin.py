@@ -60,10 +60,15 @@ TTL_S = int(os.environ.get("ORCH_THIN_TTL_S", "900"))
 DOCS_PATH = re.compile(r"\.(?:md|mdx|txt|rst)$", re.IGNORECASE)
 DOCS_DIR = re.compile(r"(?:^|/)docs/", re.IGNORECASE)
 
-# Inspection / read-only one-liners that the orchestrator legitimately runs itself.
+# Inspection / read-only one-liners that the orchestrator legitimately runs itself. The system-info
+# and text-filter tools (df/du/lsblk/free/ps/uname/…, jq/sort/uniq/cut/column) are read-only
+# VERIFICATION the orchestrator does directly — added so a multi-step verify pipe (`df -h | grep
+# /dev | head`, `gh pr view | jq | head`) is not blocked by the >=2-operator rule (coordinator).
 READ_ONLY_BASH = re.compile(
     r"^\s*(?:git\s+(?:status|log|diff|show|branch)\b|ls\b|cat\b|less\b|head\b|tail\b|"
-    r"grep\b|rg\b|find\b|pwd\b|echo\b|which\b|env\b|wc\b|stat\b|tree\b|file\b)"
+    r"grep\b|rg\b|find\b|pwd\b|echo\b|which\b|env\b|wc\b|stat\b|tree\b|file\b|"
+    r"jq\b|sort\b|uniq\b|cut\b|column\b|df\b|du\b|lsblk\b|free\b|ps\b|uname\b|"
+    r"uptime\b|whoami\b|hostname\b|nproc\b|date\b)"
 )
 # Any chain operator (&&, ||, ;, |, newline). A command that chains AT ALL is not a single
 # read-only invocation, so the read-only carve-out below must NOT short-circuit it (B1).
@@ -87,6 +92,18 @@ BUILD_EDIT = re.compile(
     r"python\s+setup|pip\s+install)\b"
 )
 INLINE_SENTINEL = re.compile(r"#\s*orchestrator-ok:\s*(\S.*)")
+
+# Sanctioned read-only ORCHESTRATION verbs the orchestrator runs ITSELF to VERIFY and REPORT — never
+# a mutation, so a chain of only these (+ read-only inspection / cd) is verify-and-report altitude,
+# not implementation. The orchestrator's role is literally "verify + report", so reporting (`tg`)
+# and PR/CI verification (gh reads) must not require a subagent (coordinator directive). Head-anchored
+# like READ_ONLY_BASH. Deliberately NOT `curl` or `ssh`: neither can be reliably classified read-only
+# (`curl -X POST`/`-d …` mutates; `ssh host '…'` runs ANY remote command) — those keep the escape hatch.
+ORCH_READONLY = re.compile(
+    r"^\s*(?:tg\b"
+    r"|gh\s+pr\s+(?:list|view|checks|status|diff)\b"
+    r"|gh\s+run\s+(?:list|view)\b)"
+)
 
 # `gh ship` — the sanctioned gated-merge (RELEASE) command — at a segment HEAD, optionally
 # after env-var assignment prefixes (`GH_PAGER=cat gh ship 605`). Anchored on the segment's
@@ -363,6 +380,31 @@ def _is_sanctioned_release_chain(command: str) -> bool:
     )
 
 
+def _is_report_or_verify_chain(command: str) -> bool:
+    """True when EVERY segment head is report/verify orchestration (`tg`, gh PR/CI reads), read-only
+    inspection, or `cd`, AND at least one is the `tg`/gh-read orchestration.
+
+    Report and verification are the orchestrator's OWN altitude — a multi-step report/verify chain
+    (`tg … | tail -3 | grep merged`, `gh pr view 5 | jq .title | head`, `tg done; gh pr view 5`)
+    must never warn-then-block as implementation, exactly like the release carve-out (coordinator
+    directive: reporting + verification must not require a subagent). Same vetoes and quote-aware
+    split as `_is_sanctioned_release_chain`: a build/edit, heredoc, command/process substitution,
+    bare-`&`, or mutating companion (`git branch <arg>`, find delete/exec/file-write) forfeits it —
+    so `tg done && sed -i …` or `gh pr view 5 && git push` is still judged as implementation."""
+    scan = _blank_quoted(command)
+    if (HEREDOC.search(scan) or BUILD_EDIT.search(scan)
+            or SUBSTITUTION.search(scan) or BG_AMP.search(scan)):
+        return False
+    segments = [s for s in _split_release_segments(command) if s.strip()]
+    if not any(ORCH_READONLY.match(s) for s in segments):
+        return False
+    return all(
+        (ORCH_READONLY.match(s) or READ_ONLY_BASH.search(s) or CD_HEAD.match(s))
+        and not UNSAFE_COMPANION.search(s)
+        for s in segments
+    )
+
+
 def _is_implementation_bash(command: str) -> bool:
     if not command.strip():
         return False
@@ -373,6 +415,10 @@ def _is_implementation_bash(command: str) -> bool:
     # A `gh ship` release line (plus read-only/`cd` plumbing) is orchestrator-altitude, not
     # implementation — see _is_sanctioned_release_chain (#159).
     if _is_sanctioned_release_chain(command):
+        return False
+    # A report/verify line (`tg …`, gh PR/CI reads, + read-only/`cd`) is likewise the orchestrator's
+    # own altitude — see _is_report_or_verify_chain (coordinator directive).
+    if _is_report_or_verify_chain(command):
         return False
     # A chain that merely STARTS with a read-only command (`git status && sed -i ...`,
     # `ls; npm run build`) is judged on its full content, not waved through on its prefix (B1).

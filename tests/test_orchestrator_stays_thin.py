@@ -564,5 +564,60 @@ def test_sanctioned_release_predicate_is_head_anchored():
     assert ost._is_sanctioned_release_chain("gh ship 605 --note 'ran $(build) earlier' | tail -3") is True
 
 
+# ── coordinator: report (`tg`) + read-only verification are orchestrator altitude, not impl ──────
+
+@pytest.mark.parametrize("command", [
+    "tg 'msg'",                                           # plain report (the mandatory case)
+    "tg --format html '<b>done</b>' | tail -3",           # report + read-only plumbing (a pipe)
+    "tg --format html 'x' | tail -3 | grep merged",       # 2-operator report chain (used to block)
+    "gh pr view 5 | jq .title | head -1",                 # PR verification piped through jq/head
+    "tg done; gh pr view 5; gh run list",                 # report + verify, 3 segments
+    "df -h | grep /dev | head",                           # read-only system verification
+    "lsblk | grep sda | wc -l",                           # ...another
+    "cd /repo && tg 'done' | tail",                       # `cd` companion on a report line
+])
+def test_report_or_verify_chain_allows(command, tmp_path, monkeypatch):
+    """`tg` reporting and read-only PR/CI/system verification are the orchestrator's OWN altitude —
+    a multi-step report/verify chain must never warn OR prime a block (coordinator directive)."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow", command
+    assert "message" not in json.loads(out1), command  # does not even warn
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")  # never primes a block
+    assert c2 == 0 and _decision(out2) == "allow", command
+
+
+@pytest.mark.parametrize("command", [
+    "tg done && sed -i 's/a/b/' f.py",    # report does not launder an in-place edit
+    "tg done; tee out.txt; ls",           # ...nor a tee write
+    "tg done $(sed -i 's/a/b/' f)",       # ...nor an edit hidden in a substitution
+    "tg done; git branch -D tmp; ls",     # ...nor a git branch mutation (>=2 operators)
+    "gh pr view 5 && git push && git push --tags",  # ...nor a >=2-operator push chain
+])
+def test_report_or_verify_does_not_launder_impl(command, tmp_path, monkeypatch):
+    """The report/verify carve-out is per-segment like the release one: a `tg`/gh-read head does not
+    exempt a mutation elsewhere on the line (coordinator directive) — it warn-then-blocks."""
+    assert ost._is_report_or_verify_chain(command) is False, command
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow", command  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block", command
+
+
+def test_report_verify_predicate_surface():
+    """Pin the predicate: `tg`/gh-read heads qualify, curl/ssh do NOT (not reliably read-only)."""
+    assert ost._is_report_or_verify_chain("tg 'x' | tail") is True
+    assert ost._is_report_or_verify_chain("gh pr checks 5 | grep fail | head") is True
+    assert ost._is_report_or_verify_chain("git log | grep x | head") is False  # no tg/gh-read head
+    # curl can POST and ssh runs any remote command — neither is a sanctioned read-only verb, so a
+    # chain fronted by them is NOT waved through (they keep the escape hatch).
+    assert ost._is_report_or_verify_chain("curl -X POST http://h/api | tg done | tail") is False
+    assert ost._is_report_or_verify_chain("ssh root@h 'df -h; lsblk' | tg done") is False
+    # The carve-out itself never launders a bare-`&` background push (the veto rejects it); A's
+    # pre-existing ordinary judgement decides the rest — the carve-out just does not exempt it.
+    assert ost._is_report_or_verify_chain("tg done & git push origin main; ls") is False
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
