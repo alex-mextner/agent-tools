@@ -118,6 +118,55 @@ def test_generated_paths_are_skipped(tmp_path, monkeypatch):
     assert "generated/vendored" in err
 
 
+def test_vendored_skip_is_scoped_to_repo_relative_path(tmp_path, monkeypatch):
+    """A checkout sitting under a parent dir that shares a skip-segment name (e.g. a
+    worktree at `/tmp/build/myrepo`) must not have every file in the repo skipped — only
+    paths vendored *within* the repo itself. Regression: the check used to run against the
+    full absolute path, matching on ancestor segments outside the repo root."""
+    assert "build" in low.SKIP_SEGMENTS, "test premise: the ancestor dir name must actually be a skip segment"
+    root = tmp_path / "build" / "myrepo"
+    root.mkdir(parents=True)
+    (root / ".git").mkdir()
+    f = root / "src" / "a.ts"
+    f.parent.mkdir(parents=True)
+    f.write_text("const x=1\n")
+    out, err, code = _run({"args": {"path": str(f)}}, monkeypatch)
+    _assert_allow(out, code)
+    assert "generated/vendored" not in err
+
+
+def test_repo_root_not_a_prefix_falls_back_without_crash(tmp_path, monkeypatch):
+    """A `repo_root` that isn't a literal path-string prefix of the written file (a case
+    that shouldn't arise given `repo_root` never resolves symlinks, but is cheap to guard)
+    must not crash the hook — fall back to the full path rather than raise."""
+    root = _mk_repo(tmp_path)
+    f = root / "src" / "a.ts"
+    f.parent.mkdir(parents=True)
+    f.write_text("const x=1\n")
+    monkeypatch.setattr(low, "repo_root", lambda start: Path("/definitely/not/a/prefix"))
+    out, err, code = _run({"args": {"path": str(f)}}, monkeypatch)
+    _assert_allow(out, code)
+
+
+def test_nested_git_root_defeats_vendored_skip_known_limitation(tmp_path, monkeypatch):
+    """Characterization test for a known, deliberately-unfixed limitation (see the comment
+    on `repo_root`): it returns the NEAREST enclosing `.git`, so a vendored dir that itself
+    carries a `.git` — including a git submodule, whose `.git` is a file pointer that
+    `find_up` matches the same as a real `.git` dir — has that segment scoped away, and a
+    file inside it is no longer skipped as vendored. This pins TODAY's behavior so a future
+    change to `repo_root`/`find_up` doesn't silently shift the boundary unnoticed."""
+    assert "vendor" in low.SKIP_SEGMENTS, "test premise: the vendored dir name must actually be a skip segment"
+    outer = _mk_repo(tmp_path)
+    nested = outer / "vendor" / "somelib"
+    nested.mkdir(parents=True)
+    (nested / ".git").write_text("gitdir: ../../.git/modules/somelib\n")  # submodule gitfile
+    f = nested / "file.ts"
+    f.write_text("const x=1\n")
+    out, err, code = _run({"args": {"path": str(f)}}, monkeypatch)
+    _assert_allow(out, code)
+    assert "generated/vendored" not in err
+
+
 # ── detection table ────────────────────────────────────────────────────────────────────
 
 

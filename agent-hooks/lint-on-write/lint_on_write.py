@@ -74,6 +74,18 @@ def find_up(start: Path, *names: str) -> Path | None:
 def repo_root(start: Path) -> Path | None:
     # Anchors config lookup + repo-local bin lookup. Outside a git repo every detector
     # returns None (config signals are root-relative), so the hook is a clean no-op there.
+    #
+    # Also used by `lintable_path` to scope the SKIP_SEGMENTS vendored-path check to the
+    # repo-relative path. That means it returns the NEAREST enclosing `.git`, not the
+    # outermost — so a vendored/generated dir that itself has a `.git` (this includes git
+    # submodules: `find_up` matches the submodule's `.git` FILE pointer just like a real
+    # `.git` dir) has that segment scoped away, and a file inside it stops being skipped —
+    # e.g. a submodule under `vendor/somelib/` would get linted instead of skipped — and,
+    # if that third-party code has findings, the write into it could get BLOCKed the same
+    # as first-party code. Known, deliberately-unfixed trade-off — pinned by
+    # `test_nested_git_root_defeats_vendored_skip_known_limitation` in
+    # tests/test_lint_on_write.py so a future change to this walk doesn't silently shift
+    # the boundary. See PR #161 review thread for the discussion.
     return find_up(start, ".git")
 
 
@@ -259,7 +271,19 @@ def lintable_path(event: dict) -> Path | None:
     if path is None or not path.is_file():
         log(f"no written file to lint (path={path!r}) — allow")
         return None
-    if SKIP_SEGMENTS.intersection(path.parts):
+    # Vendored-segment check must run against the repo-relative path: a checkout sitting
+    # under a parent dir named e.g. `build` (`/tmp/build/myrepo/src/a.ts`) would otherwise
+    # match on that ancestor segment and skip every file in the repo. `repo_root` never
+    # resolves symlinks (see `find_up`), so when it finds a root it is always a lexical
+    # prefix of `path` — no exception-prone `relative_to` needed. If it isn't a prefix (or
+    # no root was found), fall back to the full path — the same scoping this hook used
+    # before this fix, not a new failure mode.
+    root = repo_root(path)
+    if root is not None and path.parts[: len(root.parts)] == root.parts:
+        scoped = Path(*path.parts[len(root.parts) :])
+    else:
+        scoped = path
+    if SKIP_SEGMENTS.intersection(scoped.parts):
         log(f"skipping generated/vendored path {path} — allow")
         return None
     if path.suffix.lower() not in TABLE:
