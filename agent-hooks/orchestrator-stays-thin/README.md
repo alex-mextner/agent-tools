@@ -12,17 +12,34 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   Docs are exempt: a path matching `\.(md|mdx|txt|rst)$` or under `docs/` is always allowed.
 - **`pre-bash`** — a clearly **multi-step / implementation-shaped** Bash by the main thread →
   warn-then-block. Implementation-shaped = chained `> 2` steps (`&&`/`;`/`||`/`|`/newline), OR a
-  heredoc, OR an obvious build/edit (`sed -i`, `tee`, `npm`/`cargo`/`make` build). A bare
-  `>`/`>>` redirect is **not** implementation on its own (`python foo.py > out.log` is allowed).
-  A read-only inspection command is **never** blocked — including a **fully read-only chain of
-  any length** where every segment's head is inspection (`git status`/`log`/`diff`/`show`/`branch`,
-  `ls`, `cat`, `grep`, `find`, `head`, `tail`, `wc`, …), across `|`, `&&`, `;`, `||` or newline
-  (`find ... | grep ... | head`, `tail X | grep Y | wc -l`, `git status && ls && cat x`). But a
-  chain that merely *starts* read-only (`git status && sed -i ...`), or that mixes in any
+  heredoc, OR an obvious build/edit (`sed -i`, `tee`, `npm`/`cargo`/`make` build, **`git commit`/
+  `git push`**, **test runs** `pytest`/`go test`/`npm`/`bun`/`cargo test`). A bare `>`/`>>`
+  redirect is **not** implementation on its own (`python foo.py > out.log` is allowed).
+  Read-only inspection **and sanctioned orchestration** are **never** blocked — including a chain
+  of **any length** where every segment's head is inspection (`git status`/`log`/`diff`/`show`/
+  `branch`, `ls`, `cat`, `grep`, `find`, `head`, `tail`, `wc`, …) **or** orchestration
+  (`gh pr list`/`view`/`checks`/`status`/`diff`, `gh run list`/`view`/`watch`, `gh api` **GET-only**
+  — a mutation flag/`graphql` is not waved through, **`gh ship`**, `tg`, `review`, `git worktree
+  list`), across `|`, `&&`, `;`, `||` or newline
+  (`git status && ls`, `gh pr list && gh pr view 5`, `gh ship 5 && tg "shipped"`). This is the
+  **flapping fix** (Alex tg#5743 / agent-tools#23): those orchestration chains used to trip the
+  `>= 2 operators` rule and wrongly BLOCK. But a chain that merely *starts* allowed
+  (`git status && sed -i ...`, `gh pr view && git commit`), or that mixes in any
   build/edit/heredoc segment, is judged on its **full** content — not waved through on its prefix.
-  Judgement is per-segment-**head**: a build token used only as an argument/needle of a read-only
-  command (`cat tee.log`, `grep cargo notes`) stays allowed; only a build/edit *at a segment head*
-  (`sed -i ...`, `tee ...`, `npm`/`cargo`/`make` build) counts.
+  Judgement is per-segment-**head**: a build token used only as an argument/needle of an allowed
+  command (`cat tee.log`, `grep cargo notes`, `git log | rg gh`) stays allowed; only a
+  build/edit/commit *at a segment head* counts.
+
+## Per-repo opt-out (Alex tg#5743)
+
+Default **ON** (opt-OUT — this gate has always been always-on, so an un-enrolled repo keeps
+firing, no regression). A repo that legitimately does inline work on main (e.g. `3d-cli`)
+exempts itself:
+
+- `agent_hooks.orchestrator_only: false` in the repo's committed `rig.yaml` (rig-provisioned), or
+- `RIG_ORCHESTRATOR_ONLY=0` (session/CI override).
+
+This mirrors the opt-IN per-repo knob of the sibling `worktree-only-writes` guard.
 
 **Release carve-out — `gh ship` (#159):** the gated merge is the ONE repo mutation that belongs
 at *orchestrator* altitude — the auto-mode classifier denies it inside subagents (a subagent

@@ -9,11 +9,14 @@ Workflow. It enforces `delegate-work-to-subagents`.
 ONE script binds TWO points via two descriptors; it branches on ``event["point"]``:
   - pre-write : a CODE Edit/Write (non-docs) by the main thread → warn-then-block
   - pre-bash  : a clearly multi-step / implementation-shaped Bash by the main thread →
-                warn-then-block. Read-only inspection is NEVER blocked — a single one-liner
-                (git status, ls, cat, grep, find) OR a fully read-only chain of any length
-                across |/&&/;/||/newline (find ... | grep ... | head, git status && ls).
-                A `gh ship` RELEASE chain is NEVER blocked either — the gated merge is the
-                orchestrator's own action (#159, see _is_sanctioned_release_chain).
+                warn-then-block. Read-only inspection AND sanctioned ORCHESTRATION are NEVER
+                blocked — a single one-liner (git status, ls, cat, grep, find) OR a chain of any
+                length whose every segment is read-only OR an orchestration command
+                (gh pr list/view/checks, gh run, gh api, `gh ship`, tg, review, git worktree
+                list). This is the flapping fix (Alex tg#5743 / agent-tools#23): `gh pr list &&
+                gh pr view` and `gh ship 5 && tg done` used to trip the ">=2 operators" rule.
+                Commits/pushes and test runs (git commit/push, pytest, npm/bun/cargo test) ARE
+                treated as implementation and warn-then-block.
 
 TIERED (warn → block): the FIRST offense in the TTL window WARNs (allow + message); a REPEAT
 in the window BLOCKs. The tier is tracked by a marker file keyed by a hash of cwd. This gives
@@ -21,6 +24,11 @@ the doctrine's "WARN then BLOCK" instead of a hard wall on the first inline edit
 
 Subagent-exempt: a dispatched subagent (``agent_id`` present) does the actual work, so it is
 always allowed — this gate governs the orchestrator only.
+
+Per-repo opt-out (Alex tg#5743): default ON; a repo that legitimately works inline on main
+(e.g. 3d-cli) sets `agent_hooks.orchestrator_only: false` in its rig.yaml, or exports
+RIG_ORCHESTRATOR_ONLY=0. Default ON means an un-enrolled repo keeps the current always-on
+behavior (no regression). Mirrors the opt-IN worktree-only-writes guard's per-repo knob.
 
 Escape hatch (controllable — mirrors block-raw-pr-merge):
   - env  ALLOW_ORCHESTRATOR_WORK=1            — disable the guard for this session (both points)
@@ -44,6 +52,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -60,19 +69,80 @@ TTL_S = int(os.environ.get("ORCH_THIN_TTL_S", "900"))
 DOCS_PATH = re.compile(r"\.(?:md|mdx|txt|rst)$", re.IGNORECASE)
 DOCS_DIR = re.compile(r"(?:^|/)docs/", re.IGNORECASE)
 
-# Inspection / read-only one-liners that the orchestrator legitimately runs itself. The system-info
-# and text-filter tools (df/du/lsblk/free/ps/uname/…, jq/sort/uniq/cut/column) are read-only
-# VERIFICATION the orchestrator does directly — added so a multi-step verify pipe (`df -h | grep
-# /dev | head`, `gh pr view | jq | head`) is not blocked by the >=2-operator rule (coordinator).
+# Inspection / read-only one-liners that the orchestrator legitimately runs itself.
 READ_ONLY_BASH = re.compile(
     r"^\s*(?:git\s+(?:status|log|diff|show|branch)\b|ls\b|cat\b|less\b|head\b|tail\b|"
-    r"grep\b|rg\b|find\b|pwd\b|echo\b|which\b|env\b|wc\b|stat\b|tree\b|file\b|"
-    r"jq\b|sort\b|uniq\b|cut\b|column\b|df\b|du\b|lsblk\b|free\b|ps\b|uname\b|"
+    r"grep\b|rg\b|find\b|pwd\b|echo\b|which\b|env\b|wc\b|stat\b|tree\b|file\b|jq\b|"
+    # read-only system-info + text-filter verification tools (SYNC with fix/159 READ_ONLY_BASH):
+    # so a verify pipe `df -h | grep /dev | head` / `gh pr view | jq | head` is not blocked by the
+    # >=3-segment rule (coordinator: verification is the orchestrator's own altitude).
+    r"sort\b|uniq\b|cut\b|column\b|df\b|du\b|lsblk\b|free\b|ps\b|uname\b|"
     r"uptime\b|whoami\b|hostname\b|nproc\b|date\b)"
 )
-# Any chain operator (&&, ||, ;, |, newline). A command that chains AT ALL is not a single
-# read-only invocation, so the read-only carve-out below must NOT short-circuit it (B1).
-CHAIN = re.compile(r"&&|\|\||;|\||\n")
+# Sanctioned ORCHESTRATION commands the main thread legitimately runs ITSELF — coordination,
+# reporting, CI/PR inspection, and the sanctioned release path `gh ship` (agent-tools#23). These
+# are NOT implementation, so a chain composed entirely of them (or read-only inspection) must
+# never flap into a BLOCK. This is the flapping fix (Alex tg#5743): before it, `gh pr list && gh
+# pr view` or `gh ship 5 && tg "shipped"` tripped the ">=2 operators" rule because gh/tg were in
+# no allow-list. Head-anchored (`^\s*`) exactly like READ_ONLY_BASH so a build/edit head with
+# `gh`/`tg` as an ARGUMENT is not waved through (the same anchor invariant, #5/#80).
+ORCH_ALLOW = re.compile(
+    r"^\s*(?:"
+    r"gh\s+ship\b"                                        # the sanctioned release (#23)
+    r"|gh\s+pr\s+(?:list|view|checks|status|diff)\b"      # PR inspection (NOT checkout — it mutates
+                                                          # the local worktree/branch)
+    r"|gh\s+run\s+(?:list|view)\b"                        # CI status (NOT `watch` — it is a
+                                                          # long-running block; the orchestrator
+                                                          # should delegate a watch, and it is not
+                                                          # a quick inspection that this allow-list
+                                                          # is for. no-long-inline-process follow-up.)
+    r"|tg\b"                                              # Telegram status reports
+    r"|review\b"                                          # multi-model review CLI (read-only)
+    r"|git\s+worktree\s+list\b"                           # worktree inspection
+    r")"
+)
+# `gh api` is orchestration ONLY when GET-shaped. Rather than a fragile inline lookahead, detect
+# it with two token-aware regexes: the HEAD (`gh api`) and any MUTATION signal — a method flag
+# (`-X`/`--method`), a POST field (`-f`/`-F`/`--field`/`--raw-field`/`--input`, incl. ATTACHED
+# short forms like `-fkey=val` / `-XPOST`), or `graphql` (mutation-capable). A `gh api` segment
+# with NO mutation signal is a read (allowed); one WITH a signal is implementation-shaped and
+# warn-then-blocks EVEN as a single command (a mutation is a subagent's job — codex P1).
+_GH_API_HEAD = re.compile(r"^\s*gh\s+api\b")
+# gh api mutation-vs-GET is decided by shlex-parsing the args (`_gh_api_is_mutation`), not a raw
+# regex — so `--method=GET`, `-XGET`, `-fkey=val`, and `--method GET --method POST` (last wins) are
+# all read correctly.
+#
+# WRAPPER STRIPPING (`_strip_wrappers`): a leading `VAR=val` assignment or a passthrough command
+# wrapper (env / time / timeout / nice / nohup / stdbuf / ionice / setsid, basename-matched so
+# `/usr/bin/env` counts) hides the REAL command head — `timeout 60 pytest` (the mandated timeout
+# wrapper!), `env git commit`, `CI=1 pytest`, `time git push`, `nice -n10 npm build` — so they are
+# stripped before classification. This is a BEST-EFFORT discipline heuristic, NOT a security
+# boundary: a determined obfuscation (`env -S 'cmd'`, `sh -c 'cmd'`) can still evade it. The
+# sanctioned way to do deliberate inline work is the escape hatch, never evasion. A BARE `env`
+# (print environment) is preserved as read-only.
+_ASSIGN_RE = re.compile(r"^\w+=")
+# Per-wrapper option flags that consume a following OPERAND. Wrapper-SPECIFIC on purpose: the same
+# flag means different things per tool (env `-i` = ignore-env, NO operand; stdbuf `-i` = an operand),
+# so a shared set would make `env -i git commit` wrongly swallow `git` and bypass the deny (codex).
+_WRAPPER_OPT_ARGS = {
+    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-P"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "timeout": frozenset({"-k", "--kill-after", "-s", "--signal"}),
+    # `gtimeout` is GNU coreutils `timeout` on macOS (Homebrew) — enforce-timeout-on-bash accepts it
+    # as a valid timeout wrapper, so this hook must strip it too, else `gtimeout 60 git commit`
+    # slips past implementation detection (codex review).
+    "gtimeout": frozenset({"-k", "--kill-after", "-s", "--signal"}),
+    "stdbuf": frozenset({"-i", "-o", "-e"}),
+    "ionice": frozenset({"-c", "-n"}),
+    "time": frozenset(),
+    "nohup": frozenset(),
+    "setsid": frozenset(),
+}
+_WRAPPERS = frozenset(_WRAPPER_OPT_ARGS)
+# A `uv run … pytest`/`tox` test wrapper is detected by shlex-parsing (`_is_uv_test`) so the test
+# token must be the COMMAND uv runs, not an argument — `uv run rg pytest docs` (a search) is NOT a
+# test run. Chain-splitting is quote-aware (`_split_chain`) so a `|` inside a quoted jq program is
+# not a split point.
 # A command starts at the line start or right after a &&/;/|/( separator. Anchoring the
 # build-tool tokens here means the runner must be the COMMAND, not an argument/needle —
 # the same anchoring the no-long-inline-process sibling uses (#5).
@@ -86,71 +156,41 @@ HEREDOC = re.compile(r"<<-?\s*['\"]?\w+")
 # yarn`, `find . -name cargo.toml | wc -l`) is NOT mis-read as implementation (#5). The
 # in-place editors (sed -i, tee) keep a bare `\b` anchor: they are a content signal wherever
 # they appear (e.g. `git status && sed -i ...`).
+# `git commit`/`git push` and the test runners (pytest, go test) are ADDED here (Alex tg#5743):
+# the orchestrator must not commit/push or run test suites inline — that is a subagent's job.
+# They are anchored at a command head via _CMD_START (npm/bun/cargo already cover `npm test`,
+# `bun test`, `cargo test`). `git commit`/`git push` do NOT match READ_ONLY_BASH, so a chain that
+# starts read-only (`git status && git commit`) is still judged on its full content and blocks.
 BUILD_EDIT = re.compile(
     r"\b(?:sed\s+-i|tee)\b"
-    r"|" + _CMD_START + r"(?:npm|pnpm|yarn|bun|cargo|go\s+build|make|"
-    r"python\s+setup|pip\s+install)\b"
+    r"|" + _CMD_START + r"(?:npm|pnpm|yarn|bun|cargo|go\s+build|go\s+test|make|"
+    r"python\s+setup|pip\s+install|pytest|python\s+-m\s+(?:pytest|unittest)|tox|"
+    r"git\s+(?:commit|push))\b"
 )
+# `uv run … pytest` (the repo's own documented test command) is handled separately by _UV_TEST
+# below — targeted so a `uv run` of a read-only tool is not swept in. Other runner wrappers with a
+# non-build head are still not caught; the orchestrator is meant to DELEGATE the suite to a subagent
+# (which is exempt) anyway, and the tiered warn-then-block + escape hatch cover the residue.
 INLINE_SENTINEL = re.compile(r"#\s*orchestrator-ok:\s*(\S.*)")
 
-# Sanctioned read-only ORCHESTRATION verbs the orchestrator runs ITSELF to VERIFY and REPORT — never
-# a mutation, so a chain of only these (+ read-only inspection / cd) is verify-and-report altitude,
-# not implementation. The orchestrator's role is literally "verify + report", so reporting (`tg`)
-# and PR/CI verification (gh reads) must not require a subagent (coordinator directive). Head-anchored
-# like READ_ONLY_BASH. Deliberately NOT `curl` or `ssh`: neither can be reliably classified read-only
-# (`curl -X POST`/`-d …` mutates; `ssh host '…'` runs ANY remote command) — those keep the escape hatch.
-ORCH_READONLY = re.compile(
-    r"^\s*(?:tg\b"
-    r"|gh\s+pr\s+(?:list|view|checks|status|diff)\b"
-    r"|gh\s+run\s+(?:list|view)\b)"
-)
-
-# `gh ship` — the sanctioned gated-merge (RELEASE) command — at a segment HEAD, optionally
-# after env-var assignment prefixes (`GH_PAGER=cat gh ship 605`). Anchored on the segment's
-# argv like the other head tokens, NEVER matched as a substring in text: a needle such as
-# `grep 'gh ship' log` must not self-exempt a chain (#159).
-# The env-prefix value is a single unambiguous `\S*` (a run of non-space) — NOT an alternation with
-# quoted forms. An earlier `(?:'…'|"…"|\S*)` overlapped `\S*` with the quoted branches and caused
-# catastrophic backtracking on `A="" A="" …` (CodeQL py/redos, HIGH). `\S*` and the trailing `\s+`
-# are disjoint char classes, so the repeat is linear. Cost: an env value containing a SPACE
-# (`X="a b" gh ship`, rare on a ship line) no longer gets the fast path — it falls to ordinary
-# judgement. Realistic prefixes (`GH_PAGER=cat`, `GH_TOKEN=x`, `X="cat"`) still match.
-GH_SHIP_HEAD = re.compile(
-    r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*gh\s+ship(?=\s|$)"
-)
-# The only extra companion a release line may carry besides read-only inspection: `cd`
-# changes no repo state, and `cd <repo> && gh ship <PR> | tail` is a common ship shape.
-# Anchored on an argv boundary (`\s`/end), NOT `\b`: a bare `\b` matches before punctuation, so
-# `cd-clean` / `cd/foo` (other commands) would ride the carve-out — they must not (#159 review P1).
-CD_HEAD = re.compile(r"^\s*cd(?=\s|$)")
-# A command or process substitution can smuggle ANY mutation into an otherwise-benign
-# release segment (`cd $(git push ...) && gh ship`, `cat <(git push ...) && gh ship`), and
-# BUILD_EDIT only knows build/edit tools — so the release carve-out vetoes substitutions
-# wholesale, like heredocs: `$(...)`, backticks, and process substitution `<(...)`/`>(...)`.
-# A legit ship line does not need them; a rare `cd $(git rev-parse ...) && gh ship` just
-# falls back to the ordinary judgement (#159).
+# ── companion-safety vetoes for the sanctioned-orchestration allow-list ──────────────────────
+# SYNC with the sibling `gh ship` release carve-out (agent-tools#159 / fix/159-gh-ship-carveout):
+# both hooks judge per segment head, so a benign head must not launder a mutation hidden elsewhere
+# in the line. The allow-list (`_seg_is_allowed`) is HEAD-anchored, so a command/process
+# substitution (`gh ship $(sed -i …)`, `cat <(git push) && tg done`) or a bare background `&`
+# (`tg done & git push` — NOT a chain split) would smuggle a mutation past it. These veto the
+# free pass wholesale (scanned quote-blanked so a metachar INSIDE a quoted arg does not trip them).
 SUBSTITUTION = re.compile(r"\$\(|`|[<>]\(")
-# A single `&` (backgrounding / control operator) is NOT a CHAIN split, so `gh ship 605 &
-# git push` would read as ONE segment with a ship head — the release carve-out vetoes it.
-# Redirect `&`s (`2>&1`, `&>`, `>&`) and the already-split `&&` are excluded (#159).
+# Bare `&` backgrounding. `&&`, `2>&1`, `&>`, `>&` are excluded (not a control `&`).
 BG_AMP = re.compile(r"(?<![&>])&(?![&>])")
-# READ_ONLY_BASH has a documented inherited gap (#80): a read-only HEAD can still carry a
-# mutating form — `find . -delete`/`-exec ...`, the `env <cmd>` wrapper, `git branch -D`.
-# The plain read-only carve-out tolerates that gap (out of scope there), but the release
-# carve-out must not EXTEND it to ship lines that were blocked pre-#159 — so these forms
-# are excluded from the ship-companion set (#159). Head-anchored for env / git branch;
-# find's mutating actions are a content signal anywhere in the segment. This covers BOTH find's
-# delete/exec family AND its file-WRITING primaries (`-fprint`/`-fprintf`/`-fprint0`/`-fls`),
-# which write an arbitrary path just like `-delete` mutates — omitting them let
-# `gh ship | find . -fprintf evil.sh 'x' | tail` ride the carve-out (#159 review, main finding).
-# SYNC with READ_ONLY_BASH: of its git subcommands (status|log|diff|show|branch), only
-# `branch` has a mutating argument form — the rest are read-only whatever their args. If a
-# subcommand with a mutating form (tag/config/stash/notes/…) is ever added there, it must
-# be excluded here too.
-UNSAFE_COMPANION = re.compile(
-    r"^\s*(?:env\b|git\s+branch\s+\S)"
-    r"|\s-(?:delete|exec|execdir|ok|okdir|fprintf|fprint0|fprint|fls)\b"
-)
+# `cd` changes no repo state — the one extra companion a sanctioned chain may carry besides
+# read-only inspection (`cd <repo> && gh ship <PR> | tail`). Argv-boundary anchored (`cd(?=\s|$)`),
+# NOT `\b`, so `cd-clean` / `cd/foo` are not mistaken for `cd`.
+CD_HEAD = re.compile(r"^\s*cd(?=\s|$)")
+# find's mutating primaries — the delete/exec family AND the file-WRITE primaries
+# (`-fprint`/`-fprintf`/`-fprint0`/`-fls`, which write an arbitrary path) — are a content signal
+# anywhere in a segment: a read-only `find` head must not launder them into the allow-list.
+FIND_MUTATION = re.compile(r"\s-(?:delete|exec|execdir|ok|okdir|fprintf|fprint0|fprint|fls)\b")
 
 MESSAGE = (
     "Delegate to a subagent: the orchestrator plans, dispatches, and verifies — it does not "
@@ -251,74 +291,63 @@ def _is_code_write(args: dict) -> bool:
     return True
 
 
-def _is_all_read_only(command: str) -> bool:
-    """True when EVERY chain segment's HEAD is a read-only inspection command.
+def _strip_wrappers(segment: str) -> str:
+    """Drop leading ``VAR=val`` assignments and passthrough command wrappers (env/time/timeout/…)
+    so the REAL command head gets classified (codex). shlex-tokenized with basename matching, so
+    `/usr/bin/env git commit` and `timeout 60 pytest` are seen as `git commit` / `pytest`.
 
-    A fully read-only pipe (`find ... | grep ... | head`, `tail X | grep Y | wc -l`) is the
-    orchestrator's bread-and-butter inspection and must never be blocked, no matter how many
-    segments it has (#80).
-
-    The judgement is per-segment-HEAD, NOT a whole-string scan: a build/edit token that appears
-    only as an ARGUMENT/needle of a read-only command (`cat tee.log`, `grep cargo notes.txt`)
-    must stay allowed — exactly the single-command carve-out this replaced (`tee`/`sed -i` are
-    unanchored in BUILD_EDIT, so a whole-string scan would mis-flag them). A real build/edit or
-    heredoc segment has a NON-read-only head (`sed ...`, `tee ...`, `npm ...`, the heredoc body),
-    so it breaks `all(...)` and the caller then judges the command as implementation. HEREDOC is
-    additionally vetoed up front — no inspection one-liner contains a `<<WORD` redirect.
+    Best-effort: if the strip leaves nothing (a bare `env`) the original is kept (read-only), and a
+    determined `env -S 'cmd'` / `sh -c 'cmd'` obfuscation is out of scope (see the module note).
     """
-    if HEREDOC.search(command):
-        return False
-    # NOTE: judged on the segment HEAD only — READ_ONLY_BASH is head-anchored (`^\s*…`), so a
-    # build/edit head with a read-only word in its args (`sed -i … grep.py`) is NOT waved through
-    # (regression-guarded by test_build_edit_head_with_read_only_needle_blocks). Inherited gap
-    # (pre-#80, also true of the old single-command carve-out): a read-only HEAD with a mutating
-    # flag — `find . -delete`, `find . -exec sed -i …` — reads as inspection. Out of scope here.
-    segments = [s for s in CHAIN.split(command) if s.strip()]
-    return bool(segments) and all(READ_ONLY_BASH.search(s) for s in segments)
+    try:
+        toks = shlex.split(segment)
+    except ValueError:
+        return segment  # unbalanced quotes → don't transform
+    i, changed = 0, False
+    while i < len(toks):
+        if _ASSIGN_RE.match(toks[i]):  # VAR=val
+            i += 1
+            changed = True
+            continue
+        base = toks[i].rsplit("/", 1)[-1]  # /usr/bin/env → env
+        if base not in _WRAPPERS:
+            break
+        changed = True
+        is_timeout = base in ("timeout", "gtimeout")
+        opt_args = _WRAPPER_OPT_ARGS[base]  # operand-taking flags for THIS wrapper only
+        i += 1
+        while i < len(toks) and toks[i].startswith("-"):
+            opt = toks[i]
+            i += 1
+            if opt in opt_args and i < len(toks):
+                i += 1  # this option consumes an operand
+        while i < len(toks) and _ASSIGN_RE.match(toks[i]):  # env VAR=val …
+            i += 1
+        if is_timeout and i < len(toks):
+            i += 1  # `timeout`'s first positional is the DURATION; the command follows
+    if not changed:
+        return segment
+    rest = toks[i:]
+    return " ".join(shlex.quote(t) for t in rest) if rest else segment
 
 
-def _blank_quoted(command: str) -> str:
-    """Blank quoted content so a whole-string veto scan (SUBSTITUTION / BG_AMP / BUILD_EDIT) does
-    not fire on a shell metachar that is INERT inside quotes — a reason like `--no-screenshot-ok
-    'revert; reship'` or a `--title "a & b"` must not forfeit the carve-out and false-block a
-    legit ship (#159 review F2/P2).
+def _split_chain(command: str) -> list[str]:
+    """Split a command into segments on shell operators (``&&`` ``||`` ``;`` ``|`` newline AND a
+    bare control ``&``) that lie OUTSIDE quotes. Quote-aware so a ``|`` inside a quoted jq program
+    (``jq '.a | .b'``) is NOT a split point — that mis-split used to flap a read chain (codex).
 
-    Quote semantics differ and the blanking MUST follow them (#162 review P2): inside SINGLE
-    quotes everything is literal → blank it all; inside DOUBLE quotes `$(…)` and backticks still
-    EXECUTE → keep `$`, `` ` `` and `(` visible so `gh ship --note "$(git push …)"` still trips
-    the SUBSTITUTION veto (`&`, `;`, `|`, `<`, `>` are literal in double quotes and stay blanked).
-    Best-effort (matches _split_release_segments): backslash-escapes are out of scope."""
-    out: list[str] = []
-    quote: str | None = None
-    for c in command:
-        if quote is not None:
-            if c == quote:
-                out.append(c)
-                quote = None
-            elif quote == '"' and c in ("$", "`", "("):
-                out.append(c)  # substitutions are LIVE inside double quotes — keep them scannable
-            else:
-                out.append(" ")
-        elif c in ("'", '"'):
-            quote = c
-            out.append(c)
-        else:
-            out.append(c)
-    return "".join(out)
-
-
-def _split_release_segments(command: str) -> list[str]:
-    """Quote-aware split on the chain operators (``&&`` ``||`` ``;`` ``|`` newline) that lie
-    OUTSIDE quotes, so a quoted operator in a ship reason (`gh ship 605 'fix; reship'`) is NOT a
-    segment boundary (#159 review F2/P2). The plain read-only path keeps the naive CHAIN split
-    (unchanged, out of scope); only the release carve-out needs quote-awareness because ship
-    carries free-form reason args. SYNC with workflow-guards `_split_chain`."""
+    A bare ``&`` (backgrounding) IS a real segment separator, so `tg done & git commit` splits into
+    two segments and the smuggled `git commit` is judged on its own — without this it was one
+    segment with a benign `tg` head and slipped past the impl scan (codex review). A redirect ``&``
+    (`2>&1`, `&>`, `>&`) and the already-handled `&&` are NOT splits (BG_AMP semantics)."""
     segs: list[str] = []
     buf: list[str] = []
     quote: str | None = None
     i, n = 0, len(command)
     while i < n:
         c = command[i]
+        prev = command[i - 1] if i > 0 else ""
+        nxt = command[i + 1] if i + 1 < n else ""
         if quote is not None:
             buf.append(c)
             if c == quote:
@@ -332,6 +361,10 @@ def _split_release_segments(command: str) -> list[str]:
             segs.append("".join(buf))
             buf = []
             i += 2
+        elif c == "&" and prev not in ("&", ">") and nxt not in ("&", ">"):
+            segs.append("".join(buf))  # bare control `&` — a background separator, not a redirect
+            buf = []
+            i += 1
         elif c in (";", "|", "\n"):
             segs.append("".join(buf))
             buf = []
@@ -343,104 +376,382 @@ def _split_release_segments(command: str) -> list[str]:
     return [s for s in segs if s.strip()]
 
 
-def _is_sanctioned_release_chain(command: str) -> bool:
-    """True when the line is a `gh ship` RELEASE invocation: at least one segment HEAD is
-    `gh ship`, and EVERY segment head is `gh ship`, read-only inspection, or `cd`.
+def _norm_segments(command: str) -> list[str]:
+    """Chain-split (quote-aware) then strip wrappers from each segment (the unit of classification)."""
+    return [_strip_wrappers(s) for s in _split_chain(command)]
 
-    Why a carve-out at all (#159): `gh ship` is the ONE repo mutation that belongs at
-    ORCHESTRATOR altitude — the gated merge. The auto-mode classifier denies it inside
-    subagents (a subagent relaying its own merge is exactly what the gates exist to stop),
-    so when this hook warn-then-blocked the orchestrator's inline ship chains too, NOBODY
-    could reliably run the sanctioned merge command — a deadlock, observed live as flapping
-    (first ship WARNs through, the next ones in the TTL window BLOCK). Release is dispatch/
-    verify-altitude work like the rest of the orchestrator's job, not implementation.
 
-    Deliberately NARROW, judged per segment HEAD like _is_all_read_only (#80):
-      - `gh ship` must be a segment's argv head (env-var prefixes allowed) — a substring
-        (`grep 'gh ship' log`, `echo gh ship`) exempts nothing;
-      - a ship segment does NOT launder the rest of the line — `sed -i ... && gh ship`,
-        `npm run build && gh ship`, or any heredoc still counts as implementation;
-      - BUILD_EDIT, command SUBSTITUTIONS, and a bare background `&` are vetoed on the WHOLE
-        string, mirroring the heredoc veto: this predicate fires BEFORE the caller's
-        BUILD_EDIT check, and segment heads alone would miss a mutation hidden in
-        `$(...)`/backticks (`gh ship $(sed -i ...)`, `cd $(git push ...) && gh ship`) or
-        behind a single `&` (`gh ship 605 & git push` — CHAIN does not split on it).
-        Pre-fix, the whole-string BUILD_EDIT scan caught the build/edit cases — the vetoes
-        keep that and cover mutations BUILD_EDIT does not know. Cost: a build/edit token as
-        a mere needle in a ship chain (`gh ship | grep tee`, and notably `gh ship | tee
-        ship.log`) forfeits the carve-out and falls back to the ordinary judgement — log a
-        ship with a bare redirect instead (`gh ship > log 2>&1`, not implementation, B7).
-        `|&` is likewise not a supported release shape (its `&` trips the bare-`&` veto —
-        and even without it, CHAIN's `|` split would leave a `& ...` segment head that
-        never qualifies) — pipe with `2>&1 |`;
-      - READ_ONLY_BASH's inherited head-with-mutating-flag gap (#80) is NOT extended to
-        ship lines: an `env <cmd>` wrapper, `git branch <arg>`, or a find-style mutating
-        action (`-delete`/`-exec`/`-ok`) disqualifies a companion (UNSAFE_COMPANION);
-      - ONLY `gh ship` rides this: no other gh subcommand, no tg, nothing else.
+def _blank_quoted(command: str) -> str:
+    """Replace the CONTENT of '…'/"…" spans with spaces (keeping the quote chars) so a whole-string
+    veto scan (SUBSTITUTION / BG_AMP) does not fire on a shell metachar that lives INSIDE a quoted
+    argument — a `gh ship 605 --title "a & b"` or a `tg 'done; shipped'` must not forfeit the
+    orchestration free pass. Best-effort, matching `_split_chain`: backslash-escapes are out of
+    scope (this is a discipline heuristic, not a security boundary). SYNC agent-tools#159."""
+    out: list[str] = []
+    quote: str | None = None
+    for c in command:
+        if quote is not None:
+            out.append(c if c == quote else " ")
+            if c == quote:
+                quote = None
+        elif c in ("'", '"'):
+            quote = c
+            out.append(c)
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def _seg_is_allowed(segment: str) -> bool:
+    """A single (env-stripped) segment head is read-only inspection OR sanctioned orchestration.
+
+    Head-anchored, so a build/edit token appearing only as an ARGUMENT/needle (`cat tee.log`,
+    `git log | rg gh`) stays allowed on its real head, not the needle (the anchor invariant, #5/#80).
+    `gh api` counts ONLY when GET-shaped (no mutation signal).
+
+    A benign head does NOT launder a mutation the head-anchor cannot see: find's mutating primaries
+    (delete/exec/file-write) and a `git branch` WITH an argument (its `-D`/create forms) are a read
+    head that carries a write, so they forfeit the allow-list (agent-tools#159). `cd` (no repo
+    state) is an allowed companion so `cd <repo> && gh ship … | tail` stays a release chain.
     """
-    # Veto on a QUOTE-BLANKED copy so a metachar inside a quoted ship arg does not fire (F2/P2);
-    # a real substitution / bare `&` / build-edit / heredoc OUTSIDE quotes still trips it.
-    scan = _blank_quoted(command)
-    if (HEREDOC.search(scan) or BUILD_EDIT.search(scan)
-            or SUBSTITUTION.search(scan) or BG_AMP.search(scan)):
+    if FIND_MUTATION.search(segment):
         return False
-    segments = [s for s in _split_release_segments(command) if s.strip()]
-    if not any(GH_SHIP_HEAD.match(s) for s in segments):
+    if _git_subcommand(segment) == "branch" and _git_branch_has_arg(segment):
         return False
-    return all(
-        GH_SHIP_HEAD.match(s)
-        or ((READ_ONLY_BASH.search(s) or CD_HEAD.match(s))
-            and not UNSAFE_COMPANION.search(s))
-        for s in segments
+    if READ_ONLY_BASH.search(segment) or ORCH_ALLOW.search(segment) or CD_HEAD.match(segment):
+        return True
+    if _git_subcommand(segment) in _GIT_READ_SUBS:  # `git -C d status`, `/usr/bin/git log`, …
+        return True
+    return bool(_GH_API_HEAD.match(segment)) and not _gh_api_is_mutation(segment)
+
+
+def _gh_api_is_mutation(segment: str) -> bool:
+    """Decide if a `gh api` segment MUTATES by shlex-parsing its flags and computing the EFFECTIVE
+    method — robust to `--method=GET` / `-XGET` / `-fkey=val` / a later `--method POST` overriding an
+    earlier GET. A POST field (`-f`/`-F`/`--field`/`--raw-field`/`--input`) with no method implies a
+    write; an explicit non-GET method (or `graphql` with fields) mutates; a plain read does not."""
+    try:
+        toks = shlex.split(segment)
+    except ValueError:
+        return True  # unbalanced quotes → don't whitelist (conservative)
+    method: str | None = None
+    has_field = False
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t in ("-X", "--method"):
+            if i + 1 < len(toks):
+                method = toks[i + 1].upper()
+            i += 2
+            continue
+        if t.startswith("--method="):
+            method = t.split("=", 1)[1].upper()
+        elif t.startswith("-X") and len(t) > 2:  # attached, e.g. -XPOST
+            method = t[2:].upper()
+        elif t in ("-f", "-F", "--field", "--raw-field", "--input"):
+            has_field = True
+            i += 2  # skip the flag's value operand
+            continue
+        elif t.startswith(("-f", "-F")) and len(t) > 2:  # attached, e.g. -fkey=val
+            has_field = True
+        elif t.startswith(("--field=", "--raw-field=", "--input=")):
+            has_field = True
+        i += 1
+    if method is not None:
+        return method != "GET"  # explicit method: GET is a read, anything else mutates
+    return has_field  # no method + POST fields → an implicit write
+
+
+def _seg_is_impl_signal(segment: str) -> bool:
+    """A single (env-stripped) segment is implementation on its own: a build/edit head (sed -i, tee,
+    npm/…), a `git commit`/`push` or a `pytest`/`python -m pytest` test (all spellings), a
+    `uv run … pytest` wrapper, OR a `gh api` MUTATION. Caught even unchained (codex P1)."""
+    if BUILD_EDIT.search(segment) or _is_uv_test(segment) or _is_git_or_python_impl(segment):
+        return True
+    return bool(_GH_API_HEAD.match(segment)) and _gh_api_is_mutation(segment)
+
+
+# git global options that take a SEPARATE operand (so `git -C /repo commit` finds `commit`, not `/repo`).
+_GIT_GLOBAL_OPT_ARG = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"}
+)
+_GIT_READ_SUBS = frozenset({"status", "log", "diff", "show", "branch"})
+
+
+def _git_subcommand(segment: str) -> str | None:
+    """The git subcommand after skipping global options, or None if the segment isn't `git`.
+
+    shlex + basename, so it sees the subcommand across spellings the head regexes miss:
+    path-qualified (`/usr/bin/git`) and global options before the subcommand (`git -C d status`,
+    `git -c k=v commit`, `git --git-dir=.git commit`) (codex round 8). Used by BOTH the read
+    carve-out and the mutation deny so the two never disagree on what a git command is.
+    """
+    try:
+        toks = shlex.split(segment)
+    except ValueError:
+        return None
+    if not toks or toks[0].rsplit("/", 1)[-1] != "git":
+        return None
+    i = 1
+    while i < len(toks) and toks[i].startswith("-"):
+        opt = toks[i]
+        i += 1
+        if opt in _GIT_GLOBAL_OPT_ARG and i < len(toks):  # attached --opt=val has no operand
+            i += 1
+    return toks[i] if i < len(toks) else None
+
+
+def _git_branch_has_arg(segment: str) -> bool:
+    """True when a `git branch` segment carries ANY argument. `git branch` bare is a read-only
+    LIST; `git branch <arg>` covers the mutating forms (`-D`/`-d`/`-m`/`-M`/create) AND read flags
+    like `-a`/`-v` — conservatively ALL forfeit the allow-list (a lone read `git branch -a` still
+    passes via the `< 3 segments` fallback). shlex + global-option aware like `_git_subcommand`, so
+    the `-C` form (`git -C /repo branch -D`) is covered too. agent-tools#159."""
+    try:
+        toks = shlex.split(segment)
+    except ValueError:
+        return True  # unparseable → do not grant the allow-list
+    if not toks or toks[0].rsplit("/", 1)[-1] != "git":
+        return False
+    i = 1
+    while i < len(toks) and toks[i].startswith("-"):
+        opt = toks[i]
+        i += 1
+        if opt in _GIT_GLOBAL_OPT_ARG and i < len(toks):
+            i += 1
+    if i >= len(toks) or toks[i] != "branch":
+        return False
+    return i + 1 < len(toks)  # any token after `branch`
+
+
+def _is_git_or_python_impl(segment: str) -> bool:
+    """shlex-based detection of `git commit`/`git push` and `pytest`/`python -m pytest|unittest`
+    across spellings the head regex misses: path-qualified (`/usr/bin/git`, `/usr/bin/python3`),
+    `python3`/`pythonX.Y`, and git GLOBAL options before the subcommand (codex round 8)."""
+    if _git_subcommand(segment) in ("commit", "push"):
+        return True
+    try:
+        toks = shlex.split(segment)
+    except ValueError:
+        return False
+    if not toks:
+        return False
+    cmd = toks[0].rsplit("/", 1)[-1]  # basename
+    if re.fullmatch(r"python3?(?:\.\d+)?", cmd):
+        return toks[1:3] in (["-m", "pytest"], ["-m", "unittest"])
+    return cmd in ("pytest", "tox")
+
+
+def _is_uv_test(segment: str) -> bool:
+    """True when a segment is a `uv run … pytest`/`tox`/`python -m pytest|unittest` TEST run.
+
+    shlex-parsed so the test token must be the COMMAND uv runs (after `uv run` + its options), not
+    an argument — `uv run rg pytest docs` (searching for "pytest") is NOT a test run (codex)."""
+    try:
+        toks = shlex.split(segment)
+    except ValueError:
+        return False
+    if len(toks) < 3 or toks[0] != "uv" or toks[1] != "run":
+        return False
+    i = 2
+    _UV_OPTS_WITH_ARG = (
+        "--with", "--with-editable", "--python", "-p", "--project", "--directory", "--env-file",
     )
-
-
-def _is_report_or_verify_chain(command: str) -> bool:
-    """True when EVERY segment head is report/verify orchestration (`tg`, gh PR/CI reads), read-only
-    inspection, or `cd`, AND at least one is the `tg`/gh-read orchestration.
-
-    Report and verification are the orchestrator's OWN altitude — a multi-step report/verify chain
-    (`tg … | tail -3 | grep merged`, `gh pr view 5 | jq .title | head`, `tg done; gh pr view 5`)
-    must never warn-then-block as implementation, exactly like the release carve-out (coordinator
-    directive: reporting + verification must not require a subagent). Same vetoes and quote-aware
-    split as `_is_sanctioned_release_chain`: a build/edit, heredoc, command/process substitution,
-    bare-`&`, or mutating companion (`git branch <arg>`, find delete/exec/file-write) forfeits it —
-    so `tg done && sed -i …` or `gh pr view 5 && git push` is still judged as implementation."""
-    scan = _blank_quoted(command)
-    if (HEREDOC.search(scan) or BUILD_EDIT.search(scan)
-            or SUBSTITUTION.search(scan) or BG_AMP.search(scan)):
+    while i < len(toks) and toks[i].startswith("-"):
+        opt = toks[i]
+        i += 1
+        if opt in _UV_OPTS_WITH_ARG and i < len(toks):
+            i += 1  # skip the option's operand
+    if i >= len(toks):
         return False
-    segments = [s for s in _split_release_segments(command) if s.strip()]
-    if not any(ORCH_READONLY.match(s) for s in segments):
+    cmd = toks[i]
+    if cmd in ("pytest", "tox"):
+        return True
+    return cmd == "python" and toks[i + 1:i + 3] in (["-m", "pytest"], ["-m", "unittest"])
+
+
+def _is_all_read_only(command: str) -> bool:
+    """True when EVERY (env-stripped) chain segment head is a read-only inspection command.
+
+    A fully read-only pipe (`find ... | grep ... | head`) is the orchestrator's bread-and-butter
+    inspection and must never be blocked, no matter how many segments it has (#80).
+    """
+    if HEREDOC.search(command):
         return False
-    return all(
-        (ORCH_READONLY.match(s) or READ_ONLY_BASH.search(s) or CD_HEAD.match(s))
-        and not UNSAFE_COMPANION.search(s)
-        for s in segments
-    )
+    segs = _norm_segments(command)
+    return bool(segs) and all(READ_ONLY_BASH.search(s) for s in segs)
+
+
+def _is_all_inline_allowed(command: str) -> bool:
+    """True when EVERY (env-stripped) segment is read-only inspection OR sanctioned orchestration.
+
+    The superset used to decide "not implementation": a chain of only `gh pr list`/`gh ship`/`tg`/…
+    (or read-only inspection) is orchestration, never blocked. The flapping fix + the `gh ship`
+    whitelist (Alex tg#5743 / agent-tools#23).
+
+    Rejects a chain whose substitution smuggles a MUTATION (`gh ship $(gh api -X POST …)`) — the
+    head-anchored allow check cannot see inside `$(…)`, so this is the only place to catch it before
+    the fast path returns. A BENIGN substitution (`cat $(find …) | grep | head`) is NOT rejected, so
+    the #80 read-only-pipe-of-any-length invariant holds (agent-tools#159, Opus review). A bare `&`
+    is handled by `_split_chain` splitting it, so its segments are judged individually.
+    """
+    if HEREDOC.search(command):
+        return False
+    if _has_mutating_substitution(command):
+        return False
+    segs = _norm_segments(command)
+    return bool(segs) and all(_seg_is_allowed(s) for s in segs)
+
+
+# A single-level substitution — `$(…)`, backticks, `<(…)`/`>(…)` — capturing its INNER command.
+# One level (no nested parens) on purpose: a discipline heuristic, not a shell parser.
+_SUBST_INNER = re.compile(r"\$\(([^()]*)\)|`([^`]*)`|[<>]\(([^()]*)\)")
+
+
+def _substitution_inners(command: str) -> list[str]:
+    """Inner commands of the UNQUOTED substitutions in ``command`` (scanned on a quote-blanked copy,
+    so a substitution inside single/double quotes is not extracted). Lets a mutation smuggled in a
+    substitution head-position (`gh ship $(gh api -X POST …)`) still be judged: the outer segment
+    head is `gh ship`, so only scanning the inner catches the `gh api` mutation (codex review)."""
+    inners: list[str] = []
+    for m in _SUBST_INNER.finditer(_blank_quoted(command)):
+        inner = next((g for g in m.groups() if g), "")
+        if inner.strip():
+            inners.append(inner)
+    return inners
+
+
+def _has_mutating_substitution(command: str) -> bool:
+    """True when an UNQUOTED substitution's own command is implementation — a mutation smuggled
+    where no segment head can see it (`gh ship $(gh api -X POST …)`, `cat $(git commit)`). A BENIGN
+    substitution (`cat $(find …)`) is not, so the #80 read-only-pipe invariant holds (Opus review)."""
+    return any(_seg_is_impl_signal(s)
+               for inner in _substitution_inners(command)
+               for s in _norm_segments(inner))
 
 
 def _is_implementation_bash(command: str) -> bool:
     if not command.strip():
         return False
-    # A fully read-only pipe of ANY length is inspection, never implementation (#80). The older
-    # single-command carve-out was a subset of this; an all-read-only chain now passes too.
-    if _is_all_read_only(command):
+    # A fully read-only / sanctioned-orchestration chain of ANY length is inspection, never
+    # implementation (#80 + the tg#5743 flapping fix). Checked FIRST so a build-token that is only
+    # an ARGUMENT of a read-only head (`cat tee.log`) is not mis-flagged by the UNANCHORED BUILD_EDIT
+    # needle below — the head-anchored allow-list shields it (#5/#80). `_is_all_inline_allowed`
+    # itself rejects a chain whose substitution smuggles a mutation, so the fast path is safe.
+    if _is_all_inline_allowed(command):
         return False
-    # A `gh ship` release line (plus read-only/`cd` plumbing) is orchestrator-altitude, not
-    # implementation — see _is_sanctioned_release_chain (#159).
-    if _is_sanctioned_release_chain(command):
-        return False
-    # A report/verify line (`tg …`, gh PR/CI reads, + read-only/`cd`) is likewise the orchestrator's
-    # own altitude — see _is_report_or_verify_chain (coordinator directive).
-    if _is_report_or_verify_chain(command):
-        return False
-    # A chain that merely STARTS with a read-only command (`git status && sed -i ...`,
-    # `ls; npm run build`) is judged on its full content, not waved through on its prefix (B1).
-    if HEREDOC.search(command) or BUILD_EDIT.search(command):
+    if HEREDOC.search(command):
         return True
-    # Multiple chained steps (>= 2 operators, i.e. > 2 commands joined) is implementation-shaped.
-    return len(CHAIN.findall(command)) >= 2
+    # A build/edit head or a gh api mutation in ANY (env-stripped) segment is implementation — even
+    # a single unchained one (`git commit`, `env pytest`, `gh api -X POST`). `_split_chain` splits a
+    # bare `&`, so `tg done & git commit` is judged on its `git commit` segment.
+    if any(_seg_is_impl_signal(s) for s in _norm_segments(command)):
+        return True
+    # ...and a mutation smuggled inside a substitution head-position, which no segment head sees.
+    if _has_mutating_substitution(command):
+        return True
+    # Otherwise, multiple chained steps (>= 3 segments, i.e. >= 2 operators) is impl-shaped. Counted
+    # from the quote-aware split so a `|` inside a quoted arg is not counted as an operator.
+    return len(_split_chain(command)) >= 3
+
+
+# ── per-repo opt-out (rig.yaml) ─────────────────────────────────────────────────────────
+# SYNC: the two helpers below are duplicated in
+# agent-hooks/worktree-only-writes/worktree_only_writes.py (each agent-hook dir is deliberately
+# self-contained so it installs standalone — no shared import). Keep the parse logic identical.
+
+def _find_rig_yaml(cwd: str) -> Path | None:
+    """Walk up from ``cwd`` to the first directory containing a ``rig.yaml`` (or None)."""
+    try:
+        here = Path(cwd or ".").resolve()
+    except OSError:
+        return None
+    for d in (here, *here.parents):
+        if (d / "rig.yaml").is_file():
+            return d
+    return None
+
+
+def _target_dir(cwd: str, args: dict) -> str:
+    """The dir whose rig.yaml governs a WRITE — the target file's dir, else ``cwd``.
+
+    Mirrors worktree-only-writes._target_dir (SYNC): a pre-write's opt-out must follow the checkout
+    the FILE lives in, not the shell cwd (they can differ — an absolute write into another repo).
+    The file may not exist yet (a create) → walk up to the nearest existing ancestor.
+    """
+    base = cwd or os.getcwd()
+    if not isinstance(args, dict):
+        return base
+    for key in ("file_path", "path", "notebook_path"):
+        raw = args.get(key)
+        if isinstance(raw, str) and raw.strip():
+            target = Path(raw)
+            if not target.is_absolute():
+                target = Path(base) / target
+            for cand in (target.parent, *target.parent.parents):
+                if cand.exists():
+                    return str(cand)
+            return base
+    return base
+
+
+def _agent_hooks_bool(rig_yaml_text: str, key: str, default: bool) -> bool:
+    """Read the boolean ``agent_hooks.<key>`` from rig.yaml text — deliberately minimal parse.
+
+    Stdlib-only (no PyYAML): find the top-level ``agent_hooks:`` block (indent 0) and read the
+    key ONLY as a DIRECT child of it — a deeper-nested ``<key>:`` (e.g. under ``items.<hook>``)
+    must NOT flip the guard repo-wide. A malformed/absent key returns the default (fail-open) — a
+    parse miss only means "keep the default", the safe direction for a discipline gate.
+    """
+    in_block = False
+    child_indent: int | None = None  # the indent of agent_hooks' DIRECT children
+    for raw in rig_yaml_text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()  # drop trailing comment (values here are booleans)
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        head = line.strip().split(":", 1)[0].strip()
+        if indent == 0:
+            in_block = head == "agent_hooks"
+            child_indent = None
+            continue
+        if not in_block:
+            continue
+        if child_indent is None:
+            child_indent = indent  # first child fixes the direct-child level
+        if indent != child_indent:
+            continue  # deeper-nested key (items.<hook>.<k>) → not the block-level knob
+        if head == key and ":" in line.strip():
+            val = line.strip().split(":", 1)[1].strip().strip("\"'").lower()
+            if val in ("true", "yes", "on", "1"):
+                return True
+            if val in ("false", "no", "off", "0"):
+                return False
+            return default  # empty (`key:`) or unrecognized value → the default (codex P2)
+    return default
+
+
+def _orchestrator_only_enabled(cwd: str) -> bool:
+    """Whether the thin-orchestrator gate is ON for this repo. env override > rig.yaml > ON.
+
+    Default ON (opt-OUT), unlike the opt-IN worktree-only guard: this gate has always been
+    always-on, so an un-enrolled repo must keep firing (no regression). Any falsy
+    `RIG_ORCHESTRATOR_ONLY` (`0`/`false`/`no`/`off`) or `agent_hooks.orchestrator_only: false`
+    exempts a repo (e.g. 3d-cli). The env falsy set matches the rig.yaml one so `=false` behaves
+    like the YAML `false` — an env-only `!= "0"` check surprised users who set `=false` (Opus review).
+    """
+    env = os.environ.get("RIG_ORCHESTRATOR_ONLY")
+    if env is not None:
+        return env.strip().lower() not in ("0", "false", "no", "off")
+    root = _find_rig_yaml(cwd)
+    if root is None:
+        return True
+    try:
+        text = (root / "rig.yaml").read_text(encoding="utf-8")
+    except OSError as exc:
+        warn(f"could not read {root / 'rig.yaml'}: {exc}")
+        return True
+    return _agent_hooks_bool(text, "orchestrator_only", default=True)
 
 
 def main() -> int:
@@ -458,6 +769,17 @@ def main() -> int:
 
     args = event.get("args") or {}
     point = event.get("point") or ""
+    cwd = str(event.get("cwd") or "")
+
+    # Per-repo opt-out (Alex tg#5743): a repo that legitimately does inline work on main
+    # (e.g. 3d-cli) sets `agent_hooks.orchestrator_only: false` in its rig.yaml. Default ON, so an
+    # un-enrolled repo keeps the current always-on behavior (no regression). For a pre-write the
+    # governing repo is the TARGET file's, not the shell cwd (codex) — they can differ.
+    cfg_dir = _target_dir(cwd, args) if point == "pre-write" else cwd
+    if not _orchestrator_only_enabled(cfg_dir):
+        emit("allow")
+        return 0
+
     command = args.get("command") or args.get("cmd") or event.get("command") or ""
     if not isinstance(command, str):
         command = str(command)

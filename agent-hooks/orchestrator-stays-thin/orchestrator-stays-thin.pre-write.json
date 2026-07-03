@@ -5,5 +5,5 @@
   "priority": 45,
   "timeout_ms": 3000,
   "on_error": "open",
-  "description": "Keeps the main thread thin: a non-docs CODE Edit/Write by the orchestrator warns-then-blocks (delegate to a subagent/Workflow instead). Docs (*.md/mdx/txt/rst, docs/) and subagent writes (agent_id present) are allowed. WARN first, BLOCK on repeat within ORCH_THIN_TTL_S (900s). Escape hatch: ALLOW_ORCHESTRATOR_WORK=1 + ALLOW_ORCHESTRATOR_WORK_REASON='why'. on_error=open: delegation discipline, not a security boundary."
+  "description": "Keeps the main thread thin: a non-docs CODE Edit/Write by the orchestrator warns-then-blocks (delegate to a subagent/Workflow instead). Docs (*.md/mdx/txt/rst, docs/) and subagent writes (agent_id present) are allowed. WARN first, BLOCK on repeat within ORCH_THIN_TTL_S (900s). Per-repo opt-out: agent_hooks.orchestrator_only:false in rig.yaml or RIG_ORCHESTRATOR_ONLY=0 (default ON). Escape hatch: ALLOW_ORCHESTRATOR_WORK=1 + ALLOW_ORCHESTRATOR_WORK_REASON='why'. on_error=open: delegation discipline, not a security boundary."
 }
