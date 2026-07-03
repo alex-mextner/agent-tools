@@ -41,7 +41,7 @@ def _run(event, monkeypatch, marker_dir: Path, env: dict | None = None) -> tuple
     # Redirect the tier marker dir into the test sandbox and re-read the module constant.
     monkeypatch.setenv("ORCH_THIN_MARKER_DIR", str(marker_dir))
     monkeypatch.setattr(ost, "MARKER_DIR", marker_dir)
-    for k in ("ALLOW_ORCHESTRATOR_WORK", "ALLOW_ORCHESTRATOR_WORK_REASON"):
+    for k in ("ALLOW_ORCHESTRATOR_WORK", "ALLOW_ORCHESTRATOR_WORK_REASON", "RIG_ORCHESTRATOR_ONLY"):
         monkeypatch.delenv(k, raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
@@ -407,6 +407,395 @@ def test_sed_in_place_anywhere_still_implementation(tmp_path, monkeypatch):
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
 
 
+# ── tg#5743: the flapping fix — sanctioned orchestration is NEVER blocked, even chained ─────
+
+@pytest.mark.parametrize("command", [
+    "gh ship 5",                                   # the sanctioned release (agent-tools#23)
+    "gh ship 5 && tg 'shipped'",                   # ship + report (used to flap: >=2 operators)
+    "gh pr list && gh pr view 5",                  # PR inspection chain
+    "gh pr checks 5 | grep fail",                  # gh read piped into a read-only filter
+    "gh run list && gh run view 9 && tg done",     # 3-segment orchestration chain
+    "gh api repos/o/r/pulls | jq '.[].number'",    # gh api GET piped into jq (read-only)
+    "gh api repos/o/r/pulls | jq '.[]' | head",    # 2 pipes — the jq fix (was blocked before)
+    "git worktree list",                           # worktree inspection
+    "review diff",                                  # multi-model review CLI
+])
+def test_orchestration_chain_never_blocks(command, tmp_path, monkeypatch):
+    """`gh` reads / `gh ship` / `tg` / `review` / `git worktree list` are orchestration, never
+    implementation — a chain of only these must not warn OR block (Alex tg#5743 / #23). `jq`/`grep`
+    tails have read-only HEADS, so the whole chain stays allowed even with 2+ pipes."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow", command
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")  # never primes a block
+    assert c2 == 0 and _decision(out2) == "allow", command
+
+
+def test_gh_ship_is_all_inline_allowed():
+    assert ost._is_all_inline_allowed("gh ship 5 && tg 'done'") is True
+    assert ost._is_all_read_only("gh ship 5 && tg 'done'") is False  # not read-only, but allowed
+
+
+def test_gh_head_with_impl_tail_still_blocks_on_repeat(tmp_path, monkeypatch):
+    """A chain that STARTS orchestration but mixes in real work is judged on its full content —
+    `gh pr view && git commit` still blocks on repeat (the prefix does not wave it through)."""
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "gh pr view 5 && git commit -m x"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+@pytest.mark.parametrize("command", [
+    "gh api graphql -f query='mutation{x}'",  # graphql mutation, single (0 operators)
+    "gh api repos/o/r/issues -X POST -f title=x",  # explicit POST
+    "gh api repos/o/r -fkey=value && tg done",     # ATTACHED short field flag (codex)
+    "gh api repos/o/r -XPOST",                     # ATTACHED method flag
+])
+def test_gh_api_mutation_is_implementation(command, tmp_path, monkeypatch):
+    """`gh api` is whitelisted ONLY when GET-shaped — a mutation (graphql / -f field / -X method,
+    incl. ATTACHED short forms) is implementation and warn-then-blocks even UNCHAINED (codex P1)."""
+    assert ost._seg_is_impl_signal(command.split("&&")[0].strip()) is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_gh_api_explicit_get_with_fields_is_read(tmp_path, monkeypatch):
+    """An EXPLICIT GET with query fields (`--method GET -f state=open`) is a read, not a mutation —
+    it must not warn/block (that would re-introduce flapping) (codex round 4)."""
+    cmd = "gh api repos/o/r/issues --method GET -f state=open"
+    assert ost._seg_is_impl_signal(cmd) is False
+    assert ost._is_all_inline_allowed(cmd) is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": cmd}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == 0 and _decision(out2) == "allow"
+
+
+def test_prewrite_opt_out_follows_target_repo(tmp_path, monkeypatch):
+    """The orchestrator opt-out for a pre-write follows the TARGET file's repo, not cwd (codex
+    round 4). cwd is an opted-OUT repo, but the write TARGETS a strict (default-on) repo → still
+    gated (blocks on repeat)."""
+    strict = tmp_path / "strict"
+    (strict / "src").mkdir(parents=True)
+    (strict / "rig.yaml").write_text("agent_hooks:\n  all: true\n")  # no opt-out → default ON
+    optout = tmp_path / "optout"
+    optout.mkdir()
+    (optout / "rig.yaml").write_text("agent_hooks:\n  orchestrator_only: false\n")
+    event = {"point": "pre-write", "cwd": str(optout),
+             "args": {"file_path": str(strict / "src" / "a.ts")}}
+    _run(event, monkeypatch, tmp_path / "m")  # warn (gated because TARGET repo is strict)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_gh_pr_checkout_not_whitelisted(tmp_path, monkeypatch):
+    """`gh pr checkout` mutates the local worktree/branch — it is NOT in the read-only/orchestration
+    allow-list, so a chain built around it is judged on its full content (codex P2)."""
+    assert ost._is_all_inline_allowed("gh pr checkout 5 && gh pr view 6 && tg x") is False
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "gh pr checkout 5 && gh pr view 6 && tg x"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_gh_needle_in_read_only_pipe_allows(tmp_path, monkeypatch):
+    """ANCHOR INVARIANT: `gh`/`tg` as an ARGUMENT of a read-only command is not orchestration —
+    `git log | rg gh` stays allowed because the segment HEADS are read-only, not because of `gh`."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": "git log | rg gh"}}
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+    assert c == 0 and _decision(out) == "allow"
+
+
+# ── agent-tools#159: the allow-list must NOT launder a mutation past its head-anchor ─────────
+# The head-anchored allow-list (`gh ship`/`gh pr`/`tg`/`review`/read-only) once waved through a
+# mutation smuggled where the head cannot see it: a command/process substitution, a bare `&`
+# background, a `git branch <arg>`, or a find delete/exec/file-write primary. Each of these was a
+# REGRESSION vs the pre-existing hook (which blocked them all). Pin them shut.
+
+@pytest.mark.parametrize("command", [
+    "gh ship 605 $(sed -i 's/a/b/' f)",              # edit hidden in a command substitution
+    "gh ship 605 & sed -i 's/a/b/' f.py",            # edit behind a bare `&` (not a chain split)
+    "gh ship 605 & git push origin main; ls; cat x",  # push behind a bare `&`
+    "cat <(git push origin main) && gh ship 605 | tail -3",  # push in a process substitution
+    "gh ship 605; git branch -D tmp; ls",            # `git branch` mutating form
+    "gh ship 605; git -C /repo branch -D tmp; ls",   # ...incl. the `git -C <dir> branch` form
+    "gh ship 605 | find . -delete | tail -3",        # find delete primary
+    "gh ship 605 | find . -fprintf evil.sh 'x' | tail",  # find file-WRITE primary
+    "tg 'done' && npm run build",                    # a build does not ride a `tg` prefix
+])
+def test_allow_list_does_not_launder_smuggled_mutation(command, tmp_path, monkeypatch):
+    """A benign orchestration head must not exempt a mutation the head-anchor cannot see — each of
+    these warn-then-blocks, exactly as the pre-#159 hook did (regression guard)."""
+    assert ost._is_implementation_bash(command) is True, command
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow", command  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block", command
+
+
+@pytest.mark.parametrize("command", [
+    "cd /repo && gh ship 605 | tail -40",            # `cd` companion (was wrongly blocked)
+    "cd /repo && gh ship 605 --repo o/r --no-screenshot-ok | tail -3",  # cd + cross-repo + flag
+    "gh ship 605 --title 'a & b' | tail",            # a quoted `&` must not trip the bare-`&` veto
+    "gh ship 605 --note 'fix; reship' | tail",       # a quoted `;` must not split the segment
+    "git branch",                                    # a bare `git branch` LIST stays read-only
+])
+def test_allow_list_covers_cd_and_quoted_reason(command, tmp_path, monkeypatch):
+    """The `cd` companion and quote-aware handling must keep a legit ship/orchestration line
+    allowed — it must never warn or prime a block (the whole point of the flapping fix)."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow", command
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == 0 and _decision(out2) == "allow", command
+
+
+def test_seg_and_inline_allowed_predicate_surface():
+    """Pin the predicate surface for the #159 hardening at the unit level."""
+    # cd is an allowed companion; `cd-clean`/`cd/foo` (argv boundary) are NOT.
+    assert ost._seg_is_allowed("cd /repo") is True
+    assert ost._seg_is_allowed("cd-clean") is False
+    assert ost._seg_is_allowed("cd/foo") is False
+    # find mutating primaries and `git branch <arg>` forfeit the allow-list; bare reads keep it.
+    assert ost._seg_is_allowed("find . -delete") is False
+    assert ost._seg_is_allowed("find . -fprintf out.sh x") is False
+    assert ost._seg_is_allowed("git branch -D tmp") is False
+    assert ost._seg_is_allowed("git -C /repo branch -D tmp") is False
+    assert ost._seg_is_allowed("git branch") is True
+    # A smuggled mutation is caught by _is_implementation_bash (impl / substitution-inner scan runs
+    # BEFORE the fast path), NOT by a blanket veto in _is_all_inline_allowed — which honestly reports
+    # head-allowance, so a benign read-only substitution pipe still passes it (the #80 fix).
+    assert ost._is_implementation_bash("gh ship 605 $(sed -i x)") is True
+    assert ost._is_implementation_bash("gh ship 605 & git push") is True
+    assert ost._is_implementation_bash("gh ship 605 --title 'a & b' | tail") is False
+    assert ost._is_implementation_bash("gh ship 605 --note 'a; b' | tail") is False
+    assert ost._is_all_inline_allowed("cat $(find . -name x) | grep k | head") is True
+
+
+def test_read_only_pipe_with_benign_substitution_not_blocked():
+    """#80 invariant: a read-only pipe of ANY length is never blocked, even carrying a benign
+    substitution — the substitution must not fall it into the >=3 fallback (Opus review)."""
+    for cmd in ["cat $(find . -name conf.yaml) | grep -i key | head",
+                "git log $(git merge-base a b) | grep foo | head"]:
+        assert ost._is_implementation_bash(cmd) is False, cmd
+
+
+def test_orchestrator_only_env_falsy_values_disable(monkeypatch):
+    """RIG_ORCHESTRATOR_ONLY accepts the same falsy set as rig.yaml (0/false/no/off) — an env-only
+    `!= "0"` check surprised users who set `=false` expecting it to exempt the repo (Opus review)."""
+    for val in ("0", "false", "no", "off", "FALSE", "Off"):
+        monkeypatch.setenv("RIG_ORCHESTRATOR_ONLY", val)
+        assert ost._orchestrator_only_enabled("/repo") is False, val
+    for val in ("1", "true", "yes", "on"):
+        monkeypatch.setenv("RIG_ORCHESTRATOR_ONLY", val)
+        assert ost._orchestrator_only_enabled("/repo") is True, val
+
+
+# ── codex review: the veto must MAKE it offending, not just drop the fast path ───────────────
+
+@pytest.mark.parametrize("command", [
+    "tg done & git commit -m x",          # bare-`&` background smuggles a commit (own segment now)
+    "gh ship 605 & git push origin main",  # ...a push
+    "gh ship 605 $(gh api repos/o/r/x -X POST)",  # a gh api MUTATION inside a substitution head
+    "gtimeout 60 git commit -m x",        # gtimeout wrapper stripped like timeout (macOS coreutils)
+    "gtimeout 60 pytest tests/",          # ...on a test run
+    "gtimeout -k 5 60 git commit -m x",   # gtimeout with an option + duration positional
+])
+def test_smuggled_mutation_is_now_offending(command, tmp_path, monkeypatch):
+    """A bare-`&`/substitution/gtimeout form that previously only lost the fast path but stayed
+    non-offending now warn-then-blocks — the veto MAKES it implementation (codex review)."""
+    assert ost._is_implementation_bash(command) is True, command
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow", command  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block", command
+
+
+def test_gh_run_watch_not_whitelisted_but_list_view_are():
+    """`gh run watch` is a long-running block — dropped from the orchestration allow-list; the quick
+    `gh run list`/`gh run view` inspections stay (codex review)."""
+    assert ost.ORCH_ALLOW.search("gh run list") is not None
+    assert ost.ORCH_ALLOW.search("gh run view 9") is not None
+    assert ost.ORCH_ALLOW.search("gh run watch 123") is None
+    # a read-only substitution and gtimeout-wrapped ship must stay allowed (no over-block).
+    assert ost._is_implementation_bash("cat $(ls -t | head -1)") is False
+    assert ost._is_implementation_bash("gtimeout 60 gh ship 605 | tail") is False
+
+
+@pytest.mark.parametrize("command", [
+    "df -h | grep /dev | head",           # read-only system-info verification pipe
+    "lsblk | grep sda | wc -l",           # ...another
+    "gh pr view 5 | jq .title | head",    # PR verification through jq/head
+    "free -m | tail -1",                  # memory info
+])
+def test_read_only_system_verification_pipes_allow(command, tmp_path, monkeypatch):
+    """Read-only system-info + filter verification tools (df/lsblk/free/…, jq/…) added to
+    READ_ONLY_BASH so a multi-step verify pipe is not blocked by the >=3-segment rule (coordinator;
+    SYNC with fix/159)."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow", command
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == 0 and _decision(out2) == "allow", command
+
+
+# ── tg#5743: commits / pushes / test runs by the orchestrator ARE implementation ────────────
+
+@pytest.mark.parametrize("command", [
+    "git commit -m x",       # commit inline (was allowed before — 0 chains, not a build)
+    "git push",              # push inline
+    "pytest tests/",         # test run
+    "go test ./...",         # go test run
+    "python -m pytest tests/",  # wrapper form (codex P2c)
+    "tox",                   # tox test run
+    "env git commit -m x",   # env-prefix bypass (codex P1)
+    "CI=1 pytest tests/",    # leading VAR= assignment bypass (codex P1)
+    "GIT_AUTHOR_NAME=x git commit -m x",  # leading VAR= assignment bypass (codex P1)
+    "env pytest tests/",     # env wrapper on a test run (codex P1)
+    'FOO="bar baz" git commit -m x',  # QUOTED env value with a space (codex)
+    "BAR='a b' pytest tests/",        # single-quoted env value with a space (codex)
+    "uv run --with pytest pytest tests/",       # uv-wrapped test run (codex)
+    "uv run --with pytest python -m pytest",    # uv-wrapped python -m pytest (codex)
+    "uv run tox",                                # uv-wrapped tox
+    "env -u FOO git commit -m x",   # env option WITH operand (codex round 4)
+    "env -C /tmp pytest tests/",    # env --chdir operand
+    "timeout 60 pytest tests/",     # the MANDATED timeout wrapper (codex round 6)
+    "timeout -k 5 60 git commit -m x",  # timeout with --kill-after option + duration
+    "/usr/bin/env git commit -m x",     # absolute-path env (basename-matched)
+    "time git push",                # time wrapper
+    "nice -n 10 git commit -m x",   # nice with -n operand
+    "uv run --env-file .env pytest tests/",  # uv --env-file operand skipped
+    "env -i git commit -m x",       # env -i = ignore-env, NO operand (codex round 7)
+    "env -i pytest tests/",         # env -i must not swallow pytest
+    "python3 -m pytest tests/",     # python3 spelling — the repo's own form (codex round 8)
+    "/usr/bin/python3 -m pytest",   # path-qualified python
+    "python3 -m unittest discover",
+    "git -C /repo commit -m x",     # git global option before subcommand (codex round 8)
+    "git -c user.name=x commit -m x",
+    "git --git-dir=.git --work-tree=. commit -m x",
+    "/usr/bin/git commit -m x",     # path-qualified git
+    "git -C /repo push",
+])
+def test_commit_push_test_blocks_on_repeat(command, tmp_path, monkeypatch):
+    """Commits, pushes and test runs are a subagent's job — they warn-then-block for the
+    orchestrator (Alex tg#5743), including behind a leading `env`/`VAR=val` wrapper (codex P1).
+    Each was NOT caught before (a bare `git commit` had 0 chain operators and matched no build
+    token; `env git commit` presented `env` as a read-only head)."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow", command  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block", command
+
+
+@pytest.mark.parametrize("command", [
+    "uv run rig status",              # read-only tool, not a test
+    "uv run rg pytest docs",         # SEARCHING for "pytest" — not running it (codex round 5)
+])
+def test_uv_run_readonly_tool_not_overblocked(command, tmp_path, monkeypatch):
+    """The uv-test detector is shlex-based: only the COMMAND uv runs counts, not an argument.
+    `uv run rig status` / `uv run rg pytest docs` must NOT be swept in as test runs (codex)."""
+    assert ost._is_implementation_bash(command) is False, command
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == 0 and _decision(out2) == "allow"
+
+
+@pytest.mark.parametrize("command", [
+    "gh api repos/o/r/pulls | jq '.[] | select(.state==\"open\")'",  # quoted `|` inside jq
+    "git log --oneline | rg 'feat|fix' | head",                       # quoted alternation
+])
+def test_quoted_pipe_inside_arg_not_split(command, tmp_path, monkeypatch):
+    """A `|` inside a QUOTED argument (a jq program, an rg alternation) is not a chain operator —
+    quote-aware splitting keeps such a read chain allowed instead of flapping (codex round 5)."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+    assert c == 0 and _decision(out) == "allow", command
+
+
+@pytest.mark.parametrize("command", [
+    "gh api repos/o/r/issues --method=GET -f state=open",  # --method=GET spelling
+    "gh api repos/o/r/issues -X GET -q '.[]'",             # -X GET spelling
+])
+def test_gh_api_get_spellings_are_reads(command, tmp_path, monkeypatch):
+    """All GET spellings (`--method=GET`, `-X GET`) are reads even with query fields — shlex-parsed
+    effective-method detection, no false block (codex round 5)."""
+    assert ost._gh_api_is_mutation(command) is False, command
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+    assert c == 0 and _decision(out) == "allow", command
+
+
+def test_gh_api_double_method_last_wins():
+    """`--method GET --method POST` → the LAST method wins (POST) → mutation (codex round 5)."""
+    assert ost._gh_api_is_mutation("gh api repos/o/r --method GET --method POST") is True
+
+
+@pytest.mark.parametrize("command", [
+    "timeout 60 git status",        # the mandated timeout wrapper on a READ-ONLY command
+    "timeout 60 gh pr list && timeout 60 gh pr view 5",  # timeout on orchestration, chained
+    "/usr/bin/env git status",      # absolute-path env on a read-only command
+    "git -C /r status && git -C /r log && git -C /r diff",  # read-only git with -C, 3-chain (round 8)
+    "/usr/bin/git log --oneline",   # path-qualified read-only git
+])
+def test_wrappers_do_not_break_read_or_orchestration(command, tmp_path, monkeypatch):
+    """Stripping wrappers must not turn a read/orchestration command into an offense — `timeout N
+    git status` and `timeout N gh pr list && …` stay allowed, never warn/block (codex round 6)."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+    assert c == 0 and _decision(out) == "allow", command
+
+
+# ── tg#5743: per-repo opt-out (default ON, no regression) ───────────────────────────────────
+
+def test_opt_out_via_env_allows_code_write(tmp_path, monkeypatch):
+    """RIG_ORCHESTRATOR_ONLY=0 exempts a repo entirely — even a repeat code write allows."""
+    event = {"point": "pre-write", "cwd": "/repo", "args": {"file_path": "/repo/src/a.ts"}}
+    _run(event, monkeypatch, tmp_path / "m", {"RIG_ORCHESTRATOR_ONLY": "0"})  # would-be warn
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m", {"RIG_ORCHESTRATOR_ONLY": "0"})
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_opt_out_via_rigyaml_allows_code_write(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "rig.yaml").write_text("agent_hooks:\n  orchestrator_only: false\n")
+    event = {"point": "pre-write", "cwd": str(repo), "args": {"file_path": str(repo / "src/a.ts")}}
+    _run(event, monkeypatch, tmp_path / "m")
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_blank_yaml_value_keeps_the_default(tmp_path, monkeypatch):
+    """A blank value (`orchestrator_only:`) must return the DEFAULT, not silently disable a
+    default-ON gate (codex P2). Default-off worktree_only stays off for a blank too."""
+    assert ost._agent_hooks_bool(
+        "agent_hooks:\n  orchestrator_only:\n", "orchestrator_only", default=True) is True
+    assert ost._agent_hooks_bool(
+        "agent_hooks:\n  worktree_only:\n", "worktree_only", default=False) is False
+
+
+def test_default_on_still_blocks_when_no_rigyaml(tmp_path, monkeypatch):
+    """No env, no rig.yaml → gate stays ON (opt-OUT default) — no regression vs prior always-on."""
+    event = {"point": "pre-write", "cwd": str(tmp_path / "nowhere"),
+             "args": {"file_path": str(tmp_path / "nowhere/src/a.ts")}}
+    _run(event, monkeypatch, tmp_path / "m")  # warn
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
 # ── #159: `gh ship` is RELEASE, not implementation — the orchestrator's own carve-out ────
 
 @pytest.mark.parametrize("command", [
@@ -452,12 +841,11 @@ def test_gh_ship_release_chain_allows(command, tmp_path, monkeypatch):
     "cd-clean && gh ship 605 | tail -3",                    # `cd-clean` is a different command (P1)
 ])
 def test_gh_ship_does_not_launder_impl_segments(command, tmp_path, monkeypatch):
-    """The carve-out is per-segment: a `gh ship` tacked onto an implementation chain must NOT
-    exempt the rest of the line (#159) — only all-(ship|read-only|cd) lines are release.
-    BUILD_EDIT and `$()`/backtick substitutions are vetoed on the WHOLE string (like heredoc),
-    so a mutation smuggled INSIDE a ship/cd segment still blocks — pre-carve-out these fell to
-    the whole-string BUILD_EDIT / >=2-operators checks, and the exemption must not regress
-    that (review P1 + P2)."""
+    """The allowance is per-segment: a `gh ship` tacked onto an implementation chain must NOT
+    exempt the rest of the line (#159) — only all-(ship|read-only|cd) lines pass. A mutation
+    smuggled where no head can see it (inside `$()`/`<()`/backticks, behind a bare `&`, a
+    mutating find/git-branch form) is caught by the substitution-inner scan, the `&` split and
+    the companion guards — the exemption must not regress what was blocked pre-carve-out."""
     event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
     out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
     assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
@@ -479,19 +867,11 @@ def test_gh_ship_needle_or_prefix_word_is_not_exempt(command, tmp_path, monkeypa
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
 
 
-def test_gh_ship_bare_amp_zero_operator_line_keeps_inherited_allow(tmp_path, monkeypatch):
-    """Document the hook's ACTUAL decision on `gh ship 605 & git push origin main`: allowed —
-    but NOT via the release carve-out (the bare-`&` veto rejects it; pinned in the predicate
-    test). CHAIN does not split a single `&`, so the line has ZERO chain operators and falls
-    under the ordinary judgement, which never flagged 0-operator non-build lines (`python
-    x.py & git push` behaves identically) — inherited pre-#159 behavior, not a regression.
-    If CHAIN ever learns to split `&`, this documents the boundary to re-judge."""
-    event = {"point": "pre-bash", "cwd": "/repo",
-             "args": {"command": "gh ship 605 & git push origin main"}}
-    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
-    assert c1 == 0 and _decision(out1) == "allow"
-    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")  # never primes a block
-    assert c2 == 0 and _decision(out2) == "allow"
+# NOTE (rebase over #162): the old #162 test "bare-& zero-operator line keeps inherited allow"
+# (`gh ship 605 & git push origin main` allowed) is deliberately DROPPED here: this branch's
+# `_split_chain` splits a bare control `&`, so the smuggled `git push` is judged on its own
+# segment and the line warn-then-blocks — pinned by test_smuggled_mutation_is_now_offending.
+# Stricter than #162's inherited behavior, in the safe direction.
 
 
 def test_gh_ship_with_non_build_mutation_companion_blocks(tmp_path, monkeypatch):
@@ -516,57 +896,46 @@ def test_gh_ship_with_heredoc_still_blocks(tmp_path, monkeypatch):
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
 
 
-def test_sanctioned_release_predicate_is_head_anchored():
-    """Pin the predicate surface (#159): exemption requires a real `gh ship` segment HEAD —
-    an all-read-only pipe that merely MENTIONS `gh ship` is allowed via the read-only path,
-    not via the release carve-out, and an `echo gh ship` head exempts nothing."""
-    assert ost._is_sanctioned_release_chain("gh ship 605 | tail -3 | head -1") is True
-    assert ost._is_sanctioned_release_chain("grep 'gh ship' log | head | wc -l") is False
-    assert ost._is_sanctioned_release_chain("echo gh ship") is False
-    assert ost._is_sanctioned_release_chain("gh ship 605 && git push") is False
-    # READ_ONLY_BASH is `^`-anchored, so a read-only WORD mid-segment (`writer cat`) does not
-    # qualify a companion — .search cannot match past the head (#159 review).
-    assert ost._is_sanctioned_release_chain("gh ship 605 | writer cat | tool grep") is False
-    # Command substitutions are vetoed wholesale — even a read-only one forfeits the
-    # carve-out and falls back to the ordinary judgement (#159 review P2).
-    assert ost._is_sanctioned_release_chain("cd $(git rev-parse --show-toplevel) && gh ship 605") is False
-    # A bare background `&` is vetoed (CHAIN cannot split it), but redirect `&`s are not:
-    # `2>&1` must stay a first-class ship shape (#159 review P3).
-    assert ost._is_sanctioned_release_chain("gh ship 605 & git push origin main") is False
-    assert ost._is_sanctioned_release_chain("gh ship 605 2>&1 | tail -3") is True
-    # Process substitution is vetoed like `$()` — either direction (#159 review P4).
-    assert ost._is_sanctioned_release_chain("gh ship 605 | cat <(git push origin main)") is False
-    assert ost._is_sanctioned_release_chain("tee >(wc -l) | gh ship 605") is False
-    # The #80 inherited gap (read-only head, mutating form) is not extended to ship lines —
-    # but a genuinely read-only find companion still qualifies (#159 review P5).
-    assert ost._is_sanctioned_release_chain("gh ship 605 | find . -delete | tail -3") is False
-    assert ost._is_sanctioned_release_chain("gh ship 605 | find . -name x | head") is True
-    # The head anchor ends at `gh ship`, so trailing FLAGS ride along untouched. The gate does NOT
-    # validate `gh ship`'s own arguments — that is ship's job — it only recognises a release line
-    # and gets out of the way, so whatever forms the orchestrator's `gh ship` accepts must pass
-    # (task #23): `--repo <owner/repo>` (the `/` in the slug is not a chain operator) and
-    # `--no-screenshot-ok`. (A given repo's ship.sh may itself reject a flag; that is ship's error
-    # to raise downstream, not the gate's to pre-empt.)
-    assert ost._is_sanctioned_release_chain("gh ship 605 --repo alex-mextner/agent-tools") is True
-    assert ost._is_sanctioned_release_chain(
-        "gh ship 605 --repo alex-mextner/agent-tools --no-screenshot-ok") is True
-    assert ost._is_sanctioned_release_chain(
-        "cd /repo && gh ship 605 --repo alex-mextner/agent-tools --no-screenshot-ok | tail -3") is True
-    # A find file-WRITE primary is a mutation just like `-delete` — it must not ride a ship line
-    # (review F1); and `cd-clean`/`cd/foo` are NOT the `cd` companion (argv-boundary anchor, P1).
-    assert ost._is_sanctioned_release_chain("gh ship 605 | find . -fprintf evil.sh 'x' | tail -3") is False
-    assert ost._is_sanctioned_release_chain("cd-clean && gh ship 605 | tail -3") is False
-    # A quoted metachar in a ship reason must not forfeit the carve-out (quote-aware split + veto,
-    # review F2/P2): a quoted `;` is not a segment split, a quoted `&` does not trip the bare-`&`
-    # veto, and a quoted `$(`/build token does not trip the substitution/build vetoes.
-    assert ost._is_sanctioned_release_chain("gh ship 605 --no-screenshot-ok 'revert; reship' | tail -3") is True
-    assert ost._is_sanctioned_release_chain('gh ship 605 --title "a & b" | tail -3') is True
-    assert ost._is_sanctioned_release_chain("gh ship 605 --note 'ran $(build) earlier' | tail -3") is True
-    # Quote SEMANTICS (#162 review P2): `$(…)`/backticks EXECUTE inside DOUBLE quotes — a
-    # double-quoted substitution must still trip the veto; inside SINGLE quotes they are literal.
-    assert ost._is_sanctioned_release_chain('gh ship 605 --note "$(git push origin main)" | tail -3') is False
-    assert ost._is_sanctioned_release_chain('gh ship 605 --note "`git push origin main`" | tail -3') is False
-    assert ost._is_sanctioned_release_chain("gh ship 605 --note '$(git push origin main)' | tail -3") is True
+def test_release_judgement_matrix():
+    """The #162 release-carve-out guarantees, re-pinned against THIS branch's design (there is
+    no `_is_sanctioned_release_chain` here — `gh ship` rides the head-anchored ORCH_ALLOW
+    allow-list + the smuggling guards). Asserted on `_is_implementation_bash` (True = blocked).
+    Where this branch is deliberately STRICTER than #162's inherited behavior, the stricter
+    verdict is pinned (safe direction) — noted inline."""
+    impl = ost._is_implementation_bash
+    # sanctioned release shapes stay allowed
+    assert impl("gh ship 605 | tail -3 | head -1") is False
+    assert impl("gh ship 605 2>&1 | tail -3") is False
+    assert impl("grep 'gh ship' log | head | wc -l") is False  # needle in a read-only pipe
+    # `gh ship` forms the orchestrator actually runs (task #23) — the gate does NOT validate
+    # ship's own flags (that is ship's job downstream): `--repo <owner/repo>`, `--no-screenshot-ok`.
+    assert impl("gh ship 605 --repo alex-mextner/agent-tools") is False
+    assert impl("gh ship 605 --repo alex-mextner/agent-tools --no-screenshot-ok") is False
+    assert impl(
+        "cd /repo && gh ship 605 --repo alex-mextner/agent-tools --no-screenshot-ok | tail -3") is False
+    # a BENIGN read-only substitution no longer forfeits the pass (stricter-only where it
+    # matters: #162 vetoed ALL substitutions out of the carve-out; here the inner command is
+    # actually judged, so a read-only one passes and a mutating one blocks).
+    assert impl("cd $(git rev-parse --show-toplevel) && gh ship 605") is False
+    # non-allowed companion heads forfeit it (>=3 segments, no benign judgement)
+    assert impl("gh ship 605 | writer cat | tool grep") is True
+    # a companion mutation is caught — incl. forms #162 could not see:
+    assert impl("gh ship 605 && git push") is True  # STRICTER than #162 (impl-signal per segment)
+    assert impl("gh ship 605 & git push origin main") is True  # STRICTER: bare `&` is a split here
+    assert impl("gh ship 605 | cat <(git push origin main)") is True  # process-subst inner judged
+    assert impl("tee >(wc -l) | gh ship 605") is True  # tee is BUILD_EDIT
+    assert impl("gh ship 605 | find . -delete | tail -3") is True
+    assert impl("gh ship 605 | find . -name x | head") is False  # read-only find companion is fine
+    assert impl("gh ship 605 | find . -fprintf evil.sh 'x' | tail -3") is True  # find file-WRITE
+    assert impl("cd-clean && gh ship 605 | tail -3") is True  # `cd-clean` is not the `cd` companion
+    # quoted metachars in a ship reason keep the pass; LIVE double-quoted substitutions do not
+    # (quote semantics, #162/#164 review P2): `$()`/backticks execute inside double quotes.
+    assert impl("gh ship 605 --no-screenshot-ok 'revert; reship' | tail -3") is False
+    assert impl('gh ship 605 --title "a & b" | tail -3') is False
+    assert impl("gh ship 605 --note 'ran $(build) earlier' | tail -3") is False
+    assert impl('gh ship 605 --note "$(git push origin main)" | tail -3') is True
+    assert impl('gh ship 605 --note "`git push origin main`" | tail -3') is True
+    assert impl("gh ship 605 --note '$(git push origin main)' | tail -3") is False
 
 
 # ── coordinator: report (`tg`) + read-only verification are orchestrator altitude, not impl ──────
@@ -600,9 +969,9 @@ def test_report_or_verify_chain_allows(command, tmp_path, monkeypatch):
     "gh pr view 5 && git push && git push --tags",  # ...nor a >=2-operator push chain
 ])
 def test_report_or_verify_does_not_launder_impl(command, tmp_path, monkeypatch):
-    """The report/verify carve-out is per-segment like the release one: a `tg`/gh-read head does not
-    exempt a mutation elsewhere on the line (coordinator directive) — it warn-then-blocks."""
-    assert ost._is_report_or_verify_chain(command) is False, command
+    """The report/verify allowance is per-segment like the release one: a `tg`/gh-read head does
+    not exempt a mutation elsewhere on the line (coordinator directive) — it warn-then-blocks."""
+    assert ost._is_implementation_bash(command) is True, command
     event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
     out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
     assert c1 == 0 and _decision(out1) == "allow", command  # first offense WARNs
@@ -610,19 +979,41 @@ def test_report_or_verify_does_not_launder_impl(command, tmp_path, monkeypatch):
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block", command
 
 
-def test_report_verify_predicate_surface():
-    """Pin the predicate: `tg`/gh-read heads qualify, curl/ssh do NOT (not reliably read-only)."""
-    assert ost._is_report_or_verify_chain("tg 'x' | tail") is True
-    assert ost._is_report_or_verify_chain("gh pr checks 5 | grep fail | head") is True
-    assert ost._is_report_or_verify_chain("git log | grep x | head") is False  # no tg/gh-read head
-    # curl can POST and ssh runs any remote command — neither is a sanctioned read-only verb, so a
-    # chain fronted by them is NOT waved through (they keep the escape hatch).
-    assert ost._is_report_or_verify_chain("curl -X POST http://h/api | tg done | tail") is False
-    assert ost._is_report_or_verify_chain("ssh root@h 'df -h; lsblk' | tg done") is False
-    # The carve-out itself never launders a bare-`&` background push (the veto rejects it); A's
-    # pre-existing ordinary judgement decides the rest — the carve-out just does not exempt it.
-    assert ost._is_report_or_verify_chain("tg done & git push origin main; ls") is False
+def test_report_verify_allowlist_surface():
+    """Pin the doctrine (re-based over #162): `tg` and the gh reads are sanctioned orchestration
+    heads (ORCH_ALLOW), while `curl` and `ssh` are NOT — curl can POST and ssh runs any remote
+    command, so neither is reliably read-only; they never ride the allow-list."""
+    assert ost.ORCH_ALLOW.search("tg 'x'") is not None
+    assert ost.ORCH_ALLOW.search("gh pr checks 5") is not None
+    assert ost.ORCH_ALLOW.search("curl -X POST http://h/api") is None
+    assert ost.ORCH_ALLOW.search("ssh root@h 'df -h'") is None
+    impl = ost._is_implementation_bash
+    assert impl("tg 'x' | tail") is False
+    assert impl("gh pr checks 5 | grep fail | head") is False
+    assert impl("git log | grep x | head") is False  # plain read-only path, no tg/gh-read needed
+    # a chain fronted by a non-sanctioned head is judged on its full content — a 3-segment curl
+    # chain is impl-shaped, and a bare-`&` push behind a tg report is caught by the `&` split.
+    assert impl("curl -X POST http://h/api | tg done | tail") is True
+    assert impl("tg done & git push origin main; ls") is True
 
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_double_quoted_substitution_is_live_and_judged(tmp_path, monkeypatch):
+    """Quote SEMANTICS (#164 review P2): `$(…)`/backticks EXECUTE inside DOUBLE quotes, so a
+    double-quoted mutating substitution must be extracted and judged (warn-then-block); a
+    SINGLE-quoted one is literal text and stays allowed."""
+    assert ost._is_implementation_bash('gh ship "$(gh api repos/o/r/issues -X POST -f title=x)"') is True
+    assert ost._is_implementation_bash('gh ship 605 --note "$(git push origin main)" | tail -3') is True
+    assert ost._is_implementation_bash('tg "`git commit -m x`"') is True
+    assert ost._is_implementation_bash("tg 'saw $(git push) in logs'") is False
+    # read-only substitutions stay allowed in either quote form
+    assert ost._is_implementation_bash('gh pr view "$(gh pr list --json number -q .n)"') is False
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": 'gh ship "$(gh api repos/o/r/issues -X POST -f title=x)"'}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"

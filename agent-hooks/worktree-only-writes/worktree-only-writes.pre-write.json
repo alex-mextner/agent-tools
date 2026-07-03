@@ -1,0 +1,9 @@
+{
+  "id": "worktree-only-writes",
+  "point": "pre-write",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/worktree-only-writes/worktree_only_writes.py",
+  "priority": 40,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "Enforces the worktree-only workflow: DENIES an Edit/Write/MultiEdit/NotebookEdit while the checkout sits on the repo's DEFAULT branch (detected via origin/HEAD or init.defaultBranch, never hardcoded), telling the agent to author in a separate worktree on a feature branch instead. main is for merge/pull/read-only only (the mid-session complement to the pre-push protect-main git-hook). PER-REPO opt-in: enforces only where env RIG_WORKTREE_ONLY=1 or the repo's rig.yaml sets agent_hooks.worktree_only:true; default OFF so a repo that works on main (e.g. 3d-cli) is never blocked. Escape hatch: RIG_ALLOW_MAIN_EDIT=1 (+ optional RIG_ALLOW_MAIN_EDIT_REASON). on_error=open: a git/parse failure fails open (allows). Alex tg#5742."
+}
