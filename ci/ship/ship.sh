@@ -18,10 +18,16 @@
 # Requires: gh (authenticated), git. jq strongly recommended (required-checks-only gating).
 #
 # Usage:
-#   ship.sh <PR-number> [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>]
-#           [--screenshot <path> [desc]]...
+#   ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run]
+#           [--no-screenshot-ok <reason>] [--screenshot <path> [desc]]...
 #
 # Flags:
+#   --repo <owner/repo>    ship a PR that lives in a DIFFERENT repo than the current checkout:
+#                          pins every gh call (view/checks/merge) to owner/repo via GH_REPO.
+#                          The only way to ship into a non-CWD repo when a `cd && gh ship`
+#                          is not possible. Accepts -R / --repo=… / -R=… / -R… too. When the
+#                          target is not this checkout's own origin, remote-branch deletion is
+#                          skipped (see the cleanup guard) so the wrong remote is never touched.
 #   --skip-ci              admin-merge bypassing the green-CI gate (use only when CI is
 #                          billing-blocked / stuck — it still runs the other preflights).
 #   --dry-run              print what would happen; change nothing.
@@ -57,9 +63,9 @@
 set -euo pipefail
 
 ORIG_PWD=$(pwd -P)
-PR=""; SKIP_CI=0; DRY_RUN=0; NO_SHOT_OK=""; NO_VBUMP_OK=""; NO_DWELL_OK=""
+PR=""; SKIP_CI=0; DRY_RUN=0; NO_SHOT_OK=""; NO_VBUMP_OK=""; NO_DWELL_OK=""; REPO_FLAG=""
 SHOT_PATHS=(); SHOT_DESCS=()
-USAGE='Usage: ship.sh <PR-number> [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--screenshot <path> [desc]]...'
+USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--screenshot <path> [desc]]...'
 
 # --- arg parse (PR number is the lone bare arg; --screenshot takes path + optional desc) --
 args=("$@"); i=0; n=${#args[@]}
@@ -87,19 +93,30 @@ while [ "$i" -lt "$n" ]; do
         while [ "$j" -lt "$n" ]; do [ "${args[$j]:0:1}" != "-" ] && rest_bare=$((rest_bare+1)); j=$((j+1)); done
         if [ -z "$PR" ] && [ "$rest_bare" -eq 0 ]; then SHOT_DESCS+=(""); else SHOT_DESCS+=("$nxt"); i=$((i+1)); fi
       else SHOT_DESCS+=(""); fi ;;
-    -R|--repo|-R=*|--repo=*|-R?*)
-      # -R/--repo is a gh CLI flag for specifying a remote repo — ship.sh does not support
-      # it because it would need to map owner/repo to a local checkout path, which is not
-      # generally knowable.  cd into the target repo's checkout and run `gh ship <PR>` there.
-      echo "ship.sh does not support -R/--repo — run gh ship <PR-number> from inside the repo checkout instead." >&2
-      echo "  cd /path/to/your/checkout && gh ship $PR" >&2
-      exit 1 ;;
+    # --repo/-R pins every gh call to a remote repo (owner/repo) — the cross-repo ship path.
+    # It is the ONLY way to ship a PR into a non-CWD repo when a `cd && gh ship` is forbidden.
+    # Accept all gh-compatible spellings: `--repo X`, `-R X`, `--repo=X`, `-R=X`, `-RX`.
+    # (Order matters: the attached `=`/glued forms must precede the bare `--repo|-R` case.)
+    --repo=*) REPO_FLAG=${a#--repo=}; [ -n "$REPO_FLAG" ] || { echo "--repo= needs an <owner/repo> value." >&2; exit 1; } ;;
+    -R=*)     REPO_FLAG=${a#-R=};     [ -n "$REPO_FLAG" ] || { echo "-R= needs an <owner/repo> value." >&2; exit 1; } ;;
+    -R?*)     REPO_FLAG=${a#-R} ;;
+    --repo|-R)
+      i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "$a needs an <owner/repo> argument." >&2; exit 1; }
+      REPO_FLAG=${args[$i]} ;;
     -*) echo "Unknown flag: $a"$'\n'"$USAGE" >&2; exit 1 ;;
     *) [ -n "$PR" ] && { echo "Multiple PR numbers ($PR, $a) — pass one." >&2; exit 1; }; PR="$a" ;;
   esac
   i=$((i+1))
 done
 [ -n "$PR" ] || { echo "$USAGE" >&2; exit 1; }
+# Validate --repo shape once: exactly owner/repo (a single slash, no extra path segments).
+if [ -n "$REPO_FLAG" ]; then
+  case "$REPO_FLAG" in
+    */*/*) echo "Refusing: --repo value '$REPO_FLAG' looks like a URL segment — expected 'owner/repo'." >&2; exit 1 ;;
+    */*)   : ;; # ok
+    *)     echo "Refusing: --repo value '$REPO_FLAG' is not in owner/repo form." >&2; exit 1 ;;
+  esac
+fi
 
 DEFAULT_BRANCH="${SHIP_DEFAULT_BRANCH:-main}"
 MERGE_METHOD="${SHIP_MERGE_METHOD:-squash}"
@@ -223,6 +240,57 @@ abort_if_cwd_core_bare
 
 ROOT=$(git rev-parse --show-toplevel); cd "$ROOT"
 command -v gh >/dev/null 2>&1 || { echo "gh CLI not found" >&2; exit 1; }
+
+# --- cross-repo (--repo) support -------------------------------------------------------
+# Derive THIS checkout's own origin repo (owner/repo) BEFORE any override. Used only to
+# detect a cross-repo invocation — a --repo that names a repo OTHER than the one this
+# checkout pushes to — so cleanup never `git push origin --delete`s the wrong remote's
+# branch. sed returns its input unchanged on no-match, so the case-guard blanks anything
+# that isn't a clean github.com owner/repo (a raw URL, an SSH form that leaked ':'/'@', a
+# local path with extra slashes).
+# Read the URL in its own step with `|| true`: `git remote get-url` exits non-zero when there
+# is NO origin (a fresh/detached checkout), and under `set -euo pipefail` a bare
+# `git … | sed` would let that failure abort the whole script. Assign first, transform second.
+_CWD_ORIGIN_URL=$(git remote get-url origin 2>/dev/null) || true
+_CWD_ORIGIN_REPO=$(printf '%s' "$_CWD_ORIGIN_URL" \
+  | sed 's|.*github\.com[:/]\(.*\)\.git$|\1|;s|.*github\.com[:/]\(.*\)$|\1|')
+case "$_CWD_ORIGIN_REPO" in *@*|*:*|""|*/*/*) _CWD_ORIGIN_REPO="" ;; esac
+
+# Thread --repo through EVERY gh call via GH_REPO: gh honours it for all subcommands —
+# including `gh api`, where the {owner}/{repo} placeholders expand from it — so this one
+# assignment covers pr view / pr diff / pr merge / pr comment / api graphql below without
+# touching each call site. GH_SHIP_REPO is a test/override hook (mirrors SHIP_MAIN_CHECKOUT).
+# With no --repo we leave gh's normal cwd-based inference untouched: the no-repo path is
+# byte-for-byte unchanged.
+if [ -n "$REPO_FLAG" ]; then
+  GH_REPO="$REPO_FLAG"; export GH_REPO
+elif [ -n "${GH_SHIP_REPO:-}" ]; then
+  GH_REPO="$GH_SHIP_REPO"; export GH_REPO
+fi
+
+# A --repo invocation is "foreign" when it names a repo we cannot positively confirm is this
+# checkout's own origin: either it differs from the derived origin, or that origin is unknown
+# (a local/non-github remote — the case in the test harness). In cleanup, `git push origin
+# --delete <branch>` targets THIS checkout's origin, not --repo's remote, so deleting there
+# would hit the wrong repo (or a same-named branch in it). We therefore skip remote-branch
+# deletion for a foreign invocation and let GitHub's auto-delete-head-branch (or a manual
+# delete) handle the target repo. This is complementary to the fork-PR CROSS_REPO check
+# below (which covers a PR from a fork of the SAME repo); both independently skip deletion.
+#
+# SCOPE (inherited from the pre-thin-delegator ship script this ports): only the gh calls
+# (view / checks / merge) and the REMOTE-branch delete are made target-aware. The remaining
+# LOCAL operations — the version-bump gate's version-file lookup ($ROOT), the CI-down local
+# test runner ($ROOT), and the local worktree/branch preflight + cleanup ($BRANCH) — stay
+# bound to the CWD checkout, exactly as the original documented ("cross-repo cleanup requires
+# the PR's branch to exist locally"). In practice a foreign PR's branch name rarely collides
+# with a local branch here, so this is a soft limitation, not a regression. Making those paths
+# fully target-aware needs a target-checkout mapping and is tracked as a follow-up (see the PR
+# / issue) rather than folded into this minimal restoration.
+_FOREIGN_REPO_INVOKE=0
+if [ -n "$REPO_FLAG" ] && [ "$REPO_FLAG" != "$_CWD_ORIGIN_REPO" ]; then
+  _FOREIGN_REPO_INVOKE=1
+fi
+
 MAIN_CHECKOUT="${SHIP_MAIN_CHECKOUT:-$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')}"
 # Guard the MAIN checkout NOW — ship's post-merge refresh runs git ops against it (checkout /
 # fetch / pull), which would fail opaquely under core.bare. Firing before the merge means a
@@ -859,6 +927,11 @@ cleanup() {
   set +e  # local to this function's subshell-free body: warn, don't abort
   if [ "${CROSS_REPO:-false}" = "true" ]; then
     echo "[ship] PR head is a fork — leaving its branch to the fork owner."
+  elif [ "${_FOREIGN_REPO_INVOKE:-0}" = "1" ]; then
+    # --repo targets a foreign remote: `git push origin --delete` here would hit the WRONG
+    # repo (origin is THIS checkout, not --repo's). Skip it; GitHub auto-deletes the head
+    # branch in the target repo if that setting is on, otherwise it's a manual delete.
+    echo "[ship] --repo targets ${GH_REPO} (not this checkout's origin${_CWD_ORIGIN_REPO:+ ${_CWD_ORIGIN_REPO}}) — skipping remote branch deletion to avoid hitting the wrong remote. GitHub auto-deletes ${BRANCH} in ${GH_REPO} if auto-delete-head-branch is enabled; otherwise delete it manually."
   elif git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
     echo "[ship] deleting remote branch origin/${BRANCH} ..."
     run git push -q origin --delete "$BRANCH" || echo "[ship] WARNING: could not delete remote branch origin/${BRANCH} — delete it manually." >&2

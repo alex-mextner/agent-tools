@@ -31,6 +31,10 @@ _SHIP = Path(__file__).resolve().parents[1] / "ci" / "ship" / "ship.sh"
 _FAKE_GH = """\
 #!/usr/bin/env bash
 set -e
+# When SHIP_TEST_GHREPO_LOG is set, record the GH_REPO gh sees on every invocation. ship.sh
+# threads --repo through gh via GH_REPO, so this log proves the flag reached the gh calls
+# (and that the no-repo path leaves GH_REPO unset). No-op when the env var is unset.
+[ -n "${SHIP_TEST_GHREPO_LOG:-}" ] && printf '%s\\n' "${GH_REPO:-<unset>}" >> "$SHIP_TEST_GHREPO_LOG"
 sub="$1"; shift || true
 case "$sub" in
   pr)
@@ -1405,56 +1409,119 @@ def test_partial_ci_failure_below_threshold_blocks_normally(repo_with_pr_worktre
 
 
 # ---------------------------------------------------------------------------------------
-# -R/--repo flag gives a clear error (#53)
+# -R/--repo cross-repo support (restored; previously rejected)
 #
-# ship.sh previously fell through to the generic "Unknown flag" handler when invoked with
-# `-R owner/repo` (a gh CLI flag for a remote repo).  Now it emits a targeted message
-# explaining that ship.sh does not support -R and how to work around it.
+# ship.sh USED to reject -R/--repo outright ("does not support -R/--repo"). That broke the
+# only way an orchestrator (forbidden a `cd && gh ship`) can ship a PR into a non-CWD repo
+# (agent-tools / rig-cli / tg-cli). --repo is now accepted and threaded through every gh call
+# via GH_REPO, and remote-branch deletion is skipped for a foreign target (wrong-remote guard).
 # ---------------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("repo_flag", [
-    "-R",
-    "--repo",
-    "-R=owner/repo",
-    "--repo=owner/repo",
-    "-Rowner/repo",
+def _run_ship_repo(main: Path, bindir: Path, repo_args, env_extra: dict | None = None,
+                   cwd: Path | None = None):
+    """Run ship.sh with an explicit set of repo-flag args (a tuple of tokens inserted after
+    the PR number). Returns the CompletedProcess."""
+    env = dict(os.environ)
+    # Deterministic cross-repo state: clear any GH_REPO/GH_SHIP_REPO the dev/CI env may carry,
+    # so the no-repo path genuinely leaves gh's inference untouched (fake gh logs "<unset>").
+    env.pop("GH_REPO", None)
+    env.pop("GH_SHIP_REPO", None)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    if env_extra:
+        env.update(env_extra)
+    return _sh(
+        "bash", str(_SHIP), "1", *repo_args, "--skip-ci", "--no-screenshot-ok", "test",
+        cwd=cwd or main, env=env,
+    )
+
+
+@pytest.mark.parametrize("repo_args", [
+    ("-R", "owner/repo"),
+    ("--repo", "owner/repo"),
+    ("-R=owner/repo",),
+    ("--repo=owner/repo",),
+    ("-Rowner/repo",),
 ])
-def test_repo_flag_gives_clear_error(repo_with_pr_worktree, tmp_path, repo_flag):
-    """Any form of -R/--repo emits a targeted error (not the generic 'Unknown flag') and
-    exits 1.  ship.sh does not support -R because mapping owner/repo to a local checkout
-    path is not generally knowable; the fix message tells the user what to do instead."""
+def test_repo_flag_is_accepted_and_threads_gh_repo(repo_with_pr_worktree, tmp_path, repo_args):
+    """Every gh-compatible spelling of --repo is ACCEPTED (no 'Unknown flag', no 'does not
+    support' rejection), the ship completes, and GH_REPO=owner/repo reached the gh calls —
+    proving --repo is pinned onto pr view / checks / merge for the cross-repo target."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+    ghlog = tmp_path / "ghrepo.log"
+
+    r = _run_ship_repo(main, bindir, repo_args, {"SHIP_TEST_GHREPO_LOG": str(ghlog)})
+
+    assert r.returncode == 0, (
+        f"ship must accept {repo_args!r}; got {r.returncode}\n{r.stdout}\n{r.stderr}"
+    )
+    assert "merged #1" in r.stdout, r.stdout
+    assert "does not support -R/--repo" not in r.stderr, (
+        f"the old rejection still fired for {repo_args!r}:\n{r.stderr}"
+    )
+    assert "Unknown flag" not in r.stderr, (
+        f"generic 'Unknown flag' fired for {repo_args!r}:\n{r.stderr}"
+    )
+    # GH_REPO must have been exported to every gh call (the thread-through mechanism).
+    logged = ghlog.read_text(encoding="utf-8") if ghlog.exists() else ""
+    assert logged, "fake gh recorded no invocations — GH_REPO log is empty"
+    assert all(line == "owner/repo" for line in logged.splitlines()), (
+        f"expected every gh call to see GH_REPO=owner/repo, got:\n{logged}"
+    )
+
+
+def test_repo_flag_foreign_skips_remote_branch_deletion(repo_with_pr_worktree, tmp_path):
+    """Cross-repo guard: with --repo targeting a repo that is NOT this checkout's origin,
+    ship must SKIP remote-branch deletion (deleting via `git push origin --delete` would hit
+    the WRONG remote). It emits the skip message and the origin's `feat` branch survives."""
     main, _wt = repo_with_pr_worktree
     bindir = _fake_gh_dir(tmp_path)
 
-    # Build args: for bare -R/--repo the next token is the value; for attached forms there
-    # is no separate value token.
-    if repo_flag in ("-R", "--repo"):
-        args = ("1", repo_flag, "owner/repo", "--skip-ci", "--no-screenshot-ok", "test")
-    else:
-        args = ("1", repo_flag, "--skip-ci", "--no-screenshot-ok", "test")
+    # Sanity: the branch exists on origin before the ship.
+    before = _sh("git", "ls-remote", "--heads", "origin", "feat", cwd=main).stdout
+    assert "refs/heads/feat" in before, f"precondition: feat should be on origin:\n{before}"
 
-    r = _sh("bash", str(_SHIP), *args, cwd=main, env={
-        **os.environ,
-        "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
-        "SHIP_TEST_BRANCH": "feat",
-        "SHIP_DEFAULT_BRANCH": "main",
-        "SHIP_MAIN_CHECKOUT": str(main),
-    })
+    r = _run_ship_repo(main, bindir, ("--repo", "owner/repo"))
 
-    assert r.returncode != 0, (
-        f"ship must refuse {repo_flag!r} with a non-zero exit; got 0\n{r.stdout}\n{r.stderr}"
+    assert r.returncode == 0, f"ship exited {r.returncode}\n{r.stdout}\n{r.stderr}"
+    assert "merged #1" in r.stdout, r.stdout
+    # The guard message must fire (stdout).
+    assert "skipping remote branch deletion" in r.stdout, (
+        f"foreign-repo branch-deletion guard did not fire:\n{r.stdout}\n{r.stderr}"
     )
-    assert "does not support -R/--repo" in r.stderr, (
-        f"expected targeted -R error for {repo_flag!r}:\n{r.stderr}"
+    # The origin branch must be UNTOUCHED (we never pushed --delete to the wrong remote).
+    after = _sh("git", "ls-remote", "--heads", "origin", "feat", cwd=main).stdout
+    assert "refs/heads/feat" in after, (
+        f"origin's feat branch was deleted despite the foreign-repo guard:\n{after}"
     )
-    # Must NOT use the generic "Unknown flag" message.
-    assert "Unknown flag" not in r.stderr, (
-        f"generic 'Unknown flag' fired for {repo_flag!r} — targeted handler did not catch it:\n"
-        + r.stderr
+
+
+def test_no_repo_flag_path_is_unchanged(repo_with_pr_worktree, tmp_path):
+    """The no-`--repo` path is byte-for-byte unchanged: GH_REPO is NOT exported (gh keeps its
+    cwd inference), no skip message fires, and the origin `feat` branch IS deleted normally."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+    ghlog = tmp_path / "ghrepo.log"
+
+    r = _run_ship_repo(main, bindir, (), {"SHIP_TEST_GHREPO_LOG": str(ghlog)})
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\n{r.stdout}\n{r.stderr}"
+    assert "merged #1" in r.stdout, r.stdout
+    # No cross-repo messaging at all.
+    assert "skipping remote branch deletion" not in r.stdout, r.stdout
+    # GH_REPO stays unset for gh — the no-repo path does not pin it.
+    logged = ghlog.read_text(encoding="utf-8") if ghlog.exists() else ""
+    assert logged, "fake gh recorded no invocations"
+    assert all(line == "<unset>" for line in logged.splitlines()), (
+        f"no-repo path must leave GH_REPO unset for gh, got:\n{logged}"
     )
-    # Merge must NOT have been attempted.
-    assert "merged #1" not in r.stdout, (
-        f"ship merged despite {repo_flag!r} argument:\n{r.stdout}"
+    # Remote branch deleted normally (the standard cleanup path).
+    after = _sh("git", "ls-remote", "--heads", "origin", "feat", cwd=main).stdout
+    assert "refs/heads/feat" not in after, (
+        f"no-repo path should delete origin's feat branch, but it survived:\n{after}"
     )
 
 
