@@ -12,6 +12,8 @@ ONE script binds TWO points via two descriptors; it branches on ``event["point"]
                 warn-then-block. Read-only inspection is NEVER blocked — a single one-liner
                 (git status, ls, cat, grep, find) OR a fully read-only chain of any length
                 across |/&&/;/||/newline (find ... | grep ... | head, git status && ls).
+                A `gh ship` RELEASE chain is NEVER blocked either — the gated merge is the
+                orchestrator's own action (#159, see _is_sanctioned_release_chain).
 
 TIERED (warn → block): the FIRST offense in the TTL window WARNs (allow + message); a REPEAT
 in the window BLOCKs. The tier is tracked by a marker file keyed by a hash of cwd. This gives
@@ -85,6 +87,47 @@ BUILD_EDIT = re.compile(
     r"python\s+setup|pip\s+install)\b"
 )
 INLINE_SENTINEL = re.compile(r"#\s*orchestrator-ok:\s*(\S.*)")
+
+# `gh ship` — the sanctioned gated-merge (RELEASE) command — at a segment HEAD, optionally
+# after env-var assignment prefixes (`GH_PAGER=cat gh ship 605`). Anchored on the segment's
+# argv like the other head tokens, NEVER matched as a substring in text: a needle such as
+# `grep 'gh ship' log` must not self-exempt a chain (#159).
+GH_SHIP_HEAD = re.compile(
+    r"^\s*(?:[A-Za-z_]\w*=(?:'[^']*'|\"[^\"]*\"|\S*)\s+)*gh\s+ship(?=\s|$)"
+)
+# The only extra companion a release line may carry besides read-only inspection: `cd`
+# changes no repo state, and `cd <repo> && gh ship <PR> | tail` is a common ship shape.
+# Anchored on an argv boundary (`\s`/end), NOT `\b`: a bare `\b` matches before punctuation, so
+# `cd-clean` / `cd/foo` (other commands) would ride the carve-out — they must not (#159 review P1).
+CD_HEAD = re.compile(r"^\s*cd(?=\s|$)")
+# A command or process substitution can smuggle ANY mutation into an otherwise-benign
+# release segment (`cd $(git push ...) && gh ship`, `cat <(git push ...) && gh ship`), and
+# BUILD_EDIT only knows build/edit tools — so the release carve-out vetoes substitutions
+# wholesale, like heredocs: `$(...)`, backticks, and process substitution `<(...)`/`>(...)`.
+# A legit ship line does not need them; a rare `cd $(git rev-parse ...) && gh ship` just
+# falls back to the ordinary judgement (#159).
+SUBSTITUTION = re.compile(r"\$\(|`|[<>]\(")
+# A single `&` (backgrounding / control operator) is NOT a CHAIN split, so `gh ship 605 &
+# git push` would read as ONE segment with a ship head — the release carve-out vetoes it.
+# Redirect `&`s (`2>&1`, `&>`, `>&`) and the already-split `&&` are excluded (#159).
+BG_AMP = re.compile(r"(?<![&>])&(?![&>])")
+# READ_ONLY_BASH has a documented inherited gap (#80): a read-only HEAD can still carry a
+# mutating form — `find . -delete`/`-exec ...`, the `env <cmd>` wrapper, `git branch -D`.
+# The plain read-only carve-out tolerates that gap (out of scope there), but the release
+# carve-out must not EXTEND it to ship lines that were blocked pre-#159 — so these forms
+# are excluded from the ship-companion set (#159). Head-anchored for env / git branch;
+# find's mutating actions are a content signal anywhere in the segment. This covers BOTH find's
+# delete/exec family AND its file-WRITING primaries (`-fprint`/`-fprintf`/`-fprint0`/`-fls`),
+# which write an arbitrary path just like `-delete` mutates — omitting them let
+# `gh ship | find . -fprintf evil.sh 'x' | tail` ride the carve-out (#159 review, main finding).
+# SYNC with READ_ONLY_BASH: of its git subcommands (status|log|diff|show|branch), only
+# `branch` has a mutating argument form — the rest are read-only whatever their args. If a
+# subcommand with a mutating form (tag/config/stash/notes/…) is ever added there, it must
+# be excluded here too.
+UNSAFE_COMPANION = re.compile(
+    r"^\s*(?:env\b|git\s+branch\s+\S)"
+    r"|\s-(?:delete|exec|execdir|ok|okdir|fprintf|fprint0|fprint|fls)\b"
+)
 
 MESSAGE = (
     "Delegate to a subagent: the orchestrator plans, dispatches, and verifies — it does not "
@@ -211,12 +254,125 @@ def _is_all_read_only(command: str) -> bool:
     return bool(segments) and all(READ_ONLY_BASH.search(s) for s in segments)
 
 
+def _blank_quoted(command: str) -> str:
+    """Replace the CONTENT of '…'/"…" spans with spaces (keeping the quote chars) so a whole-string
+    veto scan (SUBSTITUTION / BG_AMP / BUILD_EDIT) does not fire on a shell metachar that lives
+    INSIDE a quoted `gh ship` argument — a reason like `--no-screenshot-ok 'revert; reship'` or a
+    `--title "a & b"` must not forfeit the carve-out and false-block a legit ship (#159 review
+    F2/P2). Best-effort (matches _split_release_segments): backslash-escapes are out of scope."""
+    out: list[str] = []
+    quote: str | None = None
+    for c in command:
+        if quote is not None:
+            out.append(c if c == quote else " ")
+            if c == quote:
+                quote = None
+        elif c in ("'", '"'):
+            quote = c
+            out.append(c)
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def _split_release_segments(command: str) -> list[str]:
+    """Quote-aware split on the chain operators (``&&`` ``||`` ``;`` ``|`` newline) that lie
+    OUTSIDE quotes, so a quoted operator in a ship reason (`gh ship 605 'fix; reship'`) is NOT a
+    segment boundary (#159 review F2/P2). The plain read-only path keeps the naive CHAIN split
+    (unchanged, out of scope); only the release carve-out needs quote-awareness because ship
+    carries free-form reason args. SYNC with workflow-guards `_split_chain`."""
+    segs: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i, n = 0, len(command)
+    while i < n:
+        c = command[i]
+        if quote is not None:
+            buf.append(c)
+            if c == quote:
+                quote = None
+            i += 1
+        elif c in ("'", '"'):
+            quote = c
+            buf.append(c)
+            i += 1
+        elif command[i:i + 2] in ("&&", "||"):
+            segs.append("".join(buf))
+            buf = []
+            i += 2
+        elif c in (";", "|", "\n"):
+            segs.append("".join(buf))
+            buf = []
+            i += 1
+        else:
+            buf.append(c)
+            i += 1
+    segs.append("".join(buf))
+    return [s for s in segs if s.strip()]
+
+
+def _is_sanctioned_release_chain(command: str) -> bool:
+    """True when the line is a `gh ship` RELEASE invocation: at least one segment HEAD is
+    `gh ship`, and EVERY segment head is `gh ship`, read-only inspection, or `cd`.
+
+    Why a carve-out at all (#159): `gh ship` is the ONE repo mutation that belongs at
+    ORCHESTRATOR altitude — the gated merge. The auto-mode classifier denies it inside
+    subagents (a subagent relaying its own merge is exactly what the gates exist to stop),
+    so when this hook warn-then-blocked the orchestrator's inline ship chains too, NOBODY
+    could reliably run the sanctioned merge command — a deadlock, observed live as flapping
+    (first ship WARNs through, the next ones in the TTL window BLOCK). Release is dispatch/
+    verify-altitude work like the rest of the orchestrator's job, not implementation.
+
+    Deliberately NARROW, judged per segment HEAD like _is_all_read_only (#80):
+      - `gh ship` must be a segment's argv head (env-var prefixes allowed) — a substring
+        (`grep 'gh ship' log`, `echo gh ship`) exempts nothing;
+      - a ship segment does NOT launder the rest of the line — `sed -i ... && gh ship`,
+        `npm run build && gh ship`, or any heredoc still counts as implementation;
+      - BUILD_EDIT, command SUBSTITUTIONS, and a bare background `&` are vetoed on the WHOLE
+        string, mirroring the heredoc veto: this predicate fires BEFORE the caller's
+        BUILD_EDIT check, and segment heads alone would miss a mutation hidden in
+        `$(...)`/backticks (`gh ship $(sed -i ...)`, `cd $(git push ...) && gh ship`) or
+        behind a single `&` (`gh ship 605 & git push` — CHAIN does not split on it).
+        Pre-fix, the whole-string BUILD_EDIT scan caught the build/edit cases — the vetoes
+        keep that and cover mutations BUILD_EDIT does not know. Cost: a build/edit token as
+        a mere needle in a ship chain (`gh ship | grep tee`, and notably `gh ship | tee
+        ship.log`) forfeits the carve-out and falls back to the ordinary judgement — log a
+        ship with a bare redirect instead (`gh ship > log 2>&1`, not implementation, B7).
+        `|&` is likewise not a supported release shape (its `&` trips the bare-`&` veto —
+        and even without it, CHAIN's `|` split would leave a `& ...` segment head that
+        never qualifies) — pipe with `2>&1 |`;
+      - READ_ONLY_BASH's inherited head-with-mutating-flag gap (#80) is NOT extended to
+        ship lines: an `env <cmd>` wrapper, `git branch <arg>`, or a find-style mutating
+        action (`-delete`/`-exec`/`-ok`) disqualifies a companion (UNSAFE_COMPANION);
+      - ONLY `gh ship` rides this: no other gh subcommand, no tg, nothing else.
+    """
+    # Veto on a QUOTE-BLANKED copy so a metachar inside a quoted ship arg does not fire (F2/P2);
+    # a real substitution / bare `&` / build-edit / heredoc OUTSIDE quotes still trips it.
+    scan = _blank_quoted(command)
+    if (HEREDOC.search(scan) or BUILD_EDIT.search(scan)
+            or SUBSTITUTION.search(scan) or BG_AMP.search(scan)):
+        return False
+    segments = [s for s in _split_release_segments(command) if s.strip()]
+    if not any(GH_SHIP_HEAD.match(s) for s in segments):
+        return False
+    return all(
+        GH_SHIP_HEAD.match(s)
+        or ((READ_ONLY_BASH.search(s) or CD_HEAD.match(s))
+            and not UNSAFE_COMPANION.search(s))
+        for s in segments
+    )
+
+
 def _is_implementation_bash(command: str) -> bool:
     if not command.strip():
         return False
     # A fully read-only pipe of ANY length is inspection, never implementation (#80). The older
     # single-command carve-out was a subset of this; an all-read-only chain now passes too.
     if _is_all_read_only(command):
+        return False
+    # A `gh ship` release line (plus read-only/`cd` plumbing) is orchestrator-altitude, not
+    # implementation — see _is_sanctioned_release_chain (#159).
+    if _is_sanctioned_release_chain(command):
         return False
     # A chain that merely STARTS with a read-only command (`git status && sed -i ...`,
     # `ls; npm run build`) is judged on its full content, not waved through on its prefix (B1).

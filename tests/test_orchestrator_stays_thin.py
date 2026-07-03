@@ -407,5 +407,162 @@ def test_sed_in_place_anywhere_still_implementation(tmp_path, monkeypatch):
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
 
 
+# ── #159: `gh ship` is RELEASE, not implementation — the orchestrator's own carve-out ────
+
+@pytest.mark.parametrize("command", [
+    "gh ship 605",                                             # bare ship (pins the trivial case)
+    "gh ship 605 2>&1 | tail -30 | grep -i merged",            # ship + read-only plumbing (2 ops)
+    "gh ship 605 --skip-ci | tail -20; git log --oneline -3",  # ship + post-merge inspection
+    "GH_PAGER=cat GH_TOKEN=x gh ship 605 | tail -5 | head -1",  # env-var prefixes on the ship head
+    "cd /repo && gh ship 605 | tail -40",                      # `cd` companion segment
+    "git status && gh ship 605 && git log --oneline -1",       # read-only companions via &&
+    "gh ship 605 > ship.log 2>&1",                             # the sanctioned logging shape
+    "gh ship 605 --repo alex-mextner/agent-tools",             # cross-repo ship: `--repo <owner/repo>`
+    "gh ship 605 --repo alex-mextner/agent-tools --no-screenshot-ok",  # + the no-screenshot flag
+    "cd /repo && gh ship 605 --repo alex-mextner/agent-tools --no-screenshot-ok | tail -3",  # all three
+    "gh ship 605 --no-screenshot-ok 'revert; reship' | tail -3",  # quoted `;` in a reason arg (F2/P2)
+])
+def test_gh_ship_release_chain_allows(command, tmp_path, monkeypatch):
+    """A `gh ship` line (plus read-only/`cd` plumbing) is the sanctioned RELEASE action at
+    ORCHESTRATOR altitude (#159): the auto-mode classifier denies subagents the gated merge,
+    so the orchestrator must run it itself — it must never warn and never prime the block
+    tier (the warn-then-block flapping on repeated ships was the gated-ship deadlock)."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    assert "message" not in json.loads(out1)  # does not even warn
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")  # never primes a block
+    assert c2 == 0 and _decision(out2) == "allow"
+
+
+@pytest.mark.parametrize("command", [
+    "sed -i 's/a/b/' f.py && gh ship 605",   # ship does not launder an in-place edit
+    "npm run build && gh ship 605",          # ...nor a build
+    "gh ship 605; tee out.txt; ls",          # ...nor a tee write
+    "gh ship 605 $(sed -i 's/a/b/' f)",      # ...nor an edit hidden in a substitution
+    "cd $(npm run build) && gh ship 605",    # ...nor a build inside the cd companion
+    "gh ship 605 & sed -i 's/a/b/' f.py",    # ...nor behind a single `&` (CHAIN can't split it)
+    "cd $(git push origin main) && gh ship 605 | tail -3",  # non-BUILD_EDIT mutation in $() (2 ops)
+    "gh ship 605 & git push origin main; ls; cat x",  # bare `&` hides a push in the ship segment
+    "cat <(git push origin main) && gh ship 605 | tail -3",  # process substitution smuggles a push
+    "gh ship 605 | find . -delete | tail -3",           # read-only HEAD, mutating flag (#80 gap)
+    "gh ship 605 | env git push origin main | tail -3",  # env wrapper launders a push
+    "gh ship 605; git branch -D tmp; ls",                # git branch mutating form
+    "gh ship 605 | find . -fprintf evil.sh 'x' | tail -3",  # find file-WRITE primary (review F1)
+    "cd-clean && gh ship 605 | tail -3",                    # `cd-clean` is a different command (P1)
+])
+def test_gh_ship_does_not_launder_impl_segments(command, tmp_path, monkeypatch):
+    """The carve-out is per-segment: a `gh ship` tacked onto an implementation chain must NOT
+    exempt the rest of the line (#159) — only all-(ship|read-only|cd) lines are release.
+    BUILD_EDIT and `$()`/backtick substitutions are vetoed on the WHOLE string (like heredoc),
+    so a mutation smuggled INSIDE a ship/cd segment still blocks — pre-carve-out these fell to
+    the whole-string BUILD_EDIT / >=2-operators checks, and the exemption must not regress
+    that (review P1 + P2)."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+@pytest.mark.parametrize("command", [
+    "python x.py | grep 'gh ship' | python y.py",  # needle in a non-read-only pipe
+    "gh shipwreck 1 | python x.py | head",         # word boundary: not the ship subcommand
+])
+def test_gh_ship_needle_or_prefix_word_is_not_exempt(command, tmp_path, monkeypatch):
+    """`gh ship` counts only at a segment HEAD (argv), never as a substring in text (#159) —
+    a grep needle or a `gh ship*`-prefixed other word must not self-exempt a chain."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_gh_ship_bare_amp_zero_operator_line_keeps_inherited_allow(tmp_path, monkeypatch):
+    """Document the hook's ACTUAL decision on `gh ship 605 & git push origin main`: allowed —
+    but NOT via the release carve-out (the bare-`&` veto rejects it; pinned in the predicate
+    test). CHAIN does not split a single `&`, so the line has ZERO chain operators and falls
+    under the ordinary judgement, which never flagged 0-operator non-build lines (`python
+    x.py & git push` behaves identically) — inherited pre-#159 behavior, not a regression.
+    If CHAIN ever learns to split `&`, this documents the boundary to re-judge."""
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "gh ship 605 & git push origin main"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")  # never primes a block
+    assert c2 == 0 and _decision(out2) == "allow"
+
+
+def test_gh_ship_with_non_build_mutation_companion_blocks(tmp_path, monkeypatch):
+    """A companion mutation that BUILD_EDIT does not know about (git push) still does not
+    ride the carve-out: it is not a benign head, so a >=2-operator chain stays
+    implementation-shaped and warn-then-blocks exactly as before (#159 review)."""
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "gh ship 605 && git push origin main && git push --tags"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_gh_ship_with_heredoc_still_blocks(tmp_path, monkeypatch):
+    """A heredoc anywhere vetoes the release carve-out, exactly as it vetoes read-only (#159)."""
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "cat <<EOF > notes\nbody\nEOF\ngh ship 605 | tail -5"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_sanctioned_release_predicate_is_head_anchored():
+    """Pin the predicate surface (#159): exemption requires a real `gh ship` segment HEAD —
+    an all-read-only pipe that merely MENTIONS `gh ship` is allowed via the read-only path,
+    not via the release carve-out, and an `echo gh ship` head exempts nothing."""
+    assert ost._is_sanctioned_release_chain("gh ship 605 | tail -3 | head -1") is True
+    assert ost._is_sanctioned_release_chain("grep 'gh ship' log | head | wc -l") is False
+    assert ost._is_sanctioned_release_chain("echo gh ship") is False
+    assert ost._is_sanctioned_release_chain("gh ship 605 && git push") is False
+    # READ_ONLY_BASH is `^`-anchored, so a read-only WORD mid-segment (`writer cat`) does not
+    # qualify a companion — .search cannot match past the head (#159 review).
+    assert ost._is_sanctioned_release_chain("gh ship 605 | writer cat | tool grep") is False
+    # Command substitutions are vetoed wholesale — even a read-only one forfeits the
+    # carve-out and falls back to the ordinary judgement (#159 review P2).
+    assert ost._is_sanctioned_release_chain("cd $(git rev-parse --show-toplevel) && gh ship 605") is False
+    # A bare background `&` is vetoed (CHAIN cannot split it), but redirect `&`s are not:
+    # `2>&1` must stay a first-class ship shape (#159 review P3).
+    assert ost._is_sanctioned_release_chain("gh ship 605 & git push origin main") is False
+    assert ost._is_sanctioned_release_chain("gh ship 605 2>&1 | tail -3") is True
+    # Process substitution is vetoed like `$()` — either direction (#159 review P4).
+    assert ost._is_sanctioned_release_chain("gh ship 605 | cat <(git push origin main)") is False
+    assert ost._is_sanctioned_release_chain("tee >(wc -l) | gh ship 605") is False
+    # The #80 inherited gap (read-only head, mutating form) is not extended to ship lines —
+    # but a genuinely read-only find companion still qualifies (#159 review P5).
+    assert ost._is_sanctioned_release_chain("gh ship 605 | find . -delete | tail -3") is False
+    assert ost._is_sanctioned_release_chain("gh ship 605 | find . -name x | head") is True
+    # The head anchor ends at `gh ship`, so trailing FLAGS ride along untouched. The gate does NOT
+    # validate `gh ship`'s own arguments — that is ship's job — it only recognises a release line
+    # and gets out of the way, so whatever forms the orchestrator's `gh ship` accepts must pass
+    # (task #23): `--repo <owner/repo>` (the `/` in the slug is not a chain operator) and
+    # `--no-screenshot-ok`. (A given repo's ship.sh may itself reject a flag; that is ship's error
+    # to raise downstream, not the gate's to pre-empt.)
+    assert ost._is_sanctioned_release_chain("gh ship 605 --repo alex-mextner/agent-tools") is True
+    assert ost._is_sanctioned_release_chain(
+        "gh ship 605 --repo alex-mextner/agent-tools --no-screenshot-ok") is True
+    assert ost._is_sanctioned_release_chain(
+        "cd /repo && gh ship 605 --repo alex-mextner/agent-tools --no-screenshot-ok | tail -3") is True
+    # A find file-WRITE primary is a mutation just like `-delete` — it must not ride a ship line
+    # (review F1); and `cd-clean`/`cd/foo` are NOT the `cd` companion (argv-boundary anchor, P1).
+    assert ost._is_sanctioned_release_chain("gh ship 605 | find . -fprintf evil.sh 'x' | tail -3") is False
+    assert ost._is_sanctioned_release_chain("cd-clean && gh ship 605 | tail -3") is False
+    # A quoted metachar in a ship reason must not forfeit the carve-out (quote-aware split + veto,
+    # review F2/P2): a quoted `;` is not a segment split, a quoted `&` does not trip the bare-`&`
+    # veto, and a quoted `$(`/build token does not trip the substitution/build vetoes.
+    assert ost._is_sanctioned_release_chain("gh ship 605 --no-screenshot-ok 'revert; reship' | tail -3") is True
+    assert ost._is_sanctioned_release_chain('gh ship 605 --title "a & b" | tail -3') is True
+    assert ost._is_sanctioned_release_chain("gh ship 605 --note 'ran $(build) earlier' | tail -3") is True
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
