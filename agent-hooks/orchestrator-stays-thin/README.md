@@ -24,6 +24,35 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   command (`cat tee.log`, `grep cargo notes`) stays allowed; only a build/edit *at a segment head*
   (`sed -i ...`, `tee ...`, `npm`/`cargo`/`make` build) counts.
 
+**Release carve-out — `gh ship` (#159):** the gated merge is the ONE repo mutation that belongs
+at *orchestrator* altitude — the auto-mode classifier denies it inside subagents (a subagent
+relaying its own merge is what the gates exist to stop), so blocking it here deadlocked the
+release path entirely (observed live as warn-then-block *flapping* on repeated ships). A
+`gh ship` **release chain** is therefore never warned or blocked: at least one segment head is
+`gh ship` (env-var prefixes allowed: `GH_PAGER=cat gh ship 605`) and **every** segment head is
+`gh ship`, read-only inspection, or `cd` — e.g. `gh ship 605 2>&1 | tail -30 | grep -i merged`,
+`cd /repo && gh ship 605 | tail -40`. Same per-segment-head discipline as above: `gh ship` as a
+substring/needle (`grep 'gh ship' log`) exempts nothing, and a ship segment does **not** launder
+an implementation chain (`sed -i ... && gh ship`, `npm run build && gh ship`, any heredoc still
+block). Build/edit tokens **and `$()`/backtick substitutions anywhere in the line** veto the
+carve-out wholesale (a substitution can smuggle any mutation into a benign-looking segment), so
+`gh ship 605 | tee ship.log` does **not** ride it — log a ship with a bare redirect instead
+(`gh ship 605 > ship.log 2>&1`, allowed as a plain redirect). Only `gh ship` rides the *release*
+carve-out — no other gh subcommand rides *that* one.
+
+**Report / verify carve-out — `tg` + read-only gh reads (coordinator):** the orchestrator's role is
+literally *verify + report*, so reporting to the user and read-only PR/CI verification must **not**
+require a subagent. A line whose every segment head is `tg`, a read-only gh read
+(`gh pr list/view/checks/status/diff`, `gh run list/view`), read-only inspection (incl. system-info
+`df`/`du`/`lsblk`/`free`/`ps`/… and filters `jq`/`sort`/`cut`/…), or `cd` — with at least one `tg`/
+gh-read head — is never warned or blocked, of **any** length: `tg --format html '…' | tail -3 | grep
+merged`, `gh pr view 5 | jq .title | head`, `tg done; gh pr view 5; gh run list`. Same per-segment
+discipline as the release carve-out — a build/edit, heredoc, substitution, bare-`&`, or mutating
+companion forfeits it (`tg done && sed -i …`, `gh pr view && git push` are still implementation).
+**`curl` and `ssh` are deliberately NOT sanctioned** — `curl -X POST`/`-d` mutates and `ssh host
+'…'` runs any remote command, so neither can be reliably classified read-only; use the escape hatch
+or a subagent for those.
+
 **Subagent-exempt:** a dispatched subagent (`agent_id` present) does the actual work, so it is
 always allowed. This gate governs the orchestrator only. Because the hook uses `agent_id` to
 **relax**, it reads **only** the sanitized `args.agent_id` — never a top-level `event.agent_id`
