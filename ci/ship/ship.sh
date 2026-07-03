@@ -925,13 +925,19 @@ _refresh_main_checkout() {
 
 cleanup() {
   set +e  # local to this function's subshell-free body: warn, don't abort
+  if [ "${_FOREIGN_REPO_INVOKE:-0}" = "1" ]; then
+    # --repo targets a foreign remote: EVERY cleanup action below operates on THIS checkout
+    # (origin push --delete, worktree removal, `git branch -D`, main-checkout refresh) — all of
+    # it would hit the WRONG repo. A same-named local branch/worktree here belongs to the
+    # ambient checkout, not to ${GH_REPO}'s PR, and deleting it would destroy unrelated local
+    # state (codex review P1 on #167). So skip ALL cleanup, not just the remote deletion.
+    # GitHub auto-deletes the head branch in the target repo if that setting is on, otherwise
+    # it's a manual delete.
+    echo "[ship] --repo targets ${GH_REPO} (not this checkout's origin${_CWD_ORIGIN_REPO:+ ${_CWD_ORIGIN_REPO}}) — skipping remote branch deletion AND all local branch/worktree cleanup: any local '${BRANCH}' here belongs to this checkout, not ${GH_REPO}. GitHub auto-deletes ${BRANCH} in ${GH_REPO} if auto-delete-head-branch is enabled; otherwise delete it manually."
+    return 0
+  fi
   if [ "${CROSS_REPO:-false}" = "true" ]; then
     echo "[ship] PR head is a fork — leaving its branch to the fork owner."
-  elif [ "${_FOREIGN_REPO_INVOKE:-0}" = "1" ]; then
-    # --repo targets a foreign remote: `git push origin --delete` here would hit the WRONG
-    # repo (origin is THIS checkout, not --repo's). Skip it; GitHub auto-deletes the head
-    # branch in the target repo if that setting is on, otherwise it's a manual delete.
-    echo "[ship] --repo targets ${GH_REPO} (not this checkout's origin${_CWD_ORIGIN_REPO:+ ${_CWD_ORIGIN_REPO}}) — skipping remote branch deletion to avoid hitting the wrong remote. GitHub auto-deletes ${BRANCH} in ${GH_REPO} if auto-delete-head-branch is enabled; otherwise delete it manually."
   elif git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
     echo "[ship] deleting remote branch origin/${BRANCH} ..."
     run git push -q origin --delete "$BRANCH" || echo "[ship] WARNING: could not delete remote branch origin/${BRANCH} — delete it manually." >&2

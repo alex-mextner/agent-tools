@@ -1476,8 +1476,11 @@ def test_repo_flag_is_accepted_and_threads_gh_repo(repo_with_pr_worktree, tmp_pa
 def test_repo_flag_foreign_skips_remote_branch_deletion(repo_with_pr_worktree, tmp_path):
     """Cross-repo guard: with --repo targeting a repo that is NOT this checkout's origin,
     ship must SKIP remote-branch deletion (deleting via `git push origin --delete` would hit
-    the WRONG remote). It emits the skip message and the origin's `feat` branch survives."""
-    main, _wt = repo_with_pr_worktree
+    the WRONG remote) — AND all LOCAL cleanup (worktree removal, `git branch -D`): a
+    same-named local branch/worktree belongs to THIS checkout, not the foreign PR, and
+    deleting it would destroy unrelated local state (#167 review P1). The skip message fires
+    and the origin branch, the local branch, and the local worktree all survive."""
+    main, wt = repo_with_pr_worktree
     bindir = _fake_gh_dir(tmp_path)
 
     # Sanity: the branch exists on origin before the ship.
@@ -1497,6 +1500,16 @@ def test_repo_flag_foreign_skips_remote_branch_deletion(repo_with_pr_worktree, t
     assert "refs/heads/feat" in after, (
         f"origin's feat branch was deleted despite the foreign-repo guard:\n{after}"
     )
+    # LOCAL state must be untouched too (#167 review P1): the ambient checkout's same-named
+    # branch and its worktree are NOT the foreign PR's — cleanup must not touch them.
+    assert "removing worktree" not in r.stdout, (
+        f"foreign --repo must not remove local worktrees:\n{r.stdout}"
+    )
+    local_branch = _sh("git", "show-ref", "--verify", "refs/heads/feat", cwd=main)
+    assert local_branch.returncode == 0, (
+        f"local feat branch was deleted despite the foreign-repo guard:\n{r.stdout}"
+    )
+    assert wt.exists(), f"local worktree {wt} was removed despite the foreign-repo guard"
 
 
 def test_no_repo_flag_path_is_unchanged(repo_with_pr_worktree, tmp_path):
