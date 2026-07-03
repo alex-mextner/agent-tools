@@ -278,18 +278,27 @@ def _is_all_read_only(command: str) -> bool:
 
 
 def _blank_quoted(command: str) -> str:
-    """Replace the CONTENT of '…'/"…" spans with spaces (keeping the quote chars) so a whole-string
-    veto scan (SUBSTITUTION / BG_AMP / BUILD_EDIT) does not fire on a shell metachar that lives
-    INSIDE a quoted `gh ship` argument — a reason like `--no-screenshot-ok 'revert; reship'` or a
-    `--title "a & b"` must not forfeit the carve-out and false-block a legit ship (#159 review
-    F2/P2). Best-effort (matches _split_release_segments): backslash-escapes are out of scope."""
+    """Blank quoted content so a whole-string veto scan (SUBSTITUTION / BG_AMP / BUILD_EDIT) does
+    not fire on a shell metachar that is INERT inside quotes — a reason like `--no-screenshot-ok
+    'revert; reship'` or a `--title "a & b"` must not forfeit the carve-out and false-block a
+    legit ship (#159 review F2/P2).
+
+    Quote semantics differ and the blanking MUST follow them (#162 review P2): inside SINGLE
+    quotes everything is literal → blank it all; inside DOUBLE quotes `$(…)` and backticks still
+    EXECUTE → keep `$`, `` ` `` and `(` visible so `gh ship --note "$(git push …)"` still trips
+    the SUBSTITUTION veto (`&`, `;`, `|`, `<`, `>` are literal in double quotes and stay blanked).
+    Best-effort (matches _split_release_segments): backslash-escapes are out of scope."""
     out: list[str] = []
     quote: str | None = None
     for c in command:
         if quote is not None:
-            out.append(c if c == quote else " ")
             if c == quote:
+                out.append(c)
                 quote = None
+            elif quote == '"' and c in ("$", "`", "("):
+                out.append(c)  # substitutions are LIVE inside double quotes — keep them scannable
+            else:
+                out.append(" ")
         elif c in ("'", '"'):
             quote = c
             out.append(c)

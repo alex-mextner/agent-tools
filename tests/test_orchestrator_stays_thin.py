@@ -562,6 +562,11 @@ def test_sanctioned_release_predicate_is_head_anchored():
     assert ost._is_sanctioned_release_chain("gh ship 605 --no-screenshot-ok 'revert; reship' | tail -3") is True
     assert ost._is_sanctioned_release_chain('gh ship 605 --title "a & b" | tail -3') is True
     assert ost._is_sanctioned_release_chain("gh ship 605 --note 'ran $(build) earlier' | tail -3") is True
+    # Quote SEMANTICS (#162 review P2): `$(…)`/backticks EXECUTE inside DOUBLE quotes — a
+    # double-quoted substitution must still trip the veto; inside SINGLE quotes they are literal.
+    assert ost._is_sanctioned_release_chain('gh ship 605 --note "$(git push origin main)" | tail -3') is False
+    assert ost._is_sanctioned_release_chain('gh ship 605 --note "`git push origin main`" | tail -3') is False
+    assert ost._is_sanctioned_release_chain("gh ship 605 --note '$(git push origin main)' | tail -3") is True
 
 
 # ── coordinator: report (`tg`) + read-only verification are orchestrator altitude, not impl ──────
