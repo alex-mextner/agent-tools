@@ -12,7 +12,9 @@ Confirmed CC contract (https://code.claude.com/docs/en/hooks, CC 2.1.177):
                        (we use the STRUCTURED JSON form, not exit 2, because it carries a
                        rich reason; exit 2 also blocks but discards any JSON.)
   - PostToolUse      : the tool already ran — cannot block; feedback via
-                       {"decision": "block", "reason": "..."} (stops the turn, not the tool).
+                       {"decision": "block", "reason": "..."} (surfaces the reason to the
+                       model, not un-running the tool). Maps to the `post-write` point for
+                       the file-edit tools (format-on-write, lint-on-write).
   - Stop block       : exit 0 + {"decision": "block", "reason": "..."}.
   - matcher          : matched by CC against tool_name BEFORE we run; the settings.json entry
                        carries the matcher, so the dispatcher only needs the logical point.
@@ -66,6 +68,11 @@ def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
             return "pre-write"
         if tool_name in _AGENT_TOOLS:
             return "pre-agent"
+    if hook_event_name == "PostToolUse" and tool_name in _WRITE_TOOLS:
+        # The write already landed on disk → the REACTIVE point (format-on-write,
+        # lint-on-write). A post-write hook's exit-10 is FEEDBACK to the model, not
+        # prevention — the tool already ran (see cc_block_output).
+        return "post-write"
     return None
 
 
@@ -94,10 +101,14 @@ def to_v1_event(cc_event: dict, *, point: str) -> dict:
         proposed = _proposed_write_text(tool_input)
         if proposed and not isinstance(args.get("content"), str):
             args["content"] = proposed
+    if point in ("pre-write", "post-write"):
         # Normalize the target PATH too: NotebookEdit carries `notebook_path`, not the
         # `file_path` the shipped pre-write hooks scope on. Without this a NotebookEdit
         # presents an empty path, so path-scoped raw-env checks and secret-scan allowlists
         # wave the write through — the same bypass the content-normalization above prevents.
+        # post-write hooks (format-on-write, lint-on-write) resolve the written file from
+        # the same fields, so they get the identical normalization; there is no proposed
+        # CONTENT to normalize post-write — the content is already on disk.
         path = _proposed_write_path(tool_input)
         if path:
             args.setdefault("file_path", path)
@@ -172,10 +183,16 @@ def _proposed_write_path(tool_input: dict) -> str:
 
 
 def cc_block_output(hook_event_name: str, reason: str) -> dict:
-    """The CC block JSON for an event — PreToolUse uses permissionDecision, Stop uses decision."""
-    if hook_event_name == "Stop":
+    """The CC block JSON for an event — PreToolUse uses permissionDecision, Stop uses decision.
+
+    PostToolUse uses Stop's ``{"decision": "block", "reason": …}`` shape: the tool already
+    ran, so CC treats it as FEEDBACK — the reason is surfaced to the model (which is exactly
+    what a post-write linter wants) rather than denying an action that already happened.
+    A ``permissionDecision`` on PostToolUse would be silently ignored by CC.
+    """
+    if hook_event_name in ("Stop", "PostToolUse"):
         return {"decision": "block", "reason": reason}
-    # PreToolUse (and any future tool event) → structured permission deny.
+    # PreToolUse (and any future pre-action event) → structured permission deny.
     return {
         "hookSpecificOutput": {
             "hookEventName": hook_event_name,

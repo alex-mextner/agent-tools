@@ -44,6 +44,10 @@ BLOCK_RAW_PR_MERGE = (
 BACKGROUND_SUBAGENT_GATE = (
     _REPO / "agent-hooks" / "background-subagent-gate" / "background_subagent_gate.py"
 )
+# The post-write pair: format-on-write reformats silently, lint-on-write feeds findings
+# back as PostToolUse feedback.
+FORMAT_ON_WRITE = _REPO / "agent-hooks" / "format-on-write" / "format_on_write.py"
+LINT_ON_WRITE = _REPO / "agent-hooks" / "lint-on-write" / "lint_on_write.py"
 
 
 def _install_descriptor(hooks_dir: Path, *, hook_id: str, point: str, cmd: Path,
@@ -91,6 +95,15 @@ def test_point_for_event_maps_tool_to_logical_point():
     assert dispatch.point_for_event("PreToolUse", "Agent") == "pre-agent"
     assert dispatch.point_for_event("PreToolUse", "Task") == "pre-agent"
     assert dispatch.point_for_event("Stop", None) == "stop"
+    # a COMPLETED write maps to the reactive post-write point (format-on-write, lint-on-write)
+    assert dispatch.point_for_event("PostToolUse", "Write") == "post-write"
+    assert dispatch.point_for_event("PostToolUse", "Edit") == "post-write"
+    assert dispatch.point_for_event("PostToolUse", "MultiEdit") == "post-write"
+    assert dispatch.point_for_event("PostToolUse", "NotebookEdit") == "post-write"
+    # PostToolUse on a non-write tool has no logical point — pre-bash guards must never
+    # re-fire after the command already ran
+    assert dispatch.point_for_event("PostToolUse", "Bash") is None
+    assert dispatch.point_for_event("PostToolUse", "Read") is None
     # an unmapped tool (e.g. Read) on PreToolUse has no logical point → nothing fires
     assert dispatch.point_for_event("PreToolUse", "Read") is None
 
@@ -262,6 +275,31 @@ def test_cc_block_output_stop_is_decision_block():
     out = dispatch.cc_block_output("Stop", "stay")
     assert out["decision"] == "block"
     assert out["reason"] == "stay"
+
+
+def test_cc_block_output_posttooluse_is_decision_block_feedback():
+    """PostToolUse cannot deny a tool that already ran — its block shape is the FEEDBACK
+    form {decision, reason} (CC surfaces the reason to the model). A permissionDecision
+    here would be silently ignored by CC, turning lint feedback into a no-op."""
+    out = dispatch.cc_block_output("PostToolUse", "lint errors in a.ts")
+    assert out == {"decision": "block", "reason": "lint errors in a.ts"}
+    assert "hookSpecificOutput" not in out
+
+
+def test_to_v1_event_post_write_normalizes_notebook_path():
+    """post-write hooks resolve the written file from args.file_path/path — a NotebookEdit
+    must get the same path aliasing pre-write gets, or notebooks are never formatted/linted."""
+    cc = {"hook_event_name": "PostToolUse", "tool_name": "NotebookEdit",
+          "tool_input": {"notebook_path": "/n.ipynb", "new_source": "x=1"}}
+    v1 = dispatch.to_v1_event(cc, point="post-write")
+    assert v1["point"] == "post-write"
+    assert v1["args"]["file_path"] == "/n.ipynb"
+    assert v1["args"]["path"] == "/n.ipynb"
+    # …but NO content normalization post-write: the content is already ON DISK, and a
+    # synthesized args.content (from new_source/edits) would tempt post-write hooks into
+    # scanning the proposed text instead of the real file. Guards the pre-write/post-write
+    # split in to_v1_event.
+    assert "content" not in v1["args"]
 
 
 # ── clean-room subprocess proof: a guard BLOCKS, a benign call PASSES ──────────────────
@@ -653,6 +691,149 @@ def test_first_block_wins_collects_reason(tmp_path):
     out = json.loads(proc.stdout)
     reason = out["hookSpecificOutput"]["permissionDecisionReason"]
     assert "first-reason" in reason, out
+
+
+def _mk_lint_repo(tmp_path: Path, *, findings: bool) -> Path:
+    """A throwaway repo with a fake local oxlint (findings or clean) and one .ts file."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    binp = repo / "node_modules" / ".bin" / "oxlint"
+    binp.parent.mkdir(parents=True)
+    body = (
+        '#!/bin/sh\necho "a.ts:1:7 no-unused-vars: x is never used"\nexit 1\n'
+        if findings
+        else "#!/bin/sh\nexit 0\n"
+    )
+    binp.write_text(body)
+    binp.chmod(0o755)
+    (repo / "a.ts").write_text("const x=1\n")
+    return repo
+
+
+def test_post_write_lint_findings_surface_as_posttooluse_feedback(tmp_path):
+    """END-TO-END for the previously-dead post-write point (#160): the REAL lint-on-write
+    hook, installed as rig installs it, fired through the REAL dispatcher on a CC
+    PostToolUse Write event, feeds the linter findings back as {decision:block, reason}."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="lint-on-write", point="post-write",
+                        cmd=LINT_ON_WRITE, on_error="open")
+    repo = _mk_lint_repo(tmp_path, findings=True)
+    cc_event = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(repo / "a.ts"), "content": "const x=1\n"},
+        "cwd": str(repo),
+    }
+    proc = _run_dispatch("PostToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["decision"] == "block", out
+    assert "no-unused-vars" in out["reason"]
+    assert "a.ts" in out["reason"]
+
+
+def test_post_write_clean_file_emits_nothing(tmp_path):
+    """Same pipeline, clean file → the dispatcher stays silent (no feedback, no noise)."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="lint-on-write", point="post-write",
+                        cmd=LINT_ON_WRITE, on_error="open")
+    repo = _mk_lint_repo(tmp_path, findings=False)
+    cc_event = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(repo / "a.ts"), "content": "const x = 1\n"},
+        "cwd": str(repo),
+    }
+    proc = _run_dispatch("PostToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "", proc.stdout
+
+
+def test_post_write_format_then_lint_ordering(tmp_path):
+    """BOTH real post-write hooks coexist: format-on-write (priority 60) runs BEFORE
+    lint-on-write (70), so the linter sees the FORMATTED file; format-on-write never
+    blocks, so lint's feedback is what surfaces. The fake oxlint only reports findings
+    when the fake oxfmt's marker is present — proving the ordering, not just coexistence."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="format-on-write", point="post-write",
+                        cmd=FORMAT_ON_WRITE, on_error="open", priority=60)
+    _install_descriptor(hooks, hook_id="lint-on-write", point="post-write",
+                        cmd=LINT_ON_WRITE, on_error="open", priority=70)
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    bind = repo / "node_modules" / ".bin"
+    bind.mkdir(parents=True)
+    # fake formatter: append a marker to the (last-arg) file, exit 0
+    oxfmt = bind / "oxfmt"
+    oxfmt.write_text('#!/bin/sh\neval "f=\\${$#}"\necho "FORMATTED" >> "$f"\nexit 0\n')
+    oxfmt.chmod(0o755)
+    # fake linter: findings ONLY if the formatter's marker is already in the file
+    oxlint = bind / "oxlint"
+    oxlint.write_text(
+        '#!/bin/sh\neval "f=\\${$#}"\n'
+        'if grep -q FORMATTED "$f"; then echo "lint-finding-after-format"; exit 1; fi\nexit 0\n'
+    )
+    oxlint.chmod(0o755)
+    f = repo / "a.ts"
+    f.write_text("const x=1\n")
+    cc_event = {"hook_event_name": "PostToolUse", "tool_name": "Write",
+                "tool_input": {"file_path": str(f), "content": "const x=1\n"},
+                "cwd": str(repo)}
+    proc = _run_dispatch("PostToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["decision"] == "block", (proc.stdout, proc.stderr)
+    assert "lint-finding-after-format" in out["reason"]
+    assert "FORMATTED" in f.read_text()  # the formatter really ran first
+
+
+def test_post_write_format_on_write_stays_silent_even_on_formatter_error(tmp_path):
+    """format-on-write going LIVE must never turn a formatter failure into feedback noise:
+    a formatter that exits non-zero still yields a silent allow (empty dispatcher stdout)."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="format-on-write", point="post-write",
+                        cmd=FORMAT_ON_WRITE, on_error="open", priority=60)
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    bind = repo / "node_modules" / ".bin"
+    bind.mkdir(parents=True)
+    oxfmt = bind / "oxfmt"
+    oxfmt.write_text('#!/bin/sh\necho "syntax error" >&2\nexit 2\n')
+    oxfmt.chmod(0o755)
+    f = repo / "a.ts"
+    f.write_text("const x=1\n")
+    cc_event = {"hook_event_name": "PostToolUse", "tool_name": "Write",
+                "tool_input": {"file_path": str(f), "content": "const x=1\n"},
+                "cwd": str(repo)}
+    proc = _run_dispatch("PostToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "", proc.stdout
+
+
+def test_post_write_hook_not_fired_on_posttooluse_bash(tmp_path):
+    """PostToolUse Bash has no logical point — a post-write hook must NOT fire on it."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    # a post-write hook that would ALWAYS block if (wrongly) invoked
+    blocker = tmp_path / "always_block.py"
+    blocker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json,sys\n"
+        "sys.stdout.write(json.dumps({'hook_api':'agents-hooks/v1','decision':'block','message':'should never fire'}))\n"
+        "sys.exit(10)\n"
+    )
+    blocker.chmod(0o755)
+    _install_descriptor(hooks, hook_id="always-block", point="post-write",
+                        cmd=blocker, on_error="open")
+    cc_event = {"hook_event_name": "PostToolUse", "tool_name": "Bash",
+                "tool_input": {"command": "echo hi"}, "cwd": str(tmp_path)}
+    proc = _run_dispatch("PostToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "", proc.stdout
 
 
 if __name__ == "__main__":

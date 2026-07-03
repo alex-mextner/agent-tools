@@ -19,6 +19,7 @@ A single dispatcher CC calls once per event:
 
 ```
 python3 -m cc_hook_bridge PreToolUse   # for the Bash + Edit|Write matchers
+python3 -m cc_hook_bridge PostToolUse  # for the Edit|Write matcher (post-write)
 python3 -m cc_hook_bridge Stop
 ```
 
@@ -26,7 +27,8 @@ On each call it:
 
 1. reads the CC tool-call JSON from stdin (`tool_name`, `tool_input`, `cwd`, …);
 2. maps the `(event, tool)` to a logical `agents-hooks/v1` **point**
-   (`Bash`→`pre-bash`, `Write|Edit|MultiEdit|NotebookEdit`→`pre-write`, `Stop`→`stop`);
+   (PreToolUse: `Bash`→`pre-bash`, `Write|Edit|MultiEdit|NotebookEdit`→`pre-write`;
+   PostToolUse: `Write|Edit|MultiEdit|NotebookEdit`→`post-write`; `Stop`→`stop`);
 3. enumerates the installed descriptors in `~/.claude/hooks/*.json` for that point
    (sorted by `priority`, then `id`);
 4. translates the CC event into the v1 event each hook script reads
@@ -43,6 +45,7 @@ installed CC **2.1.177**:
 | ------------- | ------------------------------------------------------------------------------------------------------- |
 | `PreToolUse`  | exit 0 + `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"…"}}` |
 | `Stop`        | exit 0 + `{"decision":"block","reason":"…"}`                                                             |
+| `PostToolUse` | exit 0 + `{"decision":"block","reason":"…"}` — **feedback**: the tool already ran, the reason is surfaced to the model |
 
 **Why the structured JSON form, not exit 2?** The docs are explicit: *"You must choose one
 approach per hook… Claude Code only processes JSON on exit 0. If you exit 2, any JSON is
@@ -51,11 +54,11 @@ ignored."* Exit 2 blocks too, but discards the reason and only shows stderr. The
 hook's `message` straight to the model — strictly richer, and it matches the existing
 installed `rtk-rewrite.sh` PreToolUse hook's style.
 
-> **PostToolUse note.** The tool has already run by then, so PostToolUse *cannot* block it
-> (the docs are explicit). The bridge therefore wires only `PreToolUse` (real prevention)
-> and `Stop`. A future advisory PostToolUse point can map to `{"decision":"block"}` (stops
-> the turn, surfaces feedback) without un-running the tool — not wired today because no
-> shipped agent-hook needs it.
+> **PostToolUse note.** The tool has already run by then, so PostToolUse *cannot* un-run
+> it (the docs are explicit) — its `{"decision":"block"}` is **advisory feedback**: CC
+> surfaces the reason to the model. That is exactly the contract the `post-write` hooks
+> want (`format-on-write` reacts silently; `lint-on-write` uses the feedback channel to
+> put lint findings in front of the agent right after the write).
 
 ## Fail policy
 
@@ -87,6 +90,11 @@ dispatcher rig points at. Manual equivalent (what rig writes):
         "hooks": [{ "type": "command",
           "command": "python3 -m cc_hook_bridge PreToolUse" }] }
     ],
+    "PostToolUse": [
+      { "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [{ "type": "command",
+          "command": "python3 -m cc_hook_bridge PostToolUse" }] }
+    ],
     "Stop": [
       { "hooks": [{ "type": "command",
           "command": "python3 -m cc_hook_bridge Stop" }] }
@@ -115,8 +123,8 @@ updating all of them together:
   file-edit tool also needs adding to `_WRITE_TOOLS` *and* its payload field taught to
   **`_proposed_write_text`** (else its content is never scanned by the pre-write guards),
   *and* added to the rig-cli matcher `Edit|Write|MultiEdit|NotebookEdit`.
-- **`cc_block_output`** — the per-event block JSON. A new blocking event (beyond PreToolUse
-  / Stop) needs its block shape added here.
+- **`cc_block_output`** — the per-event block JSON. A new blocking event (beyond
+  PreToolUse / PostToolUse / Stop) needs its block shape added here.
 - **`_KNOWN_EVENTS`** — the typo guard in `main`.
 
 ## Proof it actually blocks
