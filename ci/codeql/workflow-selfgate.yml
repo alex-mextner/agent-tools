@@ -102,9 +102,18 @@ jobs:
               echo "No presence heuristic for '$LANGUAGE'; running analysis unconditionally."
               exit 0 ;;
           esac
-          if git ls-files | grep -qiE "$pattern"; then
+          # Count matching tracked files. NOTE: do NOT pipe `git ls-files` into `grep -q` —
+          # `grep -q` exits on the FIRST match and closes the pipe, so `git ls-files` (still
+          # writing the rest of a large file list) takes SIGPIPE and exits 141. Under
+          # `set -o pipefail` that 141 becomes the pipeline's status, the `if` takes the
+          # `else` branch, and the gate FALSELY reports "no source" — self-disabling CodeQL on
+          # exactly the big repos that most need it. `grep -c` consumes ALL of stdin (no early
+          # exit -> no SIGPIPE), prints the count, and exits 1 on zero matches; `|| true`
+          # keeps that benign 1 from tripping the pipeline status.
+          match_count="$(git ls-files | grep -ciE "$pattern" || true)"
+          if [ "${match_count:-0}" -gt 0 ]; then
             echo "has_source=true" >> "$GITHUB_OUTPUT"
-            echo "Found ${LANGUAGE} source — running CodeQL."
+            echo "Found ${LANGUAGE} source (${match_count} file(s)) — running CodeQL."
           else
             echo "has_source=false" >> "$GITHUB_OUTPUT"
             echo "::notice title=CodeQL ${LANGUAGE} skipped::No ${LANGUAGE} source found in this repo — skipping CodeQL for this language (nothing to scan). This is a clean skip, not a failure. Remove '${LANGUAGE}' from the matrix to drop this notice, or add source to enable the gate."

@@ -3,8 +3,8 @@
 # Dependency Graph (where actions/dependency-review-action can't run). Auto-detects the
 # package manager and runs its native audit, failing on high/critical advisories.
 #
-# This is the "what's already in the tree" audit. The PR-time "don't let a new bad dep IN"
-# gate is workflow.yml (dependency-review-action) — prefer that on public/GHAS repos.
+# This is the "what's already in the tree" audit. The CI wrapper that runs it as a
+# merge-blocking gate (against the PR's deps, tamper-resistantly) is workflow.yml in this slot.
 #
 # Detects, in order: bun, npm/pnpm/yarn (node), pip-audit (python), cargo-audit (rust),
 # govulncheck (go). Runs every ecosystem it finds a manifest for.

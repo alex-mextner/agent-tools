@@ -56,9 +56,17 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
         run: |
-          # Fetch the PR head object into the local repo so `git diff` can reach it. We do
-          # NOT check it out and NOT run anything from it — it's only diffed + grepped.
-          git fetch --no-tags --depth=1 origin "$HEAD_SHA"
+          # Fetch the PR head object (and the ancestry needed to reach its merge-base with the
+          # base branch) so `git diff base...head` can resolve. We do NOT check it out and NOT
+          # run anything from it — it's only diffed + grepped.
+          #
+          # Do NOT use --depth=1 here. A depth-1 fetch grafts the PR head as a shallow boundary
+          # (its parents hidden), so `git merge-base base $HEAD_SHA` fails and the three-dot
+          # `base...$HEAD_SHA` diff collapses to nothing — the scan then sees ZERO added lines
+          # and the gate silently passes every PR (no-op). The base checkout above is already
+          # fetch-depth: 0, so this fetch only pulls the PR-unique commits down to the (already
+          # present) merge-base — bounded by PR size, not full history.
+          git fetch --no-tags origin "$HEAD_SHA"
 
       # codeql[actions/cache-poisoning/poisonable-step]
       # Justified: same as above — this step only runs the trusted BASE-branch gate script

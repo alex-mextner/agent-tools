@@ -32,8 +32,9 @@ with an OSS license gate (`license-checker` / `cargo-deny` / `pip-licenses`) —
 
 ```bash
 cp ci/dependency-review/workflow.yml .github/workflows/dependency-review.yml
-# add the toolchain setup your ecosystems need (see the comments in workflow.yml);
-# ubuntu-latest already ships node+npm so npm-only repos need nothing extra.
+# setup-bun ships ENABLED (bot repos use bun.lock); add the toolchain for your other
+# ecosystems (see the comments in workflow.yml). ubuntu-latest already ships node+npm so
+# npm-only repos need nothing extra.
 
 # Run the same audit locally / in any other CI:
 sh ci/dependency-review/dep-audit.sh
@@ -41,6 +42,28 @@ sh ci/dependency-review/dep-audit.sh
 
 > If your repo already has its own dependency-audit job, you don't need this one — don't
 > double up.
+
+## Tamper-resistant in CI (`pull_request_target`)
+
+A merge-blocking gate must not run a copy of itself the PR can edit. Under the plain
+`pull_request` trigger BOTH the workflow file **and** `dep-audit.sh` come from the PR's own
+code, so a PR could neuter its own gating run (drop the audit step, `exit 0` the script). The
+workflow therefore uses **`pull_request_target`**: the workflow definition runs from the
+trusted **base** branch, and it executes the **base** copy of `dep-audit.sh` (checked out to
+`./base`) — never the PR's. The PR head is checked out to `./pr` only as **data**: the auditors
+*read* its lockfiles/manifests, they never build or run it.
+
+`pull_request_target` carries write-capable context, so the naive "checkout + run PR code"
+shape is the classic pwn-request RCE. This gate avoids it: `permissions: contents: read`, **no
+secrets** referenced (nothing to exfiltrate, no write access), and only the trusted base script
+runs. **Hard rule:** do not add a build / test / `npm install` / `go build` step — that would
+execute PR code under the privileged trigger. (`govulncheck` is the one auditor that compiles
+source; with a read-only token and zero secrets its blast radius is nil, but drop `go` from a
+security-sensitive matrix if that's a concern.) Caveat: the gate does not run on the PR that
+first *adds* it (base has no gate yet).
+
+The toolchain step (`setup-bun`, etc.) installs **trusted, SHA-pinned** actions — not PR code —
+so a `bun.lock` repo actually runs `bun audit` instead of fail-closing on a missing `bun`.
 
 ## Knobs (`dep-audit.sh`)
 

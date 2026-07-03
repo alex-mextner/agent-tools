@@ -8,18 +8,43 @@
 # feature, audits the WHOLE tree (not just the PR diff), and draws from the same advisory
 # databases — so vuln coverage is equal-or-better than the GHAS action.
 #
+# TAMPER-RESISTANCE — `pull_request_target`: a merge-BLOCKING gate must not run a copy of
+# itself the PR can edit. Under the plain `pull_request` trigger BOTH the workflow file AND
+# dep-audit.sh come from the PR's own code, so a PR could neuter its own gating run — delete
+# the audit step, or `exit 0` the script. `pull_request_target` runs the workflow definition
+# from the trusted BASE branch, and we run the BASE copy of dep-audit.sh — so neither the
+# workflow nor the gate script can be self-weakened by the PR under review.
+#
+#   The RCE trap: `pull_request_target` carries write-capable context, so naively checking out
+#   AND EXECUTING the PR's code under it is the classic "pwn-request" remote-code-execution.
+#   We avoid it by construction:
+#     • permissions stay `contents: read` and NO secrets are referenced — the token is
+#       read-only and there is nothing in the job env to exfiltrate;
+#     • the gate LOGIC that runs is the trusted BASE copy of dep-audit.sh; the PR's copy of the
+#       script is never executed;
+#     • the PR's tree is checked out only as DATA to audit — the auditors (bun/npm/pnpm/yarn
+#       audit, pip-audit, cargo-audit) READ the lockfiles/manifests; they do not build or run
+#       the project.
+#   HARD RULE: do NOT add a build / test / `npm install` / `go build` step here — that WOULD
+#   execute PR code under the privileged trigger. (govulncheck is the one auditor that compiles
+#   source; with a read-only token and zero secrets its blast radius is nil, but drop `go` from
+#   a security-sensitive matrix if even that is unacceptable.)
+#   Caveat: the gate does NOT run on the PR that first ADDS it (base has no gate yet).
+#
 # ONE GAP vs the GHAS action: it does NOT enforce a LICENSE allow/deny policy. If you need
 # that, add an OSS license gate (license-checker / cargo-deny / pip-licenses) — see the
 # ci/license-policy/ template and agent-tools#21.
 #
-# INSTALL: copy to .github/workflows/dependency-review.yml. Add the toolchain setup your
-# repo's ecosystems need (see the commented examples below). If your repo already has its
+# INSTALL: copy to .github/workflows/dependency-review.yml. setup-bun ships ENABLED below
+# because the bot repos this provisions into use bun.lock — without it a bun.lock repo
+# fail-CLOSES (dep-audit.sh can't find `bun`). Add/trim the toolchain for YOUR ecosystems (see
+# the commented examples) and pin every action to a commit SHA. If your repo already has its
 # own dependency-audit job, you don't need this one.
 
 name: dependency-review
 
 on:
-  pull_request:
+  pull_request_target:
   push:
     branches: ["**"]
 
@@ -31,18 +56,41 @@ jobs:
     name: dependency-review
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout BASE (trusted gate script)
+        # Default ref under pull_request_target = the BASE branch (on `push` it's the pushed
+        # commit). This provides the TRUSTED copy of dep-audit.sh that actually runs — the PR's
+        # copy is never executed. Checked out under ./base so the PR tree (./pr) can't clobber
+        # it.
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: base
 
-      # Set up the toolchain(s) dep-audit.sh needs for YOUR repo's ecosystems. Pin each
-      # action to a commit SHA. ubuntu-latest already ships node+npm, so npm-only repos
-      # need nothing extra. Examples:
-      #   - uses: oven-sh/setup-bun@<pinned-sha>      # bun.lock     -> bun audit
+      # codeql[actions/untrusted-checkout/medium]
+      # Justified: the PR head is checked out ONLY as DATA for the auditors to READ (lockfiles
+      # / manifests). The gate logic that runs is the BASE script (above), never this tree; no
+      # build/test/install step touches it (see the HARD RULE in the header); the token is
+      # read-only and no secrets are in the job. So this privileged-trigger checkout is safe by
+      # construction — suppressed greppably rather than left to block the `actions` self-gate.
+      - name: Checkout PR head (dependency manifests — audited as data, never built)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: pr
+
+      # Toolchain the auditors need. setup-bun is ON by default: without it a bun.lock repo
+      # fail-CLOSES (dep-audit.sh can't find `bun` -> gate red). ubuntu-latest already ships
+      # node+npm, so npm-only repos need nothing extra. Pin each action to a commit SHA. Add
+      # more for your ecosystems:
       #   - uses: actions/setup-node@<pinned-sha>     # package-lock -> npm/pnpm/yarn audit
       #   - uses: actions/setup-python@<pinned-sha>   # pyproject    -> pip-audit (pipx install pip-audit)
       #   - run: rustup default stable                # Cargo.lock   -> cargo audit (cargo install cargo-audit)
+      - name: Set up bun (bun.lock -> bun audit)
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
       - name: Dependency audit (OSS — whole-tree vulns, fail on high+)
-        # dep-audit.sh fails CLOSED if it finds a manifest whose auditor isn't installed
-        # (set DEP_AUDIT_ALLOW_MISSING=1 to intentionally skip a missing ecosystem).
-        run: sh ci/dependency-review/dep-audit.sh
+        # Run the TRUSTED base script against the PR's checked-out deps (cwd = ./pr). The PR's
+        # own copy of dep-audit.sh is NOT executed. dep-audit.sh fails CLOSED if it finds a
+        # manifest whose auditor isn't installed (DEP_AUDIT_ALLOW_MISSING=1 to skip a missing
+        # ecosystem).
+        working-directory: pr
+        run: sh "$GITHUB_WORKSPACE/base/ci/dependency-review/dep-audit.sh"
