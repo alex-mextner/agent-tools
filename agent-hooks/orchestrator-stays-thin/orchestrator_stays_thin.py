@@ -109,8 +109,14 @@ ORCH_READONLY = re.compile(
 # after env-var assignment prefixes (`GH_PAGER=cat gh ship 605`). Anchored on the segment's
 # argv like the other head tokens, NEVER matched as a substring in text: a needle such as
 # `grep 'gh ship' log` must not self-exempt a chain (#159).
+# The env-prefix value is a single unambiguous `\S*` (a run of non-space) — NOT an alternation with
+# quoted forms. An earlier `(?:'…'|"…"|\S*)` overlapped `\S*` with the quoted branches and caused
+# catastrophic backtracking on `A="" A="" …` (CodeQL py/redos, HIGH). `\S*` and the trailing `\s+`
+# are disjoint char classes, so the repeat is linear. Cost: an env value containing a SPACE
+# (`X="a b" gh ship`, rare on a ship line) no longer gets the fast path — it falls to ordinary
+# judgement. Realistic prefixes (`GH_PAGER=cat`, `GH_TOKEN=x`, `X="cat"`) still match.
 GH_SHIP_HEAD = re.compile(
-    r"^\s*(?:[A-Za-z_]\w*=(?:'[^']*'|\"[^\"]*\"|\S*)\s+)*gh\s+ship(?=\s|$)"
+    r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*gh\s+ship(?=\s|$)"
 )
 # The only extra companion a release line may carry besides read-only inspection: `cd`
 # changes no repo state, and `cd <repo> && gh ship <PR> | tail` is a common ship shape.
