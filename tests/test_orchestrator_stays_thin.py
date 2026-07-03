@@ -999,3 +999,21 @@ def test_report_verify_allowlist_surface():
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_double_quoted_substitution_is_live_and_judged(tmp_path, monkeypatch):
+    """Quote SEMANTICS (#164 review P2): `$(…)`/backticks EXECUTE inside DOUBLE quotes, so a
+    double-quoted mutating substitution must be extracted and judged (warn-then-block); a
+    SINGLE-quoted one is literal text and stays allowed."""
+    assert ost._is_implementation_bash('gh ship "$(gh api repos/o/r/issues -X POST -f title=x)"') is True
+    assert ost._is_implementation_bash('gh ship 605 --note "$(git push origin main)" | tail -3') is True
+    assert ost._is_implementation_bash('tg "`git commit -m x`"') is True
+    assert ost._is_implementation_bash("tg 'saw $(git push) in logs'") is False
+    # read-only substitutions stay allowed in either quote form
+    assert ost._is_implementation_bash('gh pr view "$(gh pr list --json number -q .n)"') is False
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": 'gh ship "$(gh api repos/o/r/issues -X POST -f title=x)"'}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"

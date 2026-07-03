@@ -381,19 +381,28 @@ def _norm_segments(command: str) -> list[str]:
     return [_strip_wrappers(s) for s in _split_chain(command)]
 
 
-def _blank_quoted(command: str) -> str:
-    """Replace the CONTENT of '…'/"…" spans with spaces (keeping the quote chars) so a whole-string
-    veto scan (SUBSTITUTION / BG_AMP) does not fire on a shell metachar that lives INSIDE a quoted
-    argument — a `gh ship 605 --title "a & b"` or a `tg 'done; shipped'` must not forfeit the
-    orchestration free pass. Best-effort, matching `_split_chain`: backslash-escapes are out of
-    scope (this is a discipline heuristic, not a security boundary). SYNC agent-tools#159."""
+def _blank_single_quoted(command: str) -> str:
+    """Blank the CONTENT of SINGLE-quoted spans only (keeping the quote chars).
+
+    Feeds the substitution scan (`_substitution_inners`), so the blanking must follow shell quote
+    SEMANTICS (#164 review P2): inside single quotes everything is literal — a `tg 'saw $(x)'` is
+    text, blank it. Inside DOUBLE quotes `$(…)` and backticks still EXECUTE, so double-quoted
+    content is kept INTACT for the scan — `gh ship "$(gh api … -X POST)"` must have its inner
+    command extracted and judged, not erased. (An earlier version blanked both quote kinds, which
+    erased exactly the common quoted-mutation form.) Conservative side effect: a literal `<(…)`
+    inside double quotes (where process substitution does NOT execute) is still extracted and may
+    over-flag — the safe direction for a gate. Best-effort, matching `_split_chain`:
+    backslash-escapes are out of scope (discipline heuristic, not a security boundary).
+    SYNC agent-tools#159/#162."""
     out: list[str] = []
     quote: str | None = None
     for c in command:
         if quote is not None:
-            out.append(c if c == quote else " ")
             if c == quote:
                 quote = None
+                out.append(c)
+            else:
+                out.append(" " if quote == "'" else c)
         elif c in ("'", '"'):
             quote = c
             out.append(c)
@@ -609,12 +618,14 @@ _SUBST_INNER = re.compile(r"\$\(([^()]*)\)|`([^`]*)`|[<>]\(([^()]*)\)")
 
 
 def _substitution_inners(command: str) -> list[str]:
-    """Inner commands of the UNQUOTED substitutions in ``command`` (scanned on a quote-blanked copy,
-    so a substitution inside single/double quotes is not extracted). Lets a mutation smuggled in a
-    substitution head-position (`gh ship $(gh api -X POST …)`) still be judged: the outer segment
-    head is `gh ship`, so only scanning the inner catches the `gh api` mutation (codex review)."""
+    """Inner commands of the LIVE substitutions in ``command``. Scanned on a copy with only
+    SINGLE-quoted spans blanked: single-quoted text is literal (never a substitution), but a
+    substitution inside DOUBLE quotes still EXECUTES (`gh ship "$(gh api … -X POST)"`) and must be
+    extracted and judged (#164 review P2). Lets a mutation smuggled in a substitution head-position
+    (`gh ship $(gh api -X POST …)`) still be judged: the outer segment head is `gh ship`, so only
+    scanning the inner catches the `gh api` mutation (codex review)."""
     inners: list[str] = []
-    for m in _SUBST_INNER.finditer(_blank_quoted(command)):
+    for m in _SUBST_INNER.finditer(_blank_single_quoted(command)):
         inner = next((g for g in m.groups() if g), "")
         if inner.strip():
             inners.append(inner)
