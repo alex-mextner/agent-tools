@@ -266,5 +266,81 @@ def test_empty_command_allows(tmp_path, monkeypatch):
     assert code == 0 and _decision(out) == "allow"
 
 
+# ── the bridge execs `cmd` DIRECTLY (subprocess.run([cmd, ...])) — a missing shebang is an
+# exec-format error resolved via on_error=open, silently ALLOWING every checkout this hook
+# exists to block. `importlib`-loading (every test above) can't catch this — only a real
+# subprocess exec of the file exercises the actual bridge invocation shape ──────────────────────
+
+def test_hook_is_directly_executable(tmp_path):
+    """Regression for the missing-shebang bug: run the hook file itself as an executable
+    (exactly how ``cc_hook_bridge/dispatch.py`` invokes it), not via ``import``. Before the fix
+    this file started with a bare docstring, no ``#!``, so the OS fell back to running it as a
+    shell script — the docstring/code was executed as shell commands (observed: it literally
+    ran a stray `git checkout <branch>` parsed out of the docstring text)."""
+    repo = _make_repo(tmp_path)
+    event = {"cwd": str(repo), "args": {"command": "git checkout feat/x"}}
+    env = {k: v for k, v in os.environ.items() if k not in _ENV_KEYS}
+    proc = subprocess.run(
+        [str(_HOOK)],
+        input=json.dumps(event),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=5,
+    )
+    assert proc.returncode == ppw.BLOCK_EXIT_CODE, (proc.returncode, proc.stdout, proc.stderr)
+    assert json.loads(proc.stdout)["decision"] == "block"
+
+
+# ── a leading shell VAR=val assignment must not defeat classification ───────────────────────
+
+def test_leading_unrelated_env_assignment_still_denies(tmp_path, monkeypatch):
+    """`GIT_TRACE=1 git checkout feat/x` — an unrelated leading assignment — must still be
+    recognized and BLOCKED, not silently allowed because `toks[0] != "git"`."""
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, "GIT_TRACE=1 git checkout feat/x", monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_leading_escape_hatch_set_to_zero_still_denies(tmp_path, monkeypatch):
+    """`RIG_ALLOW_MAIN_EDIT=0 git checkout feat/x` — an explicit non-"1" value inline — must
+    still deny; the classification fix must not accidentally treat ANY leading assignment as
+    granting the escape hatch."""
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, "RIG_ALLOW_MAIN_EDIT=0 git checkout feat/x", monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_inline_escape_hatch_allows(tmp_path, monkeypatch):
+    """The README's documented one-liner shape — `RIG_ALLOW_MAIN_EDIT=1 ... git checkout x` —
+    must actually grant the escape hatch, even though this hook's own os.environ never sees an
+    inline shell assignment (it runs as a separate process before bash executes the command)."""
+    repo = _make_repo(tmp_path)
+    out, code = _run(
+        repo,
+        'RIG_ALLOW_MAIN_EDIT=1 RIG_ALLOW_MAIN_EDIT_REASON="deliberate, worktree overkill" '
+        "git checkout feat/x",
+        monkeypatch,
+    )
+    assert code == 0 and _decision(out) == "allow"
+    msg = json.loads(out)["message"].lower()
+    assert "escape hatch" in msg
+    assert "deliberate, worktree overkill" in msg
+
+
+def test_inline_escape_hatch_overrides_env_allow_to_deny(tmp_path, monkeypatch):
+    """An explicit inline `RIG_ALLOW_MAIN_EDIT=0` re-asserts the block even when the AMBIENT
+    process env already has the escape hatch on — inline is a per-command override, matching
+    shell `VAR=val cmd` precedence."""
+    repo = _make_repo(tmp_path)
+    out, code = _run(
+        repo,
+        "RIG_ALLOW_MAIN_EDIT=0 git checkout feat/x",
+        monkeypatch,
+        {"RIG_ALLOW_MAIN_EDIT": "1"},
+    )
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))

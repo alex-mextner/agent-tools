@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """agents-hooks/v1 pre-bash hook — pin the repo's PRIMARY worktree to its default branch.
 
 Incident this closes (Alex tg#6462/tg#6477, 2026-07-04): an agent doing HYP-917 work ran
@@ -28,7 +29,12 @@ PER-REPO, opt-in — reuses the SAME `agent_hooks.worktree_only` knob as `worktr
 RIG_WORKTREE_ONLY > rig.yaml agent_hooks.worktree_only > default OFF).
 
 Escape hatch (mirrors worktree-only-writes): RIG_ALLOW_MAIN_EDIT=1 (+ optional
-RIG_ALLOW_MAIN_EDIT_REASON) allows the one-off deliberate checkout.
+RIG_ALLOW_MAIN_EDIT_REASON) allows the one-off deliberate checkout. Unlike worktree-only-writes,
+this hook ALSO honors that assignment written inline on the command itself (`RIG_ALLOW_MAIN_EDIT=1
+git checkout x`, the one-off shape this file's README documents) — this hook runs as a separate
+process before the bash command executes, so an inline `VAR=val` prefix never reaches its own
+os.environ the normal way; `_escape_reason` reads it out of the parsed command text instead (see
+`_classify_git_segment`'s `leading_env`).
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; args.command/cmd (the bash string); event.cwd is the shell dir.
@@ -53,6 +59,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess  # noqa: S404 — fixed git argv, no shell
 import sys
@@ -187,10 +194,25 @@ def worktree_only_enabled(cwd: str) -> bool:
     return _agent_hooks_bool(text, CONFIG_KEY, default=False)
 
 
-def _escape_reason() -> str | None:
-    if os.environ.get("RIG_ALLOW_MAIN_EDIT") == "1":
-        return (os.environ.get("RIG_ALLOW_MAIN_EDIT_REASON") or "").strip() or "no reason given"
-    return None
+def _escape_reason(inline_env: dict[str, str] | None = None) -> str | None:
+    """RIG_ALLOW_MAIN_EDIT=1 grants the one-off escape hatch. Checked in BOTH this hook's own
+    process env (a real, session-wide `export`) AND any leading `VAR=val` shell assignment on
+    the offending segment itself (`inline_env`, from `_classify_git_segment`) — because this
+    hook fires as a SEPARATE process before the bash command runs, a `RIG_ALLOW_MAIN_EDIT=1 git
+    checkout x` shell prefix (the exact shape the README documents as "the one-off deliberate
+    checkout") never reaches this process's os.environ; it only ever exports into the child
+    process bash eventually starts for `git`. Without reading it out of the command text too,
+    the documented escape hatch would silently never fire. `inline_env` wins when present (an
+    explicit per-command value, matching shell precedence) — so `RIG_ALLOW_MAIN_EDIT=0` inline
+    can re-assert the block even under a session-wide export=1."""
+    inline = inline_env or {}
+    value = inline.get("RIG_ALLOW_MAIN_EDIT", os.environ.get("RIG_ALLOW_MAIN_EDIT"))
+    if value != "1":
+        return None
+    reason = inline.get("RIG_ALLOW_MAIN_EDIT_REASON")
+    if reason is None:
+        reason = os.environ.get("RIG_ALLOW_MAIN_EDIT_REASON") or ""
+    return reason.strip() or "no reason given"
 
 
 # ── primary-vs-linked worktree detection (the piece worktree-only-writes lacks) ─────────────
@@ -270,22 +292,43 @@ def _split_chain(command: str) -> list[str]:
 _GIT_GLOBAL_OPT_ARG = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"}
 )
+# A leading shell assignment (`VAR=val`) in front of the real command — `GIT_TRACE=1 git
+# checkout x`, or the README's own `RIG_ALLOW_MAIN_EDIT=1 git checkout x` escape-hatch shape.
+_ASSIGN_RE = re.compile(r"^\w+=")
 
 
-def _classify_git_segment(segment: str) -> tuple[str, list[str], str | None] | None:
-    """If ``segment``'s head is ``git``, return (subcommand, rest_tokens, -C override), else None.
+def _classify_git_segment(
+    segment: str,
+) -> tuple[str, list[str], str | None, dict[str, str]] | None:
+    """If ``segment``'s head is ``git`` (after any leading assignments), return (subcommand,
+    rest_tokens, -C override, leading_env), else None.
 
-    Skips leading global options (so `git -C d checkout x` and `git -c k=v checkout x` still
-    find the real subcommand); records a `-C <dir>` override so a cross-repo checkout is judged
-    against THAT repo, not the shell cwd (mirrors worktree-only-writes' target-dir principle).
+    Leading `VAR=val` shell assignments are skipped BEFORE looking for the `git` token — a
+    pre-bash event sees command-local assignments verbatim in `args.command` (they are never
+    stripped by a shell, since no shell has run yet), so without this skip a segment like
+    `GIT_TRACE=1 git checkout x` has `toks[0] == "GIT_TRACE=1"`, is classified as "not git" and
+    ignored entirely — silently ALLOWING the exact checkout this hook exists to block, for ANY
+    unrelated leading assignment. The skipped assignments are returned as `leading_env` so the
+    caller can also honor an inline `RIG_ALLOW_MAIN_EDIT=1` (see `_escape_reason`).
+
+    Also skips leading global options (so `git -C d checkout x` and `git -c k=v checkout x`
+    still find the real subcommand); records a `-C <dir>` override so a cross-repo checkout is
+    judged against THAT repo, not the shell cwd (mirrors worktree-only-writes' target-dir
+    principle).
     """
     try:
         toks = shlex.split(segment)
     except ValueError:
         return None
-    if not toks or toks[0].rsplit("/", 1)[-1] != "git":
+    leading_env: dict[str, str] = {}
+    i = 0
+    while i < len(toks) and _ASSIGN_RE.match(toks[i]):
+        key, _, val = toks[i].partition("=")
+        leading_env[key] = val
+        i += 1
+    if i >= len(toks) or toks[i].rsplit("/", 1)[-1] != "git":
         return None
-    i = 1
+    i += 1
     cwd_override: str | None = None
     while i < len(toks) and toks[i].startswith("-"):
         opt = toks[i]
@@ -296,7 +339,7 @@ def _classify_git_segment(segment: str) -> tuple[str, list[str], str | None] | N
             i += 1
     if i >= len(toks):
         return None
-    return toks[i], toks[i + 1:], cwd_override
+    return toks[i], toks[i + 1:], cwd_override, leading_env
 
 
 def _switch_target(subcommand: str, toks: list[str]) -> str | None:
@@ -353,7 +396,7 @@ def main() -> int:  # noqa: PLR0911 — a linear allow/allow/allow/block ladder 
         classified = _classify_git_segment(segment)
         if classified is None:
             continue
-        subcommand, rest, cwd_override = classified
+        subcommand, rest, cwd_override, leading_env = classified
         if subcommand not in ("checkout", "switch"):
             continue
         target = _switch_target(subcommand, rest)
@@ -381,7 +424,7 @@ def main() -> int:  # noqa: PLR0911 — a linear allow/allow/allow/block ladder 
         if not primary:
             continue  # None (undetermined) or False (a linked worktree) → fail open / allowed
 
-        reason = _escape_reason()
+        reason = _escape_reason(leading_env)
         if reason:
             warn(f"primary-worktree checkout allowed via RIG_ALLOW_MAIN_EDIT ({reason})")
             emit("allow", f"primary-worktree checkout allowed via escape hatch ({reason})")
