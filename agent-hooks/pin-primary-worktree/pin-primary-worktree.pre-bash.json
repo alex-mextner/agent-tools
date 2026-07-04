@@ -1,0 +1,9 @@
+{
+  "id": "pin-primary-worktree",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/pin-primary-worktree/pin_primary_worktree.py",
+  "priority": 40,
+  "timeout_ms": 3000,
+  "on_error": "open",
+  "description": "Pins the repo's PRIMARY worktree to its default branch: BLOCKS a `git checkout`/`git switch` that would move the primary checkout (never a `git worktree add` linked worktree) onto anything but the default branch. Complements worktree-only-writes, which blocks the Edit/Write but never sees the checkout itself, and — once on a feature branch — wrongly treats that as 'exactly where authoring belongs' regardless of WHICH worktree it is. PER-REPO opt-in: shares the worktree-only-writes.worktree_only knob (env RIG_WORKTREE_ONLY or rig.yaml agent_hooks.worktree_only:true); default OFF. Escape hatch: RIG_ALLOW_MAIN_EDIT=1. on_error=open: a git/parse failure fails open (allows). Alex tg#6462/tg#6477."
+}
