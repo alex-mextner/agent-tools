@@ -49,12 +49,46 @@ Shares the **same** knob as `worktree-only-writes` — one feature, one flag:
 2. the repo's committed `rig.yaml` → `agent_hooks.worktree_only: true`.
 3. default OFF.
 
-## Escape hatch
+## No self-service bypass — external approval only
 
-```bash
-RIG_ALLOW_MAIN_EDIT=1 RIG_ALLOW_MAIN_EDIT_REASON="deliberate, worktree overkill" \
-  git checkout some-branch
+There is **no** env-var or inline escape hatch for this checkout guard any more. The old
+`RIG_ALLOW_MAIN_EDIT=1` bypass let the very agent this hook constrains grant itself an
+exception — security theater, not a permission gate (Alex tg#6554). It was removed here.
+(The sibling `worktree-only-writes` pre-write hook still honors `RIG_ALLOW_MAIN_EDIT` — the
+same self-service pattern, tracked as a separate follow-up cleanup; this PR is scoped to the
+two `pre-bash` guards.)
+
+The block is now **deny-by-default**. A repo owner can wire a real external-approval path in
+the committed, code-reviewed `rig.yaml`:
+
+```yaml
+agent_hooks:
+  worktree_only: true
+  approval_cmd: "/path/to/approve.sh"   # optional; run when a block would fire
+  approval_cmd_timeout_s: 5             # optional; default 5.0, capped at 6.0
 ```
+
+`agent_hooks.approval_cmd` is a **single, shared key** — the same `approval_cmd` is read by
+this hook AND by `block-reset-hard`. A repo that wants different handling per guard should
+point `approval_cmd` at one dispatcher script that branches on `RIG_APPROVAL_HOOK`
+(`pin-primary-worktree` vs `block-reset-hard`) and `RIG_APPROVAL_KIND`.
+
+When set, the hook runs `approval_cmd` as the block is about to fire and **allows only on exit
+0**; a nonzero exit, an error, or a timeout all mean **denied**. With nothing configured, the
+block simply stands. The command string comes only from `rig.yaml` (never from the agent or
+the offending command), and context is passed to it as environment variables —
+`RIG_APPROVAL_HOOK`, `RIG_APPROVAL_KIND` (`checkout`/`switch`), `RIG_APPROVAL_TARGET` (the
+branch), `RIG_APPROVAL_CWD`, `RIG_APPROVAL_COMMAND` — never string-interpolated, so there is no
+injection surface. This is the intended integration point for an eventual Telegram-backed
+"ask Alex and wait for a real reply" approver (owned by the trusted `tg-ctl` daemon).
+
+> `approval_cmd` is read with the same minimal, stdlib-only rig.yaml scanner used for
+> `worktree_only` (these hooks import no YAML library). It is a single-line scalar: quote the
+> value, and avoid a literal `#` or a trailing nested-quote in it (point `approval_cmd` at a
+> script path instead of inlining a complex shell one-liner).
+
+**Agents: ask, don't self-grant.** If you have a genuine reason for a primary-worktree
+checkout, ask the human directly — you can no longer flip your own bypass.
 
 ## Known scope limits (heuristic, not a sandbox)
 
@@ -66,7 +100,8 @@ RIG_ALLOW_MAIN_EDIT=1 RIG_ALLOW_MAIN_EDIT_REASON="deliberate, worktree overkill"
   command risks false positives for a first cut.
 - `git checkout .` / a bare path restore is excluded; an unusual `git checkout <treeish>
   <path>` with no `--` (ambiguous even to git itself) can still be misclassified as a branch
-  switch — the escape hatch covers that rare case.
+  switch — a false block on that rare shape now requires either doing the checkout in a linked
+  worktree or a repo-owner `approval_cmd`, since there is no longer a self-service override.
 
 ## Test
 
