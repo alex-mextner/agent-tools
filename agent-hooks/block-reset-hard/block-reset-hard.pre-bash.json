@@ -1,0 +1,9 @@
+{
+  "id": "block-reset-hard",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/block-reset-hard/block_reset_hard.py",
+  "priority": 10,
+  "timeout_ms": 3000,
+  "on_error": "closed",
+  "description": "Blocks `git reset --hard` and `git clean` with a real `-f`/`--force` flag (alone or clustered with `-d`/`-x`) — both irreversibly wipe uncommitted/untracked work with no undo. Allows `git checkout -- <file>`/`git restore <file>`, bare/`--mixed`/`--soft` reset, and `git clean -n`/no-force. Escape hatch: ALLOW_GIT_RESET_HARD=1 + ALLOW_GIT_RESET_HARD_REASON='why', or an inline `# no-reset-guard: why` sentinel. on_error=closed: if the check itself fails, deny rather than let a destructive reset/clean through."
+}
