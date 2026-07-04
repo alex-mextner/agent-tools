@@ -3,7 +3,8 @@
 Covers the doctrine: in an ENROLLED repo's PRIMARY worktree, `git checkout`/`git switch` to
 anything but the default branch is DENIED; the same command inside a LINKED worktree (a real
 `git worktree add` tree) is ALLOWED; checking back OUT to the default branch is always allowed;
-an un-enrolled repo is never blocked; the escape hatch allows a deliberate switch; a path-restore
+an un-enrolled repo is never blocked; the old self-service escape hatch is DEAD (deny-by-default;
+a rig.yaml-configured approval_cmd exit-0 allows, unconfigured/nonzero/timeout deny); a path-restore
 form (`checkout -- file`, `checkout .`) is not mistaken for a branch switch; a chain command finds
 the offending segment; a `-C <dir>` cross-repo checkout is judged against THAT repo, not cwd.
 
@@ -54,7 +55,14 @@ def _git(repo: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
-def _make_repo(tmp_path: Path, *, branch: str = "main", enroll: bool = True) -> Path:
+def _make_repo(
+    tmp_path: Path,
+    *,
+    branch: str = "main",
+    enroll: bool = True,
+    approval_cmd: str | None = None,
+    approval_timeout: str | None = None,
+) -> Path:
     """A real git repo on ``branch`` with one commit and (by default) an enrolling rig.yaml."""
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -62,7 +70,12 @@ def _make_repo(tmp_path: Path, *, branch: str = "main", enroll: bool = True) -> 
     _git(repo, "config", "user.email", "t@t.t")
     _git(repo, "config", "user.name", "t")
     if enroll:
-        (repo / "rig.yaml").write_text("agent_hooks:\n  worktree_only: true\n")
+        lines = ["agent_hooks:", "  worktree_only: true"]
+        if approval_cmd is not None:
+            lines.append(f"  approval_cmd: {approval_cmd}")
+        if approval_timeout is not None:
+            lines.append(f"  approval_cmd_timeout_s: {approval_timeout}")
+        (repo / "rig.yaml").write_text("\n".join(lines) + "\n")
     (repo / "seed.txt").write_text("x")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", "seed")
@@ -216,13 +229,105 @@ def test_dash_c_cross_repo_not_enrolled_allows(tmp_path, monkeypatch):
     assert code == 0 and _decision(out) == "allow"
 
 
-# ── ESCAPE hatch ──────────────────────────────────────────────────────────────────────────────
+# ── regression: the OLD self-service escape hatch is DEAD (env AND inline) ──────────────────
 
-def test_escape_hatch_allows(tmp_path, monkeypatch):
+def test_env_escape_hatch_no_longer_bypasses(tmp_path, monkeypatch):
+    """RIG_ALLOW_MAIN_EDIT=1 as a real process env var must NO LONGER allow the checkout —
+    the self-service bypass was removed (Alex tg#6554)."""
     repo = _make_repo(tmp_path)
-    out, code = _run(repo, "git checkout feat/x", monkeypatch, {"RIG_ALLOW_MAIN_EDIT": "1"})
+    out, code = _run(
+        repo, "git checkout feat/x", monkeypatch,
+        {"RIG_ALLOW_MAIN_EDIT": "1", "RIG_ALLOW_MAIN_EDIT_REASON": "deliberate"},
+    )
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_inline_escape_hatch_no_longer_bypasses(tmp_path, monkeypatch):
+    """`RIG_ALLOW_MAIN_EDIT=1 git checkout feat/x` (inline VAR=val prefix) must still be
+    classified as a git checkout (the leading-assignment skip stays) AND still BLOCK — the
+    inline bypass is gone (Alex tg#6554)."""
+    repo = _make_repo(tmp_path)
+    out, code = _run(
+        repo,
+        'RIG_ALLOW_MAIN_EDIT=1 RIG_ALLOW_MAIN_EDIT_REASON="deliberate" git checkout feat/x',
+        monkeypatch,
+    )
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+# ── external approval_cmd: unconfigured denies, exit-0 allows, nonzero/timeout deny ─────────
+
+def test_approval_unconfigured_denies_no_subprocess(tmp_path, monkeypatch):
+    """No approval_cmd in rig.yaml → deny, and no approval subprocess is spawned. The approval
+    path spawns via subprocess.Popen(shell=True); git plumbing uses subprocess.run([...]) with a
+    list argv, so counting shell=True Popen calls isolates the approval invocation."""
+    import subprocess as _sub
+    calls = {"n": 0}
+    real_popen = _sub.Popen
+
+    def _counting_popen(*a, **k):
+        if k.get("shell"):
+            calls["n"] += 1
+        return real_popen(*a, **k)
+
+    monkeypatch.setattr(ppw.subprocess, "Popen", _counting_popen)
+    repo = _make_repo(tmp_path)
+    out, code = _run(repo, "git checkout feat/x", monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert calls["n"] == 0
+    assert "no automatic bypass" in json.loads(out)["message"].lower()
+
+
+def test_approval_configured_exit0_allows(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path, approval_cmd='"printf approved-by-owner"')
+    out, code = _run(repo, "git checkout feat/x", monkeypatch)
     assert code == 0 and _decision(out) == "allow"
-    assert "escape hatch" in json.loads(out)["message"].lower()
+    assert "approved-by-owner" in json.loads(out)["message"]
+
+
+def test_approval_configured_nonzero_denies(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path, approval_cmd='"exit 3"')
+    out, code = _run(repo, "git checkout feat/x", monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_approval_configured_timeout_denies(tmp_path, monkeypatch):
+    """A hanging approval_cmd past approval_cmd_timeout_s → deny (never falls through to
+    on_error=open)."""
+    repo = _make_repo(tmp_path, approval_cmd='"sleep 5"', approval_timeout="0.2")
+    out, code = _run(repo, "git checkout feat/x", monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_backgrounded_approval_cmd_times_out_and_denies(tmp_path, monkeypatch):
+    """pin is on_error=open — the class this change removes. An approval_cmd that exits 0 but
+    backgrounds a child holding the stdout pipe (`sleep 5 &`) must be SIGKILLed (process group)
+    on the internal timeout and DENY, not hang until the dispatcher's manifest budget kills the
+    hook into a silent ALLOW. Also asserts it returns fast."""
+    import time
+    repo = _make_repo(tmp_path, approval_cmd='"sleep 5 &"', approval_timeout="0.3")
+    start = time.monotonic()
+    out, code = _run(repo, "git checkout feat/x", monkeypatch)
+    elapsed = time.monotonic() - start
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert elapsed < 3.0, f"hook hung {elapsed:.1f}s — backgrounded child held the pipe past timeout"
+
+
+def test_approval_cmd_receives_context_env(tmp_path, monkeypatch):
+    """The approval_cmd sees RIG_APPROVAL_TARGET / RIG_APPROVAL_KIND / RIG_APPROVAL_HOOK
+    (dynamic data via env, not string-interpolated) — proving the trust boundary."""
+    marker = tmp_path / "ctx.txt"
+    script = tmp_path / "approve.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s|%s|%s" "$RIG_APPROVAL_KIND" "$RIG_APPROVAL_TARGET" "$RIG_APPROVAL_HOOK" > "{marker}"\n'
+        "exit 0\n"
+    )
+    script.chmod(0o755)
+    repo = _make_repo(tmp_path, approval_cmd=f'"{script}"')
+    out, code = _run(repo, "git checkout feat/x", monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+    assert marker.read_text() == "checkout|feat/x|pin-primary-worktree"
 
 
 # ── `git checkout -` (previous branch) is resolved via @{-1}, not string-blind ───────────────
@@ -299,46 +404,6 @@ def test_leading_unrelated_env_assignment_still_denies(tmp_path, monkeypatch):
     recognized and BLOCKED, not silently allowed because `toks[0] != "git"`."""
     repo = _make_repo(tmp_path)
     out, code = _run(repo, "GIT_TRACE=1 git checkout feat/x", monkeypatch)
-    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
-
-
-def test_leading_escape_hatch_set_to_zero_still_denies(tmp_path, monkeypatch):
-    """`RIG_ALLOW_MAIN_EDIT=0 git checkout feat/x` — an explicit non-"1" value inline — must
-    still deny; the classification fix must not accidentally treat ANY leading assignment as
-    granting the escape hatch."""
-    repo = _make_repo(tmp_path)
-    out, code = _run(repo, "RIG_ALLOW_MAIN_EDIT=0 git checkout feat/x", monkeypatch)
-    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
-
-
-def test_inline_escape_hatch_allows(tmp_path, monkeypatch):
-    """The README's documented one-liner shape — `RIG_ALLOW_MAIN_EDIT=1 ... git checkout x` —
-    must actually grant the escape hatch, even though this hook's own os.environ never sees an
-    inline shell assignment (it runs as a separate process before bash executes the command)."""
-    repo = _make_repo(tmp_path)
-    out, code = _run(
-        repo,
-        'RIG_ALLOW_MAIN_EDIT=1 RIG_ALLOW_MAIN_EDIT_REASON="deliberate, worktree overkill" '
-        "git checkout feat/x",
-        monkeypatch,
-    )
-    assert code == 0 and _decision(out) == "allow"
-    msg = json.loads(out)["message"].lower()
-    assert "escape hatch" in msg
-    assert "deliberate, worktree overkill" in msg
-
-
-def test_inline_escape_hatch_overrides_env_allow_to_deny(tmp_path, monkeypatch):
-    """An explicit inline `RIG_ALLOW_MAIN_EDIT=0` re-asserts the block even when the AMBIENT
-    process env already has the escape hatch on — inline is a per-command override, matching
-    shell `VAR=val cmd` precedence."""
-    repo = _make_repo(tmp_path)
-    out, code = _run(
-        repo,
-        "RIG_ALLOW_MAIN_EDIT=0 git checkout feat/x",
-        monkeypatch,
-        {"RIG_ALLOW_MAIN_EDIT": "1"},
-    )
     assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
