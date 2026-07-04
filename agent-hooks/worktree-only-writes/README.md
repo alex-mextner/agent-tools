@@ -14,6 +14,15 @@ that would precede it — redirecting the agent to a worktree **before** it writ
 it tries to push. Read-only tools and `git merge` / `git pull` are unaffected (they are not
 Edit/Write tool calls, so this point never sees them).
 
+**This gate alone does NOT stop a bare `git checkout <feature-branch>`** run directly in the
+repo's PRIMARY worktree — a `git checkout`/`switch` isn't an Edit/Write tool call, so this
+`pre-write` point never sees it, and once the checkout has moved to a feature branch this
+gate's own branch check treats that as "exactly where authoring belongs" (true for a *linked*
+worktree, not for the *primary* one — it has no notion of which worktree it's in at all). See
+the sibling `pin-primary-worktree` (a `pre-bash` gate) for that half: it blocks moving the
+PRIMARY worktree itself off the default branch. (Alex tg#6462/tg#6477 — the incident that
+surfaced this gap.)
+
 ## Default-branch detection (not hardcoded, never machine-derived)
 
 1. `git symbolic-ref --short refs/remotes/origin/HEAD` → `origin/main` → `main` (authoritative)
