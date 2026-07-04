@@ -229,6 +229,18 @@ def _basename(tok: str) -> str:
     return tok.rsplit("/", 1)[-1]
 
 
+def _shlex_tokens(line: str, *, posix: bool) -> list[str] | None:
+    """Tokenize `line` with shlex in the given quote-handling mode. Returns None on
+    unbalanced quotes (caller treats this as fail-closed)."""
+    lex = shlex.shlex(line, posix=posix, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    try:
+        return list(lex)
+    except ValueError:
+        return None
+
+
 def _tokenize_line(line: str) -> list[str] | None:
     """Tokenize ONE physical line. ``punctuation_chars=True`` splits real shell separators
     (`;`, `&&`, `||`, `|`, ...) into standalone tokens while honoring quotes.
@@ -237,20 +249,29 @@ def _tokenize_line(line: str) -> list[str] | None:
     commenter cuts at ANY unquoted `#`, even mid-word, which would truncate parsing at a
     benign `foo#bar` and silently hide a LATER `&& git reset --hard` on the same line (an
     accidental, non-adversarial miss — the exact class this hook exists to catch, ported
-    from block-no-verify/require-review-before-commit's audited fix for the same bug). A
-    token that STARTS with `#` is a real word-initial comment; drop it and the rest of the
-    line. Returns None on unbalanced quotes (caller treats this as fail-closed).
+    from block-no-verify/require-review-before-commit's audited fix for the same bug).
+
+    A token that starts with a REAL, unquoted `#` is a comment; drop it and the rest of the
+    line. Whether a `#` is "real" can NOT be decided from the POSIX-mode (quote-stripped)
+    token alone: a quoted `'# heading'` dequotes to the exact same string `# heading` that a
+    bare, unquoted `# heading` produces, so a lone `tok.startswith("#")` check on the
+    dequoted token can't tell a real comment from a quoted argument that merely starts with
+    `#` — e.g. `echo '# heading' && git reset --hard` would be misparsed as ending at the
+    (fake) comment, hiding the chained reset. A second, quote-PRESERVING (``posix=False``)
+    tokenization is run in parallel so the check can be made on the RAW token (quotes/escapes
+    intact): only a token that ITSELF starts with `#` in that raw form is a genuine, unquoted
+    comment marker. Returns None on unbalanced quotes, or if the two passes disagree on token
+    count (can't reliably align raw-to-dequoted; caller treats this as fail-closed).
     """
-    lex = shlex.shlex(line, posix=True, punctuation_chars=True)
-    lex.whitespace_split = True
-    lex.commenters = ""
-    try:
-        tokens = list(lex)
-    except ValueError:
+    posix_tokens = _shlex_tokens(line, posix=True)
+    if posix_tokens is None:
+        return None
+    raw_tokens = _shlex_tokens(line, posix=False)
+    if raw_tokens is None or len(raw_tokens) != len(posix_tokens):
         return None
     out: list[str] = []
-    for tok in tokens:
-        if tok.startswith("#"):
+    for raw, tok in zip(raw_tokens, posix_tokens):
+        if raw.startswith("#"):
             break
         out.append(tok)
     return out

@@ -266,6 +266,23 @@ def test_allow_hash_inside_commit_message(monkeypatch):
     assert _decision(out) == "allow"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo '# heading' && git reset --hard",
+        'echo "#hi" && git reset --hard',
+    ],
+)
+def test_block_quoted_word_initial_hash_does_not_fake_a_comment(command, monkeypatch):
+    """A QUOTED argument that starts with `#` (`'# heading'`) dequotes to the same string a
+    real unquoted comment would produce. A naive `tok.startswith("#")` check on the dequoted
+    token alone can't tell them apart and would wrongly treat the rest of the line — including
+    a chained `&& git reset --hard` — as inert comment text, silently letting it through."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE, command
+    assert _decision(out) == "block", command
+
+
 # ── Shell chains — should still BLOCK ──────────────────────────────────────────────────────
 
 def test_block_reset_hard_in_shell_chain_and(monkeypatch):
