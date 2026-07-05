@@ -237,6 +237,52 @@ def test_is_skip_commit_direct_trailer_value_does_not_leak_as_skip_flag():
     assert vpg.is_skip_commit("git commit --trailer=foo -m x") is False
 
 
+# ── agent-tools#174: a chain must not be exempted on its FIRST commit segment alone ───────
+#
+# NOTE: agent-tools#174's own issue body claimed this file was already fixed by agent-tools#172
+# — that was a misattribution (#172 was an unrelated effective_cwd() tilde-expansion fix), and
+# the original first-segment-only bug was still live here until this PR. Mirrors the identical
+# tests already pinning this behavior in tests/test_skills_read_gate.py.
+
+@pytest.mark.parametrize("command", [
+    "git commit --continue && git commit -m x",
+    "git commit --continue ; git commit -m x",
+])
+def test_skip_commit_followed_by_real_commit_is_not_exempt(command, tmp_path, monkeypatch):
+    """A rebase-plumbing ``--continue`` chained with a SECOND, REAL commit used to exempt the
+    WHOLE command from the gate — is_skip_commit returned on the FIRST commit segment found
+    (the plumbing one) and never looked at the second, authoring commit. One real commit
+    anywhere in the chain must force gating (BLOCK when UI is staged with no proof)."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(command, repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE, command
+    assert _decision(out) == "block"
+
+
+def test_two_skip_commits_chained_are_still_exempt(tmp_path, monkeypatch):
+    """Inverse of the above: if EVERY commit segment in the chain carries a skip flag, the
+    whole command really is just plumbing and stays exempt — ALLOW even with staged UI files
+    and no proof marker."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("git commit --continue && git commit --continue", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_chained_trailer_bypass_closed_by_both_fixes_together(tmp_path, monkeypatch):
+    """The EXACT repro from chatgpt-codex-connector's PR #197 review comment: a rebase-plumbing
+    ``--continue`` chained with a real commit whose ``--trailer``'s VALUE is literally
+    ``--skip``. Needs BOTH fixes to close — the trailer fix alone still short-circuits on the
+    first (``--continue``) segment before ever reaching the trailer segment; the all-segments
+    fix alone still lets the trailer's value leak as a skip flag on the second segment. Only
+    together do they force gating on this exact chain."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    cmd = "git commit --continue && git commit --trailer --skip -m x"
+    out, _e, c = _run(cmd, repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
 # ── T1: NOT subagent-exempt — an agent_id present must STILL block (locks the doctrine) ──
 
 def test_blocks_even_with_agent_id_present(tmp_path, monkeypatch):
