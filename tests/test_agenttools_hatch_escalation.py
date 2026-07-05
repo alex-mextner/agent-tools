@@ -10,6 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
+import agenttools_hatch_escalation
 from agenttools_hatch_escalation import hatch_env_var, request_hatch_approval
 
 
@@ -45,6 +46,8 @@ def test_env_unset_is_not_requested_and_does_not_contact_tg_ctl(tmp_path):
 
     assert result.requested is False
     assert result.approved is False
+    assert result.env_present is False
+    assert result.should_stop is False
     assert "not set" in result.reason
     assert not marker.exists()
 
@@ -65,6 +68,8 @@ def test_whitespace_env_is_not_requested_and_does_not_contact_tg_ctl(tmp_path):
 
     assert result.requested is False
     assert result.approved is False
+    assert result.env_present is True
+    assert result.should_stop is True
     assert "blank" in result.reason
     assert not marker.exists()
 
@@ -86,6 +91,8 @@ def test_bare_flag_env_is_rejected_without_tg_ctl_contact(tmp_path, value):
 
     assert result.requested is True
     assert result.approved is False
+    assert result.env_present is True
+    assert result.should_stop is True
     assert "written justification" in result.reason
     assert not marker.exists()
 
@@ -257,3 +264,8 @@ def test_rig_yaml_tg_ctl_path_override_is_used(tmp_path):
     assert result.approved is True
     assert marker.exists()
     assert result.tg_ctl_path == str(tg_ctl.resolve())
+
+
+def test_default_tg_ctl_candidates_are_hardcoded_absolute_paths():
+    assert Path("/Users/ultra/.files/bin/tg-ctl") in agenttools_hatch_escalation._TRUSTED_TG_CTL_PATHS
+    assert all(path.is_absolute() for path in agenttools_hatch_escalation._TRUSTED_TG_CTL_PATHS)

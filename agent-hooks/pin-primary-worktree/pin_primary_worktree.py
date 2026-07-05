@@ -72,6 +72,12 @@ import sys
 import time
 from pathlib import Path
 
+_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+import agenttools_hatch_escalation as hatch_escalation  # noqa: E402
+
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
@@ -79,9 +85,11 @@ CONFIG_KEY = "worktree_only"  # SYNC: same knob as worktree-only-writes/worktree
 _FALLBACK_DEFAULT_BRANCH = "main"
 _GIT_TIMEOUT_S = 3.0
 
-# Wall-clock budget for the WHOLE chained-command gate (main()'s loop over every segment),
-# comfortably under this hook's `timeout_ms: 12000` manifest budget (pin-primary-worktree.pre-
-# bash.json) even when MULTIPLE segments each need their own `approval_cmd` call. This hook is
+# Wall-clock budget for the approval_cmd fallback in the WHOLE chained-command gate (main()'s
+# loop over every segment), comfortably under this hook's manifest `timeout_ms` (pin-primary-
+# worktree.pre-bash.json) even when MULTIPLE segments each need their own `approval_cmd` call. It
+# does NOT bound the RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE live-Telegram path, which is allowed
+# to run up to tg-ctl's own 900s cap (the reason timeout_ms was raised to 930000). This hook is
 # `on_error: open` (an external manifest-timeout kill on the dispatcher side fails OPEN — allows)
 # — that's fine for a single approval_cmd call, since `_APPROVAL_TIMEOUT_CEILING_S` (6s) already
 # sits well under the 12s manifest budget. But fixing the chained-bypass bug means this loop can
@@ -624,6 +632,32 @@ def _evaluate_checkout_segment(
     # can still RUN for up to `_APPROVAL_TIMEOUT_CEILING_S` more, which alone could push the
     # aggregate past the manifest timeout. Only start this approval call if it can finish (at
     # its absolute worst case) before `deadline`.
+    context = {"hook": "pin-primary-worktree", "kind": subcommand, "target": target, "command": command}
+
+    # RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE (live Telegram ask) is checked first and is not
+    # bounded by _MAIN_LOOP_BUDGET_S/_APPROVAL_TIMEOUT_CEILING_S — a human approval round-trip
+    # legitimately runs up to tg-ctl's 900s cap, which is why this hook's manifest timeout_ms was
+    # raised to 930000. It only "stops" (should_stop=True) when an actual hatch request was made;
+    # an unset env var falls through to the approval_cmd budget below.
+    hatch = hatch_escalation.request_hatch_approval("pin-primary-worktree", context, cwd=eff_cwd)
+    if hatch.should_stop:
+        if hatch.approved:
+            warn(f"primary-worktree checkout approved via hatch escalation ({hatch.reason})")
+            return (
+                "approved",
+                f"{subcommand} {target} approved via hatch escalation ({hatch.reason})",
+            )
+        warn(f"primary-worktree checkout hatch escalation denied: {hatch.reason}")
+        return "block", (
+            f"hatch escalation denied: {hatch.reason}\n"
+            f"{MESSAGE.format(target=target, default=default)}"
+        )
+
+    # Reserve the FULL approval-cmd ceiling before starting this call, not just check whether
+    # the deadline has already passed: a call that's allowed to START just before `deadline`
+    # can still RUN for up to `_APPROVAL_TIMEOUT_CEILING_S` more, which alone could push the
+    # aggregate past the manifest timeout. Only start this approval call if it can finish (at
+    # its absolute worst case) before `deadline`.
     if time.monotonic() + _APPROVAL_TIMEOUT_CEILING_S >= deadline:
         warn(
             f"denying '{target}' — chained-command approval budget "
@@ -636,10 +670,7 @@ def _evaluate_checkout_segment(
             "fail-open). Split this into separate Bash calls so each is approved individually."
         )
 
-    approved, detail = _request_approval(
-        eff_cwd,
-        {"hook": "pin-primary-worktree", "kind": subcommand, "target": target, "command": command},
-    )
+    approved, detail = _request_approval(eff_cwd, context)
     if not approved:
         return "block", MESSAGE.format(target=target, default=default)
 

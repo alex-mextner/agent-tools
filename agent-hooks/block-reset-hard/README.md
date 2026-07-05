@@ -102,12 +102,16 @@ more. Both let the very agent this hook constrains grant itself an exception —
 theater, not a permission gate (Alex tg#6554). They were removed.
 
 The block is now **deny-by-default**. A repo owner can wire a real external-approval path in the
-committed, code-reviewed `rig.yaml`:
+committed, code-reviewed `rig.yaml`. A one-time Telegram hatch can also be requested with a
+written justification in `RIG_HATCH_REQUEST_BLOCK_RESET_HARD`; that request path runs before
+`approval_cmd`, so an invalid/denied Telegram request does not fall through to a configured
+`approval_cmd`.
 
 ```yaml
 agent_hooks:
   approval_cmd: "/path/to/approve.sh"   # optional; run when a reset --hard/clean -f would block
   approval_cmd_timeout_s: 5             # optional; default 5.0, capped at 6.0
+  tg_ctl_path: "/path/to/tg-ctl"         # optional; trusted absolute tg-ctl path
 ```
 
 `agent_hooks.approval_cmd` is a **single, shared key** — the same `approval_cmd` is read by
@@ -115,20 +119,37 @@ this hook AND by `pin-primary-worktree`. A repo that wants different handling pe
 point `approval_cmd` at one dispatcher script that branches on `RIG_APPROVAL_HOOK`
 (`block-reset-hard` vs `pin-primary-worktree`) and `RIG_APPROVAL_KIND`.
 
-When set, the hook runs `approval_cmd` as the block is about to fire and **allows only on exit
+When `approval_cmd` is set, the hook runs it as the block is about to fire and **allows only on exit
 0**; a nonzero exit, an error, or a timeout all mean **denied**. With nothing configured, the
 block stands. The command string comes only from `rig.yaml` (never from the agent or the
 offending command); context reaches it as environment variables — `RIG_APPROVAL_HOOK`,
 `RIG_APPROVAL_KIND` (`reset --hard` / `clean -f...`), `RIG_APPROVAL_CWD`, `RIG_APPROVAL_COMMAND`
 — never string-interpolated, so there is no injection surface. For a `git -C <other-repo>`
 command the config is resolved against `<other-repo>`'s rig.yaml (the repo actually being
-wiped), not the shell cwd. This is the intended integration point for an eventual
-Telegram-backed approver owned by the trusted `tg-ctl` daemon.
+wiped), not the shell cwd.
+
+The Telegram hatch is intentionally not a self-service bypass. `RIG_HATCH_REQUEST_BLOCK_RESET_HARD`
+must contain a nonblank written justification. If the env var is unset, the hook does not contact
+Telegram and falls through to `approval_cmd` / default deny. If the env var is present but blank,
+whitespace-only, or a bare flag value such as `1`, `true`, `yes`, or `on`, the hook does not contact
+Telegram and denies. A real justification runs `tg-ctl ask <question> --timeout 900`; exit 0 allows,
+and exit 1, any other nonzero exit, launch errors, and timeouts all deny. The helper never resolves
+`tg-ctl` from ambient `PATH`: it uses the optional absolute `agent_hooks.tg_ctl_path` first, then
+hardcoded absolute candidates including `/Users/ultra/.files/bin/tg-ctl`
+(`/Users/ultra/.files/repos/tg-cli/tg-ctl` after realpath), `/usr/local/bin/tg-ctl`, and
+`/opt/homebrew/bin/tg-ctl`.
 
 > `approval_cmd` is read with the same minimal, stdlib-only rig.yaml scanner this hook family
 > uses (no YAML library is imported). It is a single-line scalar: quote the value, and avoid a
 > literal `#` or a trailing nested-quote in it (point `approval_cmd` at a script path instead
 > of inlining a complex shell one-liner).
+
+> **Claude Code outer timeout:** this descriptor sets `timeout_ms: 930000`, enough for `tg-ctl`
+> ask's 900s cap plus a 30s cleanup margin. That is only the agents-hooks/v1 descriptor budget
+> enforced by `cc_hook_bridge`. Claude Code's own command-hook `timeout` defaults to 600s, and
+> the live `~/.claude/settings.json` / rig-cli `hook_bridge_entries` currently register
+> `cc_hook_bridge` without a `timeout`. Until rig-cli or settings add a hook `timeout` above
+> 900s, Claude Code can still kill the bridge before a full Telegram wait finishes.
 
 > **Repo-wide impact:** this hook is **always on** (no opt-in gate, unlike pin-primary-worktree).
 > With nothing configured, `git reset --hard` and `git clean -f...` are a hard, non-bypassable
