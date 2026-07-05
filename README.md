@@ -249,7 +249,7 @@ that nobody is required to stop at — see #543.
 
 ## Inventory
 
-- **Universal skills:** 39 — shell-timeouts, exit-codes-through-pipes, dead-code-
+- **Universal skills:** 45 — shell-timeouts, exit-codes-through-pipes, dead-code-
   investigation, TDD red-first, test discipline, atomic commits, pre-commit gate, secret
   scanning (gitleaks, hook + CI), CI gate suite, global git-hooks dispatcher, git-workflow
   safety (reset/fixup/partial-staging/worktree-removal), comment &
@@ -262,7 +262,9 @@ that nobody is required to stop at — see #543.
   verifying a fix, try to break it and prove the result with an artifact, don't just
   confirm the happy path), completion self-check, semantic code
   search, **web-page reading via agent-browser** (read full pages/docs with the
-  `agent-browser` CLI instead of a truncating fetch tool), and more.
+  `agent-browser` CLI instead of a truncating fetch tool), **message-scope verification**
+  (before dropping unfinished work for a new inbound message, check it's actually on-topic
+  and ask the user to confirm if it looks misdirected), and more.
 - **By-type skills:** 45 — bot (12), backend (13), frontend (4), cli (7), library (4),
   infra (1), monorepo (4).
 - **Agent-hooks:** 8 — block-no-verify, block-raw-pr-merge, block-secrets-write,
