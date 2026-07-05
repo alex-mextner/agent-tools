@@ -46,7 +46,7 @@ import shutil
 import sys
 import textwrap
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # ── color ───────────────────────────────────────────────────────────────────────────
 # One palette for the whole ecosystem. ANSI SGR codes; semantic names so a CLI never hard-
