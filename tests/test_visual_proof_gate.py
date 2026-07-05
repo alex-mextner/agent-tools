@@ -205,6 +205,7 @@ def test_commit_continue_is_allowed(tmp_path, monkeypatch):
     "git commit -- --skip",                       # `--skip` is a PATHSPEC after `--`, not a flag
     "git commit -m x -- --abort src/",            # pathspec named --abort after `--`
     "git rebase --abort && git commit -m x",      # skip flag on a SIBLING command, not the commit
+    "git commit --trailer --skip -m x",           # --trailer's VALUE leaks as --skip (single segment)
 ])
 def test_skip_token_in_comment_or_message_does_not_bypass(command, tmp_path, monkeypatch):
     """codex P2 bypass: ``SKIP_COMMIT`` used to match the RAW string, so a normal commit could
@@ -223,6 +224,17 @@ def test_real_skip_flag_still_exempt_after_parsing(tmp_path, monkeypatch):
     repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
     out, _e, c = _run("git commit --abort", repo, monkeypatch, proof_dir=tmp_path / "proof")
     assert c == 0 and _decision(out) == "allow"
+
+
+def test_is_skip_commit_direct_trailer_value_does_not_leak_as_skip_flag():
+    """Direct, gate-plumbing-free pin (mirrors the equivalent test in
+    tests/test_skills_read_gate.py): ``--trailer --skip`` puts the LITERAL string ``--skip`` in
+    argv as the trailer's VALUE, not a real skip flag — it must not leak into ``_commit_flags``'
+    output and falsely satisfy ``any(tok in SKIP_FLAGS ...)``. Single commit segment: the chained
+    `--continue && ... --trailer --skip` variant additionally needs the all-segments fix (see the
+    agent-tools#174 tests below) and is pinned there instead."""
+    assert vpg.is_skip_commit("git commit --trailer --skip -m x") is False
+    assert vpg.is_skip_commit("git commit --trailer=foo -m x") is False
 
 
 # ── T1: NOT subagent-exempt — an agent_id present must STILL block (locks the doctrine) ──
