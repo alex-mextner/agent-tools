@@ -210,6 +210,88 @@ def test_chain_finds_offending_segment(tmp_path, monkeypatch):
     assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
+# ── chained multi-segment commands: EVERY segment must be evaluated, not just the first ────
+# Regression for the bug found in review: `main()` used to `return 0` right after approving the
+# FIRST primary-worktree checkout it found in a chained command, so a SECOND checkout/switch
+# later in the same command — targeting a DIFFERENT enrolled primary repo with no approval
+# configured — ran completely unchecked once the first was approved. `_make_repo` always makes
+# `<tmp_path>/repo`, so each repo below gets its OWN parent subdir created first.
+
+def test_chain_second_repo_unapproved_denies_whole_command(tmp_path, monkeypatch):
+    """`git -C approved checkout feat/x ; git -C other checkout feat/x` — the first repo's
+    approval_cmd would approve, but the second enrolled primary repo has none configured. The
+    whole chained command must DENY: approving segment 1 must never let segment 2 through."""
+    approved_dir = tmp_path / "approved"
+    approved_dir.mkdir()
+    approved_repo = _make_repo(approved_dir, approval_cmd='"exit 0"')
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    other_repo = _make_repo(other_dir)  # enrolled (default), no approval_cmd
+
+    out, code = _run(
+        tmp_path,
+        f"git -C {approved_repo} checkout feat/x ; git -C {other_repo} checkout feat/x",
+        monkeypatch,
+    )
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_chain_first_repo_unapproved_denies_whole_command(tmp_path, monkeypatch):
+    """The mirror order: the unapproved repo's checkout comes FIRST, the approved one SECOND —
+    pinned down so the refactor that scans every segment doesn't regress the
+    order-doesn't-matter property (this order already blocked via the pre-existing
+    first-segment path)."""
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    other_repo = _make_repo(other_dir)
+    approved_dir = tmp_path / "approved"
+    approved_dir.mkdir()
+    approved_repo = _make_repo(approved_dir, approval_cmd='"exit 0"')
+
+    out, code = _run(
+        tmp_path,
+        f"git -C {other_repo} checkout feat/x ; git -C {approved_repo} checkout feat/x",
+        monkeypatch,
+    )
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_chain_both_repos_approved_allows_whole_command(tmp_path, monkeypatch):
+    """The positive mirror: BOTH repos have `approval_cmd: exit 0` — the whole chained command
+    is ALLOWED."""
+    a_dir = tmp_path / "repo-a"
+    a_dir.mkdir()
+    repo_a = _make_repo(a_dir, approval_cmd='"exit 0"')
+    b_dir = tmp_path / "repo-b"
+    b_dir.mkdir()
+    repo_b = _make_repo(b_dir, approval_cmd='"exit 0"')
+
+    out, code = _run(
+        tmp_path,
+        f"git -C {repo_a} checkout feat/x ; git -C {repo_b} checkout feat/x",
+        monkeypatch,
+    )
+    assert code == 0 and _decision(out) == "allow"
+
+
+# ── aggregate approval budget: too many chained segments must DENY, not let an external ────
+# manifest-timeout kill silently allow (this hook is on_error=open — a kill fails OPEN). See
+# the review finding this addresses: gating EVERY segment (the fix above) means a single
+# invocation can now call `approval_cmd` more than once, so the AGGREGATE time must stay well
+# under the descriptor's `timeout_ms`, or an unapproved segment could slip through via the
+# external kill instead of this hook's own logic.
+
+def test_chain_budget_exhausted_denies_rather_than_risk_external_timeout(tmp_path, monkeypatch):
+    """An exhausted `_MAIN_LOOP_BUDGET_S` must deny a segment that would OTHERWISE be approved
+    — proving the budget is actually enforced (checked BEFORE spawning `approval_cmd`), not
+    just documented."""
+    monkeypatch.setattr(ppw, "_MAIN_LOOP_BUDGET_S", -1.0)
+    repo = _make_repo(tmp_path, approval_cmd='"exit 0"')
+    out, code = _run(repo, "git checkout feat/x", monkeypatch)
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "budget" in json.loads(out)["message"].lower()
+
+
 # ── `-C <dir>` is judged against THAT repo, not the shell cwd ────────────────────────────────
 
 def test_dash_c_cross_repo_denies(tmp_path, monkeypatch):

@@ -334,6 +334,87 @@ def test_block_reset_hard_with_leading_env(monkeypatch):
     assert _decision(out) == "block"
 
 
+# ── chained multi-segment commands: EVERY dangerous segment must be approved ──────────────
+# Regression for the bug found in review: `_classify` used to `return` on the FIRST dangerous
+# segment it found, so `main()` only ever requested approval for (and gated) that one segment
+# — a SECOND dangerous segment later in the same chained command, aimed at a different
+# (unapproved) repo, ran completely unchecked once the first was approved.
+
+def test_chain_second_segment_unapproved_blocks_whole_command(monkeypatch, tmp_path):
+    """`git -C approved reset --hard ; git -C other clean -fd` — the FIRST segment's repo would
+    approve, but the SECOND targets a repo with no approval_cmd configured at all. The whole
+    chained command must be BLOCKED: an approved first segment must never wave through an
+    unapproved second one."""
+    approved_repo = tmp_path / "approved"
+    approved_repo.mkdir()
+    (approved_repo / "rig.yaml").write_text('agent_hooks:\n  approval_cmd: "exit 0"\n')
+    other_repo = tmp_path / "other"
+    other_repo.mkdir()
+    (other_repo / "rig.yaml").write_text("agent_hooks:\n  worktree_only: false\n")
+
+    out, _err, code = _run(
+        f"git -C {approved_repo} reset --hard ; git -C {other_repo} clean -fd", monkeypatch,
+    )
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_chain_first_segment_unapproved_blocks_whole_command(monkeypatch, tmp_path):
+    """The mirror order: the unapproved, dangerous segment comes FIRST, the approved one
+    SECOND. This already blocked via the pre-existing first-segment path — pinned down here so
+    the refactor that scans every segment doesn't regress the order-doesn't-matter property."""
+    other_repo = tmp_path / "other"
+    other_repo.mkdir()
+    (other_repo / "rig.yaml").write_text("agent_hooks:\n  worktree_only: false\n")
+    approved_repo = tmp_path / "approved"
+    approved_repo.mkdir()
+    (approved_repo / "rig.yaml").write_text('agent_hooks:\n  approval_cmd: "exit 0"\n')
+
+    out, _err, code = _run(
+        f"git -C {other_repo} clean -fd ; git -C {approved_repo} reset --hard", monkeypatch,
+    )
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_chain_both_segments_approved_allows_whole_command(monkeypatch, tmp_path):
+    """The positive mirror: BOTH segments target repos with `approval_cmd: exit 0` — the whole
+    chained command is ALLOWED, and the allow message mentions both dangerous kinds found."""
+    repo_a = tmp_path / "repo-a"
+    repo_a.mkdir()
+    (repo_a / "rig.yaml").write_text('agent_hooks:\n  approval_cmd: "exit 0"\n')
+    repo_b = tmp_path / "repo-b"
+    repo_b.mkdir()
+    (repo_b / "rig.yaml").write_text('agent_hooks:\n  approval_cmd: "exit 0"\n')
+
+    out, _err, code = _run(
+        f"git -C {repo_a} reset --hard ; git -C {repo_b} clean -fd", monkeypatch,
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+    message = json.loads(out)["message"].lower()
+    assert "reset --hard" in message
+    assert "clean -f" in message
+
+
+# ── aggregate approval budget: too many chained dangerous segments must DENY cleanly ───────
+# rather than let an external manifest-timeout kill decide (this hook is on_error=closed, so
+# that kill already fails safe — but a legitimately-approved multi-segment command shouldn't
+# spuriously get killed instead of denied by this hook's own clear message).
+
+def test_chain_budget_exhausted_denies_with_clear_message(monkeypatch, tmp_path):
+    """An exhausted `_MAIN_LOOP_BUDGET_S` must deny a segment that would OTHERWISE be approved
+    — proving the budget is actually enforced (checked BEFORE spawning `approval_cmd`), not
+    just documented."""
+    monkeypatch.setattr(hook, "_MAIN_LOOP_BUDGET_S", -1.0)
+    out, _err, code = _run(
+        "git reset --hard", monkeypatch, cwd=_rig_dir(tmp_path, approval_cmd='"exit 0"'),
+    )
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+    assert "budget" in json.loads(out)["message"].lower()
+
+
 # ── external approval (replaces the removed self-service escape hatch) ─────────────────────
 
 def test_reset_hard_env_bypass_dead(monkeypatch, tmp_path):

@@ -102,10 +102,24 @@ import shlex
 import signal
 import subprocess  # noqa: S404 — running the rig.yaml-configured approval command
 import sys
+import time
 from pathlib import Path
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
+
+# Wall-clock budget for gating EVERY dangerous segment `_classify` found in one chained command,
+# comfortably under this hook's `timeout_ms: 12000` manifest budget (block-reset-hard.pre-
+# bash.json) even when MULTIPLE segments each need their own `approval_cmd` call. Unlike
+# pin-primary-worktree (on_error=open), this hook is on_error=CLOSED — an external manifest-
+# timeout kill already fails SAFE (deny) here, so this budget is not a security fix. It exists so
+# a chained command where EVERY segment is legitimately approved doesn't spuriously get killed
+# into a generic dispatcher-level denial instead of this hook's own clear "too many segments"
+# message, and so the hook stops spending time on approval calls destined to be killed anyway.
+# Before each approval_cmd call, the caller reserves the FULL `_APPROVAL_TIMEOUT_CEILING_S`
+# against this budget (not just "has the deadline already passed") — a call merely allowed to
+# START just before the deadline could still itself run the whole ceiling and blow the aggregate.
+_MAIN_LOOP_BUDGET_S = 10.0
 
 # Shell operators that separate independent command segments in a compound command line.
 _SHELL_SEPS = frozenset({"&&", "||", ";", "|", "&", ";;", "|&", ";&", ";;&"})
@@ -544,37 +558,49 @@ def _is_clean_force(segment: list[str]) -> bool:
     return bool(sub) and sub[0] == "clean" and _has_force_flag(sub[1:])
 
 
-def _classify(command: str) -> tuple[str, str | None, str | None]:
+def _classify(command: str) -> tuple[str, list[tuple[str, str | None]]]:
     """Classify `command` for the two dangerous forms this hook guards.
 
-    Returns (verdict, kind, cwd_override):
-      verdict "safe"        — command parsed cleanly, no reset --hard / clean -f... found.
-      verdict "dangerous"   — command parsed cleanly and a segment IS one of the two forms.
+    Returns (verdict, findings):
+      verdict "safe"        — command parsed cleanly, no reset --hard / clean -f... found;
+                              `findings` is `[]`.
+      verdict "dangerous"   — command parsed cleanly and ONE OR MORE segments are one of the
+                              two forms; `findings` has one `(kind, cwd_override)` entry PER
+                              dangerous segment. A chained command can carry more than one
+                              (e.g. `git -C a reset --hard ; git -C b clean -fd`) — ALL are
+                              collected here (the loop below never returns early on the first
+                              match) so the caller can require approval for every single one,
+                              not just the first.
       verdict "unparseable" — shlex could not tokenize (unbalanced quotes) AND the raw text
-                              plausibly contains one of the dangerous forms — fail-closed.
-    `kind` is "reset --hard" or "clean -f..." whenever verdict != "safe", else None.
-    `cwd_override` is the DANGEROUS segment's `git -C <dir>` target (else None), so approval
-    config is read from the repo actually being wiped, not the shell cwd.
+                              plausibly contains one of the dangerous forms — fail-closed;
+                              `findings` has exactly one `(kind, None)` entry.
+    Each finding's `kind` is "reset --hard" or "clean -f...". Each finding's `cwd_override` is
+    THAT segment's `git -C <dir>` target (else None), so approval config for that finding is
+    read from the repo it actually targets, not the shell cwd.
     """
     try:
         segments = _split_segments(command)
     except ValueError:
         if _RESET_HARD_HINT.search(command):
-            return "unparseable", "reset --hard", None
+            return "unparseable", [("reset --hard", None)]
         if _CLEAN_FORCE_HINT.search(command):
-            return "unparseable", "clean -f...", None
-        return "safe", None, None
+            return "unparseable", [("clean -f...", None)]
+        return "safe", []
+    findings: list[tuple[str, str | None]] = []
     for seg in segments:
         try:
             if _is_reset_hard(seg):
-                return "dangerous", "reset --hard", _git_dash_c_dir(seg)
-            if _is_clean_force(seg):
-                return "dangerous", "clean -f...", _git_dash_c_dir(seg)
+                findings.append(("reset --hard", _git_dash_c_dir(seg)))
+            elif _is_clean_force(seg):
+                findings.append(("clean -f...", _git_dash_c_dir(seg)))
         except _WrapperOverflow:
-            # Can't resolve this segment's real command through the wrapper chain — the
-            # command MIGHT be a destructive reset/clean hidden behind it. Fail closed.
-            return "unparseable", "wrapper chain too deep to verify", None
-    return "safe", None, None
+            # Can't resolve THIS segment's real command through the wrapper chain — it MIGHT
+            # be a destructive reset/clean hidden behind it. Fail closed for the WHOLE command
+            # (an unresolvable segment could be hiding either dangerous form).
+            return "unparseable", [("wrapper chain too deep to verify", None)]
+    if not findings:
+        return "safe", []
+    return "dangerous", findings
 
 
 def _find_rig_yaml(cwd: str) -> Path | None:
@@ -787,6 +813,68 @@ def _request_approval(cwd: str, context: dict[str, str]) -> tuple[bool, str | No
     return True, detail
 
 
+def _block_message(kind: str) -> str:
+    """The refusal text for an unapproved dangerous segment of `kind` ("reset --hard" or
+    "clean -f..."). Factored out of `main()` so `_gate_dangerous_segments` — which may need to
+    emit this once per dangerous segment in a chained command — doesn't duplicate the literal.
+    """
+    return (
+        f"Refusing a `git {kind}`: it irreversibly wipes uncommitted/untracked work with no "
+        "undo. Use a scoped, reversible alternative instead — `git checkout -- <file>` / "
+        "`git restore <file>` for tracked files, `git clean -n` to preview untracked files "
+        "first.\nThere is NO automatic bypass and NO self-service escape hatch. Do NOT try to "
+        "self-grant via ALLOW_GIT_RESET_HARD or a `# no-reset-guard:` comment — both were "
+        "removed (an agent setting its own bypass is security theater; removed per Alex "
+        "tg#6554). If you genuinely need this, ASK the human directly (your usual channel to "
+        "Alex) — asking is fine, self-granting is not. A repo owner can wire a real "
+        "external-approval path via agent_hooks.approval_cmd in rig.yaml; unconfigured means "
+        "denied."
+    )
+
+
+def _gate_dangerous_segments(
+    findings: list[tuple[str, str | None]], cwd: str, command: str
+) -> int:
+    """Request approval for EVERY dangerous segment `_classify` found — not just the first.
+
+    Approving one segment must never let a LATER, unapproved dangerous segment in the same
+    chained command run unchecked (e.g. `git -C approved reset --hard ; git -C other clean
+    -fd`): the first finding that fails approval blocks the WHOLE command immediately, without
+    even requesting approval for any finding after it. Only if EVERY finding is approved does
+    this emit a single `allow`, whose message lists each approval.
+
+    Bounded by `_MAIN_LOOP_BUDGET_S` (see its module-level comment): a chained command with
+    enough dangerous segments could otherwise sum to more approval-cmd time than this hook's
+    manifest timeout allows, spuriously denying a command where every segment WAS approved.
+    """
+    approved_notes: list[str] = []
+    deadline = time.monotonic() + _MAIN_LOOP_BUDGET_S
+    for kind, cwd_override in findings:
+        # Reserve the FULL approval-cmd ceiling before starting this call — a call merely
+        # allowed to start just before `deadline` could still itself run the whole ceiling.
+        if time.monotonic() + _APPROVAL_TIMEOUT_CEILING_S >= deadline:
+            emit(
+                "block",
+                "block-reset-hard: too many chained dangerous segments to check safely within "
+                "this hook's time budget — denying (fail-closed) rather than risk spurious "
+                "behavior from an external timeout. Split this into separate Bash calls so "
+                "each `git reset --hard`/`git clean -f...` is approved individually.",
+            )
+            return BLOCK_EXIT_CODE
+        approved, detail = _request_approval(
+            _effective_cwd(cwd, cwd_override),
+            {"hook": "block-reset-hard", "kind": kind, "target": "", "command": command},
+        )
+        if not approved:
+            emit("block", _block_message(kind))
+            return BLOCK_EXIT_CODE
+        warn(f"{kind} approved via approval_cmd ({detail})")
+        approved_notes.append(f"{kind} approved via external approval_cmd ({detail})")
+
+    emit("allow", "; ".join(approved_notes))
+    return 0
+
+
 def main() -> int:
     try:
         event = json.load(sys.stdin)
@@ -801,13 +889,14 @@ def main() -> int:
     if not isinstance(command, str):
         command = str(command)
 
-    verdict, kind, cwd_override = _classify(command)
+    verdict, findings = _classify(command)
 
     if verdict == "safe":
         emit("allow")
         return 0
 
     if verdict == "unparseable":
+        kind = findings[0][0]
         warn(f"could not verify command ({kind}) — blocking (fail-closed)")
         emit(
             "block",
@@ -816,30 +905,10 @@ def main() -> int:
         )
         return BLOCK_EXIT_CODE
 
-    # verdict == "dangerous": a cleanly-parsed segment is a real reset --hard / clean -f...
-    approved, detail = _request_approval(
-        _effective_cwd(cwd, cwd_override),
-        {"hook": "block-reset-hard", "kind": kind or "", "target": "", "command": command},
-    )
-    if approved:
-        warn(f"{kind} approved via approval_cmd ({detail})")
-        emit("allow", f"{kind} approved via external approval_cmd ({detail})")
-        return 0
-
-    emit(
-        "block",
-        f"Refusing a `git {kind}`: it irreversibly wipes uncommitted/untracked work with no "
-        "undo. Use a scoped, reversible alternative instead — `git checkout -- <file>` / "
-        "`git restore <file>` for tracked files, `git clean -n` to preview untracked files "
-        "first.\nThere is NO automatic bypass and NO self-service escape hatch. Do NOT try to "
-        "self-grant via ALLOW_GIT_RESET_HARD or a `# no-reset-guard:` comment — both were "
-        "removed (an agent setting its own bypass is security theater; removed per Alex "
-        "tg#6554). If you genuinely need this, ASK the human directly (your usual channel to "
-        "Alex) — asking is fine, self-granting is not. A repo owner can wire a real "
-        "external-approval path via agent_hooks.approval_cmd in rig.yaml; unconfigured means "
-        "denied.",
-    )
-    return BLOCK_EXIT_CODE
+    # verdict == "dangerous": one or more cleanly-parsed segments are a real reset --hard /
+    # clean -f... — every one of them must be approved individually (see
+    # _gate_dangerous_segments); approving the first must never wave the rest through.
+    return _gate_dangerous_segments(findings, cwd, command)
 
 
 if __name__ == "__main__":

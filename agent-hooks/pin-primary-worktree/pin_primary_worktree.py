@@ -69,6 +69,7 @@ import shlex
 import signal
 import subprocess  # noqa: S404 — fixed git argv, no shell
 import sys
+import time
 from pathlib import Path
 
 BLOCK_EXIT_CODE = 10
@@ -77,6 +78,23 @@ HOOK_API = "agents-hooks/v1"
 CONFIG_KEY = "worktree_only"  # SYNC: same knob as worktree-only-writes/worktree_only_writes.py
 _FALLBACK_DEFAULT_BRANCH = "main"
 _GIT_TIMEOUT_S = 3.0
+
+# Wall-clock budget for the WHOLE chained-command gate (main()'s loop over every segment),
+# comfortably under this hook's `timeout_ms: 12000` manifest budget (pin-primary-worktree.pre-
+# bash.json) even when MULTIPLE segments each need their own `approval_cmd` call. This hook is
+# `on_error: open` (an external manifest-timeout kill on the dispatcher side fails OPEN — allows)
+# — that's fine for a single approval_cmd call, since `_APPROVAL_TIMEOUT_CEILING_S` (6s) already
+# sits well under the 12s manifest budget. But fixing the chained-bypass bug means this loop can
+# now call `_request_approval` once per gate-worthy segment: two or more slow-but-still-denying
+# approval_cmd invocations could sum to MORE than 12s, and the dispatcher's own kill-into-
+# fail-open would then let an unapproved LATER segment through — not via this hook's logic, but
+# via the external timeout. Before starting each approval_cmd call, the caller reserves the FULL
+# `_APPROVAL_TIMEOUT_CEILING_S` against this budget (not just "has the deadline already passed")
+# — a call that's merely allowed to START just before the deadline could still itself run for the
+# whole ceiling and blow the aggregate anyway. That closes the window: a command with too many
+# gate-worthy segments to safely clear in time is denied by THIS hook, deliberately, before the
+# external kill can ever fire.
+_MAIN_LOOP_BUDGET_S = 10.0
 
 MESSAGE = (
     "BLOCKED — this is the repo's PRIMARY worktree; switching it to '{target}' risks colliding "
@@ -545,7 +563,91 @@ def _resolve_effective_cwd(base_cwd: str, cwd_override: str | None) -> str:
     return str(p)
 
 
-def main() -> int:  # noqa: PLR0911 — a linear allow/allow/allow/block ladder reads clearer flat
+def _evaluate_checkout_segment(
+    segment: str, base_cwd: str, command: str, deadline: float
+) -> tuple[str, str] | None:
+    """Evaluate ONE chained-command segment for a primary-worktree checkout/switch violation.
+
+    Returns None if this segment doesn't need gating — not a git invocation, not a
+    checkout/switch, no resolvable branch target (a path-restore / bare `checkout .` / an
+    unresolvable `-`), the target repo isn't `worktree_only`-enrolled, the target IS the
+    default branch, or this isn't the PRIMARY worktree (undetermined or a linked worktree —
+    both fail open). Returns `("block", message)` if this segment must block the WHOLE chained
+    command (approval was requested and denied, OR the `deadline` has already passed — see
+    `_MAIN_LOOP_BUDGET_S`). Returns `("approved", note)` if this segment required and received
+    external approval.
+
+    `main()` keeps scanning LATER segments after an "approved" result — only a
+    `("block", ...)` result stops the scan early. That split is the fix for the bug this
+    function replaces inline loop-body logic for: approving segment 1 must never skip
+    evaluating a segment 2 in the same chained command.
+
+    `deadline` is a `time.monotonic()` cutoff: if it has already passed by the time this
+    segment would need an `approval_cmd` call, this returns `("block", ...)` WITHOUT spawning
+    that subprocess (see `_MAIN_LOOP_BUDGET_S`'s module-level comment for why — a chained
+    command with enough gate-worthy segments could otherwise push the AGGREGATE approval time
+    past this hook's manifest timeout, and this hook's `on_error` is "open": an external kill
+    fails OPEN, exactly the bypass this closes).
+    """
+    classified = _classify_git_segment(segment)
+    if classified is None:
+        return None
+    subcommand, rest, cwd_override = classified
+    if subcommand not in ("checkout", "switch"):
+        return None
+    target = _switch_target(subcommand, rest)
+    if target is None:
+        return None
+
+    eff_cwd = _resolve_effective_cwd(base_cwd, cwd_override)
+
+    if target == "-":
+        resolved = _git(eff_cwd, "rev-parse", "--abbrev-ref", "@{-1}")
+        if not resolved:
+            return None  # can't resolve "previous branch" → fail open on this segment
+        target = resolved
+
+    # Cheapest remaining gate: is this repo enrolled? (per the segment's OWN effective cwd, so
+    # a cross-repo `git -C <other-repo> checkout` is judged by THAT repo's rig.yaml.)
+    if not worktree_only_enabled(eff_cwd):
+        return None
+
+    default = default_branch(eff_cwd)
+    if target == default:
+        return None  # switching (back) to the default branch — always fine
+
+    if not is_primary_worktree(eff_cwd):
+        return None  # None (undetermined) or False (a linked worktree) → fail open / allowed
+
+    # Reserve the FULL approval-cmd ceiling before starting this call, not just check whether
+    # the deadline has already passed: a call that's allowed to START just before `deadline`
+    # can still RUN for up to `_APPROVAL_TIMEOUT_CEILING_S` more, which alone could push the
+    # aggregate past the manifest timeout. Only start this approval call if it can finish (at
+    # its absolute worst case) before `deadline`.
+    if time.monotonic() + _APPROVAL_TIMEOUT_CEILING_S >= deadline:
+        warn(
+            f"denying '{target}' — chained-command approval budget "
+            f"({_MAIN_LOOP_BUDGET_S:.1f}s) would be exhausted before this segment's "
+            "approval_cmd could safely finish"
+        )
+        return "block", (
+            f"BLOCKED — too many chained segments needed approval to check safely within this "
+            f"hook's time budget (denying '{target}' rather than risk an external-timeout "
+            "fail-open). Split this into separate Bash calls so each is approved individually."
+        )
+
+    approved, detail = _request_approval(
+        eff_cwd,
+        {"hook": "pin-primary-worktree", "kind": subcommand, "target": target, "command": command},
+    )
+    if not approved:
+        return "block", MESSAGE.format(target=target, default=default)
+
+    warn(f"primary-worktree checkout approved via approval_cmd ({detail})")
+    return "approved", f"{subcommand} {target} approved via external approval_cmd ({detail})"
+
+
+def main() -> int:
     try:
         event = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError) as exc:
@@ -560,56 +662,24 @@ def main() -> int:  # noqa: PLR0911 — a linear allow/allow/allow/block ladder 
         emit("allow")
         return 0
 
+    # Every segment of a chained command is evaluated — approving one segment must NEVER
+    # short-circuit the check for a LATER segment in the same command (the bug this fixes:
+    # `git -C approved checkout feat ; git -C other checkout feat` let the second checkout
+    # bypass the guard entirely once the first was approved). `deadline` bounds the AGGREGATE
+    # time spent across every segment's approval_cmd call (see _MAIN_LOOP_BUDGET_S).
+    approved_notes: list[str] = []
+    deadline = time.monotonic() + _MAIN_LOOP_BUDGET_S
     for segment in _split_chain(command):
-        classified = _classify_git_segment(segment)
-        if classified is None:
+        result = _evaluate_checkout_segment(segment, cwd, command, deadline)
+        if result is None:
             continue
-        subcommand, rest, cwd_override = classified
-        if subcommand not in ("checkout", "switch"):
-            continue
-        target = _switch_target(subcommand, rest)
-        if target is None:
-            continue
+        verdict, message = result
+        if verdict == "block":
+            emit("block", message)
+            return BLOCK_EXIT_CODE
+        approved_notes.append(message)
 
-        eff_cwd = _resolve_effective_cwd(cwd, cwd_override)
-
-        if target == "-":
-            resolved = _git(eff_cwd, "rev-parse", "--abbrev-ref", "@{-1}")
-            if not resolved:
-                continue  # can't resolve "previous branch" → fail open on this segment
-            target = resolved
-
-        # Cheapest remaining gate: is this repo enrolled? (per the segment's OWN effective cwd,
-        # so a cross-repo `git -C <other-repo> checkout` is judged by THAT repo's rig.yaml.)
-        if not worktree_only_enabled(eff_cwd):
-            continue
-
-        default = default_branch(eff_cwd)
-        if target == default:
-            continue  # switching (back) to the default branch — always fine
-
-        primary = is_primary_worktree(eff_cwd)
-        if not primary:
-            continue  # None (undetermined) or False (a linked worktree) → fail open / allowed
-
-        approved, detail = _request_approval(
-            eff_cwd,
-            {
-                "hook": "pin-primary-worktree",
-                "kind": subcommand,
-                "target": target,
-                "command": command,
-            },
-        )
-        if approved:
-            warn(f"primary-worktree checkout approved via approval_cmd ({detail})")
-            emit("allow", f"primary-worktree checkout approved via external approval_cmd ({detail})")
-            return 0
-
-        emit("block", MESSAGE.format(target=target, default=default))
-        return BLOCK_EXIT_CODE
-
-    emit("allow")
+    emit("allow", "; ".join(approved_notes) if approved_notes else None)
     return 0
 
 
