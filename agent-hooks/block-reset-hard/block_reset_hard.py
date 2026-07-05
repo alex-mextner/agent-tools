@@ -105,12 +105,20 @@ import sys
 import time
 from pathlib import Path
 
+_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+import agenttools_hatch_escalation as hatch_escalation  # noqa: E402
+
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
-# Wall-clock budget for gating EVERY dangerous segment `_classify` found in one chained command,
-# comfortably under this hook's `timeout_ms: 12000` manifest budget (block-reset-hard.pre-
-# bash.json) even when MULTIPLE segments each need their own `approval_cmd` call. Unlike
+# Wall-clock budget for the approval_cmd fallback while gating EVERY dangerous segment
+# `_classify` found in one chained command — comfortably under this hook's manifest `timeout_ms`
+# (block-reset-hard.pre-bash.json) even when MULTIPLE segments each need their own `approval_cmd`
+# call. It does NOT bound the RIG_HATCH_REQUEST_BLOCK_RESET_HARD live-Telegram path, which is
+# allowed to run up to tg-ctl's own 900s cap (the reason timeout_ms was raised to 930000). Unlike
 # pin-primary-worktree (on_error=open), this hook is on_error=CLOSED — an external manifest-
 # timeout kill already fails SAFE (deny) here, so this budget is not a security fix. It exists so
 # a chained command where EVERY segment is legitimately approved doesn't spuriously get killed
@@ -850,6 +858,27 @@ def _gate_dangerous_segments(
     approved_notes: list[str] = []
     deadline = time.monotonic() + _MAIN_LOOP_BUDGET_S
     for kind, cwd_override in findings:
+        eff_cwd = _effective_cwd(cwd, cwd_override)
+        context = {"hook": "block-reset-hard", "kind": kind, "target": "", "command": command}
+
+        # RIG_HATCH_REQUEST_BLOCK_RESET_HARD (live Telegram ask) is checked first and is not
+        # bounded by _MAIN_LOOP_BUDGET_S/_APPROVAL_TIMEOUT_CEILING_S — a human approval round-trip
+        # legitimately runs up to tg-ctl's 900s cap, which is why this hook's manifest timeout_ms
+        # was raised to 930000. It only "stops" (returns should_stop=True) when an actual hatch
+        # request was made; an unset env var falls through to the approval_cmd budget below.
+        hatch = hatch_escalation.request_hatch_approval("block-reset-hard", context, cwd=eff_cwd)
+        if hatch.should_stop:
+            if hatch.approved:
+                warn(f"{kind} approved via hatch escalation ({hatch.reason})")
+                approved_notes.append(f"{kind} approved via hatch escalation ({hatch.reason})")
+                continue
+            warn(f"{kind} hatch escalation denied: {hatch.reason}")
+            emit(
+                "block",
+                f"hatch escalation denied: {hatch.reason}\n{_block_message(kind)}",
+            )
+            return BLOCK_EXIT_CODE
+
         # Reserve the FULL approval-cmd ceiling before starting this call — a call merely
         # allowed to start just before `deadline` could still itself run the whole ceiling.
         if time.monotonic() + _APPROVAL_TIMEOUT_CEILING_S >= deadline:
@@ -861,10 +890,7 @@ def _gate_dangerous_segments(
                 "each `git reset --hard`/`git clean -f...` is approved individually.",
             )
             return BLOCK_EXIT_CODE
-        approved, detail = _request_approval(
-            _effective_cwd(cwd, cwd_override),
-            {"hook": "block-reset-hard", "kind": kind, "target": "", "command": command},
-        )
+        approved, detail = _request_approval(eff_cwd, context)
         if not approved:
             emit("block", _block_message(kind))
             return BLOCK_EXIT_CODE
