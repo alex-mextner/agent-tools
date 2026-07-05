@@ -28,10 +28,10 @@ A subagent working an unrelated PR ran `git reset --hard` mid-session in a check
 with a different session and wiped that other session's uncommitted work (recovered, but it
 exposed the gap). The incident was **accidental**, not a deliberate bypass attempt. This
 hook's real value is turning an accidental destructive reset/clean into a **deliberate,
-logged** one — it is **not** a hard wall an adversarial or confused agent can never get
-through. The escape hatch below is intentionally self-service, same as every sibling hook in
-this family (`block-no-verify`, `block-raw-pr-merge`). Don't oversell this as a true
-user-consent gate.
+logged** one. It previously shipped a self-service escape hatch (an env var / inline comment
+the agent could set on its own command) — that was security theater, removed per Alex tg#6554.
+The block is now **deny-by-default** with the external `approval_cmd` extension point below;
+"nothing configured" means the block stands, not a free bypass.
 
 ## Why an agent-hook (not a git-hook)
 
@@ -95,31 +95,47 @@ letters after `e` in a cluster are that pattern's text, not further flags:
 - `-ef"*.o"` → **not force** (the `e` consumes the rest of the token as its pattern value —
   `f*.o"` — this is `-e` with a value, not `-e` plus `-f`)
 
-## Escape hatch (controllable, not a hard wall)
+## No self-service bypass — external approval only
 
-One hatch, one name — it gates **both** `reset --hard` and `clean -f...` (mirrors
-`block-raw-pr-merge`'s `ALLOW_RAW_PR_MERGE`):
+There is **no** env-var (`ALLOW_GIT_RESET_HARD`) or inline `# no-reset-guard:` escape hatch any
+more. Both let the very agent this hook constrains grant itself an exception — security
+theater, not a permission gate (Alex tg#6554). They were removed.
 
-```bash
-# one-off, self-documenting in the command itself — the reliable form, works in every
-# harness because it's read straight from the command text, no env persistence required:
-git clean -fd   # no-reset-guard: aborted experiment, confirmed nothing else in this checkout
+The block is now **deny-by-default**. A repo owner can wire a real external-approval path in the
+committed, code-reviewed `rig.yaml`:
 
-# session-wide override (reason REQUIRED, or it still blocks) — export it in the
-# environment the HOOK PROCESS ITSELF inherits (e.g. before the agent/session starts, or
-# in a harness that shares env across a run). A `VAR=val` PREFIX on the git command line
-# does NOT work here: that prefix only sets the variable for that one command's own
-# subprocess, and the pre-bash hook is invoked as a SEPARATE process by the host BEFORE
-# the command ever runs — it never sees a not-yet-executed command's inline prefix.
-export ALLOW_GIT_RESET_HARD=1
-export ALLOW_GIT_RESET_HARD_REASON="recovering a known-bad worktree, verified nothing else uses it"
-git reset --hard origin/main
+```yaml
+agent_hooks:
+  approval_cmd: "/path/to/approve.sh"   # optional; run when a reset --hard/clean -f would block
+  approval_cmd_timeout_s: 5             # optional; default 5.0, capped at 6.0
 ```
 
-A reasonless `ALLOW_GIT_RESET_HARD=1` is ignored and the command stays blocked — a silent
-bypass of the bypass-guard is the exact failure this hook prevents. When in doubt, prefer
-the inline `# no-reset-guard: ...` sentinel — it always works, regardless of how (or
-whether) your harness persists environment variables across the hook boundary.
+`agent_hooks.approval_cmd` is a **single, shared key** — the same `approval_cmd` is read by
+this hook AND by `pin-primary-worktree`. A repo that wants different handling per guard should
+point `approval_cmd` at one dispatcher script that branches on `RIG_APPROVAL_HOOK`
+(`block-reset-hard` vs `pin-primary-worktree`) and `RIG_APPROVAL_KIND`.
+
+When set, the hook runs `approval_cmd` as the block is about to fire and **allows only on exit
+0**; a nonzero exit, an error, or a timeout all mean **denied**. With nothing configured, the
+block stands. The command string comes only from `rig.yaml` (never from the agent or the
+offending command); context reaches it as environment variables — `RIG_APPROVAL_HOOK`,
+`RIG_APPROVAL_KIND` (`reset --hard` / `clean -f...`), `RIG_APPROVAL_CWD`, `RIG_APPROVAL_COMMAND`
+— never string-interpolated, so there is no injection surface. For a `git -C <other-repo>`
+command the config is resolved against `<other-repo>`'s rig.yaml (the repo actually being
+wiped), not the shell cwd. This is the intended integration point for an eventual
+Telegram-backed approver owned by the trusted `tg-ctl` daemon.
+
+> `approval_cmd` is read with the same minimal, stdlib-only rig.yaml scanner this hook family
+> uses (no YAML library is imported). It is a single-line scalar: quote the value, and avoid a
+> literal `#` or a trailing nested-quote in it (point `approval_cmd` at a script path instead
+> of inlining a complex shell one-liner).
+
+> **Repo-wide impact:** this hook is **always on** (no opt-in gate, unlike pin-primary-worktree).
+> With nothing configured, `git reset --hard` and `git clean -f...` are a hard, non-bypassable
+> block for every repo that installs this hook, until that repo's owner wires `approval_cmd`.
+
+**Agents: ask, don't self-grant.** If you genuinely need a destructive reset/clean, ask the
+human directly — you can no longer flip your own bypass.
 
 ## Fail-closed
 
@@ -129,20 +145,19 @@ the exact failure this hook exists to stop.
 
 When the command itself can't be parsed (unbalanced quotes) but the raw text plausibly
 contains one of the two dangerous forms, the decision is **block** with a message that names
-the unbalanced quotes, and — matching `block-raw-pr-merge`'s behavior exactly — the escape
-hatch is **not** consulted on this path: an unparseable command that also looks like a bypass
-attempt doesn't get a free pass just because it carries `# no-reset-guard: ...` text; fix the
-quoting first. An unrelated command with an unrelated unbalanced quote (e.g. `grep won't
-file`) is **allowed** — blocking it would be pure over-block.
+the unbalanced quotes. The external `approval_cmd` is **not** consulted on this path — an
+unparseable command isn't classified as a concrete `dangerous` verdict, so it fails closed on
+the plumbing signal before any approval is requested; fix the quoting first. An unrelated
+command with an unrelated unbalanced quote (e.g. `grep won't file`) is **allowed** — blocking
+it would be pure over-block.
 
 ## Known limitations
 
-The escape hatch is **already** a deliberate, self-service bypass (by design — see above),
-so hardening the parser against an agent that genuinely *wants* through is incoherent: it
-would just use the hatch. The bar for what's fixed vs. documented here is: **would a
-confused, non-evasive agent produce this exact command by accident?** Newline-separated
-commands and mid-word `#` (both fixed above — see "Parsed, not raw-matched") clear that bar;
-these don't:
+There is no longer a self-service hatch (removed — Alex tg#6554), so the parser is the only
+line between an accidental destructive command and the block. The bar for what's fixed vs.
+documented here is: **would a confused, non-evasive agent produce this exact command by
+accident?** Newline-separated commands and mid-word `#` (both fixed above — see "Parsed, not
+raw-matched") clear that bar; these don't:
 
 - `git reset --har` (an unambiguous long-option prefix git itself accepts) is not detected —
   only the literal `--hard` spelling is matched. No one accidentally abbreviates a destructive
@@ -160,12 +175,13 @@ these don't:
   nobody sets this inline by accident, but if it's already in ambient config, a bare
   `clean -d` genuinely slips past this hook. Worth knowing, not worth building a
   git-config-value detector for.
-- The inline `# no-reset-guard: <reason>` sentinel is matched against the **whole raw command
-  string**, including inside quotes — `git commit -m "notes: no-reset-guard: x" && git reset
-  --hard` would read as a valid override even though the text is commit-message data, not a
-  real shell comment on the dangerous segment. Requires a crafted message to trigger; the
-  hatch is self-service anyway, so scoping the sentinel to a genuine comment token isn't worth
-  the added machinery here.
+- **Approval-cwd resolution follows only `git -C <dir>`.** A cwd change made by a wrapper or a
+  chained `cd` — `env -C <dir> git reset --hard`, `sudo --chdir <dir> git ...`, `cd other &&
+  git reset --hard` — is not followed, so approval for such a command is resolved against the
+  shell cwd's `rig.yaml`, not the relocated target repo. (Same documented class as
+  pin-primary-worktree's `cd other-repo` scope note.) Deny-by-default still holds; the only
+  residual is a cwd repo whose configured approver could then approve a wrapper-relocated
+  destructive command aimed at a different repo.
 - A shell **alias** for `git` (`alias g=git`) is not resolved — universal to this whole hook
   family. Aliases only expand in an *interactive* shell by default; a harness running via
   `bash -c "<command>"` doesn't expand them anyway, so this is rarely reachable in practice.
@@ -201,9 +217,11 @@ echo '{"args":{"command":"git checkout -- file.txt"}}' | ./block_reset_hard.py; 
 echo '{"args":{"command":"git clean -n"}}' | ./block_reset_hard.py; echo "exit=$?"
 # → {"hook_api":"agents-hooks/v1","decision":"allow"}  exit=0
 
-echo '{"args":{"command":"git reset --hard  # no-reset-guard: recovering known-bad worktree"}}' \
+# With a repo owner's approval_cmd wired in rig.yaml (agent_hooks.approval_cmd), a reset --hard
+# is allowed only when that command exits 0; unconfigured / nonzero / timeout all block:
+echo '{"cwd":"/repo-with-approval-cmd","args":{"command":"git reset --hard"}}' \
   | ./block_reset_hard.py; echo "exit=$?"
-# → decision":"allow" (escape hatch with a reason)  exit=0
+# → decision":"allow" iff approval_cmd exited 0, else block  exit=0|10
 ```
 
 Unit + behavior tests live in

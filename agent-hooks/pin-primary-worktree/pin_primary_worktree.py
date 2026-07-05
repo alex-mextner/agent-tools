@@ -28,13 +28,16 @@ PER-REPO, opt-in — reuses the SAME `agent_hooks.worktree_only` knob as `worktr
 (one feature, one flag; see that hook's docstring for the resolution order: env
 RIG_WORKTREE_ONLY > rig.yaml agent_hooks.worktree_only > default OFF).
 
-Escape hatch (mirrors worktree-only-writes): RIG_ALLOW_MAIN_EDIT=1 (+ optional
-RIG_ALLOW_MAIN_EDIT_REASON) allows the one-off deliberate checkout. Unlike worktree-only-writes,
-this hook ALSO honors that assignment written inline on the command itself (`RIG_ALLOW_MAIN_EDIT=1
-git checkout x`, the one-off shape this file's README documents) — this hook runs as a separate
-process before the bash command executes, so an inline `VAR=val` prefix never reaches its own
-os.environ the normal way; `_escape_reason` reads it out of the parsed command text instead (see
-`_classify_git_segment`'s `leading_env`).
+External approval (replaces the OLD self-service escape hatch): there is NO env-var / inline
+bypass for THIS checkout guard any more — an agent could set `RIG_ALLOW_MAIN_EDIT=1` on its own
+command, so that "gate" was security theater (removed here per Alex tg#6554; the sibling
+worktree-only-writes pre-write hook still reads that var — a separate cleanup). The block is
+now DENY-BY-DEFAULT.
+A repo owner may wire `agent_hooks.approval_cmd` (a shell command) in the committed,
+code-reviewed rig.yaml; when a primary-worktree checkout is about to be blocked this hook runs
+that command (with RIG_APPROVAL_* context in the child's env) and allows ONLY on exit 0.
+Nothing configured = denied; a nonzero/error/timeout verdict = denied. An agent with a genuine
+reason should ASK the human, not self-grant.
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; args.command/cmd (the bash string); event.cwd is the shell dir.
@@ -52,7 +55,9 @@ incident this closes was a `checkout`, and scope-creeping into every ref-mutatin
 risks false positives for a first cut. A bare `git checkout .` / `git checkout <path>` restore
 (no branch involved) is excluded via the `--`/`.` checks in `_switch_target`, but an unusual
 `git checkout <treeish> <path>` (no `--`, ambiguous even to git itself) can still be
-misclassified as a branch switch — the escape hatch covers that rare case.
+misclassified as a branch switch — a false block on that rare shape now needs a linked worktree
+or a repo-owner `approval_cmd` (there is no self-service override any more; see the external
+approval note above).
 """
 
 from __future__ import annotations
@@ -61,8 +66,10 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess  # noqa: S404 — fixed git argv, no shell
 import sys
+import time
 from pathlib import Path
 
 BLOCK_EXIT_CODE = 10
@@ -72,16 +79,37 @@ CONFIG_KEY = "worktree_only"  # SYNC: same knob as worktree-only-writes/worktree
 _FALLBACK_DEFAULT_BRANCH = "main"
 _GIT_TIMEOUT_S = 3.0
 
+# Wall-clock budget for the WHOLE chained-command gate (main()'s loop over every segment),
+# comfortably under this hook's `timeout_ms: 12000` manifest budget (pin-primary-worktree.pre-
+# bash.json) even when MULTIPLE segments each need their own `approval_cmd` call. This hook is
+# `on_error: open` (an external manifest-timeout kill on the dispatcher side fails OPEN — allows)
+# — that's fine for a single approval_cmd call, since `_APPROVAL_TIMEOUT_CEILING_S` (6s) already
+# sits well under the 12s manifest budget. But fixing the chained-bypass bug means this loop can
+# now call `_request_approval` once per gate-worthy segment: two or more slow-but-still-denying
+# approval_cmd invocations could sum to MORE than 12s, and the dispatcher's own kill-into-
+# fail-open would then let an unapproved LATER segment through — not via this hook's logic, but
+# via the external timeout. Before starting each approval_cmd call, the caller reserves the FULL
+# `_APPROVAL_TIMEOUT_CEILING_S` against this budget (not just "has the deadline already passed")
+# — a call that's merely allowed to START just before the deadline could still itself run for the
+# whole ceiling and blow the aggregate anyway. That closes the window: a command with too many
+# gate-worthy segments to safely clear in time is denied by THIS hook, deliberately, before the
+# external kill can ever fire.
+_MAIN_LOOP_BUDGET_S = 10.0
+
 MESSAGE = (
     "BLOCKED — this is the repo's PRIMARY worktree; switching it to '{target}' risks colliding "
     "with other concurrent agents/sessions that share this checkout (this exact collision "
     "already happened once — Alex tg#6462/tg#6477). The primary worktree is for merge / pull / "
-    "read-only only; checkout/switch there is blocked outside the default branch ({default}). "
+    "read-only only; checkout/switch there is blocked outside the default branch ({default}).\n"
     "Do the work in a separate worktree instead:\n"
     "    git worktree add ../wt-<feature> -b {target} origin/{default}\n"
     "    cd ../wt-<feature>   # then git checkout/switch there\n"
-    "(worktree-only workflow, rig-provisioned; complements worktree-only-writes.) Deliberate "
-    "one-off: set RIG_ALLOW_MAIN_EDIT=1."
+    "There is NO automatic bypass and NO self-service escape hatch for THIS checkout guard. Do "
+    "NOT try to self-grant via any environment variable — RIG_ALLOW_MAIN_EDIT no longer opens "
+    "this hook (an agent setting its own bypass is security theater; removed per Alex tg#6554). "
+    "If you have a genuine reason for an exception, ASK the human directly (your usual channel "
+    "to Alex) — asking is fine, self-granting is not. A repo owner can wire a real "
+    "external-approval path via agent_hooks.approval_cmd in rig.yaml; unconfigured means denied."
 )
 
 
@@ -147,9 +175,13 @@ def _find_rig_yaml(cwd: str) -> Path | None:
     return None
 
 
-def _agent_hooks_bool(rig_yaml_text: str, key: str, default: bool) -> bool:
-    """Minimal stdlib rig.yaml boolean reader. SYNC with worktree_only_writes /
-    orchestrator_stays_thin — keep all three in lockstep if this parse ever changes."""
+def _agent_hooks_raw(rig_yaml_text: str, key: str) -> str | None:
+    """The raw (comment-stripped, quote-stripped) string value of ``agent_hooks.<key>``, or
+    None if the key is absent from the top-level ``agent_hooks:`` block. The single
+    block-scoped, indentation-aware line scanner shared by ``_agent_hooks_bool`` and
+    ``_agent_hooks_str``. SYNC with worktree_only_writes / orchestrator_stays_thin — keep the
+    SCANNER BEHAVIOR in lockstep if it ever changes (those two copies still inline the same
+    logic inside their own ``_agent_hooks_bool``; behavior here is identical, just factored)."""
     in_block = False
     child_indent: int | None = None
     for raw in rig_yaml_text.splitlines():
@@ -169,12 +201,22 @@ def _agent_hooks_bool(rig_yaml_text: str, key: str, default: bool) -> bool:
         if indent != child_indent:
             continue
         if head == key and ":" in line.strip():
-            val = line.strip().split(":", 1)[1].strip().strip("\"'").lower()
-            if val in ("true", "yes", "on", "1"):
-                return True
-            if val in ("false", "no", "off", "0"):
-                return False
-            return default
+            return line.strip().split(":", 1)[1].strip().strip("\"'")
+    return None
+
+
+def _agent_hooks_bool(rig_yaml_text: str, key: str, default: bool) -> bool:
+    """Minimal stdlib rig.yaml boolean reader. Delegates to ``_agent_hooks_raw`` for the shared
+    block-scoped scanner. SYNC with worktree_only_writes / orchestrator_stays_thin — keep the
+    scanner behavior in lockstep if this parse ever changes."""
+    raw = _agent_hooks_raw(rig_yaml_text, key)
+    if raw is None:
+        return default
+    val = raw.lower()
+    if val in ("true", "yes", "on", "1"):
+        return True
+    if val in ("false", "no", "off", "0"):
+        return False
     return default
 
 
@@ -194,25 +236,171 @@ def worktree_only_enabled(cwd: str) -> bool:
     return _agent_hooks_bool(text, CONFIG_KEY, default=False)
 
 
-def _escape_reason(inline_env: dict[str, str] | None = None) -> str | None:
-    """RIG_ALLOW_MAIN_EDIT=1 grants the one-off escape hatch. Checked in BOTH this hook's own
-    process env (a real, session-wide `export`) AND any leading `VAR=val` shell assignment on
-    the offending segment itself (`inline_env`, from `_classify_git_segment`) — because this
-    hook fires as a SEPARATE process before the bash command runs, a `RIG_ALLOW_MAIN_EDIT=1 git
-    checkout x` shell prefix (the exact shape the README documents as "the one-off deliberate
-    checkout") never reaches this process's os.environ; it only ever exports into the child
-    process bash eventually starts for `git`. Without reading it out of the command text too,
-    the documented escape hatch would silently never fire. `inline_env` wins when present (an
-    explicit per-command value, matching shell precedence) — so `RIG_ALLOW_MAIN_EDIT=0` inline
-    can re-assert the block even under a session-wide export=1."""
-    inline = inline_env or {}
-    value = inline.get("RIG_ALLOW_MAIN_EDIT", os.environ.get("RIG_ALLOW_MAIN_EDIT"))
-    if value != "1":
-        return None
-    reason = inline.get("RIG_ALLOW_MAIN_EDIT_REASON")
-    if reason is None:
-        reason = os.environ.get("RIG_ALLOW_MAIN_EDIT_REASON") or ""
-    return reason.strip() or "no reason given"
+# ── external-approval extension point (SYNC: the functions below — _agent_hooks_raw,
+# _agent_hooks_str, _approval_timeout_s, _resolve_approval_config, _kill_process_group,
+# _request_approval — are BYTE-IDENTICAL in pin-primary-worktree/pin_primary_worktree.py and
+# block-reset-hard/block_reset_hard.py; keep the copies in lockstep. Each agent-hook is a
+# standalone script by convention, no shared import between hook dirs. (In pin, _agent_hooks_raw
+# is defined just above _agent_hooks_bool, which reuses it — same text, different placement.)
+# Replaces the old self-service escape hatch (an env var / inline sentinel the constrained agent
+# could set on itself — security theater; Alex tg#6554) with a deny-by-default gate that only a
+# committed, code-reviewed rig.yaml can open. ──────────────────────────────────────────────────
+
+_APPROVAL_CMD_KEY = "approval_cmd"
+_APPROVAL_TIMEOUT_KEY = "approval_cmd_timeout_s"
+_APPROVAL_TIMEOUT_DEFAULT_S = 5.0
+# Hard ceiling on the approval subprocess timeout, independent of what rig.yaml asks for. The
+# dispatcher (lib/cc_hook_bridge/dispatch.py) enforces this hook's manifest timeout_ms as a HARD
+# kill on the WHOLE hook process. If approval_cmd_timeout_s were honored unbounded, a repo owner
+# setting e.g. `approval_cmd_timeout_s: 30` plus a hanging script would let the outer dispatcher
+# kill the hook at its manifest budget — and for a hook with on_error=open that resolves to a
+# SILENT ALLOW (the exact self-grant class this whole change removes). Clamp the effective
+# timeout well under the manifest budget so a misconfig can never become a bypass.
+_APPROVAL_TIMEOUT_CEILING_S = 6.0
+_APPROVAL_DETAIL_CAP = 500  # cap the approval-cmd stdout captured as the logged reason
+
+
+def _agent_hooks_str(rig_yaml_text: str, key: str, default: str | None) -> str | None:
+    """Read a STRING value for ``agent_hooks.<key>`` from rig.yaml (quotes stripped), or
+    ``default`` when the key is absent or its value is blank. Shares ``_agent_hooks_raw``'s
+    block-scoped scanner with ``_agent_hooks_bool`` rather than duplicating it."""
+    raw = _agent_hooks_raw(rig_yaml_text, key)
+    if raw is None or raw == "":
+        return default
+    return raw
+
+
+def _approval_timeout_s(rig_yaml_text: str) -> float:
+    """The effective approval-cmd subprocess timeout: ``agent_hooks.approval_cmd_timeout_s``
+    (default 5.0s), clamped to ``_APPROVAL_TIMEOUT_CEILING_S`` and floored to the default on a
+    non-positive or unparseable value."""
+    raw = _agent_hooks_str(rig_yaml_text, _APPROVAL_TIMEOUT_KEY, None)
+    if raw is None:
+        return _APPROVAL_TIMEOUT_DEFAULT_S
+    try:
+        val = float(raw)
+    except ValueError:
+        warn(f"invalid {_APPROVAL_TIMEOUT_KEY}={raw!r}; using {_APPROVAL_TIMEOUT_DEFAULT_S}s")
+        return _APPROVAL_TIMEOUT_DEFAULT_S
+    if val <= 0:
+        return _APPROVAL_TIMEOUT_DEFAULT_S
+    return min(val, _APPROVAL_TIMEOUT_CEILING_S)
+
+
+def _resolve_approval_config(cwd: str) -> tuple[str | None, float, str | None]:
+    """Read the repo's committed rig.yaml (walk up from ``cwd``) for the external-approval
+    knobs. Returns ``(approval_cmd, timeout_s, rig_root)``. ``approval_cmd`` is None when
+    unconfigured (the default-DENY path — no subprocess is ever spawned). ``rig_root`` is the
+    directory holding rig.yaml, used as the child's cwd so a repo-local approval script
+    resolves relative paths."""
+    root = _find_rig_yaml(cwd)
+    if root is None:
+        return None, _APPROVAL_TIMEOUT_DEFAULT_S, None
+    try:
+        text = (root / "rig.yaml").read_text(encoding="utf-8")
+    except OSError as exc:
+        warn(f"could not read {root / 'rig.yaml'}: {exc}")
+        return None, _APPROVAL_TIMEOUT_DEFAULT_S, None
+    cmd = _agent_hooks_str(text, _APPROVAL_CMD_KEY, None)
+    if cmd is not None:
+        cmd = cmd.strip() or None
+    return cmd, _approval_timeout_s(text), str(root)
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the approval command's whole process group, then reap it. ``start_new_session``
+    makes the child a group leader, so a backgrounded GRANDCHILD that inherited the stdout pipe
+    is killed too. Without this, ``subprocess``'s post-timeout pipe drain can block FOREVER on
+    that still-open inherited pipe — defeating the internal timeout, so the dispatcher's
+    manifest-timeout kill fires instead and (for an on_error=open hook) resolves to a SILENT
+    ALLOW, the exact self-grant class this change removes."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=1)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def _request_approval(cwd: str, context: dict[str, str]) -> tuple[bool, str | None]:
+    """External-approval gate that REPLACES the old self-service escape hatch. Returns
+    ``(approved, detail)``.
+
+    Resolution:
+      - approval_cmd UNCONFIGURED in the repo's committed rig.yaml → ``(False, None)``
+        immediately, NO subprocess. This is the default-DENY path: "nothing configured" means
+        closed, never an automatic bypass.
+      - CONFIGURED → run it. Exit 0 → approved (stdout, trimmed + capped, is the logged
+        ``detail``). A nonzero exit, ANY subprocess exception, OR a timeout → NOT approved. An
+        approval-cmd failure is ALWAYS resolved to deny HERE, inside this function — it never
+        falls through to the hook's own ``on_error`` policy (that policy is for the hook's OWN
+        plumbing failing, not for an approval verdict; a broken/hanging approval_cmd must mean
+        "denied", regardless of whether this hook is on_error=open or on_error=closed).
+
+    The child runs in its OWN process group (``start_new_session=True``) and, on timeout/error,
+    the whole group is SIGKILLed (see ``_kill_process_group``) — so a well-meaning-but-broken
+    approval_cmd that backgrounds a child holding the stdout pipe can't hang the hook past its
+    internal timeout and thereby reach the dispatcher's fail-open.
+
+    TRUST BOUNDARY (why ``shell=True`` is deliberate and safe here): the command STRING comes
+    ONLY from ``agent_hooks.approval_cmd`` in rig.yaml — never from the agent's live command,
+    never from the offending bash command being checked. The security rests on rig.yaml being a
+    REVIEWED config that changes go through: an agent that can already edit-and-commit rig.yaml
+    is outside this hook's threat model, exactly as for the sibling ``worktree_only`` knob that
+    reads the same file. (This reads the working-tree copy and does NOT itself verify the file
+    is committed/clean — that is left to code review, deliberately not re-implemented here; the
+    distinction vs. the OLD hatch is that a bypass now requires a reviewed config change, not an
+    env var / comment the agent invents per-command.) Dynamic data about WHAT is being approved
+    (target, kind, cwd, the raw command) is passed to the child as ``RIG_APPROVAL_*`` environment
+    variables ONLY, never string-interpolated into the command, so there is no injection surface
+    from agent-controlled data.
+    """
+    cmd, timeout_s, rig_root = _resolve_approval_config(cwd)
+    if not cmd:
+        return False, None
+    child_env = {**os.environ}
+    child_env["RIG_APPROVAL_HOOK"] = context.get("hook") or ""
+    child_env["RIG_APPROVAL_KIND"] = context.get("kind") or ""
+    child_env["RIG_APPROVAL_TARGET"] = context.get("target") or ""
+    child_env["RIG_APPROVAL_CWD"] = cwd or ""
+    child_env["RIG_APPROVAL_COMMAND"] = context.get("command") or ""
+    try:
+        proc = subprocess.Popen(  # noqa: S602 — shell=True on a COMMITTED rig.yaml string only (see trust boundary)
+            cmd,
+            shell=True,
+            stdin=subprocess.DEVNULL,  # never inherit the hook's event-pipe stdin: a script that reads stdin gets EOF, not a hang-to-timeout
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=rig_root or None,
+            env=child_env,
+            start_new_session=True,  # own process group → a backgrounded child can't hold the pipe past timeout
+        )
+    except (OSError, ValueError) as exc:
+        warn(f"approval_cmd failed to launch ({exc}) — denying")
+        return False, None
+    try:
+        out, _err = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        warn(f"approval_cmd timed out after {timeout_s:.1f}s — denying")
+        return False, None
+    except (OSError, ValueError) as exc:
+        _kill_process_group(proc)
+        warn(f"approval_cmd errored while running ({exc}) — denying")
+        return False, None
+    if proc.returncode != 0:
+        warn(f"approval_cmd denied (exit {proc.returncode})")
+        return False, None
+    detail = (out or "").strip()[:_APPROVAL_DETAIL_CAP] or None
+    return True, detail
 
 
 # ── primary-vs-linked worktree detection (the piece worktree-only-writes lacks) ─────────────
@@ -292,24 +480,25 @@ def _split_chain(command: str) -> list[str]:
 _GIT_GLOBAL_OPT_ARG = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"}
 )
-# A leading shell assignment (`VAR=val`) in front of the real command — `GIT_TRACE=1 git
-# checkout x`, or the README's own `RIG_ALLOW_MAIN_EDIT=1 git checkout x` escape-hatch shape.
+# A leading shell assignment (`VAR=val`) in front of the real command — e.g. `GIT_TRACE=1 git
+# checkout x`.
 _ASSIGN_RE = re.compile(r"^\w+=")
 
 
 def _classify_git_segment(
     segment: str,
-) -> tuple[str, list[str], str | None, dict[str, str]] | None:
+) -> tuple[str, list[str], str | None] | None:
     """If ``segment``'s head is ``git`` (after any leading assignments), return (subcommand,
-    rest_tokens, -C override, leading_env), else None.
+    rest_tokens, -C override), else None.
 
     Leading `VAR=val` shell assignments are skipped BEFORE looking for the `git` token — a
     pre-bash event sees command-local assignments verbatim in `args.command` (they are never
     stripped by a shell, since no shell has run yet), so without this skip a segment like
     `GIT_TRACE=1 git checkout x` has `toks[0] == "GIT_TRACE=1"`, is classified as "not git" and
     ignored entirely — silently ALLOWING the exact checkout this hook exists to block, for ANY
-    unrelated leading assignment. The skipped assignments are returned as `leading_env` so the
-    caller can also honor an inline `RIG_ALLOW_MAIN_EDIT=1` (see `_escape_reason`).
+    unrelated leading assignment. The skipped assignments are discarded (the old inline
+    `RIG_ALLOW_MAIN_EDIT` bypass they used to feed was removed — Alex tg#6554); skipping them is
+    still required so the real `git` token is found.
 
     Also skips leading global options (so `git -C d checkout x` and `git -c k=v checkout x`
     still find the real subcommand); records a `-C <dir>` override so a cross-repo checkout is
@@ -320,11 +509,8 @@ def _classify_git_segment(
         toks = shlex.split(segment)
     except ValueError:
         return None
-    leading_env: dict[str, str] = {}
     i = 0
     while i < len(toks) and _ASSIGN_RE.match(toks[i]):
-        key, _, val = toks[i].partition("=")
-        leading_env[key] = val
         i += 1
     if i >= len(toks) or toks[i].rsplit("/", 1)[-1] != "git":
         return None
@@ -339,7 +525,7 @@ def _classify_git_segment(
             i += 1
     if i >= len(toks):
         return None
-    return toks[i], toks[i + 1:], cwd_override, leading_env
+    return toks[i], toks[i + 1:], cwd_override
 
 
 def _switch_target(subcommand: str, toks: list[str]) -> str | None:
@@ -377,7 +563,91 @@ def _resolve_effective_cwd(base_cwd: str, cwd_override: str | None) -> str:
     return str(p)
 
 
-def main() -> int:  # noqa: PLR0911 — a linear allow/allow/allow/block ladder reads clearer flat
+def _evaluate_checkout_segment(
+    segment: str, base_cwd: str, command: str, deadline: float
+) -> tuple[str, str] | None:
+    """Evaluate ONE chained-command segment for a primary-worktree checkout/switch violation.
+
+    Returns None if this segment doesn't need gating — not a git invocation, not a
+    checkout/switch, no resolvable branch target (a path-restore / bare `checkout .` / an
+    unresolvable `-`), the target repo isn't `worktree_only`-enrolled, the target IS the
+    default branch, or this isn't the PRIMARY worktree (undetermined or a linked worktree —
+    both fail open). Returns `("block", message)` if this segment must block the WHOLE chained
+    command (approval was requested and denied, OR the `deadline` has already passed — see
+    `_MAIN_LOOP_BUDGET_S`). Returns `("approved", note)` if this segment required and received
+    external approval.
+
+    `main()` keeps scanning LATER segments after an "approved" result — only a
+    `("block", ...)` result stops the scan early. That split is the fix for the bug this
+    function replaces inline loop-body logic for: approving segment 1 must never skip
+    evaluating a segment 2 in the same chained command.
+
+    `deadline` is a `time.monotonic()` cutoff: if it has already passed by the time this
+    segment would need an `approval_cmd` call, this returns `("block", ...)` WITHOUT spawning
+    that subprocess (see `_MAIN_LOOP_BUDGET_S`'s module-level comment for why — a chained
+    command with enough gate-worthy segments could otherwise push the AGGREGATE approval time
+    past this hook's manifest timeout, and this hook's `on_error` is "open": an external kill
+    fails OPEN, exactly the bypass this closes).
+    """
+    classified = _classify_git_segment(segment)
+    if classified is None:
+        return None
+    subcommand, rest, cwd_override = classified
+    if subcommand not in ("checkout", "switch"):
+        return None
+    target = _switch_target(subcommand, rest)
+    if target is None:
+        return None
+
+    eff_cwd = _resolve_effective_cwd(base_cwd, cwd_override)
+
+    if target == "-":
+        resolved = _git(eff_cwd, "rev-parse", "--abbrev-ref", "@{-1}")
+        if not resolved:
+            return None  # can't resolve "previous branch" → fail open on this segment
+        target = resolved
+
+    # Cheapest remaining gate: is this repo enrolled? (per the segment's OWN effective cwd, so
+    # a cross-repo `git -C <other-repo> checkout` is judged by THAT repo's rig.yaml.)
+    if not worktree_only_enabled(eff_cwd):
+        return None
+
+    default = default_branch(eff_cwd)
+    if target == default:
+        return None  # switching (back) to the default branch — always fine
+
+    if not is_primary_worktree(eff_cwd):
+        return None  # None (undetermined) or False (a linked worktree) → fail open / allowed
+
+    # Reserve the FULL approval-cmd ceiling before starting this call, not just check whether
+    # the deadline has already passed: a call that's allowed to START just before `deadline`
+    # can still RUN for up to `_APPROVAL_TIMEOUT_CEILING_S` more, which alone could push the
+    # aggregate past the manifest timeout. Only start this approval call if it can finish (at
+    # its absolute worst case) before `deadline`.
+    if time.monotonic() + _APPROVAL_TIMEOUT_CEILING_S >= deadline:
+        warn(
+            f"denying '{target}' — chained-command approval budget "
+            f"({_MAIN_LOOP_BUDGET_S:.1f}s) would be exhausted before this segment's "
+            "approval_cmd could safely finish"
+        )
+        return "block", (
+            f"BLOCKED — too many chained segments needed approval to check safely within this "
+            f"hook's time budget (denying '{target}' rather than risk an external-timeout "
+            "fail-open). Split this into separate Bash calls so each is approved individually."
+        )
+
+    approved, detail = _request_approval(
+        eff_cwd,
+        {"hook": "pin-primary-worktree", "kind": subcommand, "target": target, "command": command},
+    )
+    if not approved:
+        return "block", MESSAGE.format(target=target, default=default)
+
+    warn(f"primary-worktree checkout approved via approval_cmd ({detail})")
+    return "approved", f"{subcommand} {target} approved via external approval_cmd ({detail})"
+
+
+def main() -> int:
     try:
         event = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError) as exc:
@@ -392,48 +662,24 @@ def main() -> int:  # noqa: PLR0911 — a linear allow/allow/allow/block ladder 
         emit("allow")
         return 0
 
+    # Every segment of a chained command is evaluated — approving one segment must NEVER
+    # short-circuit the check for a LATER segment in the same command (the bug this fixes:
+    # `git -C approved checkout feat ; git -C other checkout feat` let the second checkout
+    # bypass the guard entirely once the first was approved). `deadline` bounds the AGGREGATE
+    # time spent across every segment's approval_cmd call (see _MAIN_LOOP_BUDGET_S).
+    approved_notes: list[str] = []
+    deadline = time.monotonic() + _MAIN_LOOP_BUDGET_S
     for segment in _split_chain(command):
-        classified = _classify_git_segment(segment)
-        if classified is None:
+        result = _evaluate_checkout_segment(segment, cwd, command, deadline)
+        if result is None:
             continue
-        subcommand, rest, cwd_override, leading_env = classified
-        if subcommand not in ("checkout", "switch"):
-            continue
-        target = _switch_target(subcommand, rest)
-        if target is None:
-            continue
+        verdict, message = result
+        if verdict == "block":
+            emit("block", message)
+            return BLOCK_EXIT_CODE
+        approved_notes.append(message)
 
-        eff_cwd = _resolve_effective_cwd(cwd, cwd_override)
-
-        if target == "-":
-            resolved = _git(eff_cwd, "rev-parse", "--abbrev-ref", "@{-1}")
-            if not resolved:
-                continue  # can't resolve "previous branch" → fail open on this segment
-            target = resolved
-
-        # Cheapest remaining gate: is this repo enrolled? (per the segment's OWN effective cwd,
-        # so a cross-repo `git -C <other-repo> checkout` is judged by THAT repo's rig.yaml.)
-        if not worktree_only_enabled(eff_cwd):
-            continue
-
-        default = default_branch(eff_cwd)
-        if target == default:
-            continue  # switching (back) to the default branch — always fine
-
-        primary = is_primary_worktree(eff_cwd)
-        if not primary:
-            continue  # None (undetermined) or False (a linked worktree) → fail open / allowed
-
-        reason = _escape_reason(leading_env)
-        if reason:
-            warn(f"primary-worktree checkout allowed via RIG_ALLOW_MAIN_EDIT ({reason})")
-            emit("allow", f"primary-worktree checkout allowed via escape hatch ({reason})")
-            return 0
-
-        emit("block", MESSAGE.format(target=target, default=default))
-        return BLOCK_EXIT_CODE
-
-    emit("allow")
+    emit("allow", "; ".join(approved_notes) if approved_notes else None)
     return 0
 
 

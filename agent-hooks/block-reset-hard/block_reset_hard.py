@@ -14,8 +14,9 @@ technically stops an agent from running either mid-session: a subagent working a
 PR ran `git reset --hard` in a checkout shared with a different session and wiped that
 session's uncommitted work. The incident was ACCIDENTAL, not a deliberate bypass — this
 hook's real value is turning an accidental destructive reset/clean into a DELIBERATE,
-LOGGED one. It is not a hard wall: the escape hatch below is intentionally self-service,
-same as every sibling hook in this family.
+LOGGED one. It previously shipped a self-service escape hatch (an env var / inline comment the
+agent could set on its own command); that was security theater and was removed (Alex tg#6554).
+The block is now DENY-BY-DEFAULT with the external approval_cmd extension point below.
 
 Detection is ARGV-BASED, not a raw substring match (same discipline as block-raw-pr-merge /
 block-no-verify / require-ticket-before-commit). The command is tokenized LINE BY LINE (a
@@ -43,21 +44,19 @@ Allowed (let through — the safe alternatives this hook steers agents toward):
   - `git clean` with no force flag at all (git itself refuses to delete without `-f`)
   - text that merely mentions "reset --hard" or "clean -fd" (commit message, comment, grep)
 
-Escape hatch (controllable, not a hard wall — mirrors block-raw-pr-merge):
-  - env  ALLOW_GIT_RESET_HARD=1                 — disable the guard for this session
-  - env  ALLOW_GIT_RESET_HARD_REASON=...        — REQUIRED with the override; the reason is
-    logged. Gates BOTH the reset --hard block and the clean -f block (one hatch, one name).
-  - inline sentinel  `# no-reset-guard: <reason>`  anywhere in the command also overrides,
-    so a one-off deliberate reset/clean is self-documenting in the command itself.
-  An override with no reason still blocks: a silent bypass of the bypass-guard is the very
-  thing this hook exists to prevent.
+External approval (replaces the OLD self-service escape hatch): there is NO env-var
+(ALLOW_GIT_RESET_HARD) and NO inline `# no-reset-guard:` bypass any more — an agent could set
+either on its own command, so that "gate" was security theater (removed per Alex tg#6554).
+The block is now DENY-BY-DEFAULT. A repo owner may wire `agent_hooks.approval_cmd` (a shell
+command) in the committed, code-reviewed rig.yaml; when a reset --hard / clean -f is about to
+be blocked this hook runs that command (with RIG_APPROVAL_* context in the child's env) and
+allows ONLY on exit 0. Nothing configured = denied; a nonzero/error/timeout verdict = denied.
+An agent with a genuine reason should ASK the human, not self-grant.
 
-Known limitations — the escape hatch is ALREADY a deliberate, self-service bypass (by
-design: see above), so hardening the parser against an adversarial agent that WANTS through
-is incoherent — it would just use the hatch. The bar for what's fixed above vs. documented
-below is therefore: would a confused, non-evasive agent produce this exact command BY
-ACCIDENT? Newline-separated commands and mid-word `#` (fixed above) clear that bar; these
-don't:
+Known limitations — there is no longer a self-service hatch (removed — Alex tg#6554), so the
+parser is the only line; the bar for what's fixed above vs. documented below remains: would a
+confused, non-evasive agent produce this exact command BY ACCIDENT? Newline-separated commands
+and mid-word `#` (fixed above) clear that bar; these don't:
   - `git reset --har` (an unambiguous long-option prefix git itself accepts) is not detected;
     only the literal `--hard` spelling is matched — no one accidentally abbreviates a
     destructive flag they're not trying to type in full.
@@ -74,12 +73,6 @@ don't:
     accident, but if it's ALREADY in someone's ambient config, a bare `clean -d` silently
     slips past this hook for real. Worth knowing, not worth building a git-config-value
     detector for.
-  - The inline `# no-reset-guard: <reason>` sentinel is matched against the WHOLE raw command
-    string, including inside quotes — `git commit -m "notes: no-reset-guard: x" && git reset
-    --hard` would be read as a valid override even though the text is commit-message data, not
-    a real shell comment on the dangerous segment. Requires a crafted message to trigger; the
-    hatch is self-service anyway, so scoping the sentinel to a genuine comment token isn't
-    worth the added parsing machinery here.
   - A shell alias for `git` (`alias g=git`) is not resolved — universal to this whole hook
     family (aliases only expand in an INTERACTIVE shell by default; a harness running via
     `bash -c "<command>"` doesn't expand them anyway, so this is rarely reachable in practice).
@@ -106,10 +99,27 @@ import json
 import os
 import re
 import shlex
+import signal
+import subprocess  # noqa: S404 — running the rig.yaml-configured approval command
 import sys
+import time
+from pathlib import Path
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
+
+# Wall-clock budget for gating EVERY dangerous segment `_classify` found in one chained command,
+# comfortably under this hook's `timeout_ms: 12000` manifest budget (block-reset-hard.pre-
+# bash.json) even when MULTIPLE segments each need their own `approval_cmd` call. Unlike
+# pin-primary-worktree (on_error=open), this hook is on_error=CLOSED — an external manifest-
+# timeout kill already fails SAFE (deny) here, so this budget is not a security fix. It exists so
+# a chained command where EVERY segment is legitimately approved doesn't spuriously get killed
+# into a generic dispatcher-level denial instead of this hook's own clear "too many segments"
+# message, and so the hook stops spending time on approval calls destined to be killed anyway.
+# Before each approval_cmd call, the caller reserves the FULL `_APPROVAL_TIMEOUT_CEILING_S`
+# against this budget (not just "has the deadline already passed") — a call merely allowed to
+# START just before the deadline could still itself run the whole ceiling and blow the aggregate.
+_MAIN_LOOP_BUDGET_S = 10.0
 
 # Shell operators that separate independent command segments in a compound command line.
 _SHELL_SEPS = frozenset({"&&", "||", ";", "|", "&", ";;", "|&", ";&", ";;&"})
@@ -206,11 +216,6 @@ _GIT_GLOBAL_VALUE_FLAGS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--
 # treat a parse error as fail-closed.
 _RESET_HARD_HINT = re.compile(r"\bgit\b.*\breset\b.*\bhard\b", re.DOTALL)
 _CLEAN_FORCE_HINT = re.compile(r"\bgit\b.*\bclean\b.*(-f|--force)", re.DOTALL)
-
-# Inline, self-documenting per-command override (checked on the raw string so a
-# comment stripped by shlex is still found).
-INLINE_SENTINEL = re.compile(r"#\s*no-reset-guard:\s*(\S.*)")
-
 
 def emit(decision: str, message: str | None = None) -> None:
     out: dict[str, str] = {"hook_api": HOOK_API, "decision": decision}
@@ -458,6 +463,65 @@ def _git_subcommand(segment: list[str]) -> list[str] | None:
     return _strip_git_globals(argv)
 
 
+def _git_dash_c_dir(segment: list[str]) -> str | None:
+    """The effective ``git -C <dir>`` directory a git segment targets, or None. So a destructive
+    command aimed at ANOTHER repo (`git -C ../other reset --hard`) has its approval resolved
+    against THAT repo's rig.yaml, not the shell cwd — mirroring pin-primary-worktree's cross-repo
+    `-C` handling. argv is peeled of wrappers/inline-env first; only a real `git` invocation is
+    inspected. git APPLIES SUCCESSIVE `-C` cumulatively (`git -C a -C b` == chdir a then b), so
+    the values are joined in order (an absolute later `-C` resets the path, per pathlib join).
+
+    SCOPE (documented limitation, same class as pin-primary-worktree's `cd other-repo` note):
+    only `git -C` is followed. A cwd change made by a WRAPPER or a chained `cd` — `env -C <dir>`,
+    `sudo --chdir <dir>`, `cd other && git reset --hard` — is NOT followed; approval for such a
+    command resolves against the shell cwd's rig.yaml, not the relocated target. Deny-by-default
+    still holds (an unconfigured cwd repo denies); the only residual is a cwd repo whose
+    configured approver could then authorize a wrapper-relocated command against another repo.
+    """
+    argv = _segment_argv(segment)
+    if not argv or _basename(argv[0]) != "git":
+        return None
+    dirs: list[str] = []
+    i = 1
+    n = len(argv)
+    while i < n:
+        tok = argv[i]
+        if not tok.startswith("-"):
+            break
+        if tok == "-C" and i + 1 < n:
+            dirs.append(argv[i + 1])
+            i += 2
+            continue
+        if tok.startswith("-C") and len(tok) > 2:
+            dirs.append(tok[2:])  # glued form: -C/path
+            i += 1
+            continue
+        if tok in _GIT_GLOBAL_VALUE_FLAGS:
+            i += 2
+            continue
+        if tok.startswith("-c") and len(tok) > 2:
+            i += 1  # glued -ckey=val
+            continue
+        i += 1
+    if not dirs:
+        return None
+    result = Path(dirs[0])
+    for d in dirs[1:]:
+        result = result / d  # pathlib: an absolute right operand resets the path (matches git)
+    return str(result)
+
+
+def _effective_cwd(base_cwd: str, cwd_override: str | None) -> str:
+    """Resolve a segment's ``git -C <dir>`` override against the shell cwd, so approval config
+    is read from the repo actually being acted on (SYNC with pin-primary-worktree)."""
+    if not cwd_override:
+        return base_cwd
+    p = Path(cwd_override)
+    if not p.is_absolute():
+        p = Path(base_cwd or ".") / p
+    return str(p)
+
+
 def _is_reset_hard(segment: list[str]) -> bool:
     """Return True iff this segment is `git reset --hard [ref]` (globals/wrappers peeled)."""
     sub = _git_subcommand(segment)
@@ -494,53 +558,321 @@ def _is_clean_force(segment: list[str]) -> bool:
     return bool(sub) and sub[0] == "clean" and _has_force_flag(sub[1:])
 
 
-def _classify(command: str) -> tuple[str, str | None]:
+def _classify(command: str) -> tuple[str, list[tuple[str, str | None]]]:
     """Classify `command` for the two dangerous forms this hook guards.
 
-    Returns (verdict, kind):
-      verdict "safe"        — command parsed cleanly, no reset --hard / clean -f... found.
-      verdict "dangerous"   — command parsed cleanly and a segment IS one of the two forms.
+    Returns (verdict, findings):
+      verdict "safe"        — command parsed cleanly, no reset --hard / clean -f... found;
+                              `findings` is `[]`.
+      verdict "dangerous"   — command parsed cleanly and ONE OR MORE segments are one of the
+                              two forms; `findings` has one `(kind, cwd_override)` entry PER
+                              dangerous segment. A chained command can carry more than one
+                              (e.g. `git -C a reset --hard ; git -C b clean -fd`) — ALL are
+                              collected here (the loop below never returns early on the first
+                              match) so the caller can require approval for every single one,
+                              not just the first.
       verdict "unparseable" — shlex could not tokenize (unbalanced quotes) AND the raw text
-                              plausibly contains one of the dangerous forms — fail-closed.
-    `kind` is "reset --hard" or "clean -f..." whenever verdict != "safe", else None.
+                              plausibly contains one of the dangerous forms — fail-closed;
+                              `findings` has exactly one `(kind, None)` entry.
+    Each finding's `kind` is "reset --hard" or "clean -f...". Each finding's `cwd_override` is
+    THAT segment's `git -C <dir>` target (else None), so approval config for that finding is
+    read from the repo it actually targets, not the shell cwd.
     """
     try:
         segments = _split_segments(command)
     except ValueError:
         if _RESET_HARD_HINT.search(command):
-            return "unparseable", "reset --hard"
+            return "unparseable", [("reset --hard", None)]
         if _CLEAN_FORCE_HINT.search(command):
-            return "unparseable", "clean -f..."
-        return "safe", None
+            return "unparseable", [("clean -f...", None)]
+        return "safe", []
+    findings: list[tuple[str, str | None]] = []
     for seg in segments:
         try:
             if _is_reset_hard(seg):
-                return "dangerous", "reset --hard"
-            if _is_clean_force(seg):
-                return "dangerous", "clean -f..."
+                findings.append(("reset --hard", _git_dash_c_dir(seg)))
+            elif _is_clean_force(seg):
+                findings.append(("clean -f...", _git_dash_c_dir(seg)))
         except _WrapperOverflow:
-            # Can't resolve this segment's real command through the wrapper chain — the
-            # command MIGHT be a destructive reset/clean hidden behind it. Fail closed.
-            return "unparseable", "wrapper chain too deep to verify"
-    return "safe", None
+            # Can't resolve THIS segment's real command through the wrapper chain — it MIGHT
+            # be a destructive reset/clean hidden behind it. Fail closed for the WHOLE command
+            # (an unresolvable segment could be hiding either dangerous form).
+            return "unparseable", [("wrapper chain too deep to verify", None)]
+    if not findings:
+        return "safe", []
+    return "dangerous", findings
 
 
-def _override_reason(command: str) -> str | None:
-    """Return the override reason if a valid escape hatch is present, else None.
-
-    An override is honored ONLY with a reason: env ALLOW_GIT_RESET_HARD=1 plus
-    ALLOW_GIT_RESET_HARD_REASON, OR an inline ``# no-reset-guard: <reason>`` sentinel. Gates
-    BOTH `reset --hard` and `clean -f...` — one escape hatch, one name. A reasonless override
-    is ignored (the command stays blocked).
-    """
-    if os.environ.get("ALLOW_GIT_RESET_HARD") == "1":
-        reason = (os.environ.get("ALLOW_GIT_RESET_HARD_REASON") or "").strip()
-        if reason:
-            return f"env override: {reason}"
-    m = INLINE_SENTINEL.search(command)
-    if m:
-        return f"inline override: {m.group(1).strip()}"
+def _find_rig_yaml(cwd: str) -> Path | None:
+    """Walk up from ``cwd`` to the first directory containing a ``rig.yaml`` (or None). SYNC
+    with pin-primary-worktree / worktree-only-writes — same walk-up helper."""
+    try:
+        here = Path(cwd or ".").resolve()
+    except OSError:
+        return None
+    for d in (here, *here.parents):
+        if (d / "rig.yaml").is_file():
+            return d
     return None
+
+
+# ── external-approval extension point (SYNC: the functions below — _agent_hooks_raw,
+# _agent_hooks_str, _approval_timeout_s, _resolve_approval_config, _kill_process_group,
+# _request_approval — are BYTE-IDENTICAL in pin-primary-worktree/pin_primary_worktree.py and
+# block-reset-hard/block_reset_hard.py; keep the copies in lockstep. Each agent-hook is a
+# standalone script by convention, no shared import between hook dirs. (In pin, _agent_hooks_raw
+# is defined just above _agent_hooks_bool, which reuses it — same text, different placement.)
+# Replaces the old self-service escape hatch (an env var / inline sentinel the constrained agent
+# could set on itself — security theater; Alex tg#6554) with a deny-by-default gate that only a
+# committed, code-reviewed rig.yaml can open. ──────────────────────────────────────────────────
+
+_APPROVAL_CMD_KEY = "approval_cmd"
+_APPROVAL_TIMEOUT_KEY = "approval_cmd_timeout_s"
+_APPROVAL_TIMEOUT_DEFAULT_S = 5.0
+# Hard ceiling on the approval subprocess timeout, independent of what rig.yaml asks for. The
+# dispatcher (lib/cc_hook_bridge/dispatch.py) enforces this hook's manifest timeout_ms as a HARD
+# kill on the WHOLE hook process. If approval_cmd_timeout_s were honored unbounded, a repo owner
+# setting e.g. `approval_cmd_timeout_s: 30` plus a hanging script would let the outer dispatcher
+# kill the hook at its manifest budget — and for a hook with on_error=open that resolves to a
+# SILENT ALLOW (the exact self-grant class this whole change removes). Clamp the effective
+# timeout well under the manifest budget so a misconfig can never become a bypass.
+_APPROVAL_TIMEOUT_CEILING_S = 6.0
+_APPROVAL_DETAIL_CAP = 500  # cap the approval-cmd stdout captured as the logged reason
+
+
+def _agent_hooks_raw(rig_yaml_text: str, key: str) -> str | None:
+    """The raw (comment-stripped, quote-stripped) string value of ``agent_hooks.<key>``, or
+    None if the key is absent from the top-level ``agent_hooks:`` block. The single
+    block-scoped, indentation-aware line scanner shared by ``_agent_hooks_bool`` and
+    ``_agent_hooks_str``. SYNC with worktree_only_writes / orchestrator_stays_thin — keep the
+    SCANNER BEHAVIOR in lockstep if it ever changes (those two copies still inline the same
+    logic inside their own ``_agent_hooks_bool``; behavior here is identical, just factored)."""
+    in_block = False
+    child_indent: int | None = None
+    for raw in rig_yaml_text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        head = line.strip().split(":", 1)[0].strip()
+        if indent == 0:
+            in_block = head == "agent_hooks"
+            child_indent = None
+            continue
+        if not in_block:
+            continue
+        if child_indent is None:
+            child_indent = indent
+        if indent != child_indent:
+            continue
+        if head == key and ":" in line.strip():
+            return line.strip().split(":", 1)[1].strip().strip("\"'")
+    return None
+
+
+def _agent_hooks_str(rig_yaml_text: str, key: str, default: str | None) -> str | None:
+    """Read a STRING value for ``agent_hooks.<key>`` from rig.yaml (quotes stripped), or
+    ``default`` when the key is absent or its value is blank. Shares ``_agent_hooks_raw``'s
+    block-scoped scanner with ``_agent_hooks_bool`` rather than duplicating it."""
+    raw = _agent_hooks_raw(rig_yaml_text, key)
+    if raw is None or raw == "":
+        return default
+    return raw
+
+
+def _approval_timeout_s(rig_yaml_text: str) -> float:
+    """The effective approval-cmd subprocess timeout: ``agent_hooks.approval_cmd_timeout_s``
+    (default 5.0s), clamped to ``_APPROVAL_TIMEOUT_CEILING_S`` and floored to the default on a
+    non-positive or unparseable value."""
+    raw = _agent_hooks_str(rig_yaml_text, _APPROVAL_TIMEOUT_KEY, None)
+    if raw is None:
+        return _APPROVAL_TIMEOUT_DEFAULT_S
+    try:
+        val = float(raw)
+    except ValueError:
+        warn(f"invalid {_APPROVAL_TIMEOUT_KEY}={raw!r}; using {_APPROVAL_TIMEOUT_DEFAULT_S}s")
+        return _APPROVAL_TIMEOUT_DEFAULT_S
+    if val <= 0:
+        return _APPROVAL_TIMEOUT_DEFAULT_S
+    return min(val, _APPROVAL_TIMEOUT_CEILING_S)
+
+
+def _resolve_approval_config(cwd: str) -> tuple[str | None, float, str | None]:
+    """Read the repo's committed rig.yaml (walk up from ``cwd``) for the external-approval
+    knobs. Returns ``(approval_cmd, timeout_s, rig_root)``. ``approval_cmd`` is None when
+    unconfigured (the default-DENY path — no subprocess is ever spawned). ``rig_root`` is the
+    directory holding rig.yaml, used as the child's cwd so a repo-local approval script
+    resolves relative paths."""
+    root = _find_rig_yaml(cwd)
+    if root is None:
+        return None, _APPROVAL_TIMEOUT_DEFAULT_S, None
+    try:
+        text = (root / "rig.yaml").read_text(encoding="utf-8")
+    except OSError as exc:
+        warn(f"could not read {root / 'rig.yaml'}: {exc}")
+        return None, _APPROVAL_TIMEOUT_DEFAULT_S, None
+    cmd = _agent_hooks_str(text, _APPROVAL_CMD_KEY, None)
+    if cmd is not None:
+        cmd = cmd.strip() or None
+    return cmd, _approval_timeout_s(text), str(root)
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the approval command's whole process group, then reap it. ``start_new_session``
+    makes the child a group leader, so a backgrounded GRANDCHILD that inherited the stdout pipe
+    is killed too. Without this, ``subprocess``'s post-timeout pipe drain can block FOREVER on
+    that still-open inherited pipe — defeating the internal timeout, so the dispatcher's
+    manifest-timeout kill fires instead and (for an on_error=open hook) resolves to a SILENT
+    ALLOW, the exact self-grant class this change removes."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=1)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def _request_approval(cwd: str, context: dict[str, str]) -> tuple[bool, str | None]:
+    """External-approval gate that REPLACES the old self-service escape hatch. Returns
+    ``(approved, detail)``.
+
+    Resolution:
+      - approval_cmd UNCONFIGURED in the repo's committed rig.yaml → ``(False, None)``
+        immediately, NO subprocess. This is the default-DENY path: "nothing configured" means
+        closed, never an automatic bypass.
+      - CONFIGURED → run it. Exit 0 → approved (stdout, trimmed + capped, is the logged
+        ``detail``). A nonzero exit, ANY subprocess exception, OR a timeout → NOT approved. An
+        approval-cmd failure is ALWAYS resolved to deny HERE, inside this function — it never
+        falls through to the hook's own ``on_error`` policy (that policy is for the hook's OWN
+        plumbing failing, not for an approval verdict; a broken/hanging approval_cmd must mean
+        "denied", regardless of whether this hook is on_error=open or on_error=closed).
+
+    The child runs in its OWN process group (``start_new_session=True``) and, on timeout/error,
+    the whole group is SIGKILLed (see ``_kill_process_group``) — so a well-meaning-but-broken
+    approval_cmd that backgrounds a child holding the stdout pipe can't hang the hook past its
+    internal timeout and thereby reach the dispatcher's fail-open.
+
+    TRUST BOUNDARY (why ``shell=True`` is deliberate and safe here): the command STRING comes
+    ONLY from ``agent_hooks.approval_cmd`` in rig.yaml — never from the agent's live command,
+    never from the offending bash command being checked. The security rests on rig.yaml being a
+    REVIEWED config that changes go through: an agent that can already edit-and-commit rig.yaml
+    is outside this hook's threat model, exactly as for the sibling ``worktree_only`` knob that
+    reads the same file. (This reads the working-tree copy and does NOT itself verify the file
+    is committed/clean — that is left to code review, deliberately not re-implemented here; the
+    distinction vs. the OLD hatch is that a bypass now requires a reviewed config change, not an
+    env var / comment the agent invents per-command.) Dynamic data about WHAT is being approved
+    (target, kind, cwd, the raw command) is passed to the child as ``RIG_APPROVAL_*`` environment
+    variables ONLY, never string-interpolated into the command, so there is no injection surface
+    from agent-controlled data.
+    """
+    cmd, timeout_s, rig_root = _resolve_approval_config(cwd)
+    if not cmd:
+        return False, None
+    child_env = {**os.environ}
+    child_env["RIG_APPROVAL_HOOK"] = context.get("hook") or ""
+    child_env["RIG_APPROVAL_KIND"] = context.get("kind") or ""
+    child_env["RIG_APPROVAL_TARGET"] = context.get("target") or ""
+    child_env["RIG_APPROVAL_CWD"] = cwd or ""
+    child_env["RIG_APPROVAL_COMMAND"] = context.get("command") or ""
+    try:
+        proc = subprocess.Popen(  # noqa: S602 — shell=True on a COMMITTED rig.yaml string only (see trust boundary)
+            cmd,
+            shell=True,
+            stdin=subprocess.DEVNULL,  # never inherit the hook's event-pipe stdin: a script that reads stdin gets EOF, not a hang-to-timeout
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=rig_root or None,
+            env=child_env,
+            start_new_session=True,  # own process group → a backgrounded child can't hold the pipe past timeout
+        )
+    except (OSError, ValueError) as exc:
+        warn(f"approval_cmd failed to launch ({exc}) — denying")
+        return False, None
+    try:
+        out, _err = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        warn(f"approval_cmd timed out after {timeout_s:.1f}s — denying")
+        return False, None
+    except (OSError, ValueError) as exc:
+        _kill_process_group(proc)
+        warn(f"approval_cmd errored while running ({exc}) — denying")
+        return False, None
+    if proc.returncode != 0:
+        warn(f"approval_cmd denied (exit {proc.returncode})")
+        return False, None
+    detail = (out or "").strip()[:_APPROVAL_DETAIL_CAP] or None
+    return True, detail
+
+
+def _block_message(kind: str) -> str:
+    """The refusal text for an unapproved dangerous segment of `kind` ("reset --hard" or
+    "clean -f..."). Factored out of `main()` so `_gate_dangerous_segments` — which may need to
+    emit this once per dangerous segment in a chained command — doesn't duplicate the literal.
+    """
+    return (
+        f"Refusing a `git {kind}`: it irreversibly wipes uncommitted/untracked work with no "
+        "undo. Use a scoped, reversible alternative instead — `git checkout -- <file>` / "
+        "`git restore <file>` for tracked files, `git clean -n` to preview untracked files "
+        "first.\nThere is NO automatic bypass and NO self-service escape hatch. Do NOT try to "
+        "self-grant via ALLOW_GIT_RESET_HARD or a `# no-reset-guard:` comment — both were "
+        "removed (an agent setting its own bypass is security theater; removed per Alex "
+        "tg#6554). If you genuinely need this, ASK the human directly (your usual channel to "
+        "Alex) — asking is fine, self-granting is not. A repo owner can wire a real "
+        "external-approval path via agent_hooks.approval_cmd in rig.yaml; unconfigured means "
+        "denied."
+    )
+
+
+def _gate_dangerous_segments(
+    findings: list[tuple[str, str | None]], cwd: str, command: str
+) -> int:
+    """Request approval for EVERY dangerous segment `_classify` found — not just the first.
+
+    Approving one segment must never let a LATER, unapproved dangerous segment in the same
+    chained command run unchecked (e.g. `git -C approved reset --hard ; git -C other clean
+    -fd`): the first finding that fails approval blocks the WHOLE command immediately, without
+    even requesting approval for any finding after it. Only if EVERY finding is approved does
+    this emit a single `allow`, whose message lists each approval.
+
+    Bounded by `_MAIN_LOOP_BUDGET_S` (see its module-level comment): a chained command with
+    enough dangerous segments could otherwise sum to more approval-cmd time than this hook's
+    manifest timeout allows, spuriously denying a command where every segment WAS approved.
+    """
+    approved_notes: list[str] = []
+    deadline = time.monotonic() + _MAIN_LOOP_BUDGET_S
+    for kind, cwd_override in findings:
+        # Reserve the FULL approval-cmd ceiling before starting this call — a call merely
+        # allowed to start just before `deadline` could still itself run the whole ceiling.
+        if time.monotonic() + _APPROVAL_TIMEOUT_CEILING_S >= deadline:
+            emit(
+                "block",
+                "block-reset-hard: too many chained dangerous segments to check safely within "
+                "this hook's time budget — denying (fail-closed) rather than risk spurious "
+                "behavior from an external timeout. Split this into separate Bash calls so "
+                "each `git reset --hard`/`git clean -f...` is approved individually.",
+            )
+            return BLOCK_EXIT_CODE
+        approved, detail = _request_approval(
+            _effective_cwd(cwd, cwd_override),
+            {"hook": "block-reset-hard", "kind": kind, "target": "", "command": command},
+        )
+        if not approved:
+            emit("block", _block_message(kind))
+            return BLOCK_EXIT_CODE
+        warn(f"{kind} approved via approval_cmd ({detail})")
+        approved_notes.append(f"{kind} approved via external approval_cmd ({detail})")
+
+    emit("allow", "; ".join(approved_notes))
+    return 0
 
 
 def main() -> int:
@@ -551,18 +883,20 @@ def main() -> int:
         emit("block", "block-reset-hard: could not inspect the command (fail-closed)")
         return BLOCK_EXIT_CODE
 
+    cwd = str(event.get("cwd") or os.getcwd())
     args = event.get("args") or {}
     command = args.get("command") or args.get("cmd") or event.get("command") or ""
     if not isinstance(command, str):
         command = str(command)
 
-    verdict, kind = _classify(command)
+    verdict, findings = _classify(command)
 
     if verdict == "safe":
         emit("allow")
         return 0
 
     if verdict == "unparseable":
+        kind = findings[0][0]
         warn(f"could not verify command ({kind}) — blocking (fail-closed)")
         emit(
             "block",
@@ -571,22 +905,10 @@ def main() -> int:
         )
         return BLOCK_EXIT_CODE
 
-    # verdict == "dangerous": a cleanly-parsed segment is a real reset --hard / clean -f...
-    reason = _override_reason(command)
-    if reason:
-        warn(f"{kind} allowed via escape hatch ({reason})")
-        emit("allow", f"{kind} allowed via escape hatch ({reason})")
-        return 0
-
-    emit(
-        "block",
-        f"Refusing a `git {kind}`: it irreversibly wipes uncommitted/untracked work with no "
-        "undo. Use a scoped, reversible alternative instead — `git checkout -- <file>` / "
-        "`git restore <file>` for tracked files, `git clean -n` to preview untracked files "
-        "first. Override only with an explicit reason: set ALLOW_GIT_RESET_HARD=1 and "
-        "ALLOW_GIT_RESET_HARD_REASON='why', or append `# no-reset-guard: why` to the command.",
-    )
-    return BLOCK_EXIT_CODE
+    # verdict == "dangerous": one or more cleanly-parsed segments are a real reset --hard /
+    # clean -f... — every one of them must be approved individually (see
+    # _gate_dangerous_segments); approving the first must never wave the rest through.
+    return _gate_dangerous_segments(findings, cwd, command)
 
 
 if __name__ == "__main__":
