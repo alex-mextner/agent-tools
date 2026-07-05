@@ -117,6 +117,74 @@ def test_effective_cwd_quoted_cd_path(tmp_path):
     assert vpg.effective_cwd(cmd, str(tmp_path)) == "/abs/other repo"
 
 
+@pytest.mark.parametrize("cmd", [
+    "(cd /abs/other-repo && git commit -m x)",
+    "( cd /abs/other-repo && git commit -m x )",
+])
+def test_effective_cwd_parenthesized_subshell_cd(cmd, tmp_path):
+    """Regression (PR #176 review finding, agent-tools#201): the common subshell idiom
+    `(cd <worktree> && git commit ...)` — used so the `cd` doesn't leak into the caller's
+    shell — used to defeat `cd`-detection entirely. `shlex.split` tokenizes the opening `(`
+    two different ways depending on whether it has a following space:
+      - glued, no space (`(cd repoB ...)`)  -> one token: `"(cd"`, never bare `"cd"`
+      - spaced (`( cd repoB ... )`)         -> `"("` as its own standalone token before `"cd"`
+    Before the fix, `seg[0] == "cd"` matched neither shape, so `effective_cwd` fell back to
+    `session_cwd` instead of the real target repo — silently checking the wrong repo's
+    staged files. Both shapes must resolve to the actual `cd` target."""
+    assert vpg.effective_cwd(cmd, str(tmp_path)) == "/abs/other-repo"
+
+
+@pytest.mark.parametrize("cmd", [
+    "( cd /abs/other-repo && true ) ; git commit -m x",
+    "(cd /abs/other-repo) && git commit -m x",
+    "(cd /abs/other-repo && true); git commit -m x",
+])
+def test_effective_cwd_subshell_cd_that_closes_before_the_commit_is_not_trusted(cmd, tmp_path):
+    """Regression (PR #176 review finding on the subshell fix itself, agent-tools#201): a
+    `(...)` subshell forks a CHILD process — a `cd` inside it never persists once the
+    subshell's own `)` closes. `(cd repoB && true) ; git commit -m x` (do something in
+    repoB, then come back and commit in the ORIGINAL directory — a realistic idiom for
+    exactly the reason a subshell is used at all) must resolve to `session_cwd`, not
+    `repoB`: naively trusting any `(`-recognized `cd` regardless of whether its subshell
+    already closed would resolve to a real, existing, but IRRELEVANT other repo instead of
+    the one the commit actually lands in — the very failure class this function exists to
+    prevent, self-inflicted by over-trusting a closed subshell."""
+    assert vpg.effective_cwd(cmd, str(tmp_path)) == str(tmp_path)
+
+
+def test_effective_cwd_group_command_cd_persists_past_its_closing_brace(tmp_path):
+    """Contrast case: unlike `(...)`, a `{ ...; }` GROUP command runs in the CURRENT shell
+    (no fork) — a `cd` inside it genuinely persists past the closing `}`. Proves the fix
+    distinguishes `(` (subshell, vetoed once closed) from `{` (group command, trusted
+    regardless) rather than blanket-distrusting any closed grouping construct."""
+    cmd = "{ cd /abs/other-repo ; } ; git commit -m x"
+    assert vpg.effective_cwd(cmd, str(tmp_path)) == "/abs/other-repo"
+
+
+def test_effective_cwd_closed_subshell_cd_does_not_veto_a_later_dash_c_on_the_commit(tmp_path):
+    """Regression (review finding, round 2, on the closed-subshell veto itself): an EARLIER,
+    already-closed decoy subshell `cd` must not discard a LATER, legitimately-resolved `-C`
+    on the commit's own invocation. `(cd /decoy && true) ; git -C /target commit -m x` must
+    resolve to `/target` — the decoy `cd` is correctly distrusted (its subshell already
+    closed), but that distrust must reset to session_cwd and let the commit's own `-C`
+    resolve normally from there, not blanket-veto the whole resolution to session_cwd and
+    discard a `-C` that has nothing to do with the closed subshell."""
+    cmd = "(cd /decoy && true) ; git -C /target commit -m x"
+    assert vpg.effective_cwd(cmd, str(tmp_path)) == "/target"
+
+
+def test_effective_cwd_unrelated_sibling_subshell_cannot_resurrect_a_closed_cd(tmp_path):
+    """Regression (review finding, round 2): a plain open/closed check at the commit boundary
+    can be fooled by an UNRELATED sibling subshell reopening to the SAME nesting depth after
+    the real one (with the trusted `cd`) already closed. `(cd /decoy && true) ; (echo ok &&
+    git commit -m x)` — the first subshell (containing the `cd`) closes; a wholly separate
+    second subshell (no `cd` inside it at all) happens to open before the commit, landing at
+    the same depth. Must resolve to session_cwd, not `/decoy` — the running-minimum-depth
+    check (not just the depth value right before the commit) is what tells these apart."""
+    cmd = "(cd /decoy && true) ; (echo ok && git commit -m x)"
+    assert vpg.effective_cwd(cmd, str(tmp_path)) == str(tmp_path)
+
+
 def test_effective_cwd_git_dash_c_flag(tmp_path):
     cmd = "git -C /abs/other-repo commit -m x"
     assert vpg.effective_cwd(cmd, str(tmp_path)) == "/abs/other-repo"
@@ -437,6 +505,71 @@ def test_cross_repo_cd_does_not_leak_session_cwds_staged_files(tmp_path, monkeyp
     out, _e, c = _run(f"cd {repo_b} && git commit -m x", repo_a, monkeypatch,
                       proof_dir=tmp_path / "proof")
     assert c == 0 and _decision(out) == "allow"
+
+
+def test_cross_repo_parenthesized_subshell_cd_checks_the_cd_target_not_session_cwd(
+    tmp_path, monkeypatch,
+):
+    """End-to-end version of the parenthesized-subshell regression above: session_cwd is
+    repo A (nothing visual staged); the command subshells a `cd` into repo B, which HAS a
+    staged .tsx, via the exact exploit shape from PR #176's review (`(cd repoB && git
+    commit -m x)`). Before the fix this ALLOWed — repo A (session_cwd) was checked instead
+    of repo B, so the visual-proof gate was silently bypassed for the repo the commit
+    actually lands in. Must BLOCK on repo B's staged file."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    repo_a = _mk_repo_with_staged(tmp_path / "a", "README.md")
+    repo_b = _mk_repo_with_staged(tmp_path / "b", "src/Button.tsx")
+    out, _e, c = _run(f"(cd {repo_b} && git commit -m x)", repo_a, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE
+    payload = json.loads(out)
+    assert payload["decision"] == "block"
+    assert "Button.tsx" in payload["message"]
+
+
+def test_cross_repo_closed_subshell_cd_cannot_hide_session_cwds_own_staged_file(
+    tmp_path, monkeypatch,
+):
+    """End-to-end version of the closed-subshell regression: session_cwd (repo A) HAS a
+    staged .tsx; the command subshells a `cd` into an EMPTY repo B, does something there,
+    then closes the subshell and commits back in repo A via a bare `;` (`(cd repoB &&
+    true) ; git commit -m x`). A naive fix that trusts ANY `(`-recognized `cd` regardless
+    of whether its subshell already closed would resolve to repo B (empty, nothing staged)
+    and wrongly ALLOW — hiding repo A's own real, unproven staged .tsx. Must BLOCK on repo
+    A's staged file, proving the closed subshell's `cd` is NOT trusted here."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    repo_a = _mk_repo_with_staged(tmp_path / "a", "src/Button.tsx")
+    repo_b = _mk_repo_with_staged(tmp_path / "b")
+    out, _e, c = _run(f"(cd {repo_b} && true) ; git commit -m x", repo_a, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE
+    payload = json.loads(out)
+    assert payload["decision"] == "block"
+    assert "Button.tsx" in payload["message"]
+
+
+def test_cross_repo_unrelated_sibling_subshell_cannot_hide_session_cwds_own_staged_file(
+    tmp_path, monkeypatch,
+):
+    """End-to-end version of the sibling-subshell regression (review finding, round 2):
+    session_cwd (repo A) HAS a staged .tsx; the command subshells a `cd` into an EMPTY repo
+    B, closes that subshell, then commits inside a wholly SEPARATE second subshell that
+    never `cd`s anywhere (`(cd repoB && true) ; (echo ok && git commit -m x)`). A depth
+    check that only compares the value right before the commit (rather than the running
+    minimum since the `cd`) would be fooled by the second subshell reopening to the same
+    nesting depth and wrongly ALLOW via repo B. Must BLOCK on repo A's staged file."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    repo_a = _mk_repo_with_staged(tmp_path / "a", "src/Button.tsx")
+    repo_b = _mk_repo_with_staged(tmp_path / "b")
+    out, _e, c = _run(f"(cd {repo_b} && true) ; (echo ok && git commit -m x)", repo_a,
+                      monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE
+    payload = json.loads(out)
+    assert payload["decision"] == "block"
+    assert "Button.tsx" in payload["message"]
 
 
 def test_trailing_cd_after_commit_cannot_bypass_the_gate(tmp_path, monkeypatch):

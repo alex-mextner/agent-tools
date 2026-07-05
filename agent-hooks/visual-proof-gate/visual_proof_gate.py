@@ -126,6 +126,16 @@ _CD_TRUSTED_SEP = frozenset({"&&", ";"})
 # though the `cd` was otherwise a trusted, leading/`;`-preceded segment. See the cd-trust check.
 _CD_SUBSHELL_SEP = frozenset({"|", "&"})
 _GIT_GLOBAL_VALUE_FLAGS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace"})
+# A leading `(` (subshell) — or `{` (group command), included defensively even though `{`
+# requires a following space in valid shell syntax and so never glues — immediately before a
+# segment's first real word. Matches only a RUN of pure grouping punctuation, so it strips a
+# whole standalone token (`"("`) but never eats into an actual word that merely starts with one.
+_LEADING_GROUPING = re.compile(r"^[({]+$")
+# Same characters, but for stripping a GLUED prefix off a token that also has a real word
+# attached (`"(cd"` -> `"cd"`) — `shlex.split` glues shell-grouping punctuation onto the very
+# next word when there's no space between them (`(cd repoB`), while a spaced form (`( cd
+# repoB`) emits the marker as its own token instead (caught by `_LEADING_GROUPING` above).
+_LEADING_GROUPING_PREFIX = re.compile(r"^[({]+")
 
 
 def _segments(tokens: list[str]) -> list[list[str]]:
@@ -150,6 +160,91 @@ def _segments_with_preceding_sep(tokens: list[str]) -> list[tuple[str | None, li
             cur.append(tok)
     out.append((prev_sep, cur))
     return out
+
+
+def _strip_leading_grouping(seg: list[str]) -> list[str]:
+    """Drop/strip a leading shell-grouping marker (`(`/`{`) so a `cd` right inside a subshell
+    or group command — `(cd repoB && ...)` / `( cd repoB && ... )` — is recognized as `cd`,
+    not left glued to (or hidden behind) the grouping punctuation.
+
+    `shlex.split` produces two different token shapes for the SAME construct depending on
+    whether the marker has a following space (agent-tools#201, PR #176 review finding):
+      - glued   (`(cd repoB ...`)  -> ONE token, `"(cd"` — the marker is glued onto `cd`.
+      - spaced  (`( cd repoB ...`) -> the marker is its OWN token, `"("`, ahead of `"cd"`.
+    Before this, `seg[0] == "cd"` matched neither shape, so a subshell-wrapped `cd` was
+    silently untracked and `effective_cwd` fell back to `session_cwd` — checking the wrong
+    repo's staged files instead of the one the commit actually runs in. Handles a run of
+    more than one marker (`((cd`, `(( cd`) the same way; a `(`/`{` that isn't a PURE leading
+    marker (i.e. anywhere but the very front of the segment) is left untouched."""
+    while seg and _LEADING_GROUPING.fullmatch(seg[0]):
+        seg = seg[1:]
+    if seg:
+        stripped = _LEADING_GROUPING_PREFIX.sub("", seg[0])
+        if stripped != seg[0]:
+            seg = [stripped, *seg[1:]]
+    return seg
+
+
+_LEADING_OPEN_PARENS = re.compile(r"^\(*")
+
+
+def _leading_open_paren_count(tok: str) -> int:
+    """How many `(` characters `tok` OPENS with (0 for a token like `repoB)` that only
+    closes). Used to compute the paren-depth threshold at the exact moment a subshell-`cd`
+    is recognized — see `_subshell_cd_still_trusted_at_commit`."""
+    return len(_LEADING_OPEN_PARENS.match(tok).group())
+
+
+def _subshell_cd_still_trusted_at_commit(
+    segments_with_sep: list[tuple[str | None, list[str]]], cd_index: int, commit_index: int,
+) -> bool:
+    """True if the `(` subshell that scoped a trusted `cd` at segment `cd_index` is STILL the
+    innermost open one continuously from that `cd`'s own opening token through to (not
+    including) the commit segment at `commit_index`.
+
+    Regression (review finding on agent-tools#201's own fix): a `cd` recognized because its
+    segment carried a leading `(` is only actually reached BY THE COMMIT if the SAME subshell
+    that `cd` ran inside is still open when the commit executes — `(cd repoB && git commit -m
+    x)` (subshell wraps the commit too) resolves to repoB correctly, but `(cd repoB && true) ;
+    git commit -m x` (subshell CLOSES before the commit, a realistic "cd elsewhere, do a
+    thing, then commit back home" idiom) must NOT resolve to repoB: a real shell's subshell is
+    a forked child process, so its `cd` never persists past the subshell's own closing `)` —
+    the commit after it actually lands in the ORIGINAL directory.
+
+    Tracks paren depth token-by-token across the WHOLE command (not just before/after
+    snapshots): `depth_at_cd` is the depth right after the `cd` segment's own opening
+    marker; from that token onward — through the rest of ITS OWN segment, then every later
+    segment up to the commit — the RUNNING MINIMUM depth reached must never dip below
+    `depth_at_cd`. A single dip means the subshell closed at some point, EVEN IF an
+    unrelated SIBLING subshell later reopens back to the same nesting depth (review finding,
+    round 2): `(cd /decoy && true) ; (echo ok && git commit -m x)` — the first subshell
+    (with the `cd`) closes, then a wholly separate second subshell (no `cd` inside it at
+    all) happens to reopen to the SAME depth before the commit. Comparing only the depth
+    value right before the commit can't tell these apart (both read "depth 1"); the RUNNING
+    MINIMUM can, because it dips to `depth_at_cd - 1` in between regardless of what
+    re-opens afterward. Still not full nesting-aware matching (which exact subshell — by
+    position — reopened), but sufficient for the shapes review has actually surfaced; any
+    deeper imprecision is scoped identically to this file's other documented gaps.
+
+    Deliberately `(`/`)` ONLY, NOT `{`/`}`: unlike a subshell, `{ cmds; }` is a plain GROUP
+    command that runs in the CURRENT shell (no fork) — a `cd` inside it genuinely persists
+    past the closing `}`, so counting `}` as a closer here would wrongly distrust a `{ cd
+    repoB; } ; git commit -m x` chain that a real shell resolves to repoB just fine."""
+    depth = 0
+    depth_at_cd: int | None = None
+    min_after: int | None = None
+    for i in range(commit_index):
+        for j, tok in enumerate(segments_with_sep[i][1]):
+            depth += _leading_open_paren_count(tok)
+            if i == cd_index and j == 0:
+                depth_at_cd = depth  # threshold recorded BEFORE this same token's own close
+            if tok.endswith(")"):
+                depth -= 1
+            if depth_at_cd is not None:
+                min_after = depth if min_after is None else min(min_after, depth)
+    if depth_at_cd is None:
+        return True  # cd_index wasn't reached before commit_index — caller-guarded, shouldn't happen
+    return min_after is None or min_after >= depth_at_cd
 
 
 def _takes_following_value(tok: str) -> bool:
@@ -360,7 +455,23 @@ def effective_cwd(command: str, session_cwd: str) -> str:
     KNOWN GAP (agent-tools#173): tokenization here is plain `shlex.split`, which glues a
     separator with no surrounding whitespace to the adjacent word (`cd /repo;git commit` ->
     one token `/repo;git`, never segmented) — `require_review.py` already solved this with a
-    `punctuation_chars`-based tokenizer that this function should eventually adopt too."""
+    `punctuation_chars`-based tokenizer that this function should eventually adopt too.
+
+    FIXED (agent-tools#201, PR #176 review finding): the parenthesized-subshell idiom
+    `(cd <worktree> && git commit ...)` used to defeat `cd`-detection entirely (`shlex.split`
+    glues the `(` onto `cd`, so `seg[0] == "cd"` never matched) — see `_strip_leading_grouping`.
+    A second finding on that same fix (also #201): a subshell that CLOSES before the commit
+    (`(cd repoB && true) ; git commit -m x`) must NOT be trusted, including when a wholly
+    unrelated SIBLING subshell later reopens to the same nesting depth before the commit —
+    see `_subshell_cd_still_trusted_at_commit`.
+
+    KNOWN GAP (agent-tools#201, deferred — not the confirmed exploit shape, and low-realism):
+    a subshell-wrapped commit with NO `-m`/`-F` value (`(cd repoB && git commit)`) glues the
+    closing `)` onto `commit` itself (`"commit)"`), which `_commit_flags`' exact `segment[i]
+    != "commit"` comparison doesn't recognize — this function then sees zero commit segments
+    and falls back to session_cwd. Not chased here: a bare `git commit` with no message opens
+    an interactive editor, which isn't a realistic agent-driven shell invocation (same
+    tokenization-gluing family as #173; a `punctuation_chars` tokenizer would close this too)."""
     try:
         tokens = shlex.split(command, comments=True)
     except ValueError:
@@ -371,10 +482,28 @@ def effective_cwd(command: str, session_cwd: str) -> str:
         return session_cwd
 
     cur = session_cwd
+    cur_from_open_subshell = False  # did the LATEST `cur` update come from a subshell-`cd`?
+    open_subshell_cd_index = -1  # segment index of that subshell-`cd`, for the veto check below
     for i, (sep, seg) in enumerate(segments_with_sep):
         if not seg:
             continue
-        if seg[0] == "cd":
+        # Strip a leading `(`/`{` (subshell / group command) before the `cd` check ONLY — a
+        # `(cd repoB && ...)` / `( cd repoB && ... )` must be recognized as `cd`, same as the
+        # bare form (agent-tools#201). Deliberately NOT applied to the commit-segment check
+        # below: a subshell-wrapped commit with no `cd` (`(git commit -m x)`) is a DIFFERENT,
+        # separately-tracked gap in the earlier `GIT_COMMIT` detection regex in `main()` (that
+        # regex already fails to recognize the command as a commit at all, so this function is
+        # never even reached for it) — folding a fix in here would be a no-op for that shape and
+        # would blur the two independent bugs' fixes together.
+        cd_seg = _strip_leading_grouping(seg)
+        if cd_seg and cd_seg[0] == "cd":
+            # `(` (subshell, forks a child process) needs the closed-subshell veto below;
+            # `{` (group command, no fork — a `cd` inside genuinely persists past its `}`)
+            # does NOT, so this must check specifically for `(`, not just "was anything
+            # stripped" — `seg[0]` here is still the ORIGINAL (pre-strip) first token.
+            cur_from_open_subshell = cd_seg != seg and seg[0].startswith("(")
+            open_subshell_cd_index = i
+            seg = cd_seg
             if sep is not None and sep not in _CD_TRUSTED_SEP:
                 return session_cwd  # conditionally/subshell-reached `cd` — can't trust it
             following_sep = (
@@ -399,6 +528,16 @@ def effective_cwd(command: str, session_cwd: str) -> str:
             cur = resolved
             continue
         if _commit_flags(seg) is not None:
+            if cur_from_open_subshell and not _subshell_cd_still_trusted_at_commit(
+                segments_with_sep, open_subshell_cd_index, i,
+            ):
+                # The subshell that produced `cur` via a trusted `cd` already CLOSED before
+                # this commit segment — a real shell's subshell is a forked child process,
+                # so that `cd` never persisted this far. Reset to session_cwd BEFORE applying
+                # this invocation's own `-C` (below) rather than discarding it outright —
+                # `git -C /target commit` after an unrelated closed decoy subshell must still
+                # resolve to /target, not get vetoed to session_cwd wholesale (review finding).
+                cur = session_cwd
             # Repeated `-C` on the SAME invocation chains: each is resolved relative to the
             # PREVIOUS one (see _git_c_values) — fold them in order, same as the `cd` case.
             # Same staleness guard applies: an unresolvable `-C` value means the invocation's
