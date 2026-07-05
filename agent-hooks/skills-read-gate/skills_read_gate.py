@@ -231,22 +231,32 @@ def _commit_flags(segment: list[str]) -> list[str] | None:
 
 
 def is_skip_commit(command: str) -> bool:
-    """True only when the actual `git commit` SEGMENT carries --continue/--abort/--skip.
+    """True only when EVERY `git commit` segment in `command` carries --continue/--abort/--skip.
 
-    Parses the argv after stripping shell comments, scopes to the `git commit` segment, and
+    Parses the argv after stripping shell comments, scopes to each `git commit` segment, and
     removes `-m`/`-F` message VALUES — so a skip token that lives only in a comment
     (`git commit -m x # --abort`), in the commit message (`git commit -m 'support --skip'`), or on
     a SIBLING command (`git rebase --abort && git commit -m x`) does NOT exempt an authoring
-    commit. On a tokenization failure this returns False → the commit is GATED (the safe way)."""
+    commit. On a tokenization failure this returns False → the commit is GATED (the safe way).
+
+    Regression this guards against (agent-tools#174): a command chaining a rebase-plumbing
+    commit with a REAL one (`git commit --continue && git commit -m x`) used to exempt the
+    WHOLE command, because this only inspected the FIRST commit segment found (the plumbing
+    one) and returned on it — the second, authoring commit never got checked at all. Requiring
+    EVERY commit segment to be a skip closes that: one real commit anywhere in the chain means
+    the command is NOT skip-exempt and must be gated normally. Ports the identical, already
+    review-approved fix from visual_proof_gate.py's mirrored parser (agent-tools#172/#176) —
+    keeps both hooks' skip-flag handling in step, per the SYNC comment above."""
     try:
         tokens = shlex.split(command, comments=True)
     except ValueError:
         return False
-    for seg in _segments(tokens):
-        flags = _commit_flags(seg)
-        if flags is not None:
-            return any(tok in SKIP_FLAGS for tok in flags)
-    return False
+    commit_segments_flags = [
+        flags for seg in _segments(tokens) if (flags := _commit_flags(seg)) is not None
+    ]
+    if not commit_segments_flags:
+        return False
+    return all(any(tok in SKIP_FLAGS for tok in flags) for flags in commit_segments_flags)
 
 
 def _is_work_action(command: str) -> bool:
