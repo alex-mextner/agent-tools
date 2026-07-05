@@ -228,6 +228,7 @@ def test_real_build_at_command_head_still_blocks_on_repeat(command, tmp_path, mo
     "git commit -- --skip",                       # `--skip` is a PATHSPEC after `--`, not a flag
     "git commit -m x -- --abort src/",            # pathspec named --abort after `--`
     "git rebase --abort && git commit -m x",      # skip flag on a SIBLING command, not the commit
+    "git commit --continue && git commit --trailer --skip -m x",  # --trailer's VALUE leaks as --skip
 ])
 def test_skip_token_in_comment_or_message_does_not_bypass(command, tmp_path, monkeypatch):
     """codex P2 bypass: ``SKIP_COMMIT`` used to match the RAW string, so a normal commit was
@@ -248,6 +249,65 @@ def test_real_skip_flag_still_exempt_after_parsing(tmp_path, monkeypatch):
     _run("git commit --abort", monkeypatch, invoked=invoked, tier=tier)
     out, _e, c = _run("git commit --abort", monkeypatch, invoked=invoked, tier=tier)
     assert c == 0 and _decision(out) == "allow"
+
+
+# ── agent-tools#174: a chain must not be exempted on its FIRST commit segment alone ───────
+
+@pytest.mark.parametrize("command", [
+    "git commit --continue && git commit -m x",
+    "git commit --continue ; git commit -m x",
+])
+def test_skip_commit_followed_by_real_commit_is_not_exempt(command, tmp_path, monkeypatch):
+    """Regression (agent-tools#174): a rebase-plumbing ``--continue`` chained with a SECOND,
+    REAL commit used to exempt the WHOLE command from the gate — is_skip_commit returned on
+    the FIRST commit segment found (the plumbing one) and never looked at the second,
+    authoring commit. One real commit anywhere in the chain must force gating (WARN then
+    BLOCK on repeat, same as any other real commit)."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    out1, _e1, c1 = _run(command, monkeypatch, invoked=invoked, tier=tier)
+    assert c1 == 0 and _decision(out1) == "allow", command  # first offense WARNs
+    out2, _e2, c2 = _run(command, monkeypatch, invoked=invoked, tier=tier)
+    assert c2 == srg.BLOCK_EXIT_CODE and _decision(out2) == "block", command
+
+
+def test_two_skip_commits_chained_are_still_exempt(tmp_path, monkeypatch):
+    """Inverse of the above: if EVERY commit segment in the chain carries a skip flag, the
+    whole command really is just plumbing and stays exempt — not a work action at all, so it
+    ALLOWs even on what would otherwise be a repeat."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _run("git commit --continue && git commit --continue", monkeypatch, invoked=invoked, tier=tier)
+    out, _e, c = _run(
+        "git commit --continue && git commit --continue", monkeypatch, invoked=invoked, tier=tier,
+    )
+    assert c == 0 and _decision(out) == "allow"
+
+
+# ── codex P2 (PR #197 review): --trailer's VALUE must not leak as a skip flag ─────────────
+
+def test_is_skip_commit_direct_trailer_value_does_not_leak_as_skip_flag():
+    """Direct, gate-plumbing-free pin: ``--trailer --skip`` puts the LITERAL string ``--skip``
+    in argv as the trailer's VALUE (per ``git commit -h``, `--trailer <token>[(=|:)<value>]`
+    consumes exactly one following token) — not a real skip flag. Before the fix,
+    ``_takes_following_value`` didn't know ``--trailer`` takes a following value, so the value
+    token leaked into ``_commit_flags``' output and ``any(tok in SKIP_FLAGS ...)`` wrongly
+    matched it, exempting the whole chained command (including the second, real commit)."""
+    assert srg.is_skip_commit(
+        "git commit --continue && git commit --trailer --skip -m x"
+    ) is False
+    # the `=`-glued form was never actually exploitable (a single token never in SKIP_FLAGS),
+    # but pin it stays correctly gated too, consistent with --message=/--file=.
+    assert srg.is_skip_commit("git commit --trailer=foo -m x") is False
+
+
+def test_trailer_value_leak_does_not_bypass_gate(tmp_path, monkeypatch):
+    """Same bypass as above, through the full WARN→BLOCK gate plumbing: the second, REAL commit
+    in the chain must not be exempted by the leaked ``--skip`` trailer value."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    cmd = "git commit --continue && git commit --trailer --skip -m x"
+    out1, _e1, c1 = _run(cmd, monkeypatch, invoked=invoked, tier=tier)
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
+    out2, _e2, c2 = _run(cmd, monkeypatch, invoked=invoked, tier=tier)
+    assert c2 == srg.BLOCK_EXIT_CODE and _decision(out2) == "block"
 
 
 # ── SUBAGENT: exempt from the ORCHESTRATION-ONLY defaults, still gated on project skills ──
