@@ -29,14 +29,10 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess  # noqa: S404 — running the installed hook scripts is the whole job
 import sys
 from pathlib import Path
 
-V1_BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
-DEFAULT_TIMEOUT_MS = 5000
-_DEFAULT_PRIORITY = 50  # the agents-hooks/v1 default (agent-hooks/README.md)
 # CC events this bridge knows how to register/handle (typo guard in main()).
 _KNOWN_EVENTS = frozenset({"PreToolUse", "Stop", "PostToolUse"})
 
@@ -210,136 +206,6 @@ def hooks_dir() -> Path:
     return Path(os.path.expanduser("~/.claude/hooks"))
 
 
-def _load_descriptors(point: str) -> list[dict]:
-    """Read every ``*.json`` descriptor for this point, sorted by priority then id.
-
-    A malformed or unreadable descriptor is skipped with a warning — one bad file must not
-    take down the whole dispatch (fail-open at the enumeration layer). The per-hook
-    ``on_error`` only governs the hook's RUNTIME error, not a descriptor parse error here.
-    """
-    specs: list[dict] = []
-    d = hooks_dir()
-    if not d.is_dir():
-        return specs
-    for path in sorted(d.glob("*.json")):
-        try:
-            spec = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            _warn(f"skipping unreadable descriptor {path}: {exc}")
-            continue
-        if not isinstance(spec, dict) or spec.get("point") != point:
-            continue
-        specs.append(spec)
-    # A non-int `priority` must never crash the sort (which would bubble to the top-level
-    # fail-open and skip EVERY hook — including fail-closed gates). _safe_int falls back to
-    # the default and the bad descriptor still RUNS in default-priority order.
-    specs.sort(key=lambda spec: (_safe_int(spec.get("priority"), _DEFAULT_PRIORITY), str(spec.get("id", ""))))
-    return specs
-
-
-def _run_hook(spec: dict, v1_event: dict) -> tuple[str, str]:
-    """Run one descriptor's script with the v1 event on stdin.
-
-    Returns ``(outcome, reason)`` where outcome is ``"allow"`` | ``"block"`` — the v1
-    exit code is canonical: 10 = block, 0 = allow, any other = error resolved by the
-    descriptor's ``on_error`` (``closed`` → block, ``open`` → allow). The block reason is
-    taken from the hook's stdout ``message`` when present, else a generic fallback.
-    """
-    hook_id = str(spec.get("id", "?"))
-    cmd = str(spec.get("cmd", ""))
-    if not cmd or not os.path.isabs(cmd):
-        # the v1 contract REQUIRES an absolute cmd; a relative/empty one is unrunnable.
-        return _on_error_outcome(spec, hook_id, "descriptor cmd is not absolute")
-    raw_args = spec.get("args")
-    argv = [cmd, *(str(a) for a in raw_args)] if isinstance(raw_args, list) else [cmd]
-    # A MISSING or NULL timeout_ms is fine → the default. A PRESENT-but-bad one (non-numeric,
-    # bool, or negative) is a DESCRIPTOR error, resolved per-hook: a fail-closed gate with a
-    # typo'd timeout must DENY, not be silently skipped by the dispatcher's fail-open.
-    raw_timeout = spec.get("timeout_ms", DEFAULT_TIMEOUT_MS)
-    if raw_timeout is None:
-        raw_timeout = DEFAULT_TIMEOUT_MS
-    # bool is an int subclass, so int(True)==1 / int(False)==0 would sneak past _safe_int and
-    # be silently mis-read as a 1 ms timeout / "unset". A boolean is a descriptor typo.
-    if isinstance(raw_timeout, bool):
-        return _on_error_outcome(spec, hook_id, f"non-numeric timeout_ms {raw_timeout!r}")
-    timeout_ms = _safe_int(raw_timeout, None)
-    if timeout_ms is None:
-        return _on_error_outcome(spec, hook_id, f"non-numeric timeout_ms {raw_timeout!r}")
-    # 0 = unset → the default; a NEGATIVE timeout is a descriptor typo, not "unset", so it is
-    # a descriptor error (a fail-closed gate must DENY, like any other bad descriptor field).
-    # This also avoids the old 1 ms floor that made such hooks spuriously time out.
-    if timeout_ms == 0:
-        timeout_ms = DEFAULT_TIMEOUT_MS
-    elif timeout_ms < 0:
-        return _on_error_outcome(spec, hook_id, f"negative timeout_ms {timeout_ms}")
-    timeout_s = timeout_ms / 1000.0
-    # Serialize OUTSIDE the try: a json.dumps failure here is a DISPATCHER bug (must fail open),
-    # not a hook error — keeping it out of the try keeps the ValueError catch below scoped to
-    # the subprocess launch (embedded-NUL argv), per the fail-policy contract.
-    payload = json.dumps(v1_event)
-    try:
-        proc = subprocess.run(  # noqa: S603 — cmd comes from a trusted local descriptor dir
-            argv,
-            input=payload,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",  # pin decode so it's platform-independent, not locale-default
-            errors="replace",  # non-UTF-8 hook output must not raise → it would escape to the
-                               # dispatcher's fail-open and turn a deliberate block into an allow
-            timeout=timeout_s,
-        )
-    except subprocess.TimeoutExpired:
-        return _on_error_outcome(spec, hook_id, f"timed out after {timeout_s:.1f}s")
-    except (OSError, ValueError) as exc:
-        # OSError: an unrunnable cmd. ValueError: an embedded NUL in cmd/args. Both are
-        # hook/descriptor failures resolved per-hook via on_error. We deliberately do NOT
-        # catch bare Exception: a bug in the DISPATCHER itself must fail OPEN per the contract
-        # (README), not masquerade as a hook error and block on a fail-closed gate.
-        return _on_error_outcome(spec, hook_id, f"could not run {cmd}: {exc}")
-
-    if proc.stderr:
-        _warn(f"{hook_id}: {proc.stderr.strip()}")
-
-    if proc.returncode == V1_BLOCK_EXIT_CODE:
-        return "block", _block_reason(proc.stdout, hook_id)
-    if proc.returncode == 0:
-        return "allow", ""
-    # any other exit code is a hook ERROR — resolve by the descriptor's on_error policy.
-    return _on_error_outcome(spec, hook_id, f"exited {proc.returncode}")
-
-
-def _safe_int(value, default):
-    """``int(value)`` or ``default`` — a non-numeric descriptor field never raises."""
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _block_reason(stdout: str, hook_id: str) -> str:
-    """Pull the human reason out of a hook's v1 protocol JSON; fall back to a generic one."""
-    try:
-        payload = json.loads(stdout) if stdout.strip() else {}
-    except ValueError:
-        payload = {}
-    msg = payload.get("message") if isinstance(payload, dict) else None
-    if isinstance(msg, str) and msg.strip():
-        return msg.strip()
-    return f"Blocked by agent-hook '{hook_id}'."
-
-
-def _on_error_outcome(spec: dict, hook_id: str, detail: str) -> tuple[str, str]:
-    """Resolve a hook ERROR via its ``on_error`` policy. Default 'open' (advisory)."""
-    policy = str(spec.get("on_error", "open")).lower()
-    _warn(f"{hook_id}: {detail} (on_error={policy})")
-    if policy == "closed":
-        return "block", (
-            f"agent-hook '{hook_id}' could not complete its check and is fail-closed "
-            f"(on_error=closed): {detail}. Denying rather than letting the action through."
-        )
-    return "allow", ""
-
-
 def _warn(msg: str) -> None:
     """Human log to stderr — CC shows the first stderr line as a hook notice; never parsed."""
     sys.stderr.write(f"cc-hook-bridge: {msg}\n")
@@ -356,15 +222,28 @@ def dispatch(hook_event_name: str, cc_event: dict) -> dict | None:
     point = point_for_event(hook_event_name, tool_name)
     if point is None:
         return None  # nothing maps to this (event, tool) → no-op
-    specs = _load_descriptors(point)
+    runner = _load_runner()
+    if runner is None:
+        return None
+    load_descriptors, run_hook = runner
+    specs = load_descriptors(point, hooks_dir(), warn=_warn)
     if not specs:
         return None
     v1_event = to_v1_event(cc_event, point=point)
     for spec in specs:
-        outcome, reason = _run_hook(spec, v1_event)
+        outcome, reason = run_hook(spec, v1_event, warn=_warn)
         if outcome == "block":
             return cc_block_output(hook_event_name, reason)
     return None
+
+
+def _load_runner():
+    try:
+        from agent_hooks_v1 import load_descriptors, run_hook
+    except Exception as exc:  # noqa: BLE001 - a missing shared runner must fail open
+        _warn(f"could not import shared v1 runner, failing OPEN (allowing the call): {exc}")
+        return None
+    return load_descriptors, run_hook
 
 
 def main(argv: list[str]) -> int:

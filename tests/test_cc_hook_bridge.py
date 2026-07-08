@@ -21,6 +21,7 @@ exercises the real entrypoint + the real agent-hook scripts, not a mock.
 
 from __future__ import annotations
 
+import builtins
 import json
 import os
 import subprocess
@@ -461,6 +462,66 @@ def test_no_descriptors_is_allow(tmp_path):
     if proc.stdout.strip():
         out = json.loads(proc.stdout)
         assert out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny"
+
+
+def test_dispatch_fails_open_when_shared_runner_import_fails(monkeypatch):
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "agent_hooks_v1":
+            raise ImportError("missing runner")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    result = dispatch.dispatch(
+        "PreToolUse",
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "gh pr merge 42 --admin"},
+            "cwd": "/repo",
+        },
+    )
+
+    assert result is None
+
+
+def test_posttooluse_postwrite_block_uses_decision_feedback(tmp_path):
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    blocker = tmp_path / "post_write_blocker.py"
+    blocker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "event = json.load(sys.stdin)\n"
+        "assert event['point'] == 'post-write'\n"
+        "print(json.dumps({'message': 'post-write feedback'}))\n"
+        "sys.exit(10)\n",
+        encoding="utf-8",
+    )
+    blocker.chmod(0o755)
+    _install_descriptor(
+        hooks,
+        hook_id="post-write-blocker",
+        point="post-write",
+        cmd=blocker,
+        on_error="closed",
+    )
+    cc_event = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(tmp_path / "x.py")},
+        "cwd": str(tmp_path),
+    }
+
+    proc = _run_dispatch("PostToolUse", cc_event, home=home)
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {
+        "decision": "block",
+        "reason": "post-write feedback",
+    }
 
 
 def test_fail_open_on_garbage_stdin(tmp_path):

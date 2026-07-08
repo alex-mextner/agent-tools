@@ -107,32 +107,36 @@ The shipped hooks and their points:
 
 | Point | Hooks |
 | --- | --- |
-| `pre-agent` **(bridge-ready; NOT yet live in CC — needs the rig-cli `Agent\|Task` matcher)** | `background-subagent-gate` (orchestration doctrine: block a non-trivial FOREGROUND subagent dispatch; subagent-exempt) |
+| `pre-agent` **(bridge-ready; NOT yet live in CC — needs the rig-cli `Agent\|Task` matcher; NOT mapped in Codex yet)** | `background-subagent-gate` (orchestration doctrine: block a non-trivial FOREGROUND subagent dispatch; subagent-exempt) |
 | `pre-bash` | `block-no-verify` (fail-closed), `block-raw-pr-merge`, `block-reset-hard` (fail-closed: blocks `git reset --hard` and `git clean -f...`/`-fd`/`-fdx` — irreversible working-tree wipes with no undo; deny-by-default, no self-service bypass — an optional repo-owner `agent_hooks.approval_cmd` in rig.yaml is the only override, Alex tg#6554), `require-review-before-commit`, `require-ticket-before-commit`, `enforce-timeout-on-bash`, `orchestrator-stays-thin` (impl-bash, warn→block, subagent-exempt), `no-long-inline-process` (review/--watch/build-test/long-sleep, subagent-exempt), `subagent-no-bg-longproc` (the INVERSE: block a SUBAGENT from BACKGROUNDING a long process — `run_in_background:true`/`&`/`setsid` on review/--watch/build-test/long-sleep — since a subagent is never re-invoked by a background-completion notification and would wedge forever; subagent-ONLY), `no-shell-file-edit` (block `sed -i`/`perl -i`/`gawk -i inplace` or a `> file` redirect editing a tracked source file; parsed not raw-matched; NOT subagent-exempt), `skills-read-gate` (mandatory skills before work, warn→block), `visual-proof-gate` (block a UI commit with no looked-at screenshot), `decision-request-format` (ADVISORY, never blocks: on a `tg --tag decision` send, self-check the body for Context/Options/Recommendation per the `decision-request-discipline` skill; parsed not raw-matched; NOT subagent-exempt) |
 | `pre-write` | `block-secrets-write`, `block-raw-process-env`, `orchestrator-stays-thin` (non-docs code Edit/Write, warn→block, subagent-exempt) |
-| `post-write` | `format-on-write` (reacts to the completed write; never blocks — see the bridge note: not carried to CC yet) |
+| `post-write` | `format-on-write`, `lint-on-write` (react to the completed write; exit-10 is feedback because the write already landed) |
 | `stop` | `stop-completion-selfcheck` |
 
-**The carrier trap (`lib/cc_hook_bridge`).** Claude Code does **not** run these descriptors
-directly — it only runs hooks declared in `settings.json`. `lib/cc_hook_bridge` is the
-dispatcher that makes them fire: `rig` wires it into `settings.json` and it translates the v1
-exit-10 BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`. **Without that
-bridge an agent-hook is inert in CC** (agent-tools#18). The dispatcher itself is fail-**open**
-at the top level (a broken bridge must never wedge every tool call), while an individual
-fail-closed hook still blocks.
+**The carrier trap (`lib/cc_hook_bridge`, `lib/codex_hook_bridge`).** Harnesses do **not**
+run these descriptors directly; they only run hooks declared in their own config. The bridge
+dispatchers are the carriers that make installed descriptors fire. The dispatcher itself is
+fail-**open** at the top level (a broken bridge must never wedge every tool call), while an
+individual fail-closed hook still blocks through the shared `agents-hooks/v1` runner.
 
-**Non-obvious:** the bridge only maps the points CC has a matching event for —
+**Claude Code:** `lib/cc_hook_bridge` is wired by `rig` into `settings.json`. It maps
 `PreToolUse` → `pre-bash`/`pre-write`/`pre-agent` (the last for the `Agent`/`Task` subagent
-tools) and `Stop` → `stop` (see `point_for_event` in `dispatch.py`). It does **not** yet map
-`PostToolUse` → `post-write`, so `format-on-write` — the one `post-write` hook — is not carried
-to CC through this bridge today; it works on harnesses whose own `post-write`/`PostToolUse`
-event you map it to directly. Don't assume every shipped hook is live in CC just because the
-bridge exists. The bridge also forwards CC's `agent_id`/`agent_type` (present only inside a
-dispatched subagent) into the v1 event, so a subagent-exempt gate can tell a subagent's own
-tool use apart from the orchestrator's. **rig-cli follow-up:** for CC to actually *fire*
-`pre-agent`, rig-cli must add an `Agent|Task` PreToolUse matcher to `settings.json`
-(`hook_bridge_entries`) — that wiring lives in the separate rig-cli repo; the bridge half
-(point mapping + signal forwarding) lives here.
+tools), `PostToolUse` file-edit tools → `post-write`, and `Stop` → `stop`; it translates
+exit-10 BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`. The bridge also
+forwards CC's `agent_id`/`agent_type` (present only inside a dispatched subagent) into the v1
+event, so a subagent-exempt gate can tell a subagent's own tool use apart from the
+orchestrator's. **rig-cli follow-up:** for CC to actually *fire* `pre-agent`, rig-cli must
+add an `Agent|Task` PreToolUse matcher to `settings.json` (`hook_bridge_entries`) — that
+wiring lives in the separate rig-cli repo; the bridge half (point mapping + signal forwarding)
+lives here.
+
+**Codex:** `lib/codex_hook_bridge` is the first bridge for the confirmed Codex hooks
+contract. Codex TOML hooks call it for `PreToolUse` `Bash` (`pre-bash`), `PreToolUse`
+`apply_patch` (`pre-write`), `PostToolUse` `apply_patch` (`post-write` feedback), and `Stop`
+(`stop`), reading descriptors from `~/.codex/hooks` and emitting Codex's plain
+`{"decision":"block","reason":"..."}` shape. It deliberately does **not** map Codex
+`SubagentStart`/`SubagentStop` to `pre-agent` yet; that needs a trustworthy captured payload
+fixture before this catalog can safely enforce subagent dispatch semantics.
 
 **The "runs before the command" trap.** `pre-bash` hooks run *before* the command they gate,
 so the precondition they check must already be satisfied. The clearest example is

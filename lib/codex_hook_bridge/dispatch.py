@@ -1,0 +1,334 @@
+"""The agents-hooks/v1 -> Codex hook bridge dispatcher.
+
+Accessed via: Codex hook commands call ``python3 -m codex_hook_bridge <Event>`` and
+send the native hook event JSON on stdin.
+
+Assumptions: Codex hook events use ``hook_event_name``, ``tool_name``,
+``tool_input``, ``cwd``, ``model``, and ``permission_mode`` fields; blocking is
+the plain top-level ``{"decision":"block","reason":"..."}`` JSON shape; file
+edits arrive as the ``apply_patch`` tool with patch text in ``tool_input.command``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import sys
+from pathlib import Path
+
+HOOK_API = "agents-hooks/v1"
+_KNOWN_EVENTS = frozenset(
+    {"PreToolUse", "PostToolUse", "Stop", "SubagentStart", "SubagentStop"}
+)
+_APPLY_PATCH_TOOL = "apply_patch"
+_ENV_OPTIONS_WITH_ARG = frozenset({"-u", "--unset", "-C", "--chdir", "-P", "--path"})
+_ENV_OPTIONS_WITH_ARG_PREFIXES = ("--unset=", "--chdir=", "--path=")
+_ENV_OPTIONS_WITHOUT_ARG = frozenset({"-", "-0", "-i", "--ignore-environment", "--null"})
+_ID_KEYS = ("event_id", "session_id", "conversation_id", "turn_id", "tool_call_id", "call_id")
+_METADATA_KEYS = (
+    "model",
+    "permission_mode",
+    *_ID_KEYS,
+)
+
+
+def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
+    """Map a Codex (event, tool) pair to a logical v1 point."""
+    if hook_event_name == "Stop":
+        return "stop"
+    if hook_event_name == "PreToolUse":
+        if tool_name == "Bash":
+            return "pre-bash"
+        if tool_name == _APPLY_PATCH_TOOL:
+            return "pre-write"
+    if hook_event_name == "PostToolUse" and tool_name == _APPLY_PATCH_TOOL:
+        return "post-write"
+    return None
+
+
+def to_v1_event(codex_event: dict, *, point: str) -> dict:
+    """Translate a Codex hook event into the agents-hooks/v1 event shape."""
+    tool_input = codex_event.get("tool_input")
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    args = dict(tool_input)
+    args.pop("command", None)
+    for key in (
+        "agent_id",
+        "agent_type",
+        "file_path",
+        "file_paths",
+        "path",
+        "content",
+        "patch",
+        *_METADATA_KEYS,
+    ):
+        args.pop(key, None)
+    for key in _METADATA_KEYS:
+        if codex_event.get(key) is not None:
+            args[key] = codex_event[key]
+
+    command = _tool_command(tool_input)
+    if command:
+        args["command"] = command
+    if point in ("pre-write", "post-write") and codex_event.get("tool_name") == _APPLY_PATCH_TOOL:
+        if command:
+            args.setdefault("patch", command)
+            if point == "pre-write":
+                args["content"] = _patch_added_content(command)
+            paths = _patch_file_paths(command)
+            if paths:
+                args.setdefault("file_paths", paths)
+            if len(paths) == 1:
+                args.setdefault("file_path", paths[0])
+                args.setdefault("path", paths[0])
+
+    return {
+        "hook_api": HOOK_API,
+        "event_id": _event_id(codex_event),
+        "tool": codex_event.get("tool_name"),
+        "point": point,
+        "command": command,
+        "cwd": codex_event.get("cwd") or os.getcwd(),
+        "args": args,
+    }
+
+
+def codex_block_output(reason: str) -> dict:
+    """Codex uses the same plain block shape for PreToolUse, PostToolUse, and Stop."""
+    return {"decision": "block", "reason": reason}
+
+
+def hooks_dir() -> Path:
+    """Where Codex-installed v1 descriptors live, overridable for tests."""
+    override = os.environ.get("CODEX_HOOKS_DIR")
+    if override:
+        return Path(override)
+    return Path(os.path.expanduser("~/.codex/hooks"))
+
+
+def dispatch(hook_event_name: str, codex_event: dict) -> dict | None:
+    """Run the applicable v1 hooks for this Codex event."""
+    tool_name = codex_event.get("tool_name")
+    point = point_for_event(hook_event_name, tool_name)
+    if point is None:
+        return None
+    runner = _load_runner()
+    if runner is None:
+        return None
+    load_descriptors, run_hook = runner
+    specs = load_descriptors(point, hooks_dir(), warn=_warn)
+    if not specs:
+        return None
+    v1_events = _v1_events_for_dispatch(codex_event, point=point)
+    for spec in specs:
+        for v1_event in v1_events:
+            outcome, reason = run_hook(spec, v1_event, warn=_warn)
+            if outcome == "block":
+                return codex_block_output(reason)
+    return None
+
+
+def _load_runner():
+    try:
+        from agent_hooks_v1 import load_descriptors, run_hook
+    except Exception as exc:  # noqa: BLE001 - a missing shared runner must fail open
+        _warn(f"could not import shared v1 runner, failing OPEN (allowing the call): {exc}")
+        return None
+    return load_descriptors, run_hook
+
+
+def main(argv: list[str]) -> int:
+    """CLI entry: ``codex_hook_bridge <EventName>``.
+
+    Top-level dispatcher failures fail open: a broken bridge must not wedge every
+    Codex tool call. Deliberate hook blocks still return block JSON on stdout.
+    """
+    hook_event_name = argv[0] if argv else "PreToolUse"
+    if hook_event_name not in _KNOWN_EVENTS:
+        _warn(f"unknown event arg {hook_event_name!r}; stdin's hook_event_name will be used if present")
+    try:
+        raw = sys.stdin.read()
+        codex_event = json.loads(raw) if raw.strip() else {}
+        if not isinstance(codex_event, dict):
+            codex_event = {}
+        hook_event_name = codex_event.get("hook_event_name") or hook_event_name
+        result = dispatch(hook_event_name, codex_event)
+    except Exception as exc:  # noqa: BLE001 - fail-open is the bridge contract
+        _warn(f"dispatcher error, failing OPEN (allowing the call): {exc}")
+        return 0
+    if result is not None:
+        sys.stdout.write(json.dumps(result))
+        sys.stdout.flush()
+    return 0
+
+
+def _tool_command(tool_input: dict) -> str:
+    command = tool_input.get("command", "")
+    if isinstance(command, str):
+        return command
+    if isinstance(command, list):
+        parts = [str(part) for part in command]
+        parts = _strip_env_wrapper(parts)
+        shell_payload = _shell_command_payload(parts)
+        return shell_payload if shell_payload is not None else shlex.join(parts)
+    if command is None:
+        return ""
+    return ""
+
+
+def _shell_command_payload(parts: list[str]) -> str | None:
+    if not parts or Path(parts[0]).name not in {"bash", "sh", "zsh"}:
+        return None
+    for index, part in enumerate(parts[1:], start=1):
+        if part == "--":
+            break
+        if part == "-c" or (part.startswith("-") and not part.startswith("--") and "c" in part[1:]):
+            if index + 1 < len(parts):
+                return parts[index + 1]
+            return None
+    return None
+
+
+def _strip_env_wrapper(parts: list[str]) -> list[str]:
+    if not parts or Path(parts[0]).name != "env":
+        return parts
+    index = 1
+    while index < len(parts):
+        part = parts[index]
+        if part == "--":
+            index += 1
+            break
+        if part in _ENV_OPTIONS_WITHOUT_ARG:
+            index += 1
+            continue
+        if part in _ENV_OPTIONS_WITH_ARG:
+            if index + 1 >= len(parts):
+                return parts
+            index += 2
+            continue
+        if any(part.startswith(prefix) for prefix in _ENV_OPTIONS_WITH_ARG_PREFIXES):
+            index += 1
+            continue
+        if "=" not in part or part.startswith("-"):
+            break
+        index += 1
+    return parts[index:] if index < len(parts) else parts
+
+
+def _event_id(codex_event: dict) -> str:
+    for key in _ID_KEYS:
+        val = codex_event.get(key)
+        if val:
+            return str(val)
+    return ""
+
+
+def _v1_events_for_dispatch(codex_event: dict, *, point: str) -> list[dict]:
+    base = to_v1_event(codex_event, point=point)
+    args = base.get("args")
+    if not isinstance(args, dict):
+        return [base]
+    file_paths = args.get("file_paths")
+    if (
+        point not in ("pre-write", "post-write")
+        or "file_path" in args
+        or not isinstance(file_paths, list)
+        or len(file_paths) <= 1
+    ):
+        return [base]
+
+    events: list[dict] = []
+    content_by_path = _patch_added_content_by_path(str(args.get("patch") or ""))
+    for raw_path in file_paths:
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        event = dict(base)
+        event_args = dict(args)
+        event_args["file_path"] = raw_path
+        event_args["path"] = raw_path
+        event_args.pop("file_paths", None)
+        if point == "pre-write":
+            event_args["content"] = content_by_path.get(raw_path, "")
+        event["args"] = event_args
+        events.append(event)
+    return events or [base]
+
+
+def _patch_file_paths(patch: str) -> list[str]:
+    """Extract file paths from apply_patch text, preserving first-seen order."""
+    paths: list[str] = []
+    seen: set[str] = set()
+    pending_update: str | None = None
+
+    def add(path: str) -> None:
+        if path and path not in seen:
+            seen.add(path)
+            paths.append(path)
+
+    def flush_update() -> None:
+        nonlocal pending_update
+        if pending_update:
+            add(pending_update)
+            pending_update = None
+
+    for line in patch.splitlines():
+        if line.startswith("*** Update File: "):
+            flush_update()
+            pending_update = line[len("*** Update File: ") :].strip()
+        elif line.startswith("*** Move to: "):
+            # The move target is the final on-disk path hooks should inspect.
+            pending_update = line[len("*** Move to: ") :].strip()
+        elif line.startswith("*** Add File: "):
+            flush_update()
+            add(line[len("*** Add File: ") :].strip())
+        elif line.startswith("*** Delete File: "):
+            flush_update()
+            add(line[len("*** Delete File: ") :].strip())
+    flush_update()
+    return paths
+
+
+def _patch_added_content(patch: str) -> str:
+    """Return added patch lines without their leading diff marker."""
+    lines: list[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+"):
+            lines.append(line[1:])
+    return "\n".join(lines)
+
+
+def _patch_added_content_by_path(patch: str) -> dict[str, str]:
+    content: dict[str, str] = {}
+    current_path: str | None = None
+    current_lines: list[str] = []
+
+    def finish() -> None:
+        nonlocal current_path, current_lines
+        if current_path is not None:
+            content[current_path] = "\n".join(current_lines)
+        current_path = None
+        current_lines = []
+
+    for line in patch.splitlines():
+        if line.startswith("*** Update File: "):
+            finish()
+            current_path = line[len("*** Update File: ") :].strip()
+        elif line.startswith("*** Move to: "):
+            current_path = line[len("*** Move to: ") :].strip()
+        elif line.startswith("*** Add File: "):
+            finish()
+            current_path = line[len("*** Add File: ") :].strip()
+        elif line.startswith("*** Delete File: "):
+            finish()
+            current_path = line[len("*** Delete File: ") :].strip()
+        elif current_path is not None and line.startswith("+"):
+            current_lines.append(line[1:])
+    finish()
+    return content
+
+
+def _warn(msg: str) -> None:
+    """Human log to stderr; Codex hook output parsing only reads stdout JSON."""
+    sys.stderr.write(f"codex-hook-bridge: {msg}\n")
