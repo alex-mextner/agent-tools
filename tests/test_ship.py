@@ -1355,6 +1355,173 @@ def test_cidown_local_gate_passes_merges(repo_with_pr_worktree, tmp_path):
     assert "merged #1" in r.stdout, r.stdout
 
 
+def test_cidown_local_gate_prefers_dev_run_test_when_rig_script_exists(repo_with_pr_worktree, tmp_path):
+    """When a repo declares `scripts.test` in rig.yaml and `dev` is installed, the local
+    CI-down fallback should use `dev run --repo-only test` instead of guessing a package manager."""
+    main, _wt = repo_with_pr_worktree
+    (main / "rig.yaml").write_text("scripts:\n  test: echo from rig\n", encoding="utf-8")
+    _git("add", "rig.yaml", cwd=main)
+    _git("commit", "-qm", "add rig test script", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    dev_log = tmp_path / "dev.log"
+    dev = bindir / "dev"
+    dev.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [ \"$1\" = '--agenttools-dev-probe' ]; then exit 0; fi\n"
+        "if [ \"$1\" = 'has-script' ]; then\n"
+        "  [ \"$2\" = '--repo-only' ] && [ \"$3\" = 'test' ] || exit 98\n"
+        "  exit \"${SHIP_TEST_HAS_SCRIPT_STATUS:-0}\"\n"
+        "fi\n"
+        "printf '%s\\n' \"$*\" >> \"$SHIP_TEST_DEV_LOG\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    dev.chmod(0o755)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_TEST_DEV_LOG": str(dev_log),
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must succeed when the dev-backed local gate passes\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert dev_log.read_text(encoding="utf-8").strip() == "run --repo-only test"
+    assert "[ship] local gate: running dev run --repo-only test (rig.yaml scripts.test)" in r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize("status", [2, 127])
+def test_cidown_local_gate_blocks_dev_probe_errors(repo_with_pr_worktree, tmp_path, status):
+    main, _wt = repo_with_pr_worktree
+    (main / "rig.yaml").write_text("scripts:\n  test: echo from rig\n", encoding="utf-8")
+    _git("add", "rig.yaml", cwd=main)
+    _git("commit", "-qm", "add rig test script", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    dev_log = tmp_path / "dev.log"
+    dev = bindir / "dev"
+    dev.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [ \"$1\" = '--agenttools-dev-probe' ]; then exit 0; fi\n"
+        "if [ \"$1\" = 'has-script' ]; then\n"
+        "  [ \"$2\" = '--repo-only' ] && [ \"$3\" = 'test' ] || exit 98\n"
+        "  exit \"${SHIP_TEST_HAS_SCRIPT_STATUS:-0}\"\n"
+        "fi\n"
+        "printf '%s\\n' \"$*\" >> \"$SHIP_TEST_DEV_LOG\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    dev.chmod(0o755)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_TEST_DEV_LOG": str(dev_log),
+        "SHIP_TEST_HAS_SCRIPT_STATUS": str(status),
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0
+    assert "dev has-script --repo-only test failed" in r.stderr
+    assert not dev_log.exists()
+
+
+def test_cidown_local_gate_ignores_broken_dev_when_repo_has_no_rig_yaml(
+    repo_with_pr_worktree, tmp_path
+):
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"npm-fallback"}}\n', encoding="utf-8")
+    _git("add", "package.json", cwd=main)
+    _git("commit", "-qm", "add package test script", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    dev_log = tmp_path / "dev.log"
+    npm_log = tmp_path / "npm.log"
+
+    dev = bindir / "dev"
+    dev.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [ \"$1\" = '--agenttools-dev-probe' ]; then exit 0; fi\n"
+        "if [ \"$1\" = 'has-script' ]; then exit 127; fi\n"
+        "printf '%s\\n' \"$*\" >> \"$SHIP_TEST_DEV_LOG\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    dev.chmod(0o755)
+
+    npm = bindir / "npm"
+    npm.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$*\" >> \"$SHIP_TEST_NPM_LOG\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    npm.chmod(0o755)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_TEST_DEV_LOG": str(dev_log),
+        "SHIP_TEST_NPM_LOG": str(npm_log),
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship should fall back to npm when no repo rig.yaml exists\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert not dev_log.exists()
+    assert npm_log.read_text(encoding="utf-8").strip() == "test"
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ignores_foreign_dev_when_probe_fails(
+    repo_with_pr_worktree, tmp_path
+):
+    main, _wt = repo_with_pr_worktree
+    (main / "rig.yaml").write_text("scripts:\n  test: echo from rig\n", encoding="utf-8")
+    (main / "package.json").write_text('{"scripts":{"test":"npm-fallback"}}\n', encoding="utf-8")
+    _git("add", "rig.yaml", "package.json", cwd=main)
+    _git("commit", "-qm", "add rig and package test scripts", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    dev_log = tmp_path / "dev.log"
+    npm_log = tmp_path / "npm.log"
+
+    dev = bindir / "dev"
+    dev.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [ \"$1\" = '--agenttools-dev-probe' ]; then exit 42; fi\n"
+        "printf '%s\\n' \"$*\" >> \"$SHIP_TEST_DEV_LOG\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    dev.chmod(0o755)
+
+    npm = bindir / "npm"
+    npm.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$*\" >> \"$SHIP_TEST_NPM_LOG\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    npm.chmod(0o755)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_TEST_DEV_LOG": str(dev_log),
+        "SHIP_TEST_NPM_LOG": str(npm_log),
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship should fall back to npm when dev is not agenttools-dev\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert not dev_log.exists()
+    assert npm_log.read_text(encoding="utf-8").strip() == "test"
+    assert "merged #1" in r.stdout, r.stdout
+
+
 def test_cidown_local_tests_fail_blocks(repo_with_pr_worktree, tmp_path):
     """CI-down path: SHIP_TEST_CI_DOWN=1, but local tests FAIL → ship refuses."""
     main, _wt = repo_with_pr_worktree

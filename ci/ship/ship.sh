@@ -386,14 +386,27 @@ ci_appears_structurally_down() {
   return 0
 }
 
-# Auto-detect the project's test runner and execute it.
-# Returns 0 on pass, 1 on failure or when no runner is found (conservative).
 _local_test_runner() {
-  local root="$1" cmd
+  local root="$1" cmd dev_status
   # Allow a test-only override to avoid real test execution in hermetic tests.
   if [ -n "${SHIP_LOCAL_TEST_CMD:-}" ]; then
     echo "[ship] local gate: running test command: $SHIP_LOCAL_TEST_CMD"
     eval "$SHIP_LOCAL_TEST_CMD" 2>&1; return $?
+  fi
+  if [ -f "$root/rig.yaml" ] && command -v dev >/dev/null 2>&1 && dev --agenttools-dev-probe >/dev/null 2>&1; then
+    if (cd "$root" && dev has-script --repo-only test >/dev/null 2>&1); then
+      dev_status=0
+    else
+      dev_status=$?
+    fi
+    if [ "$dev_status" -eq 0 ]; then
+      echo "[ship] local gate: running dev run --repo-only test (rig.yaml scripts.test)"
+      (cd "$root" && dev run --repo-only test) 2>&1; return $?
+    fi
+    if [ "$dev_status" -ne 1 ]; then
+      echo "[ship] local gate: FAILED — dev has-script --repo-only test failed; refusing to guess a fallback test runner." >&2
+      return 1
+    fi
   fi
   if [ -f "$root/pyproject.toml" ]; then
     echo "[ship] local gate: running pytest (pyproject.toml detected) ..."
