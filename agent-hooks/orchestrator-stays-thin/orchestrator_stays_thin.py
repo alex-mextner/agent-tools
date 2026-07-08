@@ -192,10 +192,26 @@ CD_HEAD = re.compile(r"^\s*cd(?=\s|$)")
 # anywhere in a segment: a read-only `find` head must not launder them into the allow-list.
 FIND_MUTATION = re.compile(r"\s-(?:delete|exec|execdir|ok|okdir|fprintf|fprint0|fprint|fls)\b")
 
+# Rewritten per the CTO's explicit clarification (tg thread, 2026-07-08): this hook is an
+# INTENTIONAL, jointly-accepted operating model — not friction an agent should route around. The
+# orchestrator plans and dispatches; a subagent does the implementation-shaped work (an edit, a
+# build, a raw `git commit`/`git push`, a test run). A prior draft framed this as a terse rule
+# ("does not implement inline") that read as adversarial and invited bypass attempts. The message now states
+# WHY (the agreed model, not an error), HOW to proceed (dispatch a subagent), and that fighting or
+# working around it is out of scope.
+#
+# NOTE this message does NOT claim `gh ship` / read-only `gh` verification are blocked — they
+# aren't: ORCH_ALLOW (below) explicitly exempts them so this MESSAGE never fires for them
+# (agent-tools#159/#162, merged 2026-07-03, live on main). If the operating model is meant to
+# cover those too, that's a separate, larger change to ORCH_ALLOW itself — flagged, not made here.
 MESSAGE = (
-    "Delegate to a subagent: the orchestrator plans, dispatches, and verifies — it does not "
-    "implement inline. Launch an Agent (run_in_background: true) or a Workflow to do this "
-    "Edit/Write/Bash. (delegate-work-to-subagents, enforced.)"
+    "By design, not a bug: this session is the orchestrator, and the operating model — agreed "
+    "with the CTO — is that it never implements inline. Planning, dispatching, and reading "
+    "reports back is its job; doing the Edit/Write/Bash itself (an edit, a build, a raw `git "
+    "commit`/`git push`, a test run) is not. Dispatch a subagent to do this (Agent tool, "
+    "run_in_background: true) or model it as a Workflow, then read its report. This isn't "
+    "friction to route around — if it's genuinely wrong for a case, raise that, don't bypass "
+    "it. (delegate-work-to-subagents, enforced.)"
 )
 
 
