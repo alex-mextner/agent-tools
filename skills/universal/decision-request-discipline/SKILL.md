@@ -52,6 +52,12 @@ Before sending anything upward, exhaust the cheaper advisors:
 1. Consult a peer-model advisor / `review` panel (whatever your harness exposes — an
    `advisor()` tool for the main agent, `codex exec` review via a subagent, or the `claude`
    CLI for a codex-style agent). Save a non-trivial review to `docs/reviews/` and commit it.
+   Tool access varies by *who* is asking, not just what's available: the main agent calls
+   `advisor()` directly and runs a `review`/`codex exec` panel via a subagent; a background
+   subagent has no session to hand `advisor()` (it isn't available there) but can run
+   `codex exec` / `review` directly; a Codex-style agent has neither and instead shells out to
+   the `claude` CLI. Route the consultation through whichever of these your current role
+   actually has, don't skip the step because one specific tool is unavailable.
 2. **The orchestrator does not post a decision request it drafted itself in passing.** A main
    agent juggling many tasks cuts corners — it ships a bare summary (options with no real
    pros/cons, no spec reference, no "where to look"). So the request is **drafted by a
@@ -79,6 +85,9 @@ mark resolved ones closed; don't re-list them as open.
 1. **Context** — where the code is (`file:line`), what the function does.
 2. **Glossary of terms and names** — every internal name (ticket, module, function,
    acronym, flag) explained in one phrase. The human is not obliged to remember your jargon.
+   When writing in a language other than English (e.g. Russian), don't invent transliterated
+   calques of English words — use the accepted native term, or the English word in Latin
+   script with a one-phrase gloss on first use.
 3. **Problem** — what concretely needs deciding (not abstractly).
 4. **Options** — only ones that each have a real advantage. Each option gets **meaningful,
    reasonable pros / cons** — the kind that actually move the choice, not filler.
