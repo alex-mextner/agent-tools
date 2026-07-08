@@ -18,17 +18,21 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   Read-only inspection **and sanctioned orchestration** are **never** blocked — including a chain
   of **any length** where every segment's head is inspection (`git status`/`log`/`diff`/`show`/
   `branch`, `ls`, `cat`, `grep`, `find`, `head`, `tail`, `wc`, …) **or** orchestration
-  (`gh pr list`/`view`/`checks`/`status`/`diff`, `gh run list`/`view`/`watch`, `gh api` **GET-only**
-  — a mutation flag/`graphql` is not waved through, **`gh ship`**, `tg`, `review`, `git worktree
-  list`), across `|`, `&&`, `;`, `||` or newline
-  (`git status && ls`, `gh pr list && gh pr view 5`, `gh ship 5 && tg "shipped"`). This is the
-  **flapping fix** (Alex tg#5743 / agent-tools#23): those orchestration chains used to trip the
-  `>= 2 operators` rule and wrongly BLOCK. But a chain that merely *starts* allowed
-  (`git status && sed -i ...`, `gh pr view && git commit`), or that mixes in any
+  (`tg`, `review`, `git worktree list`), across `|`, `&&`, `;`, `||` or newline
+  (`git status && ls`, `tg 'a' && tg 'b'`, `review diff && tg done`). But a chain that merely
+  *starts* allowed (`git status && sed -i ...`, `tg done && git commit`), or that mixes in any
   build/edit/heredoc segment, is judged on its **full** content — not waved through on its prefix.
   Judgement is per-segment-**head**: a build token used only as an argument/needle of an allowed
   command (`cat tee.log`, `grep cargo notes`, `git log | rg gh`) stays allowed; only a
-  build/edit/commit *at a segment head* counts.
+  build/edit/commit/`gh` *at a segment head* counts.
+
+  **ALL `gh` is delegated (Alex tg#7103).** `gh ship`, `gh pr checks`/`view`, `gh run`, `gh api`
+  — every gh subcommand — is implementation the orchestrator hands to a subagent, not inline work.
+  This **reverts** the earlier `gh ship`/read-only-`gh` carve-out (agent-tools#159/#162): shipping
+  a gated PR *and* CI/PR verification are a subagent's job. `gh` is not in the allow-list; it is an
+  impl-signal, so an inline `gh ship 605` warn-then-blocks exactly like `git commit`. A dispatched
+  subagent (`agent_id` present) is exempt and runs gh/ship freely — the gate governs the
+  orchestrator only.
 
 ## Per-repo opt-out (Alex tg#5743)
 
@@ -41,34 +45,28 @@ exempts itself:
 
 This mirrors the opt-IN per-repo knob of the sibling `worktree-only-writes` guard.
 
-**Release carve-out — `gh ship` (#159):** the gated merge is the ONE repo mutation that belongs
-at *orchestrator* altitude — the auto-mode classifier denies it inside subagents (a subagent
-relaying its own merge is what the gates exist to stop), so blocking it here deadlocked the
-release path entirely (observed live as warn-then-block *flapping* on repeated ships). A
-`gh ship` **release chain** is therefore never warned or blocked: at least one segment head is
-`gh ship` (env-var prefixes allowed: `GH_PAGER=cat gh ship 605`) and **every** segment head is
-`gh ship`, read-only inspection, or `cd` — e.g. `gh ship 605 2>&1 | tail -30 | grep -i merged`,
-`cd /repo && gh ship 605 | tail -40`. Same per-segment-head discipline as above: `gh ship` as a
-substring/needle (`grep 'gh ship' log`) exempts nothing, and a ship segment does **not** launder
-an implementation chain (`sed -i ... && gh ship`, `npm run build && gh ship`, any heredoc still
-block). Build/edit tokens **and `$()`/backtick substitutions anywhere in the line** veto the
-carve-out wholesale (a substitution can smuggle any mutation into a benign-looking segment), so
-`gh ship 605 | tee ship.log` does **not** ride it — log a ship with a bare redirect instead
-(`gh ship 605 > ship.log 2>&1`, allowed as a plain redirect). Only `gh ship` rides the *release*
-carve-out — no other gh subcommand rides *that* one.
+**`gh` is delegated, not carved out (Alex tg#7103 — reverts #159/#162).** An earlier design gave
+`gh ship` (and read-only `gh` reads) an *orchestrator* carve-out so the main thread could ship a
+gated PR and verify CI inline. The CTO reversed that: the orchestrator delegates **all** `gh` to a
+subagent — shipping *and* CI/PR verification included. So `gh ship`, `gh pr checks`/`view`,
+`gh run`, `gh api` (GET or mutation) are each an impl-signal that warn-then-blocks for the
+orchestrator, single or chained, with or without `cd`/read-only plumbing (`gh ship 605 2>&1 | tail
+-30` blocks; a subagent runs it). Per-segment-head discipline is unchanged: `gh` as a
+substring/needle (`grep 'gh ship' log`, `git log | rg gh`) is **not** a gh command and exempts
+nothing. The **dispatched subagent** (`agent_id` present) is the one meant to ship/verify and is
+exempt.
 
-**Report / verify carve-out — `tg` + read-only gh reads (coordinator):** the orchestrator's role is
-literally *verify + report*, so reporting to the user and read-only PR/CI verification must **not**
-require a subagent. A line whose every segment head is `tg`, a read-only gh read
-(`gh pr list/view/checks/status/diff`, `gh run list/view`), read-only inspection (incl. system-info
-`df`/`du`/`lsblk`/`free`/`ps`/… and filters `jq`/`sort`/`cut`/…), or `cd` — with at least one `tg`/
-gh-read head — is never warned or blocked, of **any** length: `tg --format html '…' | tail -3 | grep
-merged`, `gh pr view 5 | jq .title | head`, `tg done; gh pr view 5; gh run list`. Same per-segment
-discipline as the release carve-out — a build/edit, heredoc, substitution, bare-`&`, or mutating
-companion forfeits it (`tg done && sed -i …`, `gh pr view && git push` are still implementation).
-**`curl` and `ssh` are deliberately NOT sanctioned** — `curl -X POST`/`-d` mutates and `ssh host
-'…'` runs any remote command, so neither can be reliably classified read-only; use the escape hatch
-or a subagent for those.
+**Report / verify carve-out — `tg` + read-only inspection (coordinator):** reporting to the user
+and *read-only* verification stay at orchestrator altitude and must **not** require a subagent. A
+line whose every segment head is `tg`, `review`, `git worktree list`, read-only inspection (incl.
+system-info `df`/`du`/`lsblk`/`free`/`ps`/… and filters `jq`/`sort`/`cut`/…), or `cd` — with at
+least one `tg`/`review` head — is never warned or blocked, of **any** length: `tg --format html '…'
+| tail -3 | grep merged`, `cat status.json | jq .title | head`, `tg done; git status; git log`.
+Same per-segment discipline — a build/edit, heredoc, substitution, bare-`&`, mutating companion, or
+any **`gh`** head forfeits it (`tg done && sed -i …`, `gh pr view && git push`, and now a bare
+`gh pr view` are all implementation). **`curl` and `ssh` are deliberately NOT sanctioned** —
+`curl -X POST`/`-d` mutates and `ssh host '…'` runs any remote command, so neither can be reliably
+classified read-only; use the escape hatch or a subagent for those.
 
 **Subagent-exempt:** a dispatched subagent (`agent_id` present) does the actual work, so it is
 always allowed. This gate governs the orchestrator only. Because the hook uses `agent_id` to

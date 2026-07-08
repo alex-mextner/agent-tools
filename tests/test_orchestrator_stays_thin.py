@@ -407,23 +407,20 @@ def test_sed_in_place_anywhere_still_implementation(tmp_path, monkeypatch):
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
 
 
-# ── tg#5743: the flapping fix — sanctioned orchestration is NEVER blocked, even chained ─────
+# ── sanctioned orchestration (tg / review / git worktree list) is NEVER blocked, even chained ─────
 
 @pytest.mark.parametrize("command", [
-    "gh ship 5",                                   # the sanctioned release (agent-tools#23)
-    "gh ship 5 && tg 'shipped'",                   # ship + report (used to flap: >=2 operators)
-    "gh pr list && gh pr view 5",                  # PR inspection chain
-    "gh pr checks 5 | grep fail",                  # gh read piped into a read-only filter
-    "gh run list && gh run view 9 && tg done",     # 3-segment orchestration chain
-    "gh api repos/o/r/pulls | jq '.[].number'",    # gh api GET piped into jq (read-only)
-    "gh api repos/o/r/pulls | jq '.[]' | head",    # 2 pipes — the jq fix (was blocked before)
+    "tg 'shipped'",                                # report (the mandatory case)
+    "tg 'a' && tg 'b'",                            # report chain
     "git worktree list",                           # worktree inspection
     "review diff",                                  # multi-model review CLI
+    "review diff && tg done",                       # review + report chain
+    "git worktree list | grep wt | head",           # worktree inspection piped into read-only filter
 ])
 def test_orchestration_chain_never_blocks(command, tmp_path, monkeypatch):
-    """`gh` reads / `gh ship` / `tg` / `review` / `git worktree list` are orchestration, never
-    implementation — a chain of only these must not warn OR block (Alex tg#5743 / #23). `jq`/`grep`
-    tails have read-only HEADS, so the whole chain stays allowed even with 2+ pipes."""
+    """`tg` / `review` / `git worktree list` are orchestration, never implementation — a chain of
+    only these (plus read-only tails) must not warn OR block. `gh` is deliberately EXCLUDED now
+    (tg#7103): see test_gh_is_now_delegated_warn_then_blocks."""
     event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
     out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
     assert c1 == 0 and _decision(out1) == "allow", command
@@ -431,14 +428,100 @@ def test_orchestration_chain_never_blocks(command, tmp_path, monkeypatch):
     assert c2 == 0 and _decision(out2) == "allow", command
 
 
-def test_gh_ship_is_all_inline_allowed():
-    assert ost._is_all_inline_allowed("gh ship 5 && tg 'done'") is True
-    assert ost._is_all_read_only("gh ship 5 && tg 'done'") is False  # not read-only, but allowed
+# ── tg#7103: ALL `gh` is now DELEGATED — ship + CI/PR verification warn-then-block ─────────────
+
+@pytest.mark.parametrize("command", [
+    "gh ship 638",                                 # the sanctioned release — now a subagent's job
+    "gh ship 638 && tg 'shipped'",                 # ship + report
+    "gh pr view 638",                              # PR verification (bare)
+    "gh pr checks 638",                            # CI verification (bare)
+    "gh pr list && gh pr view 5",                  # PR inspection chain
+    "gh pr checks 5 | grep fail",                  # gh read piped into a read-only filter
+    "gh run list",                                 # CI status (bare)
+    "gh run list && gh run view 9 && tg done",     # 3-segment gh chain
+    "gh api repos/o/r/pulls | jq '.[].number'",    # gh api GET piped into jq
+    "gh api repos/o/r/issues -X POST -f title=x",  # gh api mutation
+    "gh api graphql -f query='mutation{x}'",       # graphql mutation
+    "gh api repos/o/r/issues --method GET -f state=open",  # gh api GET with fields (still delegated)
+])
+def test_gh_is_now_delegated_warn_then_blocks(command, tmp_path, monkeypatch):
+    """ALL `gh` — ship, PR/CI verification, api (GET or mutation), every subcommand — is
+    implementation the orchestrator must delegate to a subagent (Alex tg#7103, reverting the
+    #159/#162 gh-ship carve-out). It is NOT in ORCH_ALLOW and IS a gh impl-signal, so a
+    single unchained gh command warn-then-blocks exactly like `git commit`."""
+    assert ost._seg_is_impl_signal(command.split("&&")[0].split("|")[0].strip()) is True, command
+    assert ost.ORCH_ALLOW.search(command) is None, command
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow", command  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block", command
+
+
+def test_gh_is_not_inline_allowed():
+    """`gh ship`/`gh pr` are no longer inline-allowed orchestration — they are implementation."""
+    assert ost._is_all_inline_allowed("gh ship 5 && tg 'done'") is False
+    assert ost._is_implementation_bash("gh ship 5") is True
+    assert ost._is_implementation_bash("gh pr checks 5") is True
+    # `tg`/`review` still ARE inline-allowed orchestration
+    assert ost._is_all_inline_allowed("tg 'done' && review diff") is True
+
+
+def test_gh_subagent_is_exempt(tmp_path, monkeypatch):
+    """A dispatched subagent (`agent_id` present) still runs `gh ship`/`gh pr` freely — the gate
+    governs the orchestrator only, and the subagent is the one meant to ship/verify (tg#7103)."""
+    for command in ("gh ship 638", "gh pr checks 638"):
+        event = {"point": "pre-bash", "cwd": "/repo",
+                 "args": {"agent_id": "sub-1", "command": command}}
+        _run(event, monkeypatch, tmp_path / "m")  # even on a repeat it must allow
+        out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+        assert c == 0 and _decision(out) == "allow", command
+
+
+def test_path_qualified_gh_is_delegated():
+    """A path-qualified gh head (`/usr/bin/gh ship`) is normalized by basename and delegated too —
+    the SAME normalization git gets (`/usr/bin/git commit`), closing the asymmetry a bare `^gh\\b`
+    regex left open (Opus review). `gh` as a needle stays exempt; `gh-foo` is a different command."""
+    assert ost._is_gh_command("/usr/bin/gh ship 605") is True
+    assert ost._is_gh_command("/opt/homebrew/bin/gh pr checks 5") is True
+    assert ost._is_implementation_bash("/usr/bin/gh ship 605 | tail -3") is True
+    # a genuine needle / different command must NOT be swept in
+    assert ost._is_gh_command("cat gh.md") is False
+    assert ost._is_gh_command("grep 'gh ship' log") is False
+    assert ost._is_gh_command("gh-foo bar") is False  # `gh-foo` is not `gh` (basename-exact)
+
+
+def test_gh_unbalanced_quotes_are_conservative():
+    """An UNBALANCED-quote gh segment shlex cannot parse must still register as gh (block), the
+    conservative direction the old `gh api` path took — not silently pass (Opus review)."""
+    assert ost._is_gh_command("gh ship 605 'oops") is True          # head regex fallback
+    assert ost._is_gh_command("/usr/bin/gh pr view 5 'oops") is True  # ...path-qualified too
+    assert ost._is_implementation_bash("gh ship 605 'oops") is True
+    # a NON-gh unbalanced segment must NOT be mis-flagged as gh by the fallback
+    assert ost._is_gh_command("echo 'oops") is False
+
+
+def test_gh_env_prefix_is_delegated_after_strip():
+    """`_is_gh_command` handles env-prefixes ITSELF in both branches (shlex + fallback), so it is
+    correct even if a caller forgets to `_strip_wrappers` — and a timeout-WRAPPED head still
+    delegates end-to-end via the caller's strip."""
+    assert ost._is_gh_command("GH_PAGER=cat gh ship 605") is True             # no pre-strip needed
+    assert ost._is_gh_command("GH_PAGER=cat GH_TOKEN=x gh ship 605") is True  # multiple prefixes
+    assert ost._is_gh_command(ost._strip_wrappers("GH_PAGER=cat gh ship 605")) is True
+    assert ost._is_gh_command(ost._strip_wrappers("timeout 60 gh pr checks 5")) is True
+    assert ost._is_gh_command("FOO=bar echo x") is False   # env-prefix on a non-gh head
+    assert ost._is_implementation_bash("GH_PAGER=cat GH_TOKEN=x gh ship 605") is True
+    # env-prefix AND an unbalanced quote together: _strip_wrappers bails on the bad quote, so the
+    # env-prefix survives to the fallback regex, which skips leading VAR=val before the gh head.
+    assert ost._is_implementation_bash("GH_PAGER=cat gh ship 605 'oops") is True
+    assert ost._is_gh_command("GH_PAGER=cat GH_TOKEN=x gh ship 605 'oops") is True
+    # ...and a non-gh env-prefixed unbalanced segment is still NOT mis-flagged as gh
+    assert ost._is_gh_command("FOO=bar echo 'oops") is False
 
 
 def test_gh_head_with_impl_tail_still_blocks_on_repeat(tmp_path, monkeypatch):
-    """A chain that STARTS orchestration but mixes in real work is judged on its full content —
-    `gh pr view && git commit` still blocks on repeat (the prefix does not wave it through)."""
+    """A chain mixing gh with real work is judged on its full content — `gh pr view && git commit`
+    blocks on repeat (both segments are now implementation)."""
     event = {"point": "pre-bash", "cwd": "/repo",
              "args": {"command": "gh pr view 5 && git commit -m x"}}
     out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
@@ -447,34 +530,18 @@ def test_gh_head_with_impl_tail_still_blocks_on_repeat(tmp_path, monkeypatch):
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
 
 
-@pytest.mark.parametrize("command", [
-    "gh api graphql -f query='mutation{x}'",  # graphql mutation, single (0 operators)
-    "gh api repos/o/r/issues -X POST -f title=x",  # explicit POST
-    "gh api repos/o/r -fkey=value && tg done",     # ATTACHED short field flag (codex)
-    "gh api repos/o/r -XPOST",                     # ATTACHED method flag
-])
-def test_gh_api_mutation_is_implementation(command, tmp_path, monkeypatch):
-    """`gh api` is whitelisted ONLY when GET-shaped — a mutation (graphql / -f field / -X method,
-    incl. ATTACHED short forms) is implementation and warn-then-blocks even UNCHAINED (codex P1)."""
-    assert ost._seg_is_impl_signal(command.split("&&")[0].strip()) is True
-    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+def test_read_only_head_with_gh_tail_now_blocks(tmp_path, monkeypatch):
+    """DIRECTION-REVERSAL guard: a read-only head with `gh` as the ONLY impl in the tail
+    (`git status && gh pr view 5`) used to be ALLOWED (gh-read was orchestration) and must now
+    warn-then-block — the whole point of tg#7103. Pins that the reversal holds regardless of
+    segment order."""
+    assert ost._is_implementation_bash("git status && gh pr view 5") is True
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "git status && gh pr view 5"}}
     out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
     assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
     out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
-
-
-def test_gh_api_explicit_get_with_fields_is_read(tmp_path, monkeypatch):
-    """An EXPLICIT GET with query fields (`--method GET -f state=open`) is a read, not a mutation —
-    it must not warn/block (that would re-introduce flapping) (codex round 4)."""
-    cmd = "gh api repos/o/r/issues --method GET -f state=open"
-    assert ost._seg_is_impl_signal(cmd) is False
-    assert ost._is_all_inline_allowed(cmd) is True
-    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": cmd}}
-    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
-    assert c1 == 0 and _decision(out1) == "allow"
-    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
-    assert c2 == 0 and _decision(out2) == "allow"
 
 
 def test_prewrite_opt_out_follows_target_repo(tmp_path, monkeypatch):
@@ -543,15 +610,16 @@ def test_allow_list_does_not_launder_smuggled_mutation(command, tmp_path, monkey
 
 
 @pytest.mark.parametrize("command", [
-    "cd /repo && gh ship 605 | tail -40",            # `cd` companion (was wrongly blocked)
-    "cd /repo && gh ship 605 --repo o/r --no-screenshot-ok | tail -3",  # cd + cross-repo + flag
-    "gh ship 605 --title 'a & b' | tail",            # a quoted `&` must not trip the bare-`&` veto
-    "gh ship 605 --note 'fix; reship' | tail",       # a quoted `;` must not split the segment
+    "cd /repo && tg 'done' | tail -40",              # `cd` companion (was wrongly blocked)
+    "cd /repo && review diff | tail -3",             # cd + review companion
+    "tg 'saw a & b later' | tail",                   # a quoted `&` must not trip the bare-`&` veto
+    "tg 'fix; reship' | tail",                       # a quoted `;` must not split the segment
     "git branch",                                    # a bare `git branch` LIST stays read-only
 ])
 def test_allow_list_covers_cd_and_quoted_reason(command, tmp_path, monkeypatch):
-    """The `cd` companion and quote-aware handling must keep a legit ship/orchestration line
-    allowed — it must never warn or prime a block (the whole point of the flapping fix)."""
+    """The `cd` companion and quote-aware handling must keep a legit orchestration line allowed —
+    it must never warn or prime a block. (`gh` lines no longer ride this — they are delegated;
+    the coverage now uses `tg`/`review`, which stay sanctioned.)"""
     event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
     out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
     assert c1 == 0 and _decision(out1) == "allow", command
@@ -571,13 +639,17 @@ def test_seg_and_inline_allowed_predicate_surface():
     assert ost._seg_is_allowed("git branch -D tmp") is False
     assert ost._seg_is_allowed("git -C /repo branch -D tmp") is False
     assert ost._seg_is_allowed("git branch") is True
-    # A smuggled mutation is caught by _is_implementation_bash (impl / substitution-inner scan runs
-    # BEFORE the fast path), NOT by a blanket veto in _is_all_inline_allowed — which honestly reports
-    # head-allowance, so a benign read-only substitution pipe still passes it (the #80 fix).
+    # `gh` is now delegated (tg#7103): any gh line is implementation, chained or not.
     assert ost._is_implementation_bash("gh ship 605 $(sed -i x)") is True
     assert ost._is_implementation_bash("gh ship 605 & git push") is True
-    assert ost._is_implementation_bash("gh ship 605 --title 'a & b' | tail") is False
-    assert ost._is_implementation_bash("gh ship 605 --note 'a; b' | tail") is False
+    assert ost._is_implementation_bash("gh ship 605 --title 'a & b' | tail") is True  # gh head = impl
+    assert ost._is_implementation_bash("gh ship 605 --note 'a; b' | tail") is True    # gh head = impl
+    # A smuggled mutation behind a still-sanctioned `tg` head is caught by the substitution-inner
+    # scan / `&` split, NOT by a blanket veto in _is_all_inline_allowed — which honestly reports
+    # head-allowance, so a benign read-only substitution pipe still passes it (the #80 fix).
+    assert ost._is_implementation_bash("tg done $(sed -i x)") is True
+    assert ost._is_implementation_bash("tg done & git push") is True
+    assert ost._is_implementation_bash("tg 'a & b' | tail") is False
     assert ost._is_all_inline_allowed("cat $(find . -name x) | grep k | head") is True
 
 
@@ -621,27 +693,28 @@ def test_smuggled_mutation_is_now_offending(command, tmp_path, monkeypatch):
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block", command
 
 
-def test_gh_run_watch_not_whitelisted_but_list_view_are():
-    """`gh run watch` is a long-running block — dropped from the orchestration allow-list; the quick
-    `gh run list`/`gh run view` inspections stay (codex review)."""
-    assert ost.ORCH_ALLOW.search("gh run list") is not None
-    assert ost.ORCH_ALLOW.search("gh run view 9") is not None
-    assert ost.ORCH_ALLOW.search("gh run watch 123") is None
-    # a read-only substitution and gtimeout-wrapped ship must stay allowed (no over-block).
+def test_all_gh_run_is_delegated():
+    """ALL `gh run` (list/view/watch) is delegated now (tg#7103) — none is in ORCH_ALLOW, and each
+    is a gh impl-signal. A gtimeout-wrapped ship is delegated too (the wrapper is stripped,
+    exposing the `gh` head)."""
+    for cmd in ("gh run list", "gh run view 9", "gh run watch 123"):
+        assert ost.ORCH_ALLOW.search(cmd) is None, cmd
+        assert ost._is_implementation_bash(cmd) is True, cmd
+    assert ost._is_implementation_bash("gtimeout 60 gh ship 605 | tail") is True
+    # a genuinely read-only substitution must still NOT over-block.
     assert ost._is_implementation_bash("cat $(ls -t | head -1)") is False
-    assert ost._is_implementation_bash("gtimeout 60 gh ship 605 | tail") is False
 
 
 @pytest.mark.parametrize("command", [
     "df -h | grep /dev | head",           # read-only system-info verification pipe
     "lsblk | grep sda | wc -l",           # ...another
-    "gh pr view 5 | jq .title | head",    # PR verification through jq/head
+    "cat status.json | jq .title | head", # read-only file verification through jq/head
     "free -m | tail -1",                  # memory info
 ])
 def test_read_only_system_verification_pipes_allow(command, tmp_path, monkeypatch):
     """Read-only system-info + filter verification tools (df/lsblk/free/…, jq/…) added to
     READ_ONLY_BASH so a multi-step verify pipe is not blocked by the >=3-segment rule (coordinator;
-    SYNC with fix/159)."""
+    SYNC with fix/159). (A `gh pr view` verify pipe is NOT here anymore — gh is delegated, tg#7103.)"""
     event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
     out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
     assert c1 == 0 and _decision(out1) == "allow", command
@@ -725,34 +798,32 @@ def test_quoted_pipe_inside_arg_not_split(command, tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow", command
 
 
-@pytest.mark.parametrize("command", [
-    "gh api repos/o/r/issues --method=GET -f state=open",  # --method=GET spelling
-    "gh api repos/o/r/issues -X GET -q '.[]'",             # -X GET spelling
-])
-def test_gh_api_get_spellings_are_reads(command, tmp_path, monkeypatch):
-    """All GET spellings (`--method=GET`, `-X GET`) are reads even with query fields — shlex-parsed
-    effective-method detection, no false block (codex round 5)."""
-    assert ost._gh_api_is_mutation(command) is False, command
-    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
-    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
-    assert c == 0 and _decision(out) == "allow", command
-
-
-def test_gh_api_double_method_last_wins():
-    """`--method GET --method POST` → the LAST method wins (POST) → mutation (codex round 5)."""
-    assert ost._gh_api_is_mutation("gh api repos/o/r --method GET --method POST") is True
+def test_gh_api_all_shapes_are_delegated():
+    """Under tg#7103 the gh-api GET-vs-mutation distinction is gone — EVERY `gh api` shape (GET,
+    POST, graphql, any method spelling) is delegated. `_gh_api_is_mutation` was removed with the
+    carve-out; `gh api` is now caught by the general `_is_gh_command` impl-signal."""
+    for cmd in (
+        "gh api repos/o/r/issues --method=GET -f state=open",
+        "gh api repos/o/r/issues -X GET -q '.[]'",
+        "gh api repos/o/r --method GET --method POST",
+        "gh api graphql -f query='mutation{x}'",
+    ):
+        assert ost._seg_is_impl_signal(cmd) is True, cmd
+        assert ost._is_implementation_bash(cmd) is True, cmd
+    assert not hasattr(ost, "_gh_api_is_mutation")  # helper removed with the carve-out
 
 
 @pytest.mark.parametrize("command", [
     "timeout 60 git status",        # the mandated timeout wrapper on a READ-ONLY command
-    "timeout 60 gh pr list && timeout 60 gh pr view 5",  # timeout on orchestration, chained
+    "timeout 60 tg 'done' && timeout 60 review diff",  # timeout on orchestration, chained
     "/usr/bin/env git status",      # absolute-path env on a read-only command
     "git -C /r status && git -C /r log && git -C /r diff",  # read-only git with -C, 3-chain (round 8)
     "/usr/bin/git log --oneline",   # path-qualified read-only git
 ])
 def test_wrappers_do_not_break_read_or_orchestration(command, tmp_path, monkeypatch):
     """Stripping wrappers must not turn a read/orchestration command into an offense — `timeout N
-    git status` and `timeout N gh pr list && …` stay allowed, never warn/block (codex round 6)."""
+    git status` and `timeout N tg … && …` stay allowed, never warn/block (codex round 6). (`gh`
+    behind a wrapper is now delegated — see test_all_gh_run_is_delegated.)"""
     event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
     out, _e, c = _run(event, monkeypatch, tmp_path / "m")
     assert c == 0 and _decision(out) == "allow", command
@@ -796,32 +867,33 @@ def test_default_on_still_blocks_when_no_rigyaml(tmp_path, monkeypatch):
     assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-# ── #159: `gh ship` is RELEASE, not implementation — the orchestrator's own carve-out ────
+# ── tg#7103: `gh ship` is now DELEGATED, not an orchestrator carve-out (reverts #159/#162) ────
 
 @pytest.mark.parametrize("command", [
-    "gh ship 605",                                             # bare ship (pins the trivial case)
+    "gh ship 605",                                             # bare ship — now a subagent's job
     "gh ship 605 2>&1 | tail -30 | grep -i merged",            # ship + read-only plumbing (2 ops)
     "gh ship 605 --skip-ci | tail -20; git log --oneline -3",  # ship + post-merge inspection
     "GH_PAGER=cat GH_TOKEN=x gh ship 605 | tail -5 | head -1",  # env-var prefixes on the ship head
     "cd /repo && gh ship 605 | tail -40",                      # `cd` companion segment
     "git status && gh ship 605 && git log --oneline -1",       # read-only companions via &&
-    "gh ship 605 > ship.log 2>&1",                             # the sanctioned logging shape
+    "gh ship 605 > ship.log 2>&1",                             # the logging shape
     "gh ship 605 --repo alex-mextner/agent-tools",             # cross-repo ship: `--repo <owner/repo>`
     "gh ship 605 --repo alex-mextner/agent-tools --no-screenshot-ok",  # + the no-screenshot flag
     "cd /repo && gh ship 605 --repo alex-mextner/agent-tools --no-screenshot-ok | tail -3",  # all three
-    "gh ship 605 --no-screenshot-ok 'revert; reship' | tail -3",  # quoted `;` in a reason arg (F2/P2)
+    "gh ship 605 --no-screenshot-ok 'revert; reship' | tail -3",  # quoted `;` in a reason arg
 ])
-def test_gh_ship_release_chain_allows(command, tmp_path, monkeypatch):
-    """A `gh ship` line (plus read-only/`cd` plumbing) is the sanctioned RELEASE action at
-    ORCHESTRATOR altitude (#159): the auto-mode classifier denies subagents the gated merge,
-    so the orchestrator must run it itself — it must never warn and never prime the block
-    tier (the warn-then-block flapping on repeated ships was the gated-ship deadlock)."""
+def test_gh_ship_now_delegated_warn_then_blocks(command, tmp_path, monkeypatch):
+    """A `gh ship` line (any plumbing) is delegated to a subagent now (Alex tg#7103, reverting the
+    #159/#162 orchestrator carve-out): shipping a gated PR is a subagent's job, so the orchestrator
+    warn-then-blocks it exactly like `git commit`. The FIRST offense WARNs (advisory), a REPEAT in
+    the window BLOCKs. (Read-only/`cd` companions do not rescue it — the `gh ship` segment head is
+    itself the impl-signal.)"""
     event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
     out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
-    assert c1 == 0 and _decision(out1) == "allow"
-    assert "message" not in json.loads(out1)  # does not even warn
-    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")  # never primes a block
-    assert c2 == 0 and _decision(out2) == "allow"
+    assert c1 == 0 and _decision(out1) == "allow", command  # first offense WARNs (advisory)
+    assert "message" in json.loads(out1), command           # ...and it DOES warn now
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block", command
 
 
 @pytest.mark.parametrize("command", [
@@ -896,46 +968,39 @@ def test_gh_ship_with_heredoc_still_blocks(tmp_path, monkeypatch):
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
 
 
-def test_release_judgement_matrix():
-    """The #162 release-carve-out guarantees, re-pinned against THIS branch's design (there is
-    no `_is_sanctioned_release_chain` here — `gh ship` rides the head-anchored ORCH_ALLOW
-    allow-list + the smuggling guards). Asserted on `_is_implementation_bash` (True = blocked).
-    Where this branch is deliberately STRICTER than #162's inherited behavior, the stricter
-    verdict is pinned (safe direction) — noted inline."""
+def test_gh_delegation_judgement_matrix():
+    """Under tg#7103 `gh ship` (and every gh) is DELEGATED — the reverse of the #159/#162 matrix.
+    Asserted on `_is_implementation_bash` (True = blocked/delegated). ANY line whose gh segment
+    head is `gh ship`/`gh pr`/… is implementation, regardless of read-only/`cd` plumbing, quoting,
+    or substitutions — the gh head is itself the signal."""
     impl = ost._is_implementation_bash
-    # sanctioned release shapes stay allowed
-    assert impl("gh ship 605 | tail -3 | head -1") is False
-    assert impl("gh ship 605 2>&1 | tail -3") is False
-    assert impl("grep 'gh ship' log | head | wc -l") is False  # needle in a read-only pipe
-    # `gh ship` forms the orchestrator actually runs (task #23) — the gate does NOT validate
-    # ship's own flags (that is ship's job downstream): `--repo <owner/repo>`, `--no-screenshot-ok`.
-    assert impl("gh ship 605 --repo alex-mextner/agent-tools") is False
-    assert impl("gh ship 605 --repo alex-mextner/agent-tools --no-screenshot-ok") is False
+    # every gh ship shape is now delegated (True), including the plumbing forms that used to pass
+    assert impl("gh ship 605 | tail -3 | head -1") is True
+    assert impl("gh ship 605 2>&1 | tail -3") is True
+    assert impl("gh ship 605 --repo alex-mextner/agent-tools") is True
+    assert impl("gh ship 605 --repo alex-mextner/agent-tools --no-screenshot-ok") is True
     assert impl(
-        "cd /repo && gh ship 605 --repo alex-mextner/agent-tools --no-screenshot-ok | tail -3") is False
-    # a BENIGN read-only substitution no longer forfeits the pass (stricter-only where it
-    # matters: #162 vetoed ALL substitutions out of the carve-out; here the inner command is
-    # actually judged, so a read-only one passes and a mutating one blocks).
-    assert impl("cd $(git rev-parse --show-toplevel) && gh ship 605") is False
-    # non-allowed companion heads forfeit it (>=3 segments, no benign judgement)
-    assert impl("gh ship 605 | writer cat | tool grep") is True
-    # a companion mutation is caught — incl. forms #162 could not see:
-    assert impl("gh ship 605 && git push") is True  # STRICTER than #162 (impl-signal per segment)
-    assert impl("gh ship 605 & git push origin main") is True  # STRICTER: bare `&` is a split here
-    assert impl("gh ship 605 | cat <(git push origin main)") is True  # process-subst inner judged
-    assert impl("tee >(wc -l) | gh ship 605") is True  # tee is BUILD_EDIT
-    assert impl("gh ship 605 | find . -delete | tail -3") is True
-    assert impl("gh ship 605 | find . -name x | head") is False  # read-only find companion is fine
-    assert impl("gh ship 605 | find . -fprintf evil.sh 'x' | tail -3") is True  # find file-WRITE
-    assert impl("cd-clean && gh ship 605 | tail -3") is True  # `cd-clean` is not the `cd` companion
-    # quoted metachars in a ship reason keep the pass; LIVE double-quoted substitutions do not
-    # (quote semantics, #162/#164 review P2): `$()`/backticks execute inside double quotes.
-    assert impl("gh ship 605 --no-screenshot-ok 'revert; reship' | tail -3") is False
-    assert impl('gh ship 605 --title "a & b" | tail -3') is False
-    assert impl("gh ship 605 --note 'ran $(build) earlier' | tail -3") is False
+        "cd /repo && gh ship 605 --repo alex-mextner/agent-tools --no-screenshot-ok | tail -3") is True
+    assert impl("cd $(git rev-parse --show-toplevel) && gh ship 605") is True
+    # quoted-metachar and single-quoted-substitution reasons block too — the gh head is the signal,
+    # so quote handling no longer changes the verdict (it did under the #162 carve-out).
+    assert impl("gh ship 605 --no-screenshot-ok 'revert; reship' | tail -3") is True
+    assert impl('gh ship 605 --title "a & b" | tail -3') is True
+    assert impl("gh ship 605 --note 'ran $(build) earlier' | tail -3") is True
     assert impl('gh ship 605 --note "$(git push origin main)" | tail -3') is True
-    assert impl('gh ship 605 --note "`git push origin main`" | tail -3') is True
-    assert impl("gh ship 605 --note '$(git push origin main)' | tail -3") is False
+    assert impl("gh ship 605 --note '$(git push origin main)' | tail -3") is True
+    # `gh ship` counts only at a segment HEAD (argv) — a needle in a read-only pipe is NOT a gh cmd
+    assert impl("grep 'gh ship' log | head | wc -l") is False
+    # companion mutations behind gh are moot now (gh already blocks), but the guards still hold
+    assert impl("gh ship 605 && git push") is True
+    assert impl("gh ship 605 & git push origin main") is True
+    assert impl("tee >(wc -l) | gh ship 605") is True  # tee is BUILD_EDIT
+    # ...and the same guards protect the STILL-sanctioned `tg`/`review`/read-only allow-list:
+    assert impl("tg done | writer cat | tool grep") is True   # non-allowed heads, >=3 segments
+    assert impl("tg done & git push origin main") is True     # bare `&` split exposes the push
+    assert impl("tg done | cat <(git push origin main)") is True  # process-subst inner judged
+    assert impl("cd $(git rev-parse --show-toplevel) && tg done") is False  # benign read-only subst
+    assert impl("tg 'saw a & b' | tail") is False              # quoted metachar keeps the pass
 
 
 # ── coordinator: report (`tg`) + read-only verification are orchestrator altitude, not impl ──────
@@ -944,15 +1009,16 @@ def test_release_judgement_matrix():
     "tg 'msg'",                                           # plain report (the mandatory case)
     "tg --format html '<b>done</b>' | tail -3",           # report + read-only plumbing (a pipe)
     "tg --format html 'x' | tail -3 | grep merged",       # 2-operator report chain (used to block)
-    "gh pr view 5 | jq .title | head -1",                 # PR verification piped through jq/head
-    "tg done; gh pr view 5; gh run list",                 # report + verify, 3 segments
+    "cat status.json | jq .title | head -1",              # read-only file verification through jq
+    "tg done; git status; git log --oneline -3",          # report + read-only verify, 3 segments
     "df -h | grep /dev | head",                           # read-only system verification
     "lsblk | grep sda | wc -l",                           # ...another
     "cd /repo && tg 'done' | tail",                       # `cd` companion on a report line
 ])
 def test_report_or_verify_chain_allows(command, tmp_path, monkeypatch):
-    """`tg` reporting and read-only PR/CI/system verification are the orchestrator's OWN altitude —
-    a multi-step report/verify chain must never warn OR prime a block (coordinator directive)."""
+    """`tg` reporting and read-only system verification are the orchestrator's OWN altitude — a
+    multi-step report/verify chain must never warn OR prime a block. (gh-based verification like
+    `gh pr view` is NOT here anymore — gh is delegated to a subagent, tg#7103.)"""
     event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
     out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
     assert c1 == 0 and _decision(out1) == "allow", command
@@ -980,17 +1046,20 @@ def test_report_or_verify_does_not_launder_impl(command, tmp_path, monkeypatch):
 
 
 def test_report_verify_allowlist_surface():
-    """Pin the doctrine (re-based over #162): `tg` and the gh reads are sanctioned orchestration
-    heads (ORCH_ALLOW), while `curl` and `ssh` are NOT — curl can POST and ssh runs any remote
-    command, so neither is reliably read-only; they never ride the allow-list."""
+    """Pin the doctrine under tg#7103: `tg`/`review`/`git worktree list` are the sanctioned
+    orchestration heads (ORCH_ALLOW). `gh` is NO LONGER one — it is delegated. `curl`/`ssh` were
+    never sanctioned (curl can POST, ssh runs any remote command)."""
     assert ost.ORCH_ALLOW.search("tg 'x'") is not None
-    assert ost.ORCH_ALLOW.search("gh pr checks 5") is not None
+    assert ost.ORCH_ALLOW.search("review diff") is not None
+    assert ost.ORCH_ALLOW.search("git worktree list") is not None
+    assert ost.ORCH_ALLOW.search("gh pr checks 5") is None   # gh dropped from the allow-list
+    assert ost.ORCH_ALLOW.search("gh ship 5") is None
     assert ost.ORCH_ALLOW.search("curl -X POST http://h/api") is None
     assert ost.ORCH_ALLOW.search("ssh root@h 'df -h'") is None
     impl = ost._is_implementation_bash
     assert impl("tg 'x' | tail") is False
-    assert impl("gh pr checks 5 | grep fail | head") is False
-    assert impl("git log | grep x | head") is False  # plain read-only path, no tg/gh-read needed
+    assert impl("gh pr checks 5 | grep fail | head") is True   # gh is delegated now
+    assert impl("git log | grep x | head") is False  # plain read-only path, no tg/gh needed
     # a chain fronted by a non-sanctioned head is judged on its full content — a 3-segment curl
     # chain is impl-shaped, and a bare-`&` push behind a tg report is caught by the `&` split.
     assert impl("curl -X POST http://h/api | tg done | tail") is True
@@ -1009,8 +1078,11 @@ def test_double_quoted_substitution_is_live_and_judged(tmp_path, monkeypatch):
     assert ost._is_implementation_bash('gh ship 605 --note "$(git push origin main)" | tail -3') is True
     assert ost._is_implementation_bash('tg "`git commit -m x`"') is True
     assert ost._is_implementation_bash("tg 'saw $(git push) in logs'") is False
-    # read-only substitutions stay allowed in either quote form
-    assert ost._is_implementation_bash('gh pr view "$(gh pr list --json number -q .n)"') is False
+    # a gh head is delegated regardless of what its substitution contains (tg#7103)
+    assert ost._is_implementation_bash('gh pr view "$(gh pr list --json number -q .n)"') is True
+    # a still-sanctioned `tg` head with a read-only substitution stays allowed in either quote form
+    assert ost._is_implementation_bash('tg "$(git log --oneline -1)"') is False
+    assert ost._is_implementation_bash("tg 'literal $(git push) text'") is False
     event = {"point": "pre-bash", "cwd": "/repo",
              "args": {"command": 'gh ship "$(gh api repos/o/r/issues -X POST -f title=x)"'}}
     out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
