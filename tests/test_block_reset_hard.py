@@ -62,7 +62,11 @@ def _run(
     monkeypatch.setattr(sys, "stderr", err)
     # Clear the removed escape-hatch env so ambient values don't leak into tests (they no
     # longer do anything, but a regression test asserts exactly that).
-    for k in ("ALLOW_GIT_RESET_HARD", "ALLOW_GIT_RESET_HARD_REASON"):
+    for k in (
+        "ALLOW_GIT_RESET_HARD",
+        "ALLOW_GIT_RESET_HARD_REASON",
+        "RIG_HATCH_REQUEST_BLOCK_RESET_HARD",
+    ):
         monkeypatch.delenv(k, raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
@@ -618,6 +622,47 @@ def test_approval_detail_capped(monkeypatch, tmp_path):
     )
     assert approved is True
     assert detail is not None and len(detail) == hook._APPROVAL_DETAIL_CAP
+
+
+# ── generic Telegram hatch escalation: env-var path wins before approval_cmd ───────────────
+
+def _fake_tg_ctl(path: Path, body: str) -> Path:
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return path
+
+
+def test_hatch_escalation_exit0_allows_reset_hard_and_logs_source(monkeypatch, tmp_path):
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(
+        tmp_path / "tg-ctl",
+        f"touch {marker}\n"
+        'printf "approved by Telegram tap\\n"\n'
+        "exit 0\n",
+    )
+    monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _err, code = _run(
+        "git reset --hard",
+        monkeypatch,
+        {"RIG_HATCH_REQUEST_BLOCK_RESET_HARD": "Need to discard a disposable failed experiment."},
+        cwd=_rig_dir(tmp_path),
+    )
+    assert code == 0 and _decision(out) == "allow"
+    assert marker.exists()
+    assert "hatch escalation" in json.loads(out)["message"].lower()
+
+
+def test_hatch_escalation_denial_wins_over_approval_cmd(monkeypatch, tmp_path):
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _err, code = _run(
+        "git clean -fd",
+        monkeypatch,
+        {"RIG_HATCH_REQUEST_BLOCK_RESET_HARD": "Need to discard a disposable failed experiment."},
+        cwd=_rig_dir(tmp_path, approval_cmd='"exit 0"'),
+    )
+    assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "hatch escalation denied" in json.loads(out)["message"].lower()
 
 
 # ── Fail-closed paths ──────────────────────────────────────────────────────────────────────

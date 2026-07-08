@@ -12,11 +12,8 @@ import importlib.machinery
 import importlib.util
 import json
 import os
-import sys
 import tempfile
 from pathlib import Path
-
-import pytest
 
 # Load the script as a module (it has no .py extension)
 _SCRIPT = Path(__file__).resolve().parent.parent / "tools" / "mcp-skill-usage"
@@ -166,6 +163,6 @@ def test_format_table_sorts_by_calls():
     out = _mod.format_table(stats, 50)
     lines = out.strip().splitlines()
     # First data row (after header and sep) must be the higher-call entry
-    data_rows = [l for l in lines if l.startswith("mcp__")]
+    data_rows = [line for line in lines if line.startswith("mcp__")]
     assert data_rows[0].startswith("mcp__b__y")
     assert data_rows[1].startswith("mcp__a__x")

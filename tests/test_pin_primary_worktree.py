@@ -44,7 +44,12 @@ assert _spec and _spec.loader
 ppw = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ppw)
 
-_ENV_KEYS = ("RIG_WORKTREE_ONLY", "RIG_ALLOW_MAIN_EDIT", "RIG_ALLOW_MAIN_EDIT_REASON")
+_ENV_KEYS = (
+    "RIG_WORKTREE_ONLY",
+    "RIG_ALLOW_MAIN_EDIT",
+    "RIG_ALLOW_MAIN_EDIT_REASON",
+    "RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE",
+)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -410,6 +415,53 @@ def test_approval_cmd_receives_context_env(tmp_path, monkeypatch):
     out, code = _run(repo, "git checkout feat/x", monkeypatch)
     assert code == 0 and _decision(out) == "allow"
     assert marker.read_text() == "checkout|feat/x|pin-primary-worktree"
+
+
+# ── generic Telegram hatch escalation: env-var path wins before approval_cmd ───────────────
+
+def _fake_tg_ctl(path: Path, body: str) -> Path:
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return path
+
+
+def test_hatch_escalation_exit0_allows_and_logs_source(tmp_path, monkeypatch):
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(
+        tmp_path / "tg-ctl",
+        f"touch {marker}\n"
+        'printf "approved by Telegram tap\\n"\n'
+        "exit 0\n",
+    )
+    monkeypatch.setattr(ppw.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    repo = _make_repo(tmp_path)
+
+    out, code = _run(
+        repo,
+        "git checkout feat/x",
+        monkeypatch,
+        {"RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE": "Need to inspect the primary checkout."},
+    )
+
+    assert code == 0 and _decision(out) == "allow"
+    assert marker.exists()
+    assert "hatch escalation" in json.loads(out)["message"].lower()
+
+
+def test_hatch_escalation_denial_wins_over_approval_cmd(tmp_path, monkeypatch):
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    monkeypatch.setattr(ppw.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    repo = _make_repo(tmp_path, approval_cmd='"exit 0"')
+
+    out, code = _run(
+        repo,
+        "git checkout feat/x",
+        monkeypatch,
+        {"RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE": "Need to inspect the primary checkout."},
+    )
+
+    assert code == ppw.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "hatch escalation denied" in json.loads(out)["message"].lower()
 
 
 # ── `git checkout -` (previous branch) is resolved via @{-1}, not string-blind ───────────────
