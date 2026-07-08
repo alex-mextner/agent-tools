@@ -71,9 +71,17 @@ These are the *logical* points; map them to your harness's actual tool-use event
 > `permissionDecision: "deny"` / `decision: "block"`. Without that bridge these hooks
 > are inert in CC (agent-tools#18).
 
+> **Codex:** Codex also needs a carrier bridge. `lib/codex_hook_bridge` is the first
+> dispatcher for the confirmed Codex hooks contract: TOML hooks call it for `PreToolUse`
+> `Bash` (`pre-bash`), `PreToolUse` `apply_patch` (`pre-write`), `PostToolUse`
+> `apply_patch` (`post-write` feedback), and `Stop` (`stop`). It reads descriptors from
+> `~/.codex/hooks` and emits Codex's plain `{"decision":"block","reason":"..."}` shape.
+> Codex `pre-agent` is **not** mapped yet: `SubagentStart` / `SubagentStop` need a
+> trustworthy payload fixture before this catalog can safely enforce that point.
+
 | point          | fires when…                                  | hooks                                   |
 | -------------- | -------------------------------------------- | --------------------------------------- |
-| `pre-agent` **(bridge-ready; NOT yet live in CC — needs the rig-cli `Agent\|Task` matcher)** | before a subagent dispatch (Agent/Task tool) | background-subagent-gate                 |
+| `pre-agent` **(bridge-ready; NOT yet live in CC — needs the rig-cli `Agent\|Task` matcher; NOT mapped in Codex yet)** | before a subagent dispatch (Agent/Task tool) | background-subagent-gate                 |
 | `pre-bash`     | before a shell command runs                  | block-no-verify, block-raw-pr-merge, block-reset-hard, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash, orchestrator-stays-thin, no-long-inline-process, subagent-no-bg-longproc, no-shell-file-edit, skills-read-gate, visual-proof-gate, decision-request-format |
 | `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env, orchestrator-stays-thin, worktree-only-writes |
 | `post-write`   | after a file write/edit has landed on disk   | format-on-write, lint-on-write          |
