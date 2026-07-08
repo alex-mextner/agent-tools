@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenttools-stall-watchdog"
+version = "0.1.0"
+description = "Tiered warn/abort stall detection for background Claude Code subagents, by transcript mtime (stdlib + agenttools-tmux-inject only)."
+readme = "README.md"
+# 3.9 to match the lowest floor in the ecosystem (review-cli is >=3.9; rig-cli >=3.10),
+# the same floor agenttools-daemon / agenttools-tmux-inject target.
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alex Mextner" }]
+keywords = ["watchdog", "stall", "liveness", "subagent", "agent-tools"]
+# One in-ecosystem dependency: agenttools-tmux-inject, reused for the WARN tier's pane
+# nudge rather than reimplementing tmux target parsing / send-keys handling. Otherwise
+# stdlib only (subprocess + os + signal + time) — the `tg` alert shells out to the `tg`
+# CLI as an external binary, not a Python dependency.
+dependencies = ["agenttools-tmux-inject>=0.1,<1"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+# The argparse prog and the README's CLI reference both present the tool as the
+# `agenttools-stall-watchdog` executable — install it for real so that form isn't a lie
+# (the `python -m agenttools_stall_watchdog` module form works either way).
+[project.scripts]
+agenttools-stall-watchdog = "agenttools_stall_watchdog.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/alex-mextner/agent-tools"
+
+# This pyproject lives INSIDE the package directory (mirrors agenttools_tmux_inject, not
+# agenttools_daemon's `packages.find`): __init__.py/core.py/actions.py/cli.py sit next to
+# this file, so map the import package explicitly to "." rather than relying on
+# auto-discovery (which expects a subdir of the project root named after the package).
+[tool.setuptools]
+packages = ["agenttools_stall_watchdog"]
+
+[tool.setuptools.package-dir]
+agenttools_stall_watchdog = "."
+
+[tool.pytest.ini_options]
+testpaths = ["../../tests"]
