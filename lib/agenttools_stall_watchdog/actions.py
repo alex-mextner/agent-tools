@@ -351,20 +351,33 @@ def pid_kill(pid: int, *, stop_grace: float = 5.0, sleeper=time.sleep) -> Action
             return True
         return True
 
-    def _signal(sig: int) -> bool:
-        """Signal the group (preferred) or the bare pid; True if anything was signalled."""
+    def _resolve_pgid() -> Optional[int]:
+        """The pid's process group to signal, or ``None`` for bare-pid mode.
+
+        Never returns a group we ourselves belong to: with the documented
+        `nohup watchdog & ; run &` launch pattern in a non-interactive shell, the
+        watched pid can share the watchdog's OWN process group — a group kill would
+        then take down the watchdog and every sibling job (review finding).
+        """
         try:
             pgid = os.getpgid(pid)
-            # Never killpg a group we ourselves belong to: with the documented
-            # `nohup watchdog & ; run &` launch pattern in a non-interactive shell, the
-            # watched pid can share the watchdog's OWN process group — a group kill would
-            # then take down the watchdog and every sibling job (review finding). Fall
-            # back to signalling just the pid in that case.
-            if pgid != os.getpgrp():
-                os.killpg(pgid, sig)
-                return True
         except (ProcessLookupError, PermissionError, OSError):
-            pass
+            return None
+        return pgid if pgid != os.getpgrp() else None
+
+    def _signal_group(pgid: int, sig: int) -> bool:
+        """Signal (or, with sig=0, liveness-probe) the group; True if it has live members."""
+        try:
+            os.killpg(pgid, sig)
+            return True
+        except ProcessLookupError:
+            return False
+        except (PermissionError, OSError):
+            # EPERM still means SOMETHING in the group exists; report it as live so the
+            # caller escalates rather than silently declaring the run gone.
+            return True
+
+    def _signal_pid(sig: int) -> bool:
         try:
             os.kill(pid, sig)
             return True
@@ -378,11 +391,27 @@ def pid_kill(pid: int, *, stop_grace: float = 5.0, sleeper=time.sleep) -> Action
         # protects direct library callers.
         if pid <= 0:
             return
-        if not _signal(signal.SIGTERM):
+        # Resolve the group ONCE, before SIGTERM: the leader pid can exit during the
+        # grace period, after which os.getpgid(pid) is unresolvable even while its
+        # children live on.
+        pgid = _resolve_pgid()
+        if pgid is not None:
+            if not _signal_group(pgid, signal.SIGTERM):
+                return
+            sleeper(stop_grace)
+            # Escalate on GROUP liveness, never on the leader pid alone: a wrapper/npm
+            # leader routinely exits on SIGTERM while a hung child (the very process this
+            # abort exists for) ignores it and survives — gating SIGKILL on _alive(pid)
+            # would skip the escalation exactly then (review finding; the same
+            # leader-vs-group liveness gap as hyperide HYP-926).
+            if _signal_group(pgid, 0):
+                _signal_group(pgid, signal.SIGKILL)
+            return
+        if not _signal_pid(signal.SIGTERM):
             return
         sleeper(stop_grace)
         if _alive(pid):
-            _signal(signal.SIGKILL)
+            _signal_pid(signal.SIGKILL)
 
     return _action
 

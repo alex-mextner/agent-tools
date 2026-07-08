@@ -521,18 +521,23 @@ class TestPidKill:
         import signal as sig_mod
 
         group_signals = []
+
+        def fake_killpg(pgid, sig):
+            group_signals.append((pgid, sig))
+            if sig == 0:
+                raise ProcessLookupError()  # whole group gone after SIGTERM
+
         monkeypatch.setattr(os_mod, "getpgid", lambda pid: 999)
-        monkeypatch.setattr(os_mod, "killpg", lambda pgid, sig: group_signals.append((pgid, sig)))
-
-        def probe_only(pid, sig):
-            assert sig == 0, "plain os.kill must only be the liveness probe when killpg works"
-            raise ProcessLookupError()  # dead after SIGTERM
-
-        monkeypatch.setattr(os_mod, "kill", probe_only)
+        monkeypatch.setattr(os_mod, "killpg", fake_killpg)
+        monkeypatch.setattr(
+            os_mod,
+            "kill",
+            lambda pid, sig: (_ for _ in ()).throw(AssertionError("bare kill unused in group mode")),
+        )
         sleeps = []
         asw_actions.pid_kill(4242, stop_grace=3.0, sleeper=sleeps.append)(self._event())
 
-        assert group_signals == [(999, sig_mod.SIGTERM)]
+        assert group_signals == [(999, sig_mod.SIGTERM), (999, 0)]  # TERM, group probe — no KILL
         assert sleeps == [3.0]
 
     def test_group_escalates_to_sigkill_if_still_alive_after_grace(self, monkeypatch):
@@ -542,11 +547,52 @@ class TestPidKill:
         group_signals = []
         monkeypatch.setattr(os_mod, "getpgid", lambda pid: 999)
         monkeypatch.setattr(os_mod, "killpg", lambda pgid, sig: group_signals.append(sig))
-        monkeypatch.setattr(os_mod, "kill", lambda pid, sig: None)  # probe: still alive
+        monkeypatch.setattr(
+            os_mod,
+            "kill",
+            lambda pid, sig: (_ for _ in ()).throw(AssertionError("bare kill unused in group mode")),
+        )
         sleeps = []
         asw_actions.pid_kill(4242, stop_grace=1.0, sleeper=sleeps.append)(self._event())
 
-        assert group_signals == [sig_mod.SIGTERM, sig_mod.SIGKILL]
+        assert group_signals == [sig_mod.SIGTERM, 0, sig_mod.SIGKILL]
+        assert sleeps == [1.0]
+
+    def test_escalates_to_sigkill_when_the_leader_died_but_children_survive(self, monkeypatch):
+        # PR review finding (Codex P2, actions.py:385) — the leader-vs-group liveness gap,
+        # same class as hyperide HYP-926: an npm/wrapper leader exits on SIGTERM while a
+        # hung child in its group ignores it. Escalation used to gate on _alive(pid) (the
+        # dead leader) and skipped the SIGKILL exactly then. The group must be resolved
+        # BEFORE SIGTERM and probed/killed as a GROUP afterwards.
+        import os as os_mod
+        import signal as sig_mod
+
+        group_signals = []
+        leader_alive = {"v": True}
+
+        def fake_getpgid(pid):
+            if not leader_alive["v"]:
+                raise ProcessLookupError()  # unresolvable once the leader is gone
+            return 999
+
+        def fake_killpg(pgid, sig):
+            group_signals.append(sig)
+            if sig == sig_mod.SIGTERM:
+                leader_alive["v"] = False  # leader exits on SIGTERM; children survive
+            # sig==0 probe succeeds: the group still has live members
+
+        def leader_probe(pid, sig):
+            if sig == 0:
+                raise ProcessLookupError()  # the OLD buggy gate would read "dead" here
+            raise AssertionError("bare kill must not be used in group mode")
+
+        monkeypatch.setattr(os_mod, "getpgid", fake_getpgid)
+        monkeypatch.setattr(os_mod, "killpg", fake_killpg)
+        monkeypatch.setattr(os_mod, "kill", leader_probe)
+        sleeps = []
+        asw_actions.pid_kill(4242, stop_grace=1.0, sleeper=sleeps.append)(self._event())
+
+        assert group_signals == [sig_mod.SIGTERM, 0, sig_mod.SIGKILL]
         assert sleeps == [1.0]
 
     def test_falls_back_to_plain_kill_when_the_group_is_unavailable(self, monkeypatch):
