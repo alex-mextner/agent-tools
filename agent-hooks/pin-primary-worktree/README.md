@@ -101,12 +101,20 @@ hardcoded absolute candidates including `/Users/ultra/.files/bin/tg-ctl`
 > value, and avoid a literal `#` or a trailing nested-quote in it (point `approval_cmd` at a
 > script path instead of inlining a complex shell one-liner).
 
-> **Claude Code outer timeout:** this descriptor sets `timeout_ms: 930000`, enough for `tg-ctl`
-> ask's 900s cap plus a 30s cleanup margin. That is only the agents-hooks/v1 descriptor budget
-> enforced by `cc_hook_bridge`. Claude Code's own command-hook `timeout` defaults to 600s, and
-> the live `~/.claude/settings.json` / rig-cli `hook_bridge_entries` currently register
-> `cc_hook_bridge` without a `timeout`. Until rig-cli or settings add a hook `timeout` above
-> 900s, Claude Code can still kill the bridge before a full Telegram wait finishes.
+> **Claude Code outer timeout:** this descriptor sets `timeout_ms: 960000`, which STRICTLY
+> exceeds the helper's 930s worst case (`tg-ctl` ask's 900s cap plus a 30s cleanup margin) by a
+> 30s headroom. That headroom is a SAFETY margin, not cosmetic: this hook is `on_error: open`, so
+> if the descriptor budget merely *equalled* the helper's worst case, a hung or unanswered
+> `tg-ctl` could race the bridge's descriptor-timeout kill into a SILENT ALLOW instead of the
+> helper's intended deny. The 30s headroom guarantees the helper emits its own deny first.
+> Note this is only the agents-hooks/v1 descriptor budget enforced by `cc_hook_bridge`. Claude
+> Code's own command-hook `timeout` defaults to 600s, and the live `~/.claude/settings.json` /
+> rig-cli `hook_bridge_entries` currently register `cc_hook_bridge` without a `timeout`. Until
+> rig-cli or settings add a hook `timeout` above 960s, Claude Code can still kill the bridge
+> before a full Telegram wait finishes — and because that outer kill happens *before* the helper
+> returns, it is decided by Claude Code's own expired-hook behavior, not this descriptor's
+> `on_error`. Raising the settings `timeout` above 960s is required for the guard to hold on a
+> full-length Telegram wait.
 
 **Agents: ask, don't self-grant.** If you have a genuine reason for a primary-worktree
 checkout, ask the human directly — you can no longer flip your own bypass.

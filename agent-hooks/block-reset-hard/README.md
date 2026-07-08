@@ -144,12 +144,16 @@ hardcoded absolute candidates including `/Users/ultra/.files/bin/tg-ctl`
 > literal `#` or a trailing nested-quote in it (point `approval_cmd` at a script path instead
 > of inlining a complex shell one-liner).
 
-> **Claude Code outer timeout:** this descriptor sets `timeout_ms: 930000`, enough for `tg-ctl`
-> ask's 900s cap plus a 30s cleanup margin. That is only the agents-hooks/v1 descriptor budget
-> enforced by `cc_hook_bridge`. Claude Code's own command-hook `timeout` defaults to 600s, and
-> the live `~/.claude/settings.json` / rig-cli `hook_bridge_entries` currently register
-> `cc_hook_bridge` without a `timeout`. Until rig-cli or settings add a hook `timeout` above
-> 900s, Claude Code can still kill the bridge before a full Telegram wait finishes.
+> **Claude Code outer timeout:** this descriptor sets `timeout_ms: 960000`, which STRICTLY
+> exceeds the helper's 930s worst case (`tg-ctl` ask's 900s cap plus a 30s cleanup margin) by a
+> 30s headroom, so an unanswered or hung `tg-ctl` resolves to the hook's own deny before the
+> bridge reaches this descriptor budget. This hook is `on_error: closed`, so a bridge timeout
+> already fails safe (deny) — the headroom keeps the message a clear block rather than a generic
+> dispatcher denial. Note this is only the agents-hooks/v1 descriptor budget enforced by
+> `cc_hook_bridge`. Claude Code's own command-hook `timeout` defaults to 600s, and the live
+> `~/.claude/settings.json` / rig-cli `hook_bridge_entries` currently register `cc_hook_bridge`
+> without a `timeout`. Until rig-cli or settings add a hook `timeout` above 960s, Claude Code can
+> still kill the bridge before a full Telegram wait finishes.
 
 > **Repo-wide impact:** this hook is **always on** (no opt-in gate, unlike pin-primary-worktree).
 > With nothing configured, `git reset --hard` and `git clean -f...` are a hard, non-bypassable

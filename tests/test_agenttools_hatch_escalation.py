@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -269,3 +270,34 @@ def test_rig_yaml_tg_ctl_path_override_is_used(tmp_path):
 def test_default_tg_ctl_candidates_are_hardcoded_absolute_paths():
     assert Path("/Users/ultra/.files/bin/tg-ctl") in agenttools_hatch_escalation._TRUSTED_TG_CTL_PATHS
     assert all(path.is_absolute() for path in agenttools_hatch_escalation._TRUSTED_TG_CTL_PATHS)
+
+
+_AGENT_HOOKS_DIR = Path(__file__).resolve().parents[1] / "agent-hooks"
+
+
+@pytest.mark.parametrize(
+    "descriptor",
+    [
+        _AGENT_HOOKS_DIR / "block-reset-hard" / "block-reset-hard.pre-bash.json",
+        _AGENT_HOOKS_DIR / "pin-primary-worktree" / "pin-primary-worktree.pre-bash.json",
+    ],
+)
+def test_descriptor_timeout_strictly_exceeds_helper_worst_case(descriptor):
+    """The descriptor's `timeout_ms` must strictly exceed the helper's worst-case wall time.
+
+    The helper waits up to `MAX_TG_CTL_TIMEOUT_S` for tg-ctl plus `DEFAULT_PROCESS_MARGIN_S`
+    before it kills the subprocess and returns its own deny. If the descriptor budget merely
+    EQUALLED that worst case, a hung/unanswered tg-ctl could race the bridge's descriptor-timeout
+    kill (which resolves via `on_error`, fail-OPEN for pin-primary-worktree) into a silent allow
+    instead of the helper's intended deny (Codex PR #200 P2, tg#6554). A strict margin guarantees
+    the helper resolves first. Regression guard: keep timeout_ms > (cap + margin) * 1000.
+    """
+    worst_case_ms = (
+        agenttools_hatch_escalation.MAX_TG_CTL_TIMEOUT_S
+        + agenttools_hatch_escalation.DEFAULT_PROCESS_MARGIN_S
+    ) * 1000.0
+    timeout_ms = json.loads(descriptor.read_text())["timeout_ms"]
+    assert timeout_ms > worst_case_ms, (
+        f"{descriptor.name}: timeout_ms={timeout_ms} must strictly exceed the helper's "
+        f"worst case {worst_case_ms:.0f}ms so the helper's deny wins the race"
+    )

@@ -118,7 +118,7 @@ HOOK_API = "agents-hooks/v1"
 # `_classify` found in one chained command — comfortably under this hook's manifest `timeout_ms`
 # (block-reset-hard.pre-bash.json) even when MULTIPLE segments each need their own `approval_cmd`
 # call. It does NOT bound the RIG_HATCH_REQUEST_BLOCK_RESET_HARD live-Telegram path, which is
-# allowed to run up to tg-ctl's own 900s cap (the reason timeout_ms was raised to 930000). Unlike
+# allowed to run up to tg-ctl's own 900s cap (the reason timeout_ms was raised to 960000, with a 30s headroom over the 930s helper worst case). Unlike
 # pin-primary-worktree (on_error=open), this hook is on_error=CLOSED — an external manifest-
 # timeout kill already fails SAFE (deny) here, so this budget is not a security fix. It exists so
 # a chained command where EVERY segment is legitimately approved doesn't spuriously get killed
@@ -864,7 +864,7 @@ def _gate_dangerous_segments(
         # RIG_HATCH_REQUEST_BLOCK_RESET_HARD (live Telegram ask) is checked first and is not
         # bounded by _MAIN_LOOP_BUDGET_S/_APPROVAL_TIMEOUT_CEILING_S — a human approval round-trip
         # legitimately runs up to tg-ctl's 900s cap, which is why this hook's manifest timeout_ms
-        # was raised to 930000. It only "stops" (returns should_stop=True) when an actual hatch
+        # was raised to 960000. It only "stops" (returns should_stop=True) when an actual hatch
         # request was made; an unset env var falls through to the approval_cmd budget below.
         hatch = hatch_escalation.request_hatch_approval("block-reset-hard", context, cwd=eff_cwd)
         if hatch.should_stop:

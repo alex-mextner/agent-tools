@@ -89,7 +89,7 @@ _GIT_TIMEOUT_S = 3.0
 # loop over every segment), comfortably under this hook's manifest `timeout_ms` (pin-primary-
 # worktree.pre-bash.json) even when MULTIPLE segments each need their own `approval_cmd` call. It
 # does NOT bound the RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE live-Telegram path, which is allowed
-# to run up to tg-ctl's own 900s cap (the reason timeout_ms was raised to 930000). This hook is
+# to run up to tg-ctl's own 900s cap (the reason timeout_ms was raised to 960000, with a 30s headroom over the 930s helper worst case). This hook is
 # `on_error: open` (an external manifest-timeout kill on the dispatcher side fails OPEN — allows)
 # — that's fine for a single approval_cmd call, since `_APPROVAL_TIMEOUT_CEILING_S` (6s) already
 # sits well under the 12s manifest budget. But fixing the chained-bypass bug means this loop can
@@ -637,7 +637,7 @@ def _evaluate_checkout_segment(
     # RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE (live Telegram ask) is checked first and is not
     # bounded by _MAIN_LOOP_BUDGET_S/_APPROVAL_TIMEOUT_CEILING_S — a human approval round-trip
     # legitimately runs up to tg-ctl's 900s cap, which is why this hook's manifest timeout_ms was
-    # raised to 930000. It only "stops" (should_stop=True) when an actual hatch request was made;
+    # raised to 960000. It only "stops" (should_stop=True) when an actual hatch request was made;
     # an unset env var falls through to the approval_cmd budget below.
     hatch = hatch_escalation.request_hatch_approval("pin-primary-worktree", context, cwd=eff_cwd)
     if hatch.should_stop:
