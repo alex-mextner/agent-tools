@@ -22,6 +22,9 @@ _KNOWN_EVENTS = frozenset(
     {"PreToolUse", "PostToolUse", "Stop", "SubagentStart", "SubagentStop"}
 )
 _APPLY_PATCH_TOOL = "apply_patch"
+_ENV_OPTIONS_WITH_ARG = frozenset({"-u", "--unset", "-C", "--chdir", "-P", "--path"})
+_ENV_OPTIONS_WITH_ARG_PREFIXES = ("--unset=", "--chdir=", "--path=")
+_ENV_OPTIONS_WITHOUT_ARG = frozenset({"-", "-0", "-i", "--ignore-environment", "--null"})
 _ID_KEYS = ("event_id", "session_id", "conversation_id", "turn_id", "tool_call_id", "call_id")
 _METADATA_KEYS = (
     "model",
@@ -192,7 +195,24 @@ def _strip_env_wrapper(parts: list[str]) -> list[str]:
     if not parts or Path(parts[0]).name != "env":
         return parts
     index = 1
-    while index < len(parts) and "=" in parts[index] and not parts[index].startswith("-"):
+    while index < len(parts):
+        part = parts[index]
+        if part == "--":
+            index += 1
+            break
+        if part in _ENV_OPTIONS_WITHOUT_ARG:
+            index += 1
+            continue
+        if part in _ENV_OPTIONS_WITH_ARG:
+            if index + 1 >= len(parts):
+                return parts
+            index += 2
+            continue
+        if any(part.startswith(prefix) for prefix in _ENV_OPTIONS_WITH_ARG_PREFIXES):
+            index += 1
+            continue
+        if "=" not in part or part.startswith("-"):
+            break
         index += 1
     return parts[index:] if index < len(parts) else parts
 

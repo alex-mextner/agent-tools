@@ -198,6 +198,23 @@ def test_to_v1_event_shell_argv_unwraps_env_before_c_payload():
     assert v1["args"]["command"] == "gh pr merge 42 --admin"
 
 
+def test_to_v1_event_shell_argv_unwraps_env_i_before_c_payload():
+    codex_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": ["/usr/bin/env", "-i", "bash", "-lc", "gh pr merge 1"]
+        },
+        "cwd": "/repo",
+    }
+
+    v1 = dispatch.to_v1_event(codex_event, point="pre-bash")
+
+    assert v1["point"] == "pre-bash"
+    assert v1["command"] == "gh pr merge 1"
+    assert v1["args"]["command"] == "gh pr merge 1"
+
+
 def test_to_v1_event_shell_argv_without_c_payload_falls_back_to_joined_command():
     codex_event = {
         "hook_event_name": "PreToolUse",
@@ -524,6 +541,35 @@ def test_real_bash_guard_blocks_argv_style_codex_command(tmp_path):
             "hook_event_name": "PreToolUse",
             "tool_name": "Bash",
             "tool_input": {"command": ["bash", "-lc", "gh pr merge 42 --admin"]},
+            "cwd": str(tmp_path),
+        },
+        hooks_dir=hooks,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["decision"] == "block", out
+    assert "gh pr merge" in out["reason"]
+
+
+def test_real_bash_guard_blocks_env_i_shell_argv_codex_command(tmp_path):
+    hooks = tmp_path / "hooks"
+    _install_descriptor(
+        hooks,
+        hook_id="block-raw-pr-merge",
+        point="pre-bash",
+        cmd=BLOCK_RAW_PR_MERGE,
+        on_error="closed",
+    )
+
+    proc = _run_dispatch(
+        "PreToolUse",
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": ["/usr/bin/env", "-i", "bash", "-lc", "gh pr merge 1"]
+            },
             "cwd": str(tmp_path),
         },
         hooks_dir=hooks,
