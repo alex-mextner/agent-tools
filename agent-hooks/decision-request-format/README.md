@@ -78,17 +78,24 @@ The skill routes the *drafting* of a decision request to a subagent precisely so
 sloppily inline — so the self-check binds that subagent too. A subagent posting a malformed
 decision request is exactly what this catches; there is no `agent_id` carve-out.
 
-## Escape hatch (controllable)
+## No self-service silence — external approval only
 
-Because it never blocks, "escaping" here just silences the advisory note:
+Because it never blocks, "escaping" here just silences the advisory note — but there is **no**
+`ALLOW_RAW_DECISION_REQUEST` env and **no** `# decision-request-ok:` inline sentinel any more.
+An agent could set either on its own command, so those were self-grant silencers. A one-time
+silence is now requested by setting
+`RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT="<written justification>"`, which routes one Telegram
+approval request to Alex (deny-by-default):
 
 ```bash
-# session-wide:
-ALLOW_RAW_DECISION_REQUEST=1 tg --tag decision "..."
-
-# one-off, self-documenting:
-tg --tag decision "..."   # decision-request-ok: terse follow-up to an already-detailed thread
+RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT="terse follow-up to an already-detailed thread" \
+  tg --tag decision "..."
 ```
+
+Unset means the hook never contacts Telegram (the advisory prints as usual); a blank or bare
+`1`/`true`/`yes`/`on` is rejected without a Telegram call; a real justification runs the trusted
+`tg-ctl ask` and silences the advisory **only on exit 0**. Either way the send still goes
+through — the hatch only decides whether the advisory prints.
 
 ## Fail-open, on purpose
 
@@ -119,10 +126,10 @@ echo '{"args":{"command":"tg --tag report \"build green\""}}' \
 # the flag inside a string, not an argv flag → plain allow:
 echo '{"args":{"command":"echo \"use --tag decision\""}}' \
   | ./decision_request_format.py; echo " exit=$?"        # → {"decision":"allow"} exit=0
-
-# silenced → plain allow even when markers are missing:
-ALLOW_RAW_DECISION_REQUEST=1 bash -c \
-  'echo "{\"args\":{\"command\":\"tg --tag decision \\\"A or B?\\\"\"}}" | ./decision_request_format.py'; echo " exit=$?"
 ```
+
+A one-time silence is an external Telegram approval — set
+`RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT="<why>"` (deny-by-default; only an approved
+`tg-ctl ask` exit 0 silences the advisory).
 
 The full suite is `tests/test_decision_request_format.py` in the repo root.

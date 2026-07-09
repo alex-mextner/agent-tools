@@ -4,15 +4,16 @@ Covers the two fixes that landed together:
 
   (A) ROADMAP "require-review-before-commit too broad":
         - DOCS-ONLY staged diff (every path *.md / under docs/) → ALLOW without a marker.
-        - a per-commit skip the hook reads from the COMMAND — `REVIEW_SKIP=1 git commit`
-          (inline env) or a `[skip-review: <reason>]` commit-message trailer → ALLOW.
         - `git stash` / `git worktree` (non-commit git ops) → NOT gated.
         - a mixed diff (code + docs) with no marker still BLOCKs.
 
   (B) SECURITY (task #20): the skip-flag exemption (`--continue/--abort/--skip`) used to
       `re.search` the RAW command, so a skip token in a comment / commit message / pathspec /
       sibling command bypassed the gate. It is now derived from the PARSED `git commit` argv.
-      Same parsing hardens the docs/skip-trailer/env reads (scoped to the commit segment).
+
+The OLD self-service escape hatch (`REVIEW_SKIP=1` inline env, `[skip-review: <reason>]`
+commit-message trailer) is DEAD — those no longer bypass; a one-time exception is an external
+Telegram hatch via `RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT` (deny-by-default).
 
 Hermetic: a real tiny git repo is created in tmp_path so the hook's own `git diff --cached
 --name-only` runs for real; the review-marker path is redirected into tmp_path. The marker
@@ -81,6 +82,7 @@ def _run(command, cwd, monkeypatch, *, marker: Path,
     monkeypatch.setattr(sys, "stderr", err)
     monkeypatch.setenv("REVIEW_MARKER", str(marker))
     monkeypatch.delenv("REVIEW_SKIP", raising=False)
+    monkeypatch.delenv("RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT", raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
     code = rr.main()
@@ -94,6 +96,12 @@ def _decision(out: str) -> str:
 def _touch_marker(marker: Path) -> None:
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text("x")  # fresh mtime → counts as "review ran this session"
+
+
+def _fake_tg_ctl(path: Path, body: str) -> Path:
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return path
 
 
 # ── BLOCK — a real authoring commit with code staged and no marker ───────────────────────
@@ -195,22 +203,14 @@ def test_index_bypassing_flags_with_docs_index_are_gated(flag, tmp_path, monkeyp
     assert _decision(out) == "block"
 
 
-def test_glued_message_ending_in_m_reads_own_value(tmp_path, monkeypatch):
-    """`git commit -msystem` is a GLUED message "system" (which ends in `m`); it must NOT grab the
-    following token as the message. A `[skip-review:]` trailer is read from the glued value, not
-    from a sibling token (codex LOW). Here the glued message carries the trailer → allow."""
+def test_skip_review_trailer_in_message_no_longer_bypasses(tmp_path, monkeypatch):
+    """REGRESSION: a `[skip-review: …]` trailer in the commit message (even glued into `-msystem…`)
+    is NO LONGER read as a bypass — the self-service trailer is gone. Code staged, no marker →
+    still BLOCK."""
     repo = _mk_repo_with_staged(tmp_path, "src/util.py")
     out, _e, c = _run("git commit -m'system [skip-review: x]'", repo, monkeypatch,
                       marker=tmp_path / "m")
-    assert c == 0 and _decision(out) == "allow"
-
-
-def test_commit_messages_glued_m_unit():
-    f = lambda cmd: rr._commit_messages(rr._commit_segment(cmd).argv)  # noqa: E731
-    assert f("git commit -msystem foo") == ["system"]   # glued msg, NOT the following token
-    assert f("git commit -m hello") == ["hello"]
-    assert f("git commit -am msg") == ["msg"]            # -am cluster takes the next token
-    assert f("git commit -m 'x [skip-review: y]'") == ["x [skip-review: y]"]
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
 def test_commit_extends_index_unit():
@@ -333,19 +333,19 @@ def test_glued_message_with_letter_a_does_not_lose_docs_fastpath(tmp_path, monke
 
 
 def test_second_authoring_commit_in_chain_is_gated(tmp_path, monkeypatch):
-    """codex MEDIUM: an exempt FIRST commit must not shield a real SECOND one in the same line.
-    `REVIEW_SKIP=1 git commit … && git commit -am big` — the 2nd commit is a real authoring commit
-    with no skip, so the whole command is GATED (no marker → block)."""
+    """codex MEDIUM: a skip-flag FIRST commit must not shield a real SECOND one in the same line.
+    `git commit --abort && git commit -am big` — the 2nd commit is a real authoring commit with no
+    skip, so the whole command is GATED (no marker → block)."""
     repo = _mk_repo_with_staged(tmp_path, "src/util.py")
-    out, _e, c = _run("REVIEW_SKIP=1 git commit -m doc && git commit -m big",
+    out, _e, c = _run("git commit --abort && git commit -m big",
                       repo, monkeypatch, marker=tmp_path / "m")
     assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-def test_two_exempt_commits_in_chain_allowed(tmp_path, monkeypatch):
-    """Both commits in a chain exempt (both REVIEW_SKIP) → allow."""
+def test_two_skip_flag_commits_in_chain_allowed(tmp_path, monkeypatch):
+    """Both commits in a chain carry a skip flag (--abort/--skip) → nothing to gate → allow."""
     repo = _mk_repo_with_staged(tmp_path, "src/util.py")
-    out, _e, c = _run("REVIEW_SKIP=1 git commit -m a && REVIEW_SKIP=1 git commit -m b",
+    out, _e, c = _run("git commit --abort && git commit --skip",
                       repo, monkeypatch, marker=tmp_path / "m")
     assert c == 0 and _decision(out) == "allow"
 
@@ -541,63 +541,32 @@ def test_relative_dash_C_after_cd_resolves_against_cd_dir(tmp_path, monkeypatch)
     assert c == 0 and _decision(out) == "allow"
 
 
-# ── (A) per-commit skip the hook reads from the COMMAND ──────────────────────────────────
+# ── REGRESSION: the OLD self-service per-commit skip is DEAD (inline env + trailer) ───────
 
-def test_allow_inline_review_skip_env(tmp_path, monkeypatch):
-    """`REVIEW_SKIP=1 git commit` — read from the to-be-run command, not the hook's process env."""
+def test_inline_review_skip_env_no_longer_bypasses(tmp_path, monkeypatch):
+    """REGRESSION: `REVIEW_SKIP=1 git commit` used to opt out — it must NO LONGER bypass. The
+    inline env is still parsed correctly (leading-assignment skip stays), but it carries no
+    exemption any more. Code staged, no marker → BLOCK."""
     repo = _mk_repo_with_staged(tmp_path, "src/util.py")
     out, _e, c = _run("REVIEW_SKIP=1 git commit -m x", repo, monkeypatch, marker=tmp_path / "m")
-    assert c == 0 and _decision(out) == "allow"
-
-
-def test_allow_skip_review_trailer(tmp_path, monkeypatch):
-    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
-    out, _e, c = _run("git commit -m 'chore: bump [skip-review: trivial]'",
-                      repo, monkeypatch, marker=tmp_path / "m")
-    assert c == 0 and _decision(out) == "allow"
-
-
-@pytest.mark.parametrize("env_tok", ["REVIEW_SKIP=0", "REVIEW_SKIP=false", "REVIEW_SKIP="])
-def test_falsey_review_skip_still_blocks(env_tok, tmp_path, monkeypatch):
-    """A falsey REVIEW_SKIP value does NOT bypass — only a truthy one opts out."""
-    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
-    out, _e, c = _run(f"{env_tok} git commit -m x", repo, monkeypatch, marker=tmp_path / "m")
-    assert c == rr.BLOCK_EXIT_CODE, env_tok
-    assert _decision(out) == "block"
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
 @pytest.mark.parametrize("prefix", [
     "FOO=bar",
     "GIT_AUTHOR_NAME=x",
-    "REVIEW_SKIP=0 BAR=y",
+    "REVIEW_SKIP=1 BAR=y",                  # even a once-truthy REVIEW_SKIP prefix no longer opts out
     "GIT_AUTHOR_NAME='Jane Doe'",          # a QUOTED env value with an internal space (codex find)
     "GIT_COMMITTER_DATE='2026-01-01 12:00'",
 ])
 def test_unrelated_inline_env_prefix_still_gated(prefix, tmp_path, monkeypatch):
-    """An inline-env prefix that is NOT a truthy REVIEW_SKIP must NOT let a commit escape the gate.
+    """An inline-env prefix must NOT let a commit escape the gate.
     Regression: a regex pre-filter anchored to `git` could not follow a quoted env value with an
     internal space (`GIT_AUTHOR_NAME='Jane Doe' git commit`) and early-returned ALLOW before the
     parser ran. Detection is now the parser alone, which tokenizes the quoted value correctly."""
     repo = _mk_repo_with_staged(tmp_path, "src/util.py")
     out, _e, c = _run(f"{prefix} git commit -m x", repo, monkeypatch, marker=tmp_path / "m")
     assert c == rr.BLOCK_EXIT_CODE, prefix
-    assert _decision(out) == "block"
-
-
-def test_review_skip_on_sibling_command_does_not_bypass(tmp_path, monkeypatch):
-    """`REVIEW_SKIP=1 echo x; git commit` — the env is on a SIBLING, not the commit → block."""
-    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
-    out, _e, c = _run("REVIEW_SKIP=1 echo hi ; git commit -m x",
-                      repo, monkeypatch, marker=tmp_path / "m")
-    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
-
-
-@pytest.mark.parametrize("env_tok", ["REVIEW_SKIP=NO", "REVIEW_SKIP=Off", "REVIEW_SKIP=FALSE"])
-def test_review_skip_falsey_is_case_insensitive(env_tok, tmp_path, monkeypatch):
-    """A case-variant falsey value (`NO`/`Off`/`FALSE`) must NOT skip review (codex LOW-3)."""
-    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
-    out, _e, c = _run(f"{env_tok} git commit -m x", repo, monkeypatch, marker=tmp_path / "m")
-    assert c == rr.BLOCK_EXIT_CODE, env_tok
     assert _decision(out) == "block"
 
 
@@ -625,12 +594,14 @@ def test_glued_separator_commit_is_still_gated(command, tmp_path, monkeypatch):
     assert _decision(out) == "block"
 
 
-def test_glued_separator_still_reads_per_commit_skip(tmp_path, monkeypatch):
-    """A glued-separator chain whose commit DOES opt out (REVIEW_SKIP on the commit) still skips."""
+def test_glued_separator_commit_with_review_skip_prefix_is_gated(tmp_path, monkeypatch):
+    """REGRESSION: a glued-separator chain whose commit carries a `REVIEW_SKIP=1` inline env is
+    still split correctly AND still gated — the inline env no longer opts out. Code staged, no
+    marker → BLOCK."""
     repo = _mk_repo_with_staged(tmp_path, "src/util.py")
     out, _e, c = _run("make build&&REVIEW_SKIP=1 git commit -m x",
                       repo, monkeypatch, marker=tmp_path / "m")
-    assert c == 0 and _decision(out) == "allow"
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
 def test_quoted_separator_in_message_is_not_a_split(tmp_path, monkeypatch):
@@ -751,16 +722,6 @@ def test_unbalanced_quotes_fail_open(tmp_path, monkeypatch):
     repo = _mk_repo_with_staged(tmp_path, "src/util.py")
     out, _e, c = _run("git commit -m 'unterminated", repo, monkeypatch, marker=tmp_path / "m")
     assert c == 0 and _decision(out) == "allow"
-
-
-def test_exported_process_env_review_skip_does_not_bypass(tmp_path, monkeypatch):
-    """REVIEW_SKIP exported in the PROCESS env (not inline on the command) must NOT skip review —
-    only an INLINE `REVIEW_SKIP=1 git commit` opts out. (Design choice: a stale exported
-    REVIEW_SKIP in a shell shouldn't silently disable the gate for every later commit.)"""
-    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
-    out, _e, c = _run("git commit -m x", repo, monkeypatch, marker=tmp_path / "m",
-                      env={"REVIEW_SKIP": "1"})  # process env, not on the command
-    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
 # ── the PARSER (not the regex) is authoritative: `commit`-as-substring must NOT false-block ──
@@ -979,15 +940,6 @@ def test_uses_alt_repo_unit():
     assert f("git commit -m x") is False
 
 
-def test_skip_review_trailer_only_in_comment_does_not_bypass(tmp_path, monkeypatch):
-    """A `[skip-review: …]` token that lives only in a trailing shell COMMENT (not in the commit
-    message) must NOT bypass — the comment is stripped, and the message carries no trailer."""
-    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
-    out, _e, c = _run("git commit -m real  # [skip-review: sneaky]",
-                      repo, monkeypatch, marker=tmp_path / "m")
-    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
-
-
 # ── direct unit coverage of the parser helpers (B) ───────────────────────────────────────
 
 def test_is_skip_commit_unit():
@@ -1022,17 +974,58 @@ def test_skip_token_in_value_flag_value_does_not_bypass(command, tmp_path, monke
     assert _decision(out) == "block"
 
 
-def test_has_inline_review_skip_unit():
-    assert rr.has_inline_review_skip("REVIEW_SKIP=1 git commit -m x") is True
-    assert rr.has_inline_review_skip("REVIEW_SKIP=0 git commit -m x") is False
-    assert rr.has_inline_review_skip("git commit -m x") is False
-    assert rr.has_inline_review_skip("REVIEW_SKIP=1 echo x ; git commit -m x") is False
+# ── external Telegram hatch escalation (replaces the OLD self-service per-commit skip) ─────
+#
+# When a real authoring commit has no fresh marker and is not docs-only, the block is consulted
+# against RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT: unset → block with a how-to; a bare
+# `1` → deny WITHOUT contacting Telegram; a written justification runs the trusted tg-ctl and
+# allows on exit 0 / blocks (citing "hatch escalation denied") on nonzero. Mirrors
+# tests/test_pin_primary_worktree.py.
+_HATCH_ENV = "RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT"
 
 
-def test_has_skip_review_trailer_unit():
-    assert rr.has_skip_review_trailer("git commit -m 'x [skip-review: docs]'") is True
-    assert rr.has_skip_review_trailer("git commit -m 'plain message'") is False
-    assert rr.has_skip_review_trailer("git commit -F somefile") is False  # file body not read
+def test_hatch_unset_blocks_with_howto(tmp_path, monkeypatch):
+    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, marker=tmp_path / "m")
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert _HATCH_ENV in json.loads(out)["message"]
+
+
+def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
+    """A bare `1` is an invalid request: deny, and NO tg-ctl is spawned (the fake would touch a
+    marker file — it must not exist)."""
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nexit 0\n")
+    monkeypatch.setattr(rr.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, marker=tmp_path / "m",
+                      env={_HATCH_ENV: "1"})
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert not marker.exists()
+
+
+def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(
+        tmp_path / "tg-ctl",
+        f"touch {marker}\n" 'printf "approved by Telegram tap\\n"\n' "exit 0\n",
+    )
+    monkeypatch.setattr(rr.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, marker=tmp_path / "m",
+                      env={_HATCH_ENV: "Need to land a hotfix; review is mid-run."})
+    assert c == 0 and _decision(out) == "allow"
+    assert marker.exists()
+
+
+def test_hatch_justification_exit1_blocks_citing_denied(tmp_path, monkeypatch):
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    monkeypatch.setattr(rr.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, marker=tmp_path / "m",
+                      env={_HATCH_ENV: "Need to land a hotfix; review is mid-run."})
+    assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "hatch escalation denied" in json.loads(out)["message"].lower()
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -7,7 +7,8 @@ Covers:
   - Sanctioned paths: `gh ship`, `pr-ship.sh`, `ship.sh` are allowed
   - Shell chains: `gh pr merge` behind `&&`/`;`/`||` is caught
   - Inline env assignments before `gh` are stripped
-  - Escape hatches: env + inline sentinel
+  - The DEAD self-service escape hatch (`ALLOW_RAW_PR_MERGE` / `# no-ship-guard:` no longer
+    allow) and the external Telegram hatch (`RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE`)
   - Fail-closed: unbalanced quotes and malformed event both block
 
 Run from the repo root::
@@ -37,15 +38,18 @@ hook = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(hook)
 
 
-def _run(command: str, monkeypatch, env: dict | None = None) -> tuple[str, str, int]:
+def _run(command: str, monkeypatch, env: dict | None = None, cwd=None) -> tuple[str, str, int]:
     """Run the hook with a `pre-bash` event carrying `command`.  Returns (stdout, stderr, exit)."""
     event = {"args": {"command": command}}
+    if cwd is not None:
+        event["cwd"] = str(cwd)
     out, err = io.StringIO(), io.StringIO()
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
     # Clear escape-hatch env so ambient values don't leak into tests.
-    for k in ("ALLOW_RAW_PR_MERGE", "ALLOW_RAW_PR_MERGE_REASON"):
+    for k in ("ALLOW_RAW_PR_MERGE", "ALLOW_RAW_PR_MERGE_REASON",
+              "RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE"):
         monkeypatch.delenv(k, raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
@@ -55,6 +59,12 @@ def _run(command: str, monkeypatch, env: dict | None = None) -> tuple[str, str, 
 
 def _decision(out: str) -> str:
     return json.loads(out)["decision"]
+
+
+def _fake_tg_ctl(path: Path, body: str) -> Path:
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return path
 
 
 # ── True positives — should BLOCK ──────────────────────────────────────────────────────────
@@ -179,42 +189,75 @@ def test_allow_pr_ship_sh(monkeypatch):
     assert _decision(out) == "allow"
 
 
-# ── Escape hatches ─────────────────────────────────────────────────────────────────────────
+# ── REGRESSION: the OLD self-service escape hatch is DEAD ────────────────────────────────────
 
-def test_env_override_with_reason_allows(monkeypatch):
+def test_env_override_no_longer_allows(monkeypatch):
+    """REGRESSION: `ALLOW_RAW_PR_MERGE=1` (+ `_REASON`) used to allow a raw merge — it must NO
+    LONGER; the merge still BLOCKs."""
     out, _err, code = _run(
         "gh pr merge 5 --squash",
         monkeypatch,
         {"ALLOW_RAW_PR_MERGE": "1", "ALLOW_RAW_PR_MERGE_REASON": "CI provider outage"},
     )
-    assert code == 0
-    assert _decision(out) == "allow"
-
-
-def test_env_override_without_reason_still_blocks(monkeypatch):
-    out, _err, code = _run(
-        "gh pr merge 5",
-        monkeypatch,
-        {"ALLOW_RAW_PR_MERGE": "1"},  # no reason → stays blocked
-    )
     assert code == hook.BLOCK_EXIT_CODE
     assert _decision(out) == "block"
 
 
-def test_inline_sentinel_with_reason_allows(monkeypatch):
+def test_inline_sentinel_no_longer_allows(monkeypatch):
+    """REGRESSION: an inline `# no-ship-guard: <reason>` sentinel no longer allows — still BLOCK."""
     out, _err, code = _run(
         "gh pr merge 5 --admin  # no-ship-guard: hotfix during provider outage",
         monkeypatch,
     )
-    assert code == 0
-    assert _decision(out) == "allow"
-
-
-def test_inline_sentinel_without_reason_blocks(monkeypatch):
-    """A bare `# no-ship-guard:` with no reason text is not a valid sentinel."""
-    out, _err, code = _run("gh pr merge 5  # no-ship-guard:", monkeypatch)
     assert code == hook.BLOCK_EXIT_CODE
     assert _decision(out) == "block"
+
+
+# ── external Telegram hatch escalation (replaces the OLD self-service escape hatch) ──────────
+_HATCH_ENV = "RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE"
+
+
+def test_hatch_unset_blocks_with_howto(monkeypatch):
+    out, _err, code = _run("gh pr merge 5", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert _HATCH_ENV in json.loads(out)["message"]
+
+
+def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
+    """A bare `1` is an invalid request: deny WITHOUT contacting Telegram (the fake would touch a
+    marker — it must not exist)."""
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nexit 0\n")
+    monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _err, code = _run("gh pr merge 5", monkeypatch, {_HATCH_ENV: "1"}, cwd=tmp_path)
+    assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert not marker.exists()
+
+
+def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(
+        tmp_path / "tg-ctl",
+        f"touch {marker}\n" 'printf "approved by Telegram tap\\n"\n' "exit 0\n",
+    )
+    monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _err, code = _run(
+        "gh pr merge 5", monkeypatch,
+        {_HATCH_ENV: "Ship gate is down; manual verify done, hotfix must land."}, cwd=tmp_path,
+    )
+    assert code == 0 and _decision(out) == "allow"
+    assert marker.exists()
+
+
+def test_hatch_justification_exit1_blocks_citing_denied(tmp_path, monkeypatch):
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _err, code = _run(
+        "gh pr merge 5", monkeypatch,
+        {_HATCH_ENV: "Ship gate is down; manual verify done, hotfix must land."}, cwd=tmp_path,
+    )
+    assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "hatch escalation denied" in json.loads(out)["message"].lower()
 
 
 # ── Path-qualified and subshell forms — should BLOCK ───────────────────────────────────────

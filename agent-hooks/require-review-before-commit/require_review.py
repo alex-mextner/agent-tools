@@ -16,8 +16,15 @@ What is NOT gated (so the reminder stays honest and unobtrusive):
     string, so a `commit` in a comment / message / pathspec never trips it).
   - A DOCS-ONLY commit — every staged path matches `*.md` or lives under a `docs/`
     directory. The project rule explicitly allows skipping review for docs.
-  - An explicit per-commit skip — a ``[skip-review: <reason>]`` commit-message trailer,
-    or ``REVIEW_SKIP=1`` set as INLINE ENV on the git command (`REVIEW_SKIP=1 git commit`).
+
+External approval (replaces the OLD self-service escape hatch): there is NO env-var
+(`REVIEW_SKIP`) or commit-message-trailer (`[skip-review: …]`) bypass any more — an agent
+could set either on its own commit, so that "gate" was security theater. The block is now
+DENY-BY-DEFAULT. A one-time exception is requested by setting
+`RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT="<written justification>"`, which routes a
+single approval request to the human via Telegram (deny-by-default; a bare `1`/`true` is
+rejected — it needs a real justification). An agent with a genuine reason should ASK the
+human, not self-grant.
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; the shell command is in args.command, the repo cwd in event.cwd
@@ -40,6 +47,12 @@ import time
 from pathlib import Path
 from typing import NamedTuple
 
+_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+import agenttools_hatch_escalation as hatch_escalation  # noqa: E402
+
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
@@ -52,9 +65,6 @@ HOOK_API = "agents-hooks/v1"
 # in a shell COMMENT (`git commit -m x # --abort`), in the commit MESSAGE (`git commit -m 'support
 # --skip'`), after `--` (a pathspec), or on a SIBLING command must NOT exempt a real commit.
 SKIP_FLAGS = frozenset({"--continue", "--abort", "--skip"})
-
-# Per-commit review skip: a trailer in the commit message. Honest because it lands IN the commit.
-SKIP_REVIEW_TRAILER = re.compile(r"\[skip-review:\s*[^\]]+\]", re.IGNORECASE)
 
 DEFAULT_MARKER = "~/.cache/agent-tools/last-review"
 # How recent the review marker must be to count as "this session" (seconds).
@@ -73,8 +83,8 @@ GIT_DIFF_TIMEOUT_S = 2
 # `docs/` directory AND is not itself code/config. `.txt` is intentionally EXCLUDED — a `.txt` is
 # commonly a dependency manifest (`requirements.txt`) or config, not prose, and a dependency change
 # is exactly what review should see (codex supply-chain). A CODE file under `docs/` (e.g.
-# `docs/conf.py`, `docs/build.py`, `docs/deploy.sh`) is NOT auto-skipped either: only an explicit
-# `[skip-review:…]` / `REVIEW_SKIP` opts those out (codex).
+# `docs/conf.py`, `docs/build.py`, `docs/deploy.sh`) is NOT auto-skipped either: it always
+# requires review (there is no per-commit self-service skip any more — see the module docstring).
 DOCS_EXT = re.compile(r"\.(?:md|mdx|markdown|rst|adoc|rdoc|pod)$", re.IGNORECASE)
 DOCS_DIR = re.compile(r"(?:^|/)docs/", re.IGNORECASE)
 # Extensions that are NEVER docs even under a `docs/` dir — source, scripts, and config that can
@@ -277,15 +287,6 @@ def _takes_following_value(tok: str) -> bool:
     return False
 
 
-def _glued_message_value(tok: str) -> str | None:
-    """The message text glued onto a flag (`-mMSG`, `--message=MSG`), or None if not such a flag."""
-    if tok.startswith("--message="):
-        return tok[len("--message="):]
-    if tok.startswith("-m") and len(tok) > 2:
-        return tok[2:]
-    return None
-
-
 def _is_git_executable(tok: str) -> bool:
     """True when `tok` is the git binary — bare `git` or an absolute/relative path to it
     (`/usr/bin/git`, `./git`), which agent environments frequently use. NOT `mygit` / `git-foo`."""
@@ -365,43 +366,6 @@ def _commit_flags(argv: list[str]) -> list[str]:
         out.append(tok)
         j += 1
     return out
-
-
-def _commit_messages(argv: list[str]) -> list[str]:
-    """The commit-message VALUES carried by `-m`/`--message` (separate or glued) in `argv`.
-
-    Used to read a ``[skip-review: …]`` trailer FROM the message. `-F`/`--file` point at a path
-    we do not read here, so a file-supplied trailer is simply not detected (and the gate stays —
-    the safe default)."""
-    msgs: list[str] = []
-    j = 0
-    while j < len(argv):
-        tok = argv[j]
-        if tok == "--":
-            break
-        if tok in ("--message", "-m") and j + 1 < len(argv):
-            msgs.append(argv[j + 1])
-            j += 2
-            continue
-        # A GLUED `-mMSG` / `--message=MSG` must be read BEFORE the "cluster ending in m" branch —
-        # otherwise `-msystem` (glued message "system", which ends in `m`) would wrongly grab the
-        # NEXT token as its message instead of using "system".
-        glued = _glued_message_value(tok)
-        if glued is not None:
-            msgs.append(glued)
-            j += 1
-            continue
-        if (tok.startswith("-") and not tok.startswith("--") and not tok.startswith("-m")
-                and tok[-1] == "m" and j + 1 < len(argv)):
-            # a short cluster ending in `m` but NOT `-m…` (e.g. `-am`) takes the NEXT token as msg
-            msgs.append(argv[j + 1])
-            j += 2
-            continue
-        if _takes_following_value(tok) and j + 1 < len(argv):
-            j += 2  # some other value-flag (e.g. -F PATH) — skip its value, it's not a message
-            continue
-        j += 1
-    return msgs
 
 
 class CommitSegment(NamedTuple):
@@ -566,42 +530,12 @@ def is_skip_commit_argv(argv: list[str]) -> bool:
     return any(tok in SKIP_FLAGS for tok in _commit_flags(argv))
 
 
-_REVIEW_SKIP_FALSEY = frozenset({"", "0", "false", "no", "off"})
-
-
-def is_inline_review_skip(env: dict[str, str]) -> bool:
-    """True when the commit segment's inline env sets `REVIEW_SKIP=<truthy>`.
-
-    Reads from the to-be-run COMMAND's env (not the hook's process env): `REVIEW_SKIP=1 git commit`.
-    Scoped to the commit segment by the caller, so `REVIEW_SKIP=1 echo x; git commit` does NOT
-    bypass (the assignment is on a sibling, not the commit segment). Falsey values are matched
-    case-insensitively so `REVIEW_SKIP=NO`/`=Off`/`=FALSE` don't accidentally skip review."""
-    return env.get("REVIEW_SKIP", "").strip().lower() not in _REVIEW_SKIP_FALSEY
-
-
-def has_skip_review_trailer_argv(argv: list[str]) -> bool:
-    """True when a `[skip-review: <reason>]` trailer appears in the commit's `-m`/`--message`."""
-    return any(SKIP_REVIEW_TRAILER.search(msg) for msg in _commit_messages(argv))
-
-
-# Thin string-level wrappers (parse + delegate) — convenient for unit tests and external callers.
+# Thin string-level wrapper (parse + delegate) — convenient for unit tests and external callers.
 def is_skip_commit(command: str) -> bool:
     """True only when the real `git commit` SEGMENT carries --continue/--abort/--skip. On a
     tokenization failure / non-commit → False (a real commit is then GATED, the safe way)."""
     seg = _commit_segment(command)
     return seg is not None and is_skip_commit_argv(seg.argv)
-
-
-def has_inline_review_skip(command: str) -> bool:
-    """True when the real `git commit` segment is prefixed with `REVIEW_SKIP=<truthy>` inline env."""
-    seg = _commit_segment(command)
-    return seg is not None and is_inline_review_skip(seg.env)
-
-
-def has_skip_review_trailer(command: str) -> bool:
-    """True when a `[skip-review: <reason>]` trailer appears in the commit's `-m`/`--message`."""
-    seg = _commit_segment(command)
-    return seg is not None and has_skip_review_trailer_argv(seg.argv)
 
 
 # ── docs-only classification ─────────────────────────────────────────────────────────────────
@@ -740,15 +674,6 @@ def commit_extends_index(argv: list[str]) -> bool:
 # ── skip resolution + marker freshness ───────────────────────────────────────────────────────
 
 
-def _explicit_skip_reason(env: dict[str, str], argv: list[str]) -> str | None:
-    """A per-commit review-skip reason if the parsed commit segment opts out, else None."""
-    if is_inline_review_skip(env):
-        return "inline env REVIEW_SKIP"
-    if has_skip_review_trailer_argv(argv):
-        return "[skip-review:…] commit trailer"
-    return None
-
-
 def _marker_is_fresh() -> bool | None:
     """True/False if the review marker exists-and-is-fresh; None if it could not be stat'd."""
     marker = marker_path()
@@ -761,20 +686,22 @@ def _marker_is_fresh() -> bool | None:
     return False
 
 
-def _block() -> int:
+def _block(prefix: str | None = None) -> int:
     marker = marker_path()
-    emit(
-        "block",
+    body = (
         "No recent AI code review found for this change. Run a review on the "
         "uncommitted diff (e.g. `review` / `codex exec review --uncommitted`) and "
         f"address its findings before committing. (Set/touch {marker} on a successful "
-        "review, set REVIEW_MARKER, or — for a genuine exception — skip per-commit with "
-        "`REVIEW_SKIP=1 git commit …` or a `[skip-review: <reason>]` message trailer. "
-        "A PURE-docs commit auto-allows — but only the simple form: `git commit -a`/`-am`, "
-        "a trailing pathspec, or a preceding `git add` of other files FORFEITS that fast-path "
-        "(the commit may include un-reviewed non-docs changes), so a docs-only diff can still "
-        "land here — stage just the docs and `git commit` them alone, or skip as above.)",
+        "review, or set REVIEW_MARKER. A PURE-docs commit auto-allows — but only the simple "
+        "form: `git commit -a`/`-am`, a trailing pathspec, or a preceding `git add` of other "
+        "files FORFEITS that fast-path (the commit may include un-reviewed non-docs changes), "
+        "so a docs-only diff can still land here — stage just the docs and `git commit` them "
+        "alone.) There is NO self-service skip any more (`REVIEW_SKIP` / `[skip-review: …]` are "
+        "gone). For a genuine one-time exception, ASK the human, or request a single approval "
+        'via RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT="<why>" — that routes a Telegram '
+        "approval request to Alex (deny-by-default; a bare `1` is rejected)."
     )
+    emit("block", f"{prefix}\n{body}" if prefix else body)
     return BLOCK_EXIT_CODE
 
 
@@ -784,16 +711,11 @@ def _allow() -> int:
 
 
 def _is_exempt_skip(seg: CommitSegment) -> bool:
-    """A CHEAP (no subprocess) check: this commit segment opts out of review via a skip flag or an
-    explicit per-commit skip (inline `REVIEW_SKIP`/`[skip-review:…]`). Does NOT cover docs-only —
-    that needs a `git diff` and is only worth running when no fresh marker exists."""
-    if is_skip_commit_argv(seg.argv):
-        return True  # inert for git commit (no such flag); kept for sibling-parser SYNC parity
-    reason = _explicit_skip_reason(seg.env, seg.argv)
-    if reason:
-        warn(f"review gate skipped per-commit ({reason})")
-        return True
-    return False
+    """A CHEAP (no subprocess) check: this commit segment opts out of review via a skip flag
+    (`--continue`/`--abort`/`--skip`). Does NOT cover docs-only — that needs a `git diff` and is
+    only worth running when no fresh marker exists. There is no per-commit self-service skip any
+    more; a one-time exception is an external Telegram hatch (see `main`)."""
+    return is_skip_commit_argv(seg.argv)  # inert for git commit; kept for sibling-parser SYNC parity
 
 
 def _is_docs_only_commit(seg: CommitSegment, cwd: str) -> bool:
@@ -854,10 +776,10 @@ def main() -> int:
     # pre-filter is needed (a pre-filter that early-returns `allow` would re-introduce
     # miss-classification bugs, e.g. `GIT_AUTHOR_NAME='Jane Doe' git commit`, a spaced env value a
     # regex anchor can't follow). Gate if ANY segment is a real authoring commit needing review —
-    # an exempt first commit (`REVIEW_SKIP=1 git commit … && git commit -am big`) must not shield a
+    # a skip-flag first commit (`git rebase --abort && git commit -am big`) must not shield a
     # second authoring one (codex MEDIUM).
     segments = _commit_segments(command)
-    # CHEAP first: drop the segments that opt out via a skip flag / per-commit skip (no subprocess).
+    # CHEAP first: drop the segments that opt out via a skip flag (--continue/--abort/--skip).
     authoring = [seg for seg in segments if not _is_exempt_skip(seg)]
     if not authoring:
         return _allow()  # no segment, or every commit segment is skip-exempt → nothing to gate
@@ -869,9 +791,22 @@ def main() -> int:
         return _allow()
 
     # No fresh marker: the only thing that can still exempt a commit is being a trustworthy
-    # docs-only one. If EVERY authoring segment is docs-only → allow; otherwise block.
+    # docs-only one. If EVERY authoring segment is docs-only → allow; otherwise consult the
+    # external Telegram hatch before blocking (deny-by-default; env unset → normal block).
     if all(_is_docs_only_commit(seg, cwd) for seg in authoring):
         return _allow()
+
+    hatch = hatch_escalation.request_hatch_approval(
+        "require-review-before-commit",
+        {"hook": "require-review-before-commit", "command": command},
+        cwd=cwd,
+    )
+    if hatch.should_stop:
+        if hatch.approved:
+            warn(f"review gate allowed via hatch escalation ({hatch.reason})")
+            return _allow()
+        warn(f"review gate hatch escalation denied: {hatch.reason}")
+        return _block(prefix=f"hatch escalation denied: {hatch.reason}")
     return _block()
 
 
