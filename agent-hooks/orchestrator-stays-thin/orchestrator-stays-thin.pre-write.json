@@ -3,7 +3,7 @@
   "point": "pre-write",
   "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/orchestrator-stays-thin/orchestrator_stays_thin.py",
   "priority": 45,
-  "timeout_ms": 3000,
+  "timeout_ms": 960000,
   "on_error": "open",
-  "description": "Keeps the main thread thin: a non-docs CODE Edit/Write by the orchestrator warns-then-blocks (delegate to a subagent/Workflow instead). Docs (*.md/mdx/txt/rst, docs/) and subagent writes (agent_id present) are allowed. WARN first, BLOCK on repeat within ORCH_THIN_TTL_S (900s). Per-repo opt-out: agent_hooks.orchestrator_only:false in rig.yaml or RIG_ORCHESTRATOR_ONLY=0 (default ON). Escape hatch: ALLOW_ORCHESTRATOR_WORK=1 + ALLOW_ORCHESTRATOR_WORK_REASON='why'. on_error=open: delegation discipline, not a security boundary."
+  "description": "Keeps the main thread thin: a non-docs CODE Edit/Write by the orchestrator warns-then-blocks (delegate to a subagent/Workflow instead). Docs (*.md/mdx/txt/rst, docs/) and subagent writes (agent_id present) are allowed. WARN first, BLOCK on repeat within ORCH_THIN_TTL_S (900s). Per-repo opt-out (repo owner, not the constrained agent): agent_hooks.orchestrator_only:false in rig.yaml or RIG_ORCHESTRATOR_ONLY=0 (default ON). Deny-by-default: no self-service bypass (ALLOW_ORCHESTRATOR_WORK removed); a would-be BLOCK consults RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN with a written justification, which asks Telegram via trusted tg-ctl and allows ONLY on an approval tap (a blank/bare 1 denies). timeout_ms 960000 covers tg-ctl ask's 900s cap plus margin so a hung ask can't race the dispatcher's timeout kill into a silent on_error=open ALLOW; a CC settings entry launching cc_hook_bridge must set timeout >960s. on_error=open: delegation discipline, not a security boundary."
 }

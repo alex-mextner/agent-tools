@@ -8,7 +8,9 @@ receive (only the main loop is re-invoked by background completion), wedging for
 Covers: BLOCK (subagent backgrounding a long process, every background form), ALLOW (subagent
 runs the long process FOREGROUND; the orchestrator — no agent_id — backgrounds it; a subagent
 backgrounds a SHORT command; a keyword inside a quoted arg; redirections that contain `&`),
-and the ESCAPE hatch (env+reason and inline sentinel; reasonless still blocks).
+and the deny-by-default Telegram hatch escalation (the old ALLOW_SUBAGENT_BACKGROUND env +
+`# subagent-bg-ok:` sentinel are DEAD; RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC with a written
+justification asks tg-ctl and allows only on exit 0, a bare `1` denies).
 
 Run from the repo root::
 
@@ -54,7 +56,8 @@ def _run(
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"args": args})))
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
-    for k in ("ALLOW_SUBAGENT_BACKGROUND", "ALLOW_SUBAGENT_BACKGROUND_REASON"):
+    for k in ("ALLOW_SUBAGENT_BACKGROUND", "ALLOW_SUBAGENT_BACKGROUND_REASON",
+              "RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC"):
         monkeypatch.delenv(k, raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
@@ -128,7 +131,8 @@ def test_agent_id_top_level_event_fallback(monkeypatch):
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
-    for k in ("ALLOW_SUBAGENT_BACKGROUND", "ALLOW_SUBAGENT_BACKGROUND_REASON"):
+    for k in ("ALLOW_SUBAGENT_BACKGROUND", "ALLOW_SUBAGENT_BACKGROUND_REASON",
+              "RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC"):
         monkeypatch.delenv(k, raising=False)
     code = hook.main()
     assert code == hook.BLOCK_EXIT_CODE
@@ -146,7 +150,8 @@ def test_run_in_background_top_level_event_fallback(monkeypatch):
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
-    for k in ("ALLOW_SUBAGENT_BACKGROUND", "ALLOW_SUBAGENT_BACKGROUND_REASON"):
+    for k in ("ALLOW_SUBAGENT_BACKGROUND", "ALLOW_SUBAGENT_BACKGROUND_REASON",
+              "RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC"):
         monkeypatch.delenv(k, raising=False)
     code = hook.main()
     assert code == hook.BLOCK_EXIT_CODE
@@ -302,88 +307,78 @@ def test_allow_short_sleep_backgrounded(monkeypatch):
     assert _decision(out) == "allow"
 
 
-# ── ESCAPE hatch ─────────────────────────────────────────────────────────────────────────
+# ── regression: the OLD self-service escape hatch is DEAD (env AND inline) ──────────────────
 
-def test_escape_env_with_reason_allows(monkeypatch):
+def test_old_env_escape_hatch_no_longer_bypasses(monkeypatch):
+    """ALLOW_SUBAGENT_BACKGROUND=1 + _REASON as a real env pair must NO LONGER allow a
+    backgrounded long process — the self-service bypass was removed (replaced by the Telegram
+    hatch)."""
     out, _e, code = _run(
         "review diff -C /repo &",
         monkeypatch,
-        env={"ALLOW_SUBAGENT_BACKGROUND": "1", "ALLOW_SUBAGENT_BACKGROUND_REASON": "self-polled watchdog"},
-    )
-    assert code == 0
-    assert _decision(out) == "allow"
-
-
-def test_reasonless_env_override_still_blocks(monkeypatch):
-    out, _e, code = _run(
-        "review diff -C /repo &",
-        monkeypatch,
-        env={"ALLOW_SUBAGENT_BACKGROUND": "1"},  # no reason
+        env={"ALLOW_SUBAGENT_BACKGROUND": "1", "ALLOW_SUBAGENT_BACKGROUND_REASON": "watchdog"},
     )
     assert code == hook.BLOCK_EXIT_CODE
     assert _decision(out) == "block"
 
 
-def test_reasonless_inline_sentinel_still_blocks(monkeypatch):
-    """A `# subagent-bg-ok:` with an EMPTY reason is not a valid override (the sentinel regex
-    requires a non-space reason) → still BLOCK. The inline counterpart of
-    `test_reasonless_env_override_still_blocks`, which only covered the env branch (review #3)."""
-    out, _e, code = _run("review diff -C /repo &  # subagent-bg-ok:", monkeypatch)
-    assert code == hook.BLOCK_EXIT_CODE
-    assert _decision(out) == "block"
-
-
-def test_inline_sentinel_allows(monkeypatch):
-    out, _e, code = _run(
-        "review diff -C /repo &  # subagent-bg-ok: orchestrator handoff, marker-polled",
-        monkeypatch,
-    )
-    assert code == 0
-    assert _decision(out) == "allow"
-
-
-def test_sentinel_inside_quotes_is_not_an_override(monkeypatch):
-    """A `# subagent-bg-ok:` hidden INSIDE quotes is NOT a bash comment, so it must NOT override
-    the gate — searching the raw string would be a silent bypass (review #1)."""
-    out, _e, code = _run(
-        'review -C /r & echo "# subagent-bg-ok: sneaky"',
-        monkeypatch,
-    )
-    assert code == hook.BLOCK_EXIT_CODE
-    assert _decision(out) == "block"
-
-
-def test_sentinel_inside_heredoc_body_is_not_an_override(monkeypatch):
-    """A `# subagent-bg-ok:` inside a HEREDOC body is data, not a comment → must NOT override
-    (the wedge detector already strips heredoc bodies; the override scan must too)."""
-    out, _e, code = _run(
-        "review -C /r &\ncat <<'EOF'\n# subagent-bg-ok: not really\nEOF",
-        monkeypatch,
-    )
-    assert code == hook.BLOCK_EXIT_CODE
-    assert _decision(out) == "block"
-
-
-def test_sentinel_inside_multiline_quote_is_not_an_override(monkeypatch):
-    """A `# subagent-bg-ok:` inside a MULTI-LINE quoted string (open quote carries across the
-    newline) is not a comment → must NOT override."""
-    out, _e, code = _run(
-        'review -C /r & echo "start\n# subagent-bg-ok: x\nend"',
-        monkeypatch,
-    )
-    assert code == hook.BLOCK_EXIT_CODE
-    assert _decision(out) == "block"
-
-
-def test_real_multiline_trailing_comment_sentinel_overrides(monkeypatch):
-    """A genuine trailing `#` comment on a later physical line IS a real override → ALLOW
-    (the positive counterpart, so the heredoc/quote guards aren't just blanket-blocking)."""
+def test_old_inline_sentinel_no_longer_bypasses(monkeypatch):
+    """A genuine trailing `# subagent-bg-ok: …` comment (which previously ALLOWED) must now still
+    BLOCK — the inline sentinel is gone."""
     out, _e, code = _run(
         "echo prep\nreview -C /r &  # subagent-bg-ok: handoff to orchestrator",
         monkeypatch,
     )
-    assert code == 0
-    assert _decision(out) == "allow"
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+# ── Telegram hatch escalation (deny-by-default) ────────────────────────────────────────────
+
+def _fake_tg_ctl(path: Path, body: str) -> Path:
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return path
+
+
+def test_hatch_unset_blocks_and_names_env_var(monkeypatch):
+    out, _e, code = _run("review diff -C /repo &", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC" in json.loads(out)["message"]
+
+
+def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nexit 0\n")
+    monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _e, code = _run("review diff -C /repo &", monkeypatch,
+                         env={"RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC": "1"})
+    assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert not marker.exists()
+
+
+def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nprintf approved\nexit 0\n")
+    monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _e, code = _run(
+        "review diff -C /repo &", monkeypatch,
+        env={"RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC": "Self-managed watchdog, polls inline."},
+    )
+    assert code == 0 and _decision(out) == "allow"
+    assert marker.exists()
+    assert "hatch escalation" in json.loads(out)["message"].lower()
+
+
+def test_hatch_justification_exit1_blocks(tmp_path, monkeypatch):
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _e, code = _run(
+        "review diff -C /repo &", monkeypatch,
+        env={"RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC": "Self-managed watchdog, polls inline."},
+    )
+    assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "hatch escalation denied" in json.loads(out)["message"].lower()
 
 
 # ── fail-open & robustness ───────────────────────────────────────────────────────────────
@@ -480,3 +475,19 @@ def test_long_process_detection_constants_match_sibling():
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
+    """The justification supplied as an inline command PREFIX (env var NOT exported) must reach
+    tg-ctl via the new `command=` contract. Regression for the documented inline form (Codex #232)."""
+    marker = tmp_path / "asked"
+    question = tmp_path / "q.txt"
+    tg_ctl = _fake_tg_ctl(
+        tmp_path / "tg-ctl", f'touch {marker}\nprintf "%s" "$2" > "{question}"\nprintf approved\nexit 0\n')
+    monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _e, code = _run(
+        'RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC="self-managed watchdog, polls inline" review diff -C /repo &',
+        monkeypatch)  # env deliberately NOT set — only the inline prefix
+    assert code == 0 and _decision(out) == "allow"
+    assert marker.exists()
+    assert "self-managed watchdog, polls inline" in question.read_text()

@@ -47,11 +47,12 @@ playwright, cargo/go test|build, make/rake/msbuild test|build|all, mvn/gradle
 test|build|verify|package), or ``sleep N`` with N>=10s. A keyword inside a quoted argument
 to a DIFFERENT command (``tg "…review…" &``) never trips it.
 
-Escape hatch (controllable — mirrors no-long-inline-process):
-  - env  ALLOW_SUBAGENT_BACKGROUND=1            — disable the guard for this session
-  - env  ALLOW_SUBAGENT_BACKGROUND_REASON=...   — REQUIRED with the override; logged
-  - inline  `# subagent-bg-ok: <reason>`         — self-documenting per-command
-  A reasonless override still blocks.
+External approval (deny-by-default): there is NO self-service bypass. For a genuine exception,
+ASK the human, or request a one-time Telegram approval by setting
+`RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC="<written justification>"` — the hook asks via a
+trusted `tg-ctl` and allows ONLY on an explicit approval tap. A blank value or a bare `1`/`true`
+is rejected (deny), no Telegram call is made. An agent can request, not self-grant — the human
+decides.
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; the shell command is in args.command, the bg flag in
@@ -70,11 +71,17 @@ import os
 import re
 import shlex
 import sys
+from pathlib import Path
+
+_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+import agenttools_hatch_escalation as hatch_escalation  # noqa: E402
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
-INLINE_SENTINEL = re.compile(r"#\s*subagent-bg-ok:\s*(\S.*)")
 # Unescaped shell metachars that, like whitespace, are a word boundary at which a `#` opens a comment
 # (`cmd ;# note`, `a |# note`) — used by `_strip_line_comment` to match POSIX comment semantics.
 _COMMENT_BOUNDARY_METACHARS = frozenset(";&|()")
@@ -179,49 +186,6 @@ def _is_run_in_background(event: dict) -> bool:
     if isinstance(val, (int, float)):  # bool handled above → this is a real int/float
         return val != 0
     return isinstance(val, str) and val.strip().lower() in {"true", "1", "yes"}
-
-
-def _inline_sentinel_reason(command: str) -> str | None:
-    """The `# subagent-bg-ok:` reason, but ONLY from a REAL shell comment (quote/heredoc-aware).
-
-    A sentinel hidden where bash does NOT see a comment must not override the gate — that would
-    be a false ALLOW of a real wedge (the unsafe direction). Three traps the raw-string search
-    fell into, all fixed by mirroring the tokenizer's exact line pipeline:
-      - inside single-line quotes (`echo "# subagent-bg-ok: x"`) — `#` is not a comment;
-      - inside a HEREDOC body (`cat <<EOF` … `# subagent-bg-ok` … `EOF`) — it's data;
-      - inside a MULTI-LINE quoted string spanning a newline — the open quote carries over, so a
-        `#` on a later line is still quoted.
-    So: strip heredoc bodies (`_strip_heredocs`), re-join lines until each chunk tokenizes
-    (balancing a multi-line quote, like `_tokenize`), and cut the comment from the BALANCED
-    chunk with the quote/escape-aware `_strip_line_comment` (whose state carries across the
-    embedded newlines). The sentinel is matched only in that real comment tail.
-    """
-    joined = command.replace("\r\n", "\n").replace("\r", "\n").replace("\\\n", "")
-    lines = _strip_heredocs(joined.split("\n"))
-    i = 0
-    while i < len(lines):
-        chunk = lines[i]
-        while _tokenize_line(chunk) is None and i + 1 < len(lines):
-            i += 1
-            chunk = f"{chunk}\n{lines[i]}"
-        commentless = _strip_line_comment(chunk)
-        comment = chunk[len(commentless):]  # the `# …` tail, or "" when the chunk has no comment
-        m = INLINE_SENTINEL.search(comment)
-        if m:
-            return m.group(1).strip()
-        i += 1
-    return None
-
-
-def _override_reason(command: str) -> str | None:
-    if os.environ.get("ALLOW_SUBAGENT_BACKGROUND") == "1":
-        reason = (os.environ.get("ALLOW_SUBAGENT_BACKGROUND_REASON") or "").strip()
-        if reason:
-            return f"env override: {reason}"
-    inline = _inline_sentinel_reason(command)
-    if inline:
-        return f"inline override: {inline}"
-    return None
 
 
 def _strip_line_comment(line: str) -> str:
@@ -572,23 +536,33 @@ def main() -> int:
         emit("allow")
         return 0
 
-    reason = _override_reason(command)
-    if reason:
-        warn(f"subagent background long process allowed via escape hatch ({reason})")
-        emit("allow", f"subagent background long process allowed via escape hatch ({reason})")
-        return 0
-
-    emit(
-        "block",
+    cwd = str(event.get("cwd") or args.get("cwd") or os.getcwd())
+    block_message = (
         f"You are a SUBAGENT — run this long process ({matched}) in the FOREGROUND and BLOCK "
         "on it; do NOT background it. A subagent is NOT re-invoked by a background-completion "
         "notification "
         "(only the main loop is), so backgrounding this and ending your turn wedges you "
         "FOREVER with uncommitted work and no PR. Remove `run_in_background: true` (and any "
         "trailing `&` / `setsid`) and run it inline so this tool call blocks until it "
-        "finishes. Override only with a reason: ALLOW_SUBAGENT_BACKGROUND=1 + "
-        "ALLOW_SUBAGENT_BACKGROUND_REASON='why', or append `# subagent-bg-ok: why`.",
+        "finishes. There is NO self-service bypass. For a genuine exception, ASK the human, or "
+        "request a one-time Telegram approval by setting "
+        "RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC=\"<written justification>\" "
+        "(deny-by-default; a bare 1 is rejected)."
     )
+
+    ctx = {"hook": "subagent-no-bg-longproc", "command": command}
+    hatch = hatch_escalation.request_hatch_approval(
+        "subagent-no-bg-longproc", ctx, cwd=cwd, command=command
+    )
+    if hatch.should_stop:
+        if hatch.approved:
+            warn(f"subagent-no-bg-longproc allowed via hatch escalation ({hatch.reason})")
+            emit("allow", f"allowed via hatch escalation ({hatch.reason})")
+            return 0
+        emit("block", f"hatch escalation denied: {hatch.reason}\n{block_message}")
+        return BLOCK_EXIT_CODE
+
+    emit("block", block_message)
     return BLOCK_EXIT_CODE
 
 

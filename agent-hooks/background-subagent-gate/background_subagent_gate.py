@@ -13,11 +13,12 @@ Allowed (let through):
   - a dispatch made BY a subagent itself (subagent-exempt: ``agent_id`` present) — a subagent
     may fan out further, and this gate governs the orchestrator, not the workers
 
-Escape hatch (controllable, not a hard wall — mirrors block-raw-pr-merge):
-  - env  ALLOW_FOREGROUND_SUBAGENT=1            — disable the guard for this session
-  - env  ALLOW_FOREGROUND_SUBAGENT_REASON=...   — REQUIRED with the override; logged
-  A reasonless override still blocks. (No inline sentinel: the Agent tool carries no shell
-  string to hide a `# ...` comment in.)
+External approval (deny-by-default): there is NO self-service bypass. For a genuine exception,
+ASK the human, or request a one-time Telegram approval by setting
+`RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE="<written justification>"` — the hook asks via a
+trusted `tg-ctl` and allows ONLY on an explicit approval tap. A blank value or a bare `1`/`true`
+is rejected (deny), and no Telegram call is made. An agent setting its own env var can request,
+not self-grant — the human decides.
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; the dispatch payload is in args (run_in_background, prompt, description)
@@ -32,6 +33,13 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
+
+_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+import agenttools_hatch_escalation as hatch_escalation  # noqa: E402
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
@@ -48,8 +56,10 @@ REMINDER = (
     "dynamic Workflow. "
     "(3) A foreground subagent blocks the main thread until it finishes — that defeats "
     "orchestration. "
-    "Override only with a reason: ALLOW_FOREGROUND_SUBAGENT=1 + "
-    "ALLOW_FOREGROUND_SUBAGENT_REASON='why'."
+    "There is NO self-service bypass. For a genuine exception, ASK the human, or request a "
+    "one-time Telegram approval by setting "
+    "RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE=\"<written justification>\" (deny-by-default; "
+    "a bare 1 is rejected)."
 )
 
 
@@ -97,15 +107,6 @@ def _is_trivial(args: dict) -> bool:
     return max(len(t) for t in texts) < TRIVIAL_MAX_CHARS
 
 
-def _override_reason() -> str | None:
-    """The override reason if the env escape hatch is present WITH a reason, else None."""
-    if os.environ.get("ALLOW_FOREGROUND_SUBAGENT") == "1":
-        reason = (os.environ.get("ALLOW_FOREGROUND_SUBAGENT_REASON") or "").strip()
-        if reason:
-            return f"env override: {reason}"
-    return None
-
-
 def main() -> int:
     try:
         event = json.load(sys.stdin)
@@ -129,11 +130,16 @@ def main() -> int:
         emit("allow")  # cheap one-liner — inline is fine
         return 0
 
-    reason = _override_reason()
-    if reason:
-        warn(f"foreground subagent allowed via escape hatch ({reason})")
-        emit("allow", f"foreground subagent allowed via escape hatch ({reason})")
-        return 0
+    cwd = str(event.get("cwd") or os.getcwd())
+    ctx = {"hook": "background-subagent-gate"}
+    hatch = hatch_escalation.request_hatch_approval("background-subagent-gate", ctx, cwd=cwd)
+    if hatch.should_stop:
+        if hatch.approved:
+            warn(f"background-subagent-gate allowed via hatch escalation ({hatch.reason})")
+            emit("allow", f"allowed via hatch escalation ({hatch.reason})")
+            return 0
+        emit("block", f"hatch escalation denied: {hatch.reason}\n{REMINDER}")
+        return BLOCK_EXIT_CODE
 
     emit("block", REMINDER)
     return BLOCK_EXIT_CODE

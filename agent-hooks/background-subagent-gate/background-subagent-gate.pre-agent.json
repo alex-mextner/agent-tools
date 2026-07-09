@@ -3,7 +3,7 @@
   "point": "pre-agent",
   "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/background-subagent-gate/background_subagent_gate.py",
   "priority": 30,
-  "timeout_ms": 3000,
+  "timeout_ms": 960000,
   "on_error": "open",
-  "description": "Blocks the orchestrator from dispatching a non-trivial subagent in the FOREGROUND — a foreground subagent blocks the main thread until it finishes, defeating orchestration. Allows `run_in_background: true`, trivial one-liner dispatches, and subagent-made dispatches (agent_id present). Escape hatch: ALLOW_FOREGROUND_SUBAGENT=1 + ALLOW_FOREGROUND_SUBAGENT_REASON='why'. on_error=open: orchestration discipline, not a security boundary."
+  "description": "Blocks the orchestrator from dispatching a non-trivial subagent in the FOREGROUND — a foreground subagent blocks the main thread until it finishes, defeating orchestration. Allows `run_in_background: true`, trivial one-liner dispatches, and subagent-made dispatches (agent_id present). Deny-by-default: no self-service bypass (ALLOW_FOREGROUND_SUBAGENT env removed); a would-be BLOCK consults RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE with a written justification, which asks Telegram via trusted tg-ctl and allows ONLY on an approval tap (a blank/bare 1 denies). timeout_ms 960000 covers tg-ctl ask's 900s cap plus margin so a hung ask can't race the dispatcher's timeout kill into a silent on_error=open ALLOW; a CC settings entry launching cc_hook_bridge must set timeout >960s. on_error=open: orchestration discipline, not a security boundary."
 }

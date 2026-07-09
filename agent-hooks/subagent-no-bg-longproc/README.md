@@ -99,17 +99,32 @@ subagent's Bash call today (no rig-cli follow-up needed — unlike the `pre-agen
 > `args.agent_id` must not let the orchestrator be mis-classified as a subagent, and (the
 > direction this gate cares about) a worker can't strip its own `agent_id` to dodge the gate.
 
-## Escape hatch (controllable, not a hard wall)
+## No self-service bypass — external Telegram approval only
+
+There is **no** env-var or inline escape hatch any more. The old `ALLOW_SUBAGENT_BACKGROUND=1` +
+`ALLOW_SUBAGENT_BACKGROUND_REASON` env and the `# subagent-bg-ok:` inline sentinel let the very
+worker this gate constrains grant itself an exception — security theater, not a permission gate.
+Both were removed.
+
+The block is now **deny-by-default**. For a genuine exception, ASK the human, or request a
+one-time Telegram approval with a written justification:
 
 ```bash
-# session-wide override (reason REQUIRED, or it still blocks):
-ALLOW_SUBAGENT_BACKGROUND=1 ALLOW_SUBAGENT_BACKGROUND_REASON="self-managed watchdog, polls inline"
-
-# or per-command, self-documenting:
-review diff -C /repo &   # subagent-bg-ok: orchestrator handoff, marker-polled
+RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC="self-managed watchdog, polls inline" \
+  review diff -C /repo &
 ```
 
-A reasonless `ALLOW_SUBAGENT_BACKGROUND=1` is ignored and the command stays blocked.
+This is a **pre-bash** hook, so the inline prefix is honored: the hook parses the leading
+`RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC=…` assignment out of the command string the event
+carries (a pre-bash hook runs in its own process *before* the shell evaluates the `VAR=x cmd`
+prefix, so the value never reaches its `os.environ`). Exporting the var into the harness
+environment works too and takes precedence over an inline value.
+
+If the env var is unset, no Telegram call is made and the command simply blocks. If it is
+present but blank, whitespace-only, or a bare flag value (`1`/`true`/`yes`/`on`), the hook does
+not contact Telegram and denies — a bare `1` is not a justification. A real justification runs
+`tg-ctl ask` through a trusted absolute path (never ambient `PATH`); exit 0 allows, and any
+nonzero exit, launch error, or timeout denies. An agent can *request*, not self-grant.
 
 ## Fail-open, on purpose
 

@@ -38,19 +38,37 @@ self-exempts the orchestrator (full contract in `background-subagent-gate/README
 
 The other delegation gates warn-then-block, but a long inline process is unambiguous: it WILL
 stall the main thread, every time. There is no borderline case to warn about — so this one
-blocks on the first occurrence, with a real escape hatch for the rare deliberate exception.
+blocks on the first occurrence, deny-by-default, with an external Telegram approval for the
+rare deliberate exception.
 
-## Escape hatch (controllable, not a hard wall)
+## No self-service bypass — external Telegram approval only
+
+There is **no** env-var or inline escape hatch any more. The old `ALLOW_INLINE_PROCESS=1` +
+`ALLOW_INLINE_PROCESS_REASON` env and the `# inline-process-ok:` inline sentinel let the very
+agent this gate constrains grant itself an exception — security theater, not a permission gate.
+Both were removed.
+
+The block is now **deny-by-default**. For a genuine one-off exception, ASK the human, or request
+a one-time Telegram approval with a written justification:
 
 ```bash
-# session-wide override (reason REQUIRED, or it still blocks):
-ALLOW_INLINE_PROCESS=1 ALLOW_INLINE_PROCESS_REASON="one-shot smoke build, output needed now"
-
-# one-off, self-documenting:
-npm test   # inline-process-ok: single fast unit file, not the full suite
+RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS="one-shot smoke build, output needed now" \
+  <the command>
 ```
 
-A reasonless `ALLOW_INLINE_PROCESS=1` is ignored and the command stays blocked.
+This is a **pre-bash** hook, so the inline prefix is honored: the hook parses the leading
+`RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS=…` assignment out of the command string the event
+carries (a pre-bash hook runs in its own process *before* the shell evaluates the `VAR=x cmd`
+prefix, so the value never reaches its `os.environ`). It also works when the gated command is not
+first (`cd repo && RIG_HATCH_REQUEST_…="why" <cmd>`). Exporting the var into the harness
+environment works too and takes precedence over an inline value.
+
+If the env var is unset, no Telegram call is made and the command simply blocks. If it is
+present but blank, whitespace-only, or a bare flag value (`1`/`true`/`yes`/`on`), the hook does
+not contact Telegram and denies — a bare `1` is not a justification. A real justification runs
+`tg-ctl ask <question> --timeout 900` through a trusted absolute path (never ambient `PATH`);
+exit 0 allows, and any nonzero exit, launch error, or timeout denies. An agent can *request*, not
+self-grant — the human taps to approve.
 
 ## Fail-open, on purpose
 

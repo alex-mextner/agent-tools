@@ -2,9 +2,11 @@
 
 Covers the doctrine's four cases for BOTH points: BLOCK (a repeat code write / impl bash by
 the main thread), ALLOW (docs path / read-only one-liner / first-offense WARN), SUBAGENT-EXEMPT
-(agent_id present), and the ESCAPE hatch (env+reason and inline sentinel; reasonless still
-blocks). Hermetic: the warn/block tier marker dir is redirected into tmp_path via env, so the
-two-call warn→block sequence is exercised without touching the real cache.
+(agent_id present), and the deny-by-default Telegram hatch escalation (the old
+ALLOW_ORCHESTRATOR_WORK env + `# orchestrator-ok:` sentinel are DEAD; on a would-be BLOCK,
+RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN with a written justification asks tg-ctl and allows
+only on exit 0, a bare `1` denies). Hermetic: the warn/block tier marker dir is redirected into
+tmp_path via env, so the two-call warn→block sequence is exercised without touching the real cache.
 
 Run from the repo root::
 
@@ -41,7 +43,8 @@ def _run(event, monkeypatch, marker_dir: Path, env: dict | None = None) -> tuple
     # Redirect the tier marker dir into the test sandbox and re-read the module constant.
     monkeypatch.setenv("ORCH_THIN_MARKER_DIR", str(marker_dir))
     monkeypatch.setattr(ost, "MARKER_DIR", marker_dir)
-    for k in ("ALLOW_ORCHESTRATOR_WORK", "ALLOW_ORCHESTRATOR_WORK_REASON", "RIG_ORCHESTRATOR_ONLY"):
+    for k in ("ALLOW_ORCHESTRATOR_WORK", "ALLOW_ORCHESTRATOR_WORK_REASON", "RIG_ORCHESTRATOR_ONLY",
+              "RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN"):
         monkeypatch.delenv(k, raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
@@ -137,31 +140,88 @@ def test_only_args_agent_id_exempts_not_top_level_or_tool_input(tmp_path, monkey
     assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-# ── ESCAPE ─────────────────────────────────────────────────────────────────────────────
+# ── regression: the OLD self-service escape hatch is DEAD (env AND inline) ──────────────────
 
-def test_escape_env_reason_allows(tmp_path, monkeypatch):
+def test_old_env_escape_hatch_no_longer_bypasses(tmp_path, monkeypatch):
+    """ALLOW_ORCHESTRATOR_WORK=1 + _REASON as a real env pair must NO LONGER allow a repeat
+    offense — the self-service bypass was removed (replaced by the Telegram hatch)."""
     event = {"point": "pre-write", "cwd": "/repo", "args": {"file_path": "/repo/src/a.ts"}}
     _run(event, monkeypatch, tmp_path / "m")  # prime the warn marker
     out, _e, c = _run(
         event, monkeypatch, tmp_path / "m",
         {"ALLOW_ORCHESTRATOR_WORK": "1", "ALLOW_ORCHESTRATOR_WORK_REASON": "trivial tweak"},
     )
-    assert c == 0 and _decision(out) == "allow"
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-def test_escape_inline_sentinel_allows_bash(tmp_path, monkeypatch):
+def test_old_inline_sentinel_no_longer_bypasses(tmp_path, monkeypatch):
+    """A `# orchestrator-ok: …` sentinel on a repeat impl bash must still BLOCK — the inline
+    sentinel is gone."""
     event = {"point": "pre-bash", "cwd": "/repo",
              "args": {"command": "sed -i s/a/b/ f && echo x && echo y  # orchestrator-ok: one-off"}}
     _run(event, monkeypatch, tmp_path / "m")  # prime the warn marker
     out, _e, c = _run(event, monkeypatch, tmp_path / "m")
-    assert c == 0 and _decision(out) == "allow"
-
-
-def test_reasonless_override_still_blocks_on_repeat(tmp_path, monkeypatch):
-    event = {"point": "pre-write", "cwd": "/repo", "args": {"file_path": "/repo/src/a.ts"}}
-    _run(event, monkeypatch, tmp_path / "m")  # warn
-    out, _e, c = _run(event, monkeypatch, tmp_path / "m", {"ALLOW_ORCHESTRATOR_WORK": "1"})  # no reason
     assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+# ── Telegram hatch escalation (deny-by-default; only a would-be BLOCK consults it) ─────────
+
+def _fake_tg_ctl(path: Path, body: str):
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return path
+
+
+def _repeat_event() -> dict:
+    return {"point": "pre-write", "cwd": "/repo", "args": {"file_path": "/repo/src/a.ts"}}
+
+
+def test_hatch_unset_blocks_and_names_env_var(tmp_path, monkeypatch):
+    event = _repeat_event()
+    _run(event, monkeypatch, tmp_path / "m")  # warn
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")  # repeat → block
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN" in json.loads(out)["message"]
+
+
+def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nexit 0\n")
+    monkeypatch.setattr(ost.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    event = _repeat_event()
+    _run(event, monkeypatch, tmp_path / "m")  # warn
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m",
+                      {"RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN": "1"})  # repeat → deny
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert not marker.exists()
+
+
+def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nprintf approved\nexit 0\n")
+    monkeypatch.setattr(ost.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    event = _repeat_event()
+    _run(event, monkeypatch, tmp_path / "m")  # warn
+    out, _e, c = _run(
+        event, monkeypatch, tmp_path / "m",
+        {"RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN": "One-char fix in a generated file."},
+    )
+    assert c == 0 and _decision(out) == "allow"
+    assert marker.exists()
+    assert "hatch escalation" in json.loads(out)["message"].lower()
+
+
+def test_hatch_justification_exit1_blocks(tmp_path, monkeypatch):
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    monkeypatch.setattr(ost.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    event = _repeat_event()
+    _run(event, monkeypatch, tmp_path / "m")  # warn
+    out, _e, c = _run(
+        event, monkeypatch, tmp_path / "m",
+        {"RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN": "One-char fix in a generated file."},
+    )
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "hatch escalation denied" in json.loads(out)["message"].lower()
 
 
 # ── B1: a chain that merely STARTS read-only is judged on its full content ───────────────
@@ -1169,3 +1229,60 @@ def test_double_quoted_substitution_is_live_and_judged(tmp_path, monkeypatch):
     assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
     out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+# ── Inline command hatch (pre-bash) + write-target config routing (pre-write) ────────────
+
+
+def test_pre_bash_inline_command_triggers_hatch(tmp_path, monkeypatch):
+    """A pre-bash repeat offense with the justification supplied as an inline command prefix
+    (env var NOT exported) must reach tg-ctl — the hook now passes the command string through so
+    request_hatch_approval can parse the leading assignment. Regression guard for the inline form
+    being unusable (Codex P2 on #232)."""
+    marker = tmp_path / "asked"
+    question = tmp_path / "q.txt"
+    tg_ctl = _fake_tg_ctl(
+        tmp_path / "tg-ctl",
+        f'touch {marker}\nprintf "%s" "$2" > "{question}"\nprintf approved\nexit 0\n',
+    )
+    monkeypatch.setattr(ost.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    impl = "sed -i 's/a/b/' f && npm run build && echo done"
+    inline = 'RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN="one generated file, no subagent" ' + impl
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": inline}}
+    _run(event, monkeypatch, tmp_path / "m")  # warn
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")  # repeat → inline hatch → approve
+    assert c == 0 and _decision(out) == "allow"
+    assert marker.exists()
+    assert "one generated file, no subagent" in question.read_text()
+
+
+def test_pre_write_hatch_ignores_target_repo_tg_ctl_path(tmp_path, monkeypatch):
+    """SECURITY (P1): for a pre-write into ANOTHER repo, the approval binary (tg-ctl) must come
+    from the account home, NEVER the target (or shell) repo's rig.yaml. Otherwise a guarded agent
+    commits `rig.yaml` with `tg_ctl_path: /tmp/always-exit-0` into the repo it writes and
+    self-approves. Here the target repo's rig.yaml points tg_ctl_path at an always-exit-0 binary,
+    home carries no override, and the trusted fallback is emptied — so the request must DENY and
+    the repo-local binary must never run. (The orchestrator still resolves the *enablement* knob
+    `orchestrator_only` from the target repo via cfg_dir — that lookup is in the hook, not the
+    approval-binary lookup, which is now home-anchored in the shared lib.)"""
+    marker = tmp_path / "evil-called"
+    evil = _fake_tg_ctl(tmp_path / "evil-tg-ctl", f"touch {marker}\nexit 0\n")  # would approve
+    monkeypatch.setattr(ost.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", ())
+    clean_home = tmp_path / "home"
+    clean_home.mkdir()  # account home carries NO tg_ctl_path override
+    monkeypatch.setattr(ost.hatch_escalation, "resolve_home", lambda: str(clean_home))
+    target_repo = tmp_path / "target"
+    (target_repo / "src").mkdir(parents=True)
+    (target_repo / "rig.yaml").write_text(f'agent_hooks:\n  tg_ctl_path: "{evil}"\n')
+    event = {
+        "point": "pre-write",
+        "cwd": str(target_repo),
+        "args": {"file_path": str(target_repo / "src" / "a.ts")},
+    }
+    _run(event, monkeypatch, tmp_path / "m")  # warn
+    out, _e, c = _run(
+        event, monkeypatch, tmp_path / "m",
+        {"RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN": "attacker-supplied justification"},
+    )
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert not marker.exists()  # the repo-local (attacker) binary was NEVER executed

@@ -32,13 +32,14 @@ Per-repo opt-out (Alex tg#5743): default ON; a repo that legitimately works inli
 RIG_ORCHESTRATOR_ONLY=0. Default ON means an un-enrolled repo keeps the current always-on
 behavior (no regression). Mirrors the opt-IN worktree-only-writes guard's per-repo knob.
 
-Escape hatch (controllable — mirrors block-raw-pr-merge):
-  - env  ALLOW_ORCHESTRATOR_WORK=1            — disable the guard for this session (both points)
-  - env  ALLOW_ORCHESTRATOR_WORK_REASON=...   — REQUIRED with the override; logged
-  - inline (PRE-BASH ONLY)  `# orchestrator-ok: <reason>`  — self-documenting per-command.
-    A pre-write carries no shell string, so the inline sentinel can only fire for a bash
-    command; for a write use the ENV hatch.
-  A reasonless override still blocks.
+External approval (deny-by-default): there is NO self-service bypass. For a genuine exception,
+ASK the human, or request a one-time Telegram approval by setting
+`RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN="<written justification>"` — when the tiered guard
+would BLOCK (a REPEAT offense), the hook asks via a trusted `tg-ctl` and allows ONLY on an
+explicit approval tap. A blank value or a bare `1`/`true` is rejected (deny), no Telegram call
+is made. An agent can request, not self-grant — the human decides. (This is distinct from the
+per-repo ENABLE knob RIG_ORCHESTRATOR_ONLY / agent_hooks.orchestrator_only, which a repo owner,
+not the constrained agent, sets to opt a repo out entirely.)
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; args.command (bash) or args.file_path/path (write); event.point
@@ -59,6 +60,12 @@ import sys
 import time
 from pathlib import Path
 from typing import Iterable
+
+_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+import agenttools_hatch_escalation as hatch_escalation  # noqa: E402
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
@@ -167,8 +174,6 @@ BUILD_EDIT = re.compile(
 # below — targeted so a `uv run` of a read-only tool is not swept in. Other runner wrappers with a
 # non-build head are still not caught; the orchestrator is meant to DELEGATE the suite to a subagent
 # (which is exempt) anyway, and the tiered warn-then-block + escape hatch cover the residue.
-INLINE_SENTINEL = re.compile(r"#\s*orchestrator-ok:\s*(\S.*)")
-
 # ── companion-safety vetoes for the sanctioned-orchestration allow-list ──────────────────────
 # The allow-list (`_seg_is_allowed`) judges per segment HEAD, so a benign head (`tg`, `review`, a
 # read-only inspection) must not launder a mutation hidden elsewhere in the line: a command/process
@@ -205,8 +210,10 @@ MESSAGE = (
     "and CI/PR verification like `gh pr checks`/`gh run` are a subagent's job too, not the "
     "orchestrator's). Dispatch a subagent to do this (Agent tool, run_in_background: true) or "
     "model it as a Workflow, then read its report. This isn't friction to route around — if it's "
-    "genuinely wrong for a case, raise that, don't bypass it. (delegate-work-to-subagents, "
-    "enforced.)"
+    "genuinely wrong for a case, raise that, don't bypass it. There is NO self-service bypass; for "
+    "a genuine exception ASK the human, or request a one-time Telegram approval by setting "
+    "RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN=\"<written justification>\" (deny-by-default; a "
+    "bare 1 is rejected). (delegate-work-to-subagents, enforced.)"
 )
 
 
@@ -243,26 +250,6 @@ def _is_subagent(event: dict) -> bool:
     args = event.get("args") or {}
     aid = args.get("agent_id")
     return bool(aid and str(aid).strip())
-
-
-def _override_reason(command: str, point: str) -> str | None:
-    """The override reason if a valid escape hatch is present, else None.
-
-    Honored ONLY with a reason:
-      - env ALLOW_ORCHESTRATOR_WORK=1 + ALLOW_ORCHESTRATOR_WORK_REASON (both points), OR
-      - an inline ``# orchestrator-ok: <reason>`` — PRE-BASH ONLY. A pre-write carries no shell
-        string, so the inline sentinel genuinely cannot fire for a write; only the ENV hatch
-        applies there (B4). A reasonless override is ignored.
-    """
-    if os.environ.get("ALLOW_ORCHESTRATOR_WORK") == "1":
-        reason = (os.environ.get("ALLOW_ORCHESTRATOR_WORK_REASON") or "").strip()
-        if reason:
-            return f"env override: {reason}"
-    if point == "pre-bash":
-        m = INLINE_SENTINEL.search(command)
-        if m:
-            return f"inline override: {m.group(1).strip()}"
-    return None
 
 
 def _marker(event: dict) -> Path:
@@ -1008,14 +995,28 @@ def main() -> int:
         emit("allow")
         return 0
 
-    reason = _override_reason(command, point)
-    if reason:
-        warn(f"orchestrator work allowed via escape hatch ({reason})")
-        emit("allow", f"orchestrator work allowed via escape hatch ({reason})")
-        return 0
-
-    # WARN first, BLOCK on repeat within the window.
+    # WARN first, BLOCK on repeat within the window. Only a would-be BLOCK consults the hatch —
+    # a first-offense WARN is advisory (allow) and needs no escalation.
     if _is_repeat(event):
+        ctx = {"hook": "orchestrator-stays-thin", "point": point, "command": command}
+        # Resolve the hatch config (rig.yaml / tg_ctl_path) from the GOVERNING repo — for a
+        # pre-write that is the TARGET file's repo (`cfg_dir`), which can differ from the shell
+        # `cwd`; using `cwd` would route/deny an approval for a cross-repo write via the wrong
+        # repo's config. The inline `RIG_HATCH_REQUEST_*=` form only exists for the pre-bash
+        # point (a pre-write has no shell command to carry it — the var must be exported there).
+        hatch = hatch_escalation.request_hatch_approval(
+            "orchestrator-stays-thin",
+            ctx,
+            cwd=cfg_dir,
+            command=command if point == "pre-bash" else None,
+        )
+        if hatch.should_stop:
+            if hatch.approved:
+                warn(f"orchestrator-stays-thin allowed via hatch escalation ({hatch.reason})")
+                emit("allow", f"allowed via hatch escalation ({hatch.reason})")
+                return 0
+            emit("block", f"hatch escalation denied: {hatch.reason}\n{MESSAGE}")
+            return BLOCK_EXIT_CODE
         emit("block", MESSAGE)
         return BLOCK_EXIT_CODE
     warn(MESSAGE)

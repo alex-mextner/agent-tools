@@ -52,11 +52,12 @@ shared parser (follow-up, not this change). Pinned by `test_quoted_token_equal_t
 Subagent-exempt: a dispatched subagent (``agent_id`` present) is EXPECTED to run these in
 the background, so it is always allowed — this gate governs the orchestrator only.
 
-Escape hatch (controllable — mirrors block-raw-pr-merge):
-  - env  ALLOW_INLINE_PROCESS=1            — disable the guard for this session
-  - env  ALLOW_INLINE_PROCESS_REASON=...   — REQUIRED with the override; logged
-  - inline  `# inline-process-ok: <reason>`  — self-documenting per-command
-  A reasonless override still blocks.
+External approval (deny-by-default): there is NO self-service bypass. For a genuine exception,
+ASK the human, or request a one-time Telegram approval by setting
+`RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS="<written justification>"` — the hook asks via a
+trusted `tg-ctl` and allows ONLY on an explicit approval tap. A blank value or a bare `1`/`true`
+is rejected (deny), no Telegram call is made. An agent can request, not self-grant — the human
+decides.
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; the shell command is in args.command
@@ -74,11 +75,17 @@ import os
 import re
 import shlex
 import sys
+from pathlib import Path
+
+_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+import agenttools_hatch_escalation as hatch_escalation  # noqa: E402
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
-INLINE_SENTINEL = re.compile(r"#\s*inline-process-ok:\s*(\S.*)")
 # Unescaped shell metachars that, like whitespace, are a word boundary at which a `#` opens a comment
 # (`cmd ;# note`, `a |# note`) — used by `_strip_line_comment` to match POSIX comment semantics.
 _COMMENT_BOUNDARY_METACHARS = frozenset(";&|()")
@@ -168,17 +175,6 @@ def _is_subagent(event: dict) -> bool:
     args = event.get("args") or {}
     aid = args.get("agent_id") or event.get("agent_id")
     return bool(aid and str(aid).strip())
-
-
-def _override_reason(command: str) -> str | None:
-    if os.environ.get("ALLOW_INLINE_PROCESS") == "1":
-        reason = (os.environ.get("ALLOW_INLINE_PROCESS_REASON") or "").strip()
-        if reason:
-            return f"env override: {reason}"
-    m = INLINE_SENTINEL.search(command)
-    if m:
-        return f"inline override: {m.group(1).strip()}"
-    return None
 
 
 def _strip_line_comment(line: str) -> str:
@@ -511,20 +507,30 @@ def main() -> int:
         emit("allow")
         return 0
 
-    reason = _override_reason(command)
-    if reason:
-        warn(f"inline long process allowed via escape hatch ({reason})")
-        emit("allow", f"inline long process allowed via escape hatch ({reason})")
-        return 0
-
-    emit(
-        "block",
+    cwd = str(event.get("cwd") or args.get("cwd") or os.getcwd())
+    block_message = (
         f"Run this in a BACKGROUND subagent, not the orchestrator: `{matched}` is a "
         "long-running process (review / --watch / build-or-test suite / long sleep) that "
         "would block the main thread. Dispatch an Agent with run_in_background: true to run "
-        "it. Override only with a reason: ALLOW_INLINE_PROCESS=1 + "
-        "ALLOW_INLINE_PROCESS_REASON='why', or append `# inline-process-ok: why`.",
+        "it. There is NO self-service bypass. For a genuine exception, ASK the human, or "
+        "request a one-time Telegram approval by setting "
+        "RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS=\"<written justification>\" "
+        "(deny-by-default; a bare 1 is rejected)."
     )
+
+    ctx = {"hook": "no-long-inline-process", "command": command}
+    hatch = hatch_escalation.request_hatch_approval(
+        "no-long-inline-process", ctx, cwd=cwd, command=command
+    )
+    if hatch.should_stop:
+        if hatch.approved:
+            warn(f"no-long-inline-process allowed via hatch escalation ({hatch.reason})")
+            emit("allow", f"allowed via hatch escalation ({hatch.reason})")
+            return 0
+        emit("block", f"hatch escalation denied: {hatch.reason}\n{block_message}")
+        return BLOCK_EXIT_CODE
+
+    emit("block", block_message)
     return BLOCK_EXIT_CODE
 
 

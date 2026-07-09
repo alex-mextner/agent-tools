@@ -2,8 +2,10 @@
 
 Covers the doctrine's four cases: BLOCK (review / --watch / build-test suite / long sleep),
 ALLOW (short sleep, a path that merely contains "review", a benign read), SUBAGENT-EXEMPT
-(agent_id present), and the ESCAPE hatch (env+reason and inline sentinel; reasonless still
-blocks).
+(agent_id present), and the deny-by-default Telegram hatch escalation (the old
+ALLOW_INLINE_PROCESS env + `# inline-process-ok:` sentinel are DEAD;
+RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS with a written justification asks tg-ctl and allows
+only on exit 0, a bare `1` denies).
 
 Run from the repo root::
 
@@ -40,7 +42,8 @@ def _run(command, monkeypatch, *, agent_id=None, env: dict | None = None) -> tup
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"args": args})))
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
-    for k in ("ALLOW_INLINE_PROCESS", "ALLOW_INLINE_PROCESS_REASON"):
+    for k in ("ALLOW_INLINE_PROCESS", "ALLOW_INLINE_PROCESS_REASON",
+              "RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS"):
         monkeypatch.delenv(k, raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
@@ -372,28 +375,90 @@ def test_subagent_exempt_allows_review(monkeypatch):
     assert _decision(out) == "allow"
 
 
-# ── ESCAPE ─────────────────────────────────────────────────────────────────────────────
+# ── regression: the OLD self-service escape hatch is DEAD (env AND inline) ──────────────────
 
-def test_escape_env_reason_allows(monkeypatch):
+def test_old_env_escape_hatch_no_longer_bypasses(monkeypatch):
+    """ALLOW_INLINE_PROCESS=1 + _REASON as a real env pair must NO LONGER allow the long
+    process — the self-service bypass was removed (replaced by the Telegram hatch)."""
     out, _e, code = _run(
         "review", monkeypatch,
         env={"ALLOW_INLINE_PROCESS": "1", "ALLOW_INLINE_PROCESS_REASON": "one-shot probe"},
     )
-    assert code == 0
-    assert _decision(out) == "allow"
-
-
-def test_escape_inline_sentinel_allows(monkeypatch):
-    out, _e, code = _run("npm test  # inline-process-ok: single fast file", monkeypatch)
-    assert code == 0
-    assert _decision(out) == "allow"
-
-
-def test_reasonless_override_still_blocks(monkeypatch):
-    out, _e, code = _run("review", monkeypatch, env={"ALLOW_INLINE_PROCESS": "1"})  # no reason
     assert code == nlip.BLOCK_EXIT_CODE
     assert _decision(out) == "block"
 
 
+def test_old_inline_sentinel_no_longer_bypasses(monkeypatch):
+    """`# inline-process-ok: …` appended to a real long process must still BLOCK — the inline
+    sentinel is gone."""
+    out, _e, code = _run("npm test  # inline-process-ok: single fast file", monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+# ── Telegram hatch escalation (deny-by-default) ────────────────────────────────────────────
+
+def _fake_tg_ctl(path: Path, body: str) -> Path:
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return path
+
+
+def test_hatch_unset_blocks_and_names_env_var(monkeypatch):
+    out, _e, code = _run("review", monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS" in json.loads(out)["message"]
+
+
+def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nexit 0\n")
+    monkeypatch.setattr(nlip.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _e, code = _run("review", monkeypatch,
+                         env={"RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS": "1"})
+    assert code == nlip.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert not marker.exists()
+
+
+def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nprintf approved\nexit 0\n")
+    monkeypatch.setattr(nlip.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _e, code = _run(
+        "review", monkeypatch,
+        env={"RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS": "One-shot review, output needed now."},
+    )
+    assert code == 0 and _decision(out) == "allow"
+    assert marker.exists()
+    assert "hatch escalation" in json.loads(out)["message"].lower()
+
+
+def test_hatch_justification_exit1_blocks(tmp_path, monkeypatch):
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    monkeypatch.setattr(nlip.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _e, code = _run(
+        "review", monkeypatch,
+        env={"RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS": "One-shot review, output needed now."},
+    )
+    assert code == nlip.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "hatch escalation denied" in json.loads(out)["message"].lower()
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
+    """The justification supplied as an inline command PREFIX (env var NOT exported) must reach
+    tg-ctl via the new `command=` contract. Regression for the documented inline form (Codex #232)."""
+    marker = tmp_path / "asked"
+    question = tmp_path / "q.txt"
+    tg_ctl = _fake_tg_ctl(
+        tmp_path / "tg-ctl", f'touch {marker}\nprintf "%s" "$2" > "{question}"\nprintf approved\nexit 0\n')
+    monkeypatch.setattr(nlip.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _e, code = _run(
+        'RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS="one-shot review, output needed now" review',
+        monkeypatch)  # env deliberately NOT set — only the inline prefix
+    assert code == 0 and _decision(out) == "allow"
+    assert marker.exists()
+    assert "one-shot review, output needed now" in question.read_text()

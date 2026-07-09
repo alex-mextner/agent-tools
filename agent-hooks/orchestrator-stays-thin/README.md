@@ -91,21 +91,38 @@ This delivers the doctrine's "WARN then BLOCK" rather than a hard wall on the fi
 > The env-configured marker dir is read at import time; CC re-invokes the script per call, so a
 > per-session env change is always picked up on the next call — this is fine, not a footgun.
 
-## Escape hatch (controllable, not a hard wall)
+## No self-service bypass — external Telegram approval only
+
+There is **no** env-var or inline escape hatch any more. The old `ALLOW_ORCHESTRATOR_WORK=1` +
+`ALLOW_ORCHESTRATOR_WORK_REASON` env and the `# orchestrator-ok:` inline sentinel let the very
+orchestrator this gate constrains grant itself an exception — security theater, not a permission
+gate. Both were removed. (This is distinct from the per-repo **enable** knob
+`RIG_ORCHESTRATOR_ONLY` / `agent_hooks.orchestrator_only`, which a repo owner — not the
+constrained agent — sets to opt a repo out entirely; that stays.)
+
+The gate still **WARNs first**; only a would-be **BLOCK** (a repeat offense within the TTL
+window) is **deny-by-default**. For a genuine exception, ASK the human, or request a one-time
+Telegram approval with a written justification:
 
 ```bash
-# session-wide override (reason REQUIRED, or it still blocks) — works for BOTH points:
-ALLOW_ORCHESTRATOR_WORK=1 ALLOW_ORCHESTRATOR_WORK_REASON="trivial config tweak, no subagent worth it"
-
-# one-off, self-documenting — PRE-BASH ONLY:
-sed -i 's/a/b/' file   # orchestrator-ok: one-char fix in a generated file
+# pre-bash point: the inline VAR=… prefix is parsed out of the command string, so it works
+# even when the gated command is not first (`cd repo && RIG_HATCH_REQUEST_…="why" cmd`).
+RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN="trivial config tweak, no subagent worth it" \
+  sed -i 's/a/b/' file
 ```
 
-A reasonless `ALLOW_ORCHESTRATOR_WORK=1` is ignored and the action stays gated.
+The inline prefix form works **only at the pre-bash point** (the hook parses the leading
+assignment out of the command string; a pre-bash hook runs before the shell evaluates the
+`VAR=x cmd` prefix, so the value never reaches its `os.environ`). At the **pre-write** point
+(a code write via Edit/Write) there is no shell command to carry the prefix — the variable must
+be **exported** into the harness environment so the hook reads it from `os.environ`. An exported
+value takes precedence over an inline one at either point.
 
-> **The inline `# orchestrator-ok:` sentinel only applies to `pre-bash`.** A `pre-write` (an
-> Edit/Write tool call) carries no shell string for the comment to live in, so the inline hatch
-> genuinely cannot fire for a write — for a write use the **env** hatch above.
+If the env var is unset, no Telegram call is made and the block simply stands. If it is present
+but blank, whitespace-only, or a bare flag value (`1`/`true`/`yes`/`on`), the hook does not
+contact Telegram and denies — a bare `1` is not a justification. A real justification runs
+`tg-ctl ask` through a trusted absolute path (never ambient `PATH`); exit 0 allows, and any
+nonzero exit, launch error, or timeout denies. An agent can *request*, not self-grant.
 
 ## Fail-open, on purpose
 
