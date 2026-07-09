@@ -26,6 +26,14 @@ import pytest
 
 _SHIP = Path(__file__).resolve().parents[1] / "ci" / "ship" / "ship.sh"
 
+# The review-quorum gate (Guard-B, see the "review-quorum preflight gate" section of
+# ship.sh) defaults to ENABLED in the product, but almost every test in this file predates
+# it and exercises unrelated gates via a fake `gh` with no `review` CLI on PATH. Force it
+# off process-wide here; the quorum-gate tests below opt back in explicitly by setting
+# SHIP_REVIEW_QUORUM=1 in their own env dict (each test builds `env = dict(os.environ)`,
+# so a later explicit assignment there still wins over this default).
+os.environ.setdefault("SHIP_REVIEW_QUORUM", "0")
+
 # A fake `gh` that answers exactly the calls ship.sh makes (with --skip-ci the CI rollup
 # is not queried). Branch name is read from $SHIP_TEST_BRANCH so the test controls it.
 _FAKE_GH = """\
@@ -1806,6 +1814,381 @@ def test_review_dwell_rejects_non_numeric_window(repo_with_two_worktrees, tmp_pa
     r = _sh("bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
     assert r.returncode != 0, f"non-numeric window must be refused\n{r.stdout}\n{r.stderr}"
     assert "must be a non-negative integer" in r.stderr, r.stderr
+
+
+# --- review-quorum preflight gate (Guard-B, self-merge-authority program) -----------------
+# A fake `gh` complete enough that --skip-ci + --no-screenshot-ok leaves every OTHER gate
+# passing trivially (docs-only diff -> no version bump required, no UI touched; 0 unresolved
+# threads; old dwell timestamps), so these tests isolate the review-quorum gate itself. Also
+# answers `gh pr view --json body` (task-code-from-PR-body derivation) via SHIP_TEST_PR_BODY.
+_FAKE_GH_QUORUM = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        case "$*" in
+          *headRefName*) printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}" ;;
+          *"--json body"*) printf '%s' "${SHIP_TEST_PR_BODY:-}" ;;
+          *) echo '[]' ;;
+        esac ;;
+      diff) echo "README.md" ;;   # docs-only: version-bump/screenshot gates pass trivially
+      comment) : ;;
+      merge) echo "[fake gh] merged" ;;
+      *) : ;;
+    esac ;;
+  api)
+    if printf '%s ' "$@" | grep -q committedDate; then
+      printf '2020-01-01T00:00:00Z\\t\\t2020-01-01T00:00:00Z\\n'   # old dwell window -> passes
+    else
+      echo "0"   # 0 unresolved review threads
+    fi ;;
+  *) : ;;
+esac
+"""
+
+# A fake `review` CLI answering `review task <code> [--check|--quorum-check] --min-iter N
+# --min-models M --json`. Behavior is driven entirely by env vars so each test controls it:
+#   SHIP_TEST_REVIEW_ITER / SHIP_TEST_REVIEW_MODELS   iteration/model counts to report (default 3/3)
+#   SHIP_TEST_REVIEW_SUPPORTS_CHECK=0   reject --check with an argparse-style error (exit 2,
+#                                       empty stdout) so ship.sh must fall back to --quorum-check
+#   SHIP_TEST_REVIEW_BROKEN=1           fail BOTH --check and --quorum-check (simulates an
+#                                       unreadable stats store) -> ship.sh must fail closed
+#   SHIP_TEST_REVIEW_LOG                if set, append the flag actually used (check/quorum-check)
+#                                       so a test can assert which one ship.sh invoked
+_FAKE_REVIEW = """\
+#!/usr/bin/env bash
+sub="${1:-}"; shift || true
+[ "$sub" = "task" ] || exit 0
+code="${1:-}"; shift || true
+flag=""
+minit=3
+minmodels=3
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) flag="check" ;;
+    --quorum-check) flag="quorum-check" ;;
+    --min-iter) shift; minit="$1" ;;
+    --min-models) shift; minmodels="$1" ;;
+  esac
+  shift || true
+done
+if [ "$flag" = "check" ] && [ "${SHIP_TEST_REVIEW_SUPPORTS_CHECK:-1}" = "0" ]; then
+  echo "review task: error: unrecognized arguments: --check" >&2
+  exit 2
+fi
+[ -n "${SHIP_TEST_REVIEW_LOG:-}" ] && printf '%s\\n' "$flag" >> "${SHIP_TEST_REVIEW_LOG}"
+if [ "${SHIP_TEST_REVIEW_BROKEN:-0}" = "1" ]; then
+  echo "internal error: stats store unreadable" >&2
+  exit 1
+fi
+iterations="${SHIP_TEST_REVIEW_ITER:-3}"
+models_n="${SHIP_TEST_REVIEW_MODELS:-3}"
+passed="false"
+if [ "$iterations" -ge "$minit" ] && [ "$models_n" -ge "$minmodels" ]; then passed="true"; fi
+printf '{"task_code":"%s","iterations":%s,"distinct_models":%s,"models":["claude","codex","gemini"],"min_iter":%s,"min_models":%s,"passed":%s}\\n' \\
+  "$code" "$iterations" "$models_n" "$minit" "$minmodels" "$passed"
+"""
+
+
+def _fake_gh_quorum_dir(tmp_path: Path, name: str = "bin_gh_quorum") -> Path:
+    bindir = tmp_path / name
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_QUORUM, encoding="utf-8")
+    gh.chmod(0o755)
+    return bindir
+
+
+def _fake_review_dir(tmp_path: Path, name: str = "bin_review") -> Path:
+    bindir = tmp_path / name
+    bindir.mkdir()
+    fp = bindir / "review"
+    fp.write_text(_FAKE_REVIEW, encoding="utf-8")
+    fp.chmod(0o755)
+    return bindir
+
+
+def _make_repo_with_branch(tmp_path: Path, branch: str):
+    """A minimal repo on `main` with ONE feature branch (name controllable, for task-code
+    derivation from the branch) checked out in a worktree, plus an origin remote."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+    main = tmp_path / "main"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", branch, cwd=main)
+    _git("push", "-q", "origin", branch, cwd=main)
+    wt = tmp_path / "wt-quorum"
+    _git("worktree", "add", "-q", str(wt), branch, cwd=main)
+    return main, wt
+
+
+def _minimal_hermetic_path(*bindirs) -> str:
+    """A PATH built ONLY from the given fake-binary dirs plus the real dirs holding bash/git/jq
+    — deliberately excluding the ambient PATH. The quorum gate's "review CLI missing" test needs
+    this: this dev machine has a REAL `review` (review-cli) installed, and if the ambient PATH
+    were appended it would shadow the intended absence and the test would exercise the wrong
+    code path (a live query against the real store instead of a missing-binary refusal)."""
+    dirs = [str(d) for d in bindirs if d is not None]
+    for tool in ("bash", "git", "jq"):
+        found = shutil.which(tool)
+        if found:
+            d = str(Path(found).resolve().parent)
+            if d not in dirs:
+                dirs.append(d)
+    for d in ("/usr/bin", "/bin", "/usr/sbin", "/sbin"):
+        if d not in dirs:
+            dirs.append(d)
+    return os.pathsep.join(dirs)
+
+
+def _run_ship_quorum(main, gh_bindir, review_bindir, *, branch="feat", extra_args=(), env_extra=None):
+    env = dict(os.environ)
+    env["PATH"] = _minimal_hermetic_path(gh_bindir, review_bindir)
+    env["SHIP_TEST_BRANCH"] = branch
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_REVIEW_QUORUM"] = "1"   # opt back into the gate (module default is 0)
+    if env_extra:
+        env.update(env_extra)
+    return _sh(
+        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", *extra_args,
+        cwd=main, env=env,
+    )
+
+
+def test_review_quorum_blocks_when_bar_short(tmp_path):
+    """Fewer recorded iterations/models than the default 3/3 floor -> ship REFUSES."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"REVIEW_TASK_CODE": "HYP-100", "SHIP_TEST_REVIEW_ITER": "1", "SHIP_TEST_REVIEW_MODELS": "1"},
+    )
+    assert r.returncode != 0, f"a short quorum must be refused\n{r.stdout}\n{r.stderr}"
+    assert "review-quorum bar NOT met" in r.stderr, r.stderr
+    assert "HYP-100" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_review_quorum_passes_and_authorizes_when_bar_met(tmp_path):
+    """3 iterations across 3 models (the default floor) -> AUTHORITY CONFIRMED, then merges."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"REVIEW_TASK_CODE": "HYP-101", "SHIP_TEST_REVIEW_ITER": "3", "SHIP_TEST_REVIEW_MODELS": "3"},
+    )
+    assert r.returncode == 0, f"a met quorum should pass and merge\n{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
+    assert "HYP-101" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_review_quorum_calls_check_flag_by_default(tmp_path):
+    """The default invocation prefers --check (the review-cli rename target), not the legacy
+    --quorum-check spelling."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    log = tmp_path / "review-flag.log"
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"REVIEW_TASK_CODE": "HYP-102", "SHIP_TEST_REVIEW_LOG": str(log)},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert log.read_text().strip() == "check", f"expected --check to be used, log: {log.read_text()!r}"
+
+
+def test_review_quorum_falls_back_to_quorum_check_flag(tmp_path):
+    """When the installed review-cli doesn't yet support --check (rename in flight), ship.sh
+    falls back to the legacy --quorum-check spelling and still evaluates correctly."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    log = tmp_path / "review-flag.log"
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-103",
+            "SHIP_TEST_REVIEW_SUPPORTS_CHECK": "0",
+            "SHIP_TEST_REVIEW_LOG": str(log),
+        },
+    )
+    assert r.returncode == 0, f"fallback to --quorum-check should still pass a met quorum\n{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
+    assert log.read_text().strip() == "quorum-check", f"expected the --quorum-check fallback, log: {log.read_text()!r}"
+
+
+def test_review_quorum_override_with_reason(tmp_path):
+    """--no-review-quorum-ok <reason> lets a short/untracked quorum through, logging the reason."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        extra_args=("--no-review-quorum-ok", "trivial docs fix, no risk"),
+        env_extra={"REVIEW_TASK_CODE": "HYP-104", "SHIP_TEST_REVIEW_ITER": "0", "SHIP_TEST_REVIEW_MODELS": "0"},
+    )
+    assert r.returncode == 0, f"override should allow the ship\n{r.stdout}\n{r.stderr}"
+    assert "review-quorum gate OVERRIDDEN" in r.stdout, r.stdout
+    assert "trivial docs fix, no risk" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_review_quorum_disabled_via_env(tmp_path):
+    """SHIP_REVIEW_QUORUM=0 disables the gate entirely — merges even with no review CLI on
+    PATH and no derivable task code."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, review_bindir=None, env_extra={"SHIP_REVIEW_QUORUM": "0"})
+    assert r.returncode == 0, f"disabled gate must not block the ship\n{r.stdout}\n{r.stderr}"
+    assert "review-quorum gate disabled" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_review_quorum_fails_closed_when_review_cli_missing(tmp_path):
+    """No `review` binary on PATH -> refuse rather than merge unverified (fail-closed)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, review_bindir=None, env_extra={"REVIEW_TASK_CODE": "HYP-105"})
+    assert r.returncode != 0, f"a missing review CLI must fail closed\n{r.stdout}\n{r.stderr}"
+    assert "'review' CLI not found" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_fails_closed_when_store_broken(tmp_path):
+    """`review` is present but its store is unreadable (both flags fail) -> refuse rather than
+    merge unverified (fail-closed)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"REVIEW_TASK_CODE": "HYP-106", "SHIP_TEST_REVIEW_BROKEN": "1"},
+    )
+    assert r.returncode != 0, f"a broken review-cli store must fail closed\n{r.stdout}\n{r.stderr}"
+    assert "could not query review-cli" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_derives_code_from_branch_name(tmp_path):
+    """No $REVIEW_TASK_CODE set -> ship extracts the ticket token (HYP-742) from the branch name."""
+    main, _wt = _make_repo_with_branch(tmp_path, "fix/HYP-742-widget")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, rv, branch="fix/HYP-742-widget")
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "HYP-742" in r.stdout, r.stdout
+
+
+def test_review_quorum_derives_code_from_pr_body(tmp_path):
+    """No $REVIEW_TASK_CODE and no ticket in the branch name -> ship falls back to a ticket
+    token embedded in the PR body."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": "Fixes HYP-999 for the widget regression."},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "HYP-999" in r.stdout, r.stdout
+
+
+def test_review_quorum_refuses_when_no_task_code_derivable(tmp_path):
+    """No $REVIEW_TASK_CODE, no ticket in the branch, no ticket in the PR body -> refuse with
+    guidance rather than silently skip the gate."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": "no ticket here"})
+    assert r.returncode != 0, f"an undiscoverable task code must refuse\n{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "REVIEW_TASK_CODE" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_audit_log_records_authorized(tmp_path):
+    """A bar-met ship appends an 'authorized' JSONL audit line with the task code, iteration,
+    and model counts."""
+    import json
+
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    audit = tmp_path / "ship-audit.jsonl"
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"REVIEW_TASK_CODE": "HYP-107", "SHIP_AUDIT_FILE": str(audit)},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    lines = audit.read_text().strip().splitlines()
+    assert len(lines) == 1, f"expected exactly one audit line, got: {lines}"
+    rec = json.loads(lines[0])
+    assert rec["decision"] == "authorized", rec
+    assert rec["task_code"] == "HYP-107", rec
+    assert rec["iterations"] == 3, rec
+    assert rec["models"] == 3, rec
+    assert rec["pr"] == "1", rec
+    assert "ts" in rec, rec
+
+
+def test_review_quorum_audit_log_records_refused(tmp_path):
+    """A bar-short ship (that is then blocked) still appends a 'refused' JSONL audit line."""
+    import json
+
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    audit = tmp_path / "ship-audit.jsonl"
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-108", "SHIP_TEST_REVIEW_ITER": "1", "SHIP_TEST_REVIEW_MODELS": "1",
+            "SHIP_AUDIT_FILE": str(audit),
+        },
+    )
+    assert r.returncode != 0, f"{r.stdout}\n{r.stderr}"
+    rec = json.loads(audit.read_text().strip().splitlines()[0])
+    assert rec["decision"] == "refused", rec
+    assert rec["task_code"] == "HYP-108", rec
+    assert rec["iterations"] == 1, rec
+    assert rec["models"] == 1, rec
+
+
+def test_review_quorum_audit_log_records_overridden(tmp_path):
+    """An overridden ship appends an 'overridden' JSONL audit line carrying the reason."""
+    import json
+
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    audit = tmp_path / "ship-audit.jsonl"
+    r = _run_ship_quorum(
+        main, gh, rv,
+        extra_args=("--no-review-quorum-ok", "urgent hotfix, review pending"),
+        env_extra={"REVIEW_TASK_CODE": "HYP-109", "SHIP_AUDIT_FILE": str(audit)},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    rec = json.loads(audit.read_text().strip().splitlines()[0])
+    assert rec["decision"] == "overridden", rec
+    assert rec["task_code"] == "HYP-109", rec
+    assert rec["override_reason"] == "urgent hotfix, review pending", rec
 
 
 if __name__ == "__main__":

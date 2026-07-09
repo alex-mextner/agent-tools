@@ -11,6 +11,9 @@
 #     its questions yet — "0 unresolved threads" is vacuous if no review has posted).
 #   • A UI-touching PR has no embedded screenshot (see ci/screenshots/) — unless overridden.
 #   • The local branch has unpushed/diverged commits, or its worktree is dirty.
+#   • The review-quorum bar (Guard-B of the self-merge-authority program) is not met: the
+#     PR's task code has fewer than SHIP_REVIEW_QUORUM_MIN_ITER recorded review-cli iterations
+#     across SHIP_REVIEW_QUORUM_MIN_MODELS distinct models — unless overridden.
 #
 # All project-specific coupling is OPTIONAL and configured by env/flags — no issue-tracker,
 # no path layout, no org is hard-coded.
@@ -36,6 +39,9 @@
 #                          (genuine no-release ship: docs-only, pure test/CI, a revert).
 #   --no-review-dwell-ok R override the review-dwell window with a logged reason R (a genuine
 #                          fast-track: a trivial/urgent merge that doesn't need review latency).
+#   --no-review-quorum-ok R override the review-quorum gate (Guard-B) with a logged reason R
+#                          (a genuine exception: an untracked/trivial ship that doesn't need
+#                          the recorded multi-model review record).
 #   --screenshot P [D]     attach a local screenshot P (desc D) via SHIP_IMAGE_UPLOAD_CMD,
 #                          then post it as a PR comment. Repeatable.
 #
@@ -60,12 +66,23 @@
 #   SHIP_REVIEW_DWELL      minimum seconds since the PR's last code push before a merge is
 #                          allowed, so asynchronous review (multi-model / CI-AI / human) has
 #                          time to FORM its comments. Default 600 (10 min). 0 disables the gate.
+#   REVIEW_TASK_CODE       the task/ticket code (e.g. HYP-931) this ship belongs to, for the
+#                          review-quorum gate. If unset, ship derives it from a ticket-like
+#                          token in the branch name, then the PR body. If none is found, the
+#                          gate refuses (fail-closed) with guidance.
+#   SHIP_REVIEW_QUORUM_ENABLED / SHIP_REVIEW_QUORUM  set either to 0 to disable the
+#                          review-quorum gate entirely (default: enabled).
+#   SHIP_REVIEW_QUORUM_MIN_ITER    quorum floor: recorded review-cli iterations (default 3).
+#   SHIP_REVIEW_QUORUM_MIN_MODELS  quorum floor: distinct models (default 3).
+#   SHIP_AUDIT_FILE        path for the review-quorum gate's audit JSONL (default
+#                          ~/.config/agent-tools/ship-audit.jsonl). One line is appended per
+#                          gated ship (authorized / overridden / refused).
 set -euo pipefail
 
 ORIG_PWD=$(pwd -P)
-PR=""; SKIP_CI=0; DRY_RUN=0; NO_SHOT_OK=""; NO_VBUMP_OK=""; NO_DWELL_OK=""; REPO_FLAG=""
+PR=""; SKIP_CI=0; DRY_RUN=0; NO_SHOT_OK=""; NO_VBUMP_OK=""; NO_DWELL_OK=""; NO_QUORUM_OK=""; REPO_FLAG=""
 SHOT_PATHS=(); SHOT_DESCS=()
-USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--screenshot <path> [desc]]...'
+USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--no-review-quorum-ok <reason>] [--screenshot <path> [desc]]...'
 
 # --- arg parse (PR number is the lone bare arg; --screenshot takes path + optional desc) --
 args=("$@"); i=0; n=${#args[@]}
@@ -83,6 +100,9 @@ while [ "$i" -lt "$n" ]; do
     --no-review-dwell-ok)
       i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "--no-review-dwell-ok needs a <reason>." >&2; exit 1; }
       NO_DWELL_OK=${args[$i]}; [ -n "$NO_DWELL_OK" ] || { echo "--no-review-dwell-ok reason empty." >&2; exit 1; } ;;
+    --no-review-quorum-ok)
+      i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "--no-review-quorum-ok needs a <reason>." >&2; exit 1; }
+      NO_QUORUM_OK=${args[$i]}; [ -n "$NO_QUORUM_OK" ] || { echo "--no-review-quorum-ok reason empty." >&2; exit 1; } ;;
     --screenshot|--shot)
       i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "$a needs a <path>." >&2; exit 1; }
       p=${args[$i]}; case "$p" in /*) : ;; *) p="$ORIG_PWD/$p" ;; esac
@@ -873,6 +893,119 @@ if [ "$UI_TOUCHING" = "1" ]; then
     else
       echo "Refusing: PR #$PR touches UI but has NO embedded screenshot. Pass --screenshot <path> [desc]" >&2
       echo "  (with SHIP_IMAGE_UPLOAD_CMD set), or --no-screenshot-ok <reason> to override." >&2
+      exit 1
+    fi
+  fi
+fi
+
+# --- review-quorum preflight gate (Guard-B, self-merge-authority program) --------------
+# WHY this exists: the earlier gates verify CI is green and human/AI review THREADS are
+# resolved, but neither proves an actual multi-model review RAN. This gate is the "strictly
+# controlled" guarantee — it hard-refuses the merge unless review-cli's own record shows the
+# PR's task code has enough recorded review iterations across enough distinct models (a
+# STRUCTURAL check on runs that were dispatched, not on their verdicts — see `review task
+# --help`). Fail-CLOSED: a missing `review` CLI, an unreadable store, or no derivable task
+# code all refuse rather than merge unverified.
+#
+# Runs independently of --skip-ci, same posture as the review-dwell gate above.
+# Override with --no-review-quorum-ok <reason> (logged) or disable entirely with
+# SHIP_REVIEW_QUORUM_ENABLED=0 / SHIP_REVIEW_QUORUM=0.
+
+# Prints the first ticket-like token found in $1, or nothing. Tries the repo's own HYP-<n>
+# convention first (case-insensitive, normalized to uppercase), then a generic
+# UPPERCASE-PREFIX-<n> ticket token (2+ uppercase letters, a hyphen, digits) so other repos'
+# conventions (JIRA-style PROJ-123, etc.) are also picked up. The generic pattern is
+# deliberately uppercase-only so it doesn't false-match ordinary prose like "utf-8" or "step-2".
+_review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing; ALWAYS exits 0
+  local text="$1" m
+  m=$(printf '%s\n' "$text" | grep -oiE 'HYP-[0-9]+' | head -1 || true)
+  if [ -n "$m" ]; then printf '%s' "$m" | tr '[:lower:]' '[:upper:]'; return 0; fi
+  m=$(printf '%s\n' "$text" | grep -oE '[A-Z][A-Z]+-[0-9]+' | head -1 || true)
+  printf '%s' "$m"
+  return 0
+}
+
+# Append one audit line to the review-quorum audit log. Best-effort: a logging failure must
+# never block or unblock the ship, so failures here are swallowed (`|| true`).
+# $1=decision(authorized|overridden|refused) $2=task_code $3=iterations $4=models $5=reason(optional)
+_review_quorum_audit_log() {
+  local decision="$1" code="$2" iterations="${3:-0}" models="${4:-0}" reason="${5:-}"
+  local file="${SHIP_AUDIT_FILE:-$HOME/.config/agent-tools/ship-audit.jsonl}"
+  mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
+  local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if command -v jq >/dev/null 2>&1; then
+    jq -nc --arg ts "$ts" --arg pr "$PR" --arg code "$code" --argjson it "$iterations" \
+      --argjson m "$models" --arg dec "$decision" \
+      --arg reason "$reason" \
+      '{ts:$ts, pr:$pr, task_code:$code, iterations:$it, models:$m, decision:$dec} +
+       (if $reason == "" then {} else {override_reason:$reason} end)' \
+      >> "$file" 2>/dev/null || true
+  fi
+}
+
+QUORUM_ENABLED=1
+case "${SHIP_REVIEW_QUORUM_ENABLED:-1}" in 0|false|no) QUORUM_ENABLED=0 ;; esac
+case "${SHIP_REVIEW_QUORUM:-1}" in 0|false|no) QUORUM_ENABLED=0 ;; esac
+
+if [ "$QUORUM_ENABLED" = "0" ]; then
+  echo "[ship] review-quorum gate disabled (SHIP_REVIEW_QUORUM_ENABLED/SHIP_REVIEW_QUORUM=0)."
+else
+  MIN_ITER="${SHIP_REVIEW_QUORUM_MIN_ITER:-3}"
+  MIN_MODELS="${SHIP_REVIEW_QUORUM_MIN_MODELS:-3}"
+
+  TASK_CODE="${REVIEW_TASK_CODE:-}"
+  [ -n "$TASK_CODE" ] || TASK_CODE=$(_review_quorum_extract_ticket "$BRANCH")
+  if [ -z "$TASK_CODE" ]; then
+    PR_BODY_QC=$(gh pr view "$PR" --json body -q '.body // ""' 2>/dev/null) || PR_BODY_QC=""
+    TASK_CODE=$(_review_quorum_extract_ticket "$PR_BODY_QC")
+  fi
+
+  if [ -z "$TASK_CODE" ]; then
+    if [ -n "$NO_QUORUM_OK" ]; then
+      echo "[ship] review-quorum gate OVERRIDDEN (no task code found) — reason: $NO_QUORUM_OK"
+      _review_quorum_audit_log overridden "" 0 0 "$NO_QUORUM_OK"
+    else
+      { echo "Refusing: could not derive a task code for the review-quorum gate — set \$REVIEW_TASK_CODE, or put the ticket code (e.g. HYP-931) in the branch name or the PR body."
+        echo "  Override ONLY if this ship is genuinely untracked: --no-review-quorum-ok <reason> (or SHIP_REVIEW_QUORUM=0 to disable the gate)."; } >&2
+      exit 1
+    fi
+  elif [ -n "$NO_QUORUM_OK" ]; then
+    echo "[ship] review-quorum gate OVERRIDDEN for ${TASK_CODE} — reason: $NO_QUORUM_OK"
+    _review_quorum_audit_log overridden "$TASK_CODE" 0 0 "$NO_QUORUM_OK"
+  else
+    command -v review >/dev/null 2>&1 || { echo "Refusing: 'review' CLI not found on PATH — cannot verify the review-quorum bar (Guard-B of the self-merge-authority program) for ${TASK_CODE}. Install review-cli, or override with --no-review-quorum-ok <reason> (or SHIP_REVIEW_QUORUM=0)." >&2; exit 1; }
+    command -v jq >/dev/null 2>&1 || { echo "Refusing: jq is required to evaluate the review-quorum gate (install jq, or override with --no-review-quorum-ok <reason>)." >&2; exit 1; }
+
+    # Prefer --check (the review-cli rename target); fall back to --quorum-check when running
+    # against a review-cli build that hasn't picked up the rename yet. In --json mode review-cli
+    # always prints JSON to stdout (pass or fail) — only an unsupported-flag argparse error
+    # leaves stdout empty, which is the fallback trigger.
+    QUORUM_JSON=$(review task "$TASK_CODE" --check --min-iter "$MIN_ITER" --min-models "$MIN_MODELS" --json 2>/dev/null) || true
+    if [ -z "$QUORUM_JSON" ]; then
+      QUORUM_JSON=$(review task "$TASK_CODE" --quorum-check --min-iter "$MIN_ITER" --min-models "$MIN_MODELS" --json 2>/dev/null) || true
+    fi
+
+    if [ -z "$QUORUM_JSON" ]; then
+      { echo "Refusing: could not query review-cli for the review-quorum gate (task ${TASK_CODE}) — refusing rather than merge unverified."
+        echo "  Fix review-cli / its stats store, or override with --no-review-quorum-ok <reason>."; } >&2
+      _review_quorum_audit_log refused "$TASK_CODE" 0 0 ""
+      exit 1
+    fi
+
+    QPASSED=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed // false' 2>/dev/null || echo false)
+    QITER=$(printf '%s' "$QUORUM_JSON" | jq -r '.iterations // 0' 2>/dev/null || echo 0)
+    QMODELS_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_models // 0' 2>/dev/null || echo 0)
+    QMODELS=$(printf '%s' "$QUORUM_JSON" | jq -r '(.models // []) | join(", ")' 2>/dev/null || echo "")
+    QERR=$(printf '%s' "$QUORUM_JSON" | jq -r '.error // empty' 2>/dev/null || echo "")
+
+    if [ "$QPASSED" = "true" ]; then
+      echo "[ship] AUTHORITY CONFIRMED — review quorum met: ${QITER} iterations across ${QMODELS_N} models for ${TASK_CODE}. Self-merge authorized by the review-quorum gate."
+      _review_quorum_audit_log authorized "$TASK_CODE" "$QITER" "$QMODELS_N" ""
+    else
+      { echo "Refusing: review-quorum bar NOT met for ${TASK_CODE} — ${QITER}/${MIN_ITER} iterations, ${QMODELS_N}/${MIN_MODELS} distinct models${QMODELS:+ (models seen: ${QMODELS})}${QERR:+ (${QERR})}."
+        echo "  Run more independent review iterations (e.g. \`review diff --task ${TASK_CODE}\`) across distinct models, then re-run ship."
+        echo "  Override ONLY for a genuine exception: --no-review-quorum-ok <reason> (or SHIP_REVIEW_QUORUM=0 to disable the gate)."; } >&2
+      _review_quorum_audit_log refused "$TASK_CODE" "$QITER" "$QMODELS_N" ""
       exit 1
     fi
   fi
