@@ -6,19 +6,54 @@
 # that used to live at the top of this file has MOVED UP into the composer so it
 # runs exactly ONCE — do NOT re-add it here.
 #
-# Blocks a commit whose staged diff has not been reviewed. Bypass with
-#   REVIEW_SKIP=1 git commit ...   or   git commit --no-verify
+# Blocks a commit whose staged diff has not been reviewed. There is no REVIEW_SKIP
+# self-service bypass; `git commit --no-verify` remains Git's blanket hook bypass.
 #
 # `command git` bypasses shell aliases and functions (e.g. an rtk-style wrapper that
 # rewrites `git diff` output), so the hash matches the one written by review-cli, which
 # also calls the real git binary directly. Without this, a shell alias rewriting `git diff`
 # could produce a different hash and block a legitimately-reviewed commit.
-[ -n "$REVIEW_SKIP" ] && exit 0
-[ -z "$(command git diff --cached --name-only)" ] && exit 0
+if ! files="$(command git -c core.quotepath=false diff --cached --name-only --no-renames)"; then
+  echo "review-before-commit: could not list staged files; refusing to skip review." >&2
+  exit 1
+fi
+[ -z "$files" ] && exit 0
+
+is_docs_path() {
+  path="$1"
+  lower_path="$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')"
+  lower_base="${lower_path##*/}"
+
+  case "$lower_path" in
+    agents.md|claude.md|*/agents.md|*/claude.md|skill.md|*/skill.md|skills/*|*/skills/*|agent-hooks/*|*/agent-hooks/*) return 1 ;;
+  esac
+
+  case "$lower_base" in
+    makefile|dockerfile|containerfile|jenkinsfile|vagrantfile|rakefile|gemfile|procfile|brewfile|justfile|cmakelists.txt|requirements.txt) return 1 ;;
+  esac
+
+  case "$lower_path" in
+    *.md|*.mdx|*.markdown|*.rst|*.adoc|*.rdoc|*.pod) return 0 ;;
+  esac
+
+  case "$lower_path" in
+    docs/*.txt|docs/*.text|docs/*.png|docs/*.jpg|docs/*.jpeg|docs/*.gif|docs/*.webp|docs/*.avif|docs/*.pdf) return 0 ;;
+  esac
+
+  return 1
+}
+
+if printf '%s\n' "$files" | while IFS= read -r path; do
+  [ -z "$path" ] && continue
+  is_docs_path "$path" || exit 1
+done; then
+  exit 0
+fi
+
 h=$(command git diff --no-ext-diff --cached | shasum -a 256 | cut -d' ' -f1)
 stamp=$(command git rev-parse --git-path review-stamp)
 if [ -f "$stamp" ] && grep -q "$h" "$stamp"; then exit 0; fi
 echo "review-before-commit: staged changes have not been reviewed." >&2
-echo "  run:  review --staged      (then commit)" >&2
-echo "  skip: REVIEW_SKIP=1 git commit ...   |   git commit --no-verify" >&2
+echo "  run:  review diff --staged      (then commit)" >&2
+echo "  skip: none in this gate (Git's --no-verify bypasses this and all other hooks)" >&2
 exit 1
