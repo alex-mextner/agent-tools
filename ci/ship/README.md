@@ -22,6 +22,7 @@ that isn't actually ready even with a one-liner.
 | **PR younger than the review-dwell window** | Closes the premature-merge gap: the unresolved-threads check above only fails when threads *already exist*, so "0 unresolved threads" is **vacuously true** before any review has posted — a PR opened and shipped within seconds passes it without a single question forming. The dwell gate refuses until at least `SHIP_REVIEW_DWELL` seconds (default **600 / 10 min**) have elapsed since the PR's last code push, giving async review (multi-model / CI-AI / human) time to form its comments (which then become threads the check above forces resolved). Runs **independently of `--skip-ci`**. Window starts at `max(createdAt, head-commit committedDate)` so a new push restarts it. Disable with `SHIP_REVIEW_DWELL=0`; override one ship with `--no-review-dwell-ok <reason>` (logged). Fail-closed: unreadable/unparseable timestamps refuse. |
 | UI-touching PR with no screenshot | Same check as [`../screenshots/`](../screenshots/); override with `--no-screenshot-ok`. |
 | **Shippable source changed but the version is UNCHANGED** | A ship of source is a release; the declared version (`pyproject.toml` `version`/`package.json` `"version"`) must be bumped so `--version` stays a real freshness signal (skill: `bump-version-on-release`). Docs-only / pure test/CI PRs are exempt. Override a genuine no-release ship with `--no-version-bump-ok <reason>` (or `SHIP_SKIP_VERSION_BUMP=1`). |
+| **Review-quorum bar not met** (Guard-B, self-merge-authority) | The gate that makes self-merge *"strictly controlled"*. Before merging, ship derives the PR's task code (`$REVIEW_TASK_CODE`, else a `HYP-<n>`/uppercase ticket token from the branch name, else the PR body) and asks review-cli whether that task has ≥ `SHIP_REVIEW_QUORUM_MIN_ITER` recorded review iterations across ≥ `SHIP_REVIEW_QUORUM_MIN_MODELS` distinct models (`review task <code> --check`, falling back to `--quorum-check` on an older review-cli). Bar met → prints `AUTHORITY CONFIRMED` and proceeds. Bar not met, no task code, `review`/`jq` missing, or the store unreadable → **fail-closed refuse**. There is **NO self-service override flag**: a one-time bypass is requested by setting `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>"`, which asks Alex **live on Telegram** (via the shared `agenttools_hatch_escalation` lib) and proceeds ONLY on his real-time approval — a blank/bare value is denied. Runs **independently of `--skip-ci`**. Every gated ship appends an audit line (`authorized` / `bypass:approved` / `bypass:denied` / `refused`) to `SHIP_AUDIT_FILE`. Disable the whole gate with `SHIP_REVIEW_QUORUM=0`. |
 | Local branch has unpushed/diverged commits, or dirty worktree | Avoids merging stale/uncommitted local state. |
 
 Then it squash-merges, deletes the remote branch, removes the local branch+worktree
@@ -60,6 +61,13 @@ Nothing org-/tracker-/layout-specific is hard-coded. Configure via env:
 | `SHIP_SKIP_VERSION_BUMP` | (unset) | `=1` overrides the version-bump gate (env equivalent of `--no-version-bump-ok`). |
 | `SHIP_VERSION_FILES` | auto-detect | Space-separated version files to check (relative to repo root). Default: `pyproject.toml` then `package.json` at the root. Set for a non-standard layout. |
 | `SHIP_REVIEW_DWELL` | `600` | Minimum seconds since the PR's last code push before a merge is allowed, so async review has time to **form** its comments. `0` disables the gate. |
+| `SHIP_REVIEW_QUORUM` / `SHIP_REVIEW_QUORUM_ENABLED` | enabled | Set either to `0` to disable the review-quorum gate (Guard-B) entirely (ops off-switch). |
+| `SHIP_REVIEW_QUORUM_MIN_ITER` | `3` | Quorum floor: recorded review-cli iterations for the task. |
+| `SHIP_REVIEW_QUORUM_MIN_MODELS` | `3` | Quorum floor: distinct models across those iterations. |
+| `REVIEW_TASK_CODE` | (auto) | The PR's task code for the quorum gate. Unset → derived from a `HYP-<n>`/uppercase ticket token in the branch name, then the PR body; none found → fail-closed refuse. |
+| `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM` | (unset) | One-time bypass request for a not-met quorum bar: set to a written justification to ask Alex live on Telegram (shared `agenttools_hatch_escalation` lib); proceeds ONLY on his real-time approval. Blank/bare values denied. **No self-service reason flag exists.** |
+| `SHIP_HATCH_LIB_DIR` | (derived) | Override the `lib/` dir the hatch escalation imports from (default: relative to `ship.sh`). |
+| `SHIP_AUDIT_FILE` | `~/.config/agent-tools/ship-audit.jsonl` | JSONL audit log; one line per gated ship (`authorized` / `bypass:approved` / `bypass:denied` / `refused`). |
 
 ## Flags
 
@@ -73,6 +81,10 @@ Nothing org-/tracker-/layout-specific is hard-coded. Configure via env:
   trivial/urgent merge, logged (the reason is printed to the ship log).
 - `--screenshot <path> [desc]` — upload (via `SHIP_IMAGE_UPLOAD_CMD`) and post a screenshot
   as a PR comment; repeatable.
+
+The **review-quorum gate (Guard-B) has no override flag** by design — a bypass goes through live
+Telegram approval to Alex via `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>"` (see the env
+table above), never a self-service reason.
 
 ## What was stripped vs an internal version
 

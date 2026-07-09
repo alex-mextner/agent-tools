@@ -169,6 +169,16 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   of source is a release, so `--version` stays a real freshness signal instead of a stale
   literal (skill: `bump-version-on-release`); override a genuine no-release ship with
   `--no-version-bump-ok <reason>` or `SHIP_SKIP_VERSION_BUMP=1`;
+- the **review-quorum bar is met** (Guard-B of the self-merge-authority program) — the PR's task
+  code (`$REVIEW_TASK_CODE`, else a `HYP-<n>`/uppercase ticket token from the branch name or PR
+  body) has ≥ `SHIP_REVIEW_QUORUM_MIN_ITER` recorded review-cli iterations across ≥
+  `SHIP_REVIEW_QUORUM_MIN_MODELS` distinct models (`review task <code> --check`). This is the gate
+  that makes self-merge *strictly controlled*; it **fails closed** (a missing task code / `review`
+  CLI / readable store all refuse). There is **NO self-service override flag** — a one-time bypass
+  is requested via `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>"`, which asks Alex live
+  on Telegram (shared `agenttools_hatch_escalation` lib) and proceeds ONLY on his real-time
+  approval. Disable the whole gate with `SHIP_REVIEW_QUORUM=0`. Every gated ship is audited to
+  `SHIP_AUDIT_FILE`;
 - the local branch has **no unpushed/diverged commits** and a **clean worktree**.
 
 Then it squash-merges, deletes the remote branch, removes the local worktree + branch (unless
