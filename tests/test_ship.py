@@ -19,12 +19,21 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 _SHIP = Path(__file__).resolve().parents[1] / "ci" / "ship" / "ship.sh"
+
+# The review-quorum gate (Guard-B, see the "review-quorum preflight gate" section of
+# ship.sh) defaults to ENABLED in the product, but almost every test in this file predates
+# it and exercises unrelated gates via a fake `gh` with no `review` CLI on PATH. Force it
+# off process-wide here; the quorum-gate tests below opt back in explicitly by setting
+# SHIP_REVIEW_QUORUM=1 in their own env dict (each test builds `env = dict(os.environ)`,
+# so a later explicit assignment there still wins over this default).
+os.environ.setdefault("SHIP_REVIEW_QUORUM", "0")
 
 # A fake `gh` that answers exactly the calls ship.sh makes (with --skip-ci the CI rollup
 # is not queried). Branch name is read from $SHIP_TEST_BRANCH so the test controls it.
@@ -1973,6 +1982,781 @@ def test_review_dwell_rejects_non_numeric_window(repo_with_two_worktrees, tmp_pa
     r = _sh("bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
     assert r.returncode != 0, f"non-numeric window must be refused\n{r.stdout}\n{r.stderr}"
     assert "must be a non-negative integer" in r.stderr, r.stderr
+
+
+# --- review-quorum preflight gate (Guard-B, self-merge-authority program) -----------------
+# A fake `gh` complete enough that --skip-ci + --no-screenshot-ok leaves every OTHER gate
+# passing trivially (docs-only diff -> no version bump required, no UI touched; 0 unresolved
+# threads; old dwell timestamps), so these tests isolate the review-quorum gate itself. Also
+# answers `gh pr view --json body` (task-code-from-PR-body derivation) via SHIP_TEST_PR_BODY.
+_FAKE_GH_QUORUM = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        case "$*" in
+          *headRefName*) printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}" ;;
+          *"--json body"*) printf '%s' "${SHIP_TEST_PR_BODY:-}" ;;
+          *) echo '[]' ;;
+        esac ;;
+      diff) echo "README.md" ;;   # docs-only: version-bump/screenshot gates pass trivially
+      comment) : ;;
+      merge) echo "[fake gh] merged" ;;
+      *) : ;;
+    esac ;;
+  api)
+    if printf '%s ' "$@" | grep -q committedDate; then
+      printf '2020-01-01T00:00:00Z\\t\\t2020-01-01T00:00:00Z\\n'   # old dwell window -> passes
+    else
+      echo "0"   # 0 unresolved review threads
+    fi ;;
+  *) : ;;
+esac
+"""
+
+# A fake `review` CLI answering `review task <code> [--check|--quorum-check] --min-iter N
+# --min-models M --json`. Behavior is driven entirely by env vars so each test controls it:
+#   SHIP_TEST_REVIEW_ITER / SHIP_TEST_REVIEW_MODELS   iteration/model counts to report (default 3/3)
+#   SHIP_TEST_REVIEW_SUPPORTS_CHECK=0   reject --check with an argparse-style error (exit 2,
+#                                       empty stdout) so ship.sh must fall back to --quorum-check
+#   SHIP_TEST_REVIEW_BROKEN=1           fail BOTH --check and --quorum-check (simulates an
+#                                       unreadable stats store) -> ship.sh must fail closed
+#   SHIP_TEST_REVIEW_LOG                if set, append the flag actually used (check/quorum-check)
+#                                       so a test can assert which one ship.sh invoked
+_FAKE_REVIEW = """\
+#!/usr/bin/env bash
+sub="${1:-}"; shift || true
+[ "$sub" = "task" ] || exit 0
+code="${1:-}"; shift || true
+flag=""
+minit=3
+minmodels=3
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) flag="check" ;;
+    --quorum-check) flag="quorum-check" ;;
+    --min-iter) shift; minit="$1" ;;
+    --min-models) shift; minmodels="$1" ;;
+  esac
+  shift || true
+done
+if [ "$flag" = "check" ] && [ "${SHIP_TEST_REVIEW_SUPPORTS_CHECK:-1}" = "0" ]; then
+  echo "review task: error: unrecognized arguments: --check" >&2
+  exit 2
+fi
+[ -n "${SHIP_TEST_REVIEW_LOG:-}" ] && printf '%s\\n' "$flag" >> "${SHIP_TEST_REVIEW_LOG}"
+if [ "${SHIP_TEST_REVIEW_BROKEN:-0}" = "1" ]; then
+  echo "internal error: stats store unreadable" >&2
+  exit 1
+fi
+iterations="${SHIP_TEST_REVIEW_ITER:-3}"
+models_n="${SHIP_TEST_REVIEW_MODELS:-3}"
+passed="false"
+if [ "$iterations" -ge "$minit" ] && [ "$models_n" -ge "$minmodels" ]; then passed="true"; fi
+printf '{"task_code":"%s","iterations":%s,"distinct_models":%s,"models":["claude","codex","gemini"],"min_iter":%s,"min_models":%s,"passed":%s}\\n' \\
+  "$code" "$iterations" "$models_n" "$minit" "$minmodels" "$passed"
+"""
+
+
+def _fake_gh_quorum_dir(tmp_path: Path, name: str = "bin_gh_quorum") -> Path:
+    bindir = tmp_path / name
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_QUORUM, encoding="utf-8")
+    gh.chmod(0o755)
+    return bindir
+
+
+def _fake_review_dir(tmp_path: Path, name: str = "bin_review") -> Path:
+    bindir = tmp_path / name
+    bindir.mkdir()
+    fp = bindir / "review"
+    fp.write_text(_FAKE_REVIEW, encoding="utf-8")
+    fp.chmod(0o755)
+    return bindir
+
+
+def _make_repo_with_branch(tmp_path: Path, branch: str):
+    """A minimal repo on `main` with ONE feature branch (name controllable, for task-code
+    derivation from the branch) checked out in a worktree, plus an origin remote."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+    main = tmp_path / "main"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", branch, cwd=main)
+    _git("push", "-q", "origin", branch, cwd=main)
+    wt = tmp_path / "wt-quorum"
+    _git("worktree", "add", "-q", str(wt), branch, cwd=main)
+    return main, wt
+
+
+def _minimal_hermetic_path(*bindirs) -> str:
+    """A PATH built ONLY from the given fake-binary dirs plus the real dirs holding bash/git/jq
+    — deliberately excluding the ambient PATH. The quorum gate's "review CLI missing" test needs
+    this: this dev machine has a REAL `review` (review-cli) installed, and if the ambient PATH
+    were appended it would shadow the intended absence and the test would exercise the wrong
+    code path (a live query against the real store instead of a missing-binary refusal)."""
+    dirs = [str(d) for d in bindirs if d is not None]
+    # python3 is needed by the review-quorum hatch escalation bridge (ship.sh shells out to it
+    # to call the shared agenttools_hatch_escalation lib), so it must be on the hermetic PATH.
+    for tool in ("bash", "git", "jq", "python3"):
+        found = shutil.which(tool)
+        if found:
+            d = str(Path(found).resolve().parent)
+            if d not in dirs:
+                dirs.append(d)
+    for d in ("/usr/bin", "/bin", "/usr/sbin", "/sbin"):
+        if d not in dirs:
+            dirs.append(d)
+    return os.pathsep.join(dirs)
+
+
+def _write_fake_tg_ctl(tmp_path: Path, *, name: str, body: str) -> Path:
+    """A fake `tg-ctl` the hatch lib will invoke as `tg-ctl ask <question> --timeout <s>`.
+    `body` is the shell after the shebang; $2 is the question text."""
+    fp = tmp_path / name
+    fp.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    fp.chmod(0o755)
+    return fp
+
+
+def _fake_home_with_tg_ctl(tmp_path: Path, tg_ctl: Path, *, name: str = "fake-home") -> Path:
+    """A fake HOME dir carrying a rig.yaml whose `agent_hooks.tg_ctl_path` points at the fake
+    tg-ctl. The hatch helper resolves tg-ctl from the OS account's real home (pwd.getpwuid), so
+    in-process module tests monkeypatch `resolve_home` to return THIS dir — a controllable tg-ctl
+    that never touches the real one or messages Alex, matching the production resolution path."""
+    home = tmp_path / name
+    home.mkdir()
+    (home / "rig.yaml").write_text(
+        f'agent_hooks:\n  tg_ctl_path: "{tg_ctl}"\n', encoding="utf-8"
+    )
+    return home
+
+
+def _run_ship_quorum(main, gh_bindir, review_bindir, *, branch="feat", extra_args=(), env_extra=None):
+    env = dict(os.environ)
+    env["PATH"] = _minimal_hermetic_path(gh_bindir, review_bindir)
+    env["SHIP_TEST_BRANCH"] = branch
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_REVIEW_QUORUM"] = "1"   # opt back into the gate (module default is 0)
+    # Never let an ambient hatch-request env var leak into a test that doesn't set one (it would
+    # turn a plain refusal into a live tg-ctl call). Tests that exercise the hatch set it via
+    # env_extra AFTER this pop.
+    env.pop("RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM", None)
+    if env_extra:
+        env.update(env_extra)
+    return _sh(
+        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", *extra_args,
+        cwd=main, env=env,
+    )
+
+
+def test_review_quorum_blocks_when_bar_short(tmp_path):
+    """Fewer recorded iterations/models than the default 3/3 floor -> ship REFUSES."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"REVIEW_TASK_CODE": "HYP-100", "SHIP_TEST_REVIEW_ITER": "1", "SHIP_TEST_REVIEW_MODELS": "1"},
+    )
+    assert r.returncode != 0, f"a short quorum must be refused\n{r.stdout}\n{r.stderr}"
+    assert "bar NOT met" in r.stderr, r.stderr
+    assert "HYP-100" in r.stderr, r.stderr
+    # No self-service override exists; the refusal must point at the hatch env var instead.
+    assert "RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_review_quorum_passes_and_authorizes_when_bar_met(tmp_path):
+    """3 iterations across 3 models (the default floor) -> AUTHORITY CONFIRMED, then merges."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"REVIEW_TASK_CODE": "HYP-101", "SHIP_TEST_REVIEW_ITER": "3", "SHIP_TEST_REVIEW_MODELS": "3"},
+    )
+    assert r.returncode == 0, f"a met quorum should pass and merge\n{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
+    assert "HYP-101" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_review_quorum_calls_check_flag_by_default(tmp_path):
+    """The default invocation prefers --check (the review-cli rename target), not the legacy
+    --quorum-check spelling."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    log = tmp_path / "review-flag.log"
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"REVIEW_TASK_CODE": "HYP-102", "SHIP_TEST_REVIEW_LOG": str(log)},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert log.read_text().strip() == "check", f"expected --check to be used, log: {log.read_text()!r}"
+
+
+def test_review_quorum_falls_back_to_quorum_check_flag(tmp_path):
+    """When the installed review-cli doesn't yet support --check (rename in flight), ship.sh
+    falls back to the legacy --quorum-check spelling and still evaluates correctly."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    log = tmp_path / "review-flag.log"
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-103",
+            "SHIP_TEST_REVIEW_SUPPORTS_CHECK": "0",
+            "SHIP_TEST_REVIEW_LOG": str(log),
+        },
+    )
+    assert r.returncode == 0, f"fallback to --quorum-check should still pass a met quorum\n{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
+    assert log.read_text().strip() == "quorum-check", f"expected the --quorum-check fallback, log: {log.read_text()!r}"
+
+
+def test_review_quorum_disabled_via_env(tmp_path):
+    """SHIP_REVIEW_QUORUM=0 disables the gate entirely — merges even with no review CLI on
+    PATH and no derivable task code."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, review_bindir=None, env_extra={"SHIP_REVIEW_QUORUM": "0"})
+    assert r.returncode == 0, f"disabled gate must not block the ship\n{r.stdout}\n{r.stderr}"
+    assert "review-quorum gate disabled" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_review_quorum_fails_closed_when_review_cli_missing(tmp_path):
+    """No `review` binary on PATH -> refuse rather than merge unverified (fail-closed)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, review_bindir=None, env_extra={"REVIEW_TASK_CODE": "HYP-105"})
+    assert r.returncode != 0, f"a missing review CLI must fail closed\n{r.stdout}\n{r.stderr}"
+    assert "'review' CLI not found" in r.stderr, r.stderr
+    assert "RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_fails_closed_when_store_broken(tmp_path):
+    """`review` is present but its store is unreadable (both flags fail) -> refuse rather than
+    merge unverified (fail-closed)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"REVIEW_TASK_CODE": "HYP-106", "SHIP_TEST_REVIEW_BROKEN": "1"},
+    )
+    assert r.returncode != 0, f"a broken review-cli store must fail closed\n{r.stdout}\n{r.stderr}"
+    assert "could not query review-cli" in r.stderr, r.stderr
+    assert "RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_derives_code_from_branch_name(tmp_path):
+    """No $REVIEW_TASK_CODE set -> ship extracts the ticket token (HYP-742) from the branch name."""
+    main, _wt = _make_repo_with_branch(tmp_path, "fix/HYP-742-widget")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, rv, branch="fix/HYP-742-widget")
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "HYP-742" in r.stdout, r.stdout
+
+
+def test_review_quorum_derives_code_from_pr_body(tmp_path):
+    """No $REVIEW_TASK_CODE and no ticket in the branch name -> ship falls back to a ticket
+    token embedded in the PR body."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": "Fixes HYP-999 for the widget regression."},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "HYP-999" in r.stdout, r.stdout
+
+
+def test_review_quorum_refuses_when_no_task_code_derivable(tmp_path):
+    """No $REVIEW_TASK_CODE, no ticket in the branch, no ticket in the PR body -> refuse with
+    guidance rather than silently skip the gate."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": "no ticket here"})
+    assert r.returncode != 0, f"an undiscoverable task code must refuse\n{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "REVIEW_TASK_CODE" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_audit_log_records_authorized(tmp_path):
+    """A bar-met ship appends an 'authorized' JSONL audit line with the task code, iteration,
+    and model counts."""
+    import json
+
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    audit = tmp_path / "ship-audit.jsonl"
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"REVIEW_TASK_CODE": "HYP-107", "SHIP_AUDIT_FILE": str(audit)},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    lines = audit.read_text().strip().splitlines()
+    assert len(lines) == 1, f"expected exactly one audit line, got: {lines}"
+    rec = json.loads(lines[0])
+    assert rec["decision"] == "authorized", rec
+    assert rec["task_code"] == "HYP-107", rec
+    assert rec["iterations"] == 3, rec
+    assert rec["models"] == 3, rec
+    assert rec["pr"] == "1", rec
+    assert "ts" in rec, rec
+
+
+def test_review_quorum_audit_log_records_refused(tmp_path):
+    """A bar-short ship (that is then blocked) still appends a 'refused' JSONL audit line."""
+    import json
+
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    audit = tmp_path / "ship-audit.jsonl"
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-108", "SHIP_TEST_REVIEW_ITER": "1", "SHIP_TEST_REVIEW_MODELS": "1",
+            "SHIP_AUDIT_FILE": str(audit),
+        },
+    )
+    assert r.returncode != 0, f"{r.stdout}\n{r.stderr}"
+    rec = json.loads(audit.read_text().strip().splitlines()[0])
+    assert rec["decision"] == "refused", rec
+    assert rec["task_code"] == "HYP-108", rec
+    assert rec["iterations"] == 1, rec
+    assert rec["models"] == 1, rec
+
+
+def test_review_quorum_audit_log_skipped_in_dry_run(tmp_path):
+    """--dry-run must honor its 'change nothing' contract: a bar-met (would-be authorized) run
+    still evaluates and prints the gate verdict, but MUST NOT create or append to the audit file.
+    Regression for the Codex P2 (#225) where the audit line was written even in dry-run."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    audit = tmp_path / "ship-audit.jsonl"
+    r = _run_ship_quorum(
+        main, gh, rv, extra_args=("--dry-run",),
+        env_extra={"REVIEW_TASK_CODE": "HYP-109", "SHIP_AUDIT_FILE": str(audit)},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    # The gate still evaluated and reported it would authorize...
+    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
+    assert "[dry-run] would append review-quorum audit" in r.stderr, r.stderr
+    # ...but no persistent audit record was written.
+    assert not audit.exists(), f"dry-run must not write the audit file, found: {audit.read_text()!r}"
+
+
+# --- hatch escalation: the ONLY bypass for a not-met review-quorum bar ---------------------
+# There is no self-service override flag. A short bar can only be bypassed by setting
+# RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>", which routes through the
+# ci/ship/review_quorum_hatch.py helper -> the shared agenttools_hatch_escalation lib ->
+# `tg-ctl ask` Alex live. The helper resolves tg-ctl from the OS account's REAL home
+# (pwd.getpwuid), NOT $HOME and NOT the repo, so nothing the shipper/PR controls can redirect
+# approval. The hatch MECHANICS (approve/deny/timeout/empty + the bypass:* audit + the
+# HOME-is-ignored guarantee) are tested IN-PROCESS against the real helper with `resolve_home`
+# monkeypatched to a fake home — this is the only way to exercise a controllable tg-ctl through a
+# subprocess without touching the real one (mirrors how pin-primary-worktree tests the shared
+# lib). The ship.sh<->helper WIRING (proceed on exit 0, refuse otherwise, fail-closed when the
+# helper is unreachable) is tested via the subprocess with a fake helper, so no real tg-ctl is
+# ever invoked.
+
+_HATCH_MOD_DIR = str(Path(__file__).resolve().parents[1] / "ci" / "ship")
+
+
+def _load_hatch_module():
+    """Import ci/ship/review_quorum_hatch as a module (fresh each call so a monkeypatched
+    resolve_home never leaks between tests)."""
+    import importlib
+
+    if _HATCH_MOD_DIR not in sys.path:
+        sys.path.insert(0, _HATCH_MOD_DIR)
+    mod = importlib.import_module("review_quorum_hatch")
+    return importlib.reload(mod)
+
+
+def _run_hatch_main(monkeypatch, tmp_path, *, request, resolve_home, audit,
+                    timeout="5", margin=None, trusted=None):
+    """Call review_quorum_hatch.main() with resolve_home monkeypatched to a fixed dir and the
+    hatch env set. Returns the exit code. `resolve_home` is the dir the helper will treat as the
+    account's real home (where it looks for a rig.yaml tg_ctl_path override)."""
+    mod = _load_hatch_module()
+    monkeypatch.setattr(mod, "resolve_home", lambda: str(resolve_home))
+    if trusted is not None:
+        monkeypatch.setattr(mod.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", tuple(trusted))
+    monkeypatch.setenv("RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM", request)
+    monkeypatch.setenv("SHIP_AUDIT_FILE", str(audit))
+    monkeypatch.setenv("SHIP_HATCH_PR", "1")
+    monkeypatch.setenv("SHIP_HATCH_CODE", "HYP-200")
+    monkeypatch.setenv("SHIP_HATCH_ITER", "1")
+    monkeypatch.setenv("SHIP_HATCH_MODELS", "1")
+    monkeypatch.setenv("SHIP_HATCH_TIMEOUT_S", timeout)
+    if margin is not None:
+        monkeypatch.setenv("SHIP_HATCH_PROCESS_MARGIN_S", margin)
+    return mod.main()
+
+
+def test_hatch_empty_request_is_denied_without_tg_contact(tmp_path, monkeypatch):
+    """A hatch request with an EMPTY value is invalid: the lib denies it without contacting
+    tg-ctl, the helper exits 1 and audits bypass:denied."""
+    import json
+
+    marker = tmp_path / "tg-called"
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body=f"touch {marker}\nexit 0\n")
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_hatch_main(monkeypatch, tmp_path, request="", resolve_home=home, audit=audit)
+    assert rc == 1, "an empty hatch value must be denied"
+    assert not marker.exists(), "tg-ctl must NOT be contacted for a blank hatch request"
+    rec = json.loads(audit.read_text().strip())
+    assert rec["decision"] == "bypass:denied", rec
+
+
+def test_hatch_reason_triggers_tg_ask_and_approval_returns_0(tmp_path, monkeypatch):
+    """A real justification runs `tg-ctl ask`; on Alex's live approval the helper returns 0,
+    the question carries the hook id + justification + PR context, and it audits bypass:approved."""
+    import json
+
+    question_file = tmp_path / "question.txt"
+    tg = _write_fake_tg_ctl(
+        tmp_path, name="tg-ctl",
+        body=f'printf "%s" "$2" > "{question_file}"\nprintf "approved by Alex\\n"\nexit 0\n',
+    )
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_hatch_main(
+        monkeypatch, tmp_path,
+        request="Security hotfix for prod outage; review dispatched, cannot wait for quorum.",
+        resolve_home=home, audit=audit,
+    )
+    assert rc == 0, "a live-approved hatch must return 0"
+    question = question_file.read_text()
+    assert "ship-review-quorum" in question, question
+    assert "Security hotfix for prod outage" in question, question
+    assert "HYP-200" in question, question
+    rec = json.loads(audit.read_text().strip())
+    assert rec["decision"] == "bypass:approved", rec
+    assert "approved by Alex" in rec.get("override_reason", ""), rec
+
+
+def test_hatch_denial_returns_1_and_audits(tmp_path, monkeypatch):
+    """When Alex declines (tg-ctl exits non-zero) the helper returns 1 and audits bypass:denied."""
+    import json
+
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body='printf "declined\\n"\nexit 1\n')
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_hatch_main(
+        monkeypatch, tmp_path, request="Please let this through, I am in a hurry.",
+        resolve_home=home, audit=audit,
+    )
+    assert rc == 1, "a declined hatch must return 1"
+    rec = json.loads(audit.read_text().strip())
+    assert rec["decision"] == "bypass:denied", rec
+
+
+def test_hatch_timeout_returns_1(tmp_path, monkeypatch):
+    """When Alex does not answer in time (tg-ctl hangs past the timeout) the helper returns 1 —
+    silence is not approval."""
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body="sleep 10\nexit 0\n")
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_hatch_main(
+        monkeypatch, tmp_path, request="No response expected — testing the timeout path.",
+        resolve_home=home, audit=audit, timeout="1", margin="1",
+    )
+    assert rc == 1, "a timed-out hatch must return 1"
+
+
+def test_hatch_helper_import_resists_pythonpath_hijack(tmp_path):
+    """P0 regression (codex review): a shipping agent must not be able to swap the shared lib via
+    PYTHONPATH. The helper loads agenttools_hatch_escalation by EXPLICIT FILE PATH (and ship.sh
+    additionally runs it under `python3 -I`), so a same-named module planted on PYTHONPATH is NOT
+    imported — even with PYTHONPATH active and no isolation flag, the REAL lib wins."""
+    mal = tmp_path / "mal"
+    mal.mkdir()
+    (mal / "agenttools_hatch_escalation.py").write_text(
+        "MALICIOUS = True\n"
+        "def request_hatch_approval(*a, **k):\n"
+        "    class R:\n        approved = True\n        env_present = True\n        reason = 'EVIL'\n"
+        "    return R()\n",
+        encoding="utf-8",
+    )
+    real_lib_dir = Path(__file__).resolve().parents[1] / "lib"
+    real_init = real_lib_dir / "agenttools_hatch_escalation" / "__init__.py"
+    hatch_dir = str(Path(__file__).resolve().parents[1] / "ci" / "ship")
+    probe = (
+        f"import sys; sys.path.insert(0, {hatch_dir!r}); "
+        "import review_quorum_hatch as m; "
+        "print(m.hatch_escalation.__file__); "
+        "print('MAL' if getattr(m.hatch_escalation, 'MALICIOUS', False) else 'REAL')"
+    )
+    env = dict(os.environ)
+    # The exact attack shape: PYTHONPATH lists the MALICIOUS dir BEFORE the real lib dir. A naive
+    # "insert real lib only if not already in sys.path" would then skip the prepend (the real lib
+    # is already present via PYTHONPATH) and import the malicious module first. The by-path load
+    # must beat this. No -I here: prove the by-path import alone defeats it (belt); ship.sh runs
+    # the helper under -I too (suspenders).
+    env["PYTHONPATH"] = os.pathsep.join([str(mal), str(real_lib_dir)])
+    r = _sh("python3", "-c", probe, cwd=tmp_path, env=env)
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert str(real_init) in r.stdout, f"helper loaded the wrong lib:\n{r.stdout}"
+    assert r.stdout.strip().splitlines()[-1] == "REAL", r.stdout
+
+
+def test_audit_line_written_without_jq(tmp_path):
+    """P2 regression (codex review): the audit line must not be DROPPED when jq is absent —
+    jq-missing is itself a hatchable gate refusal, so its fail-closed audit must still land via the
+    printf fallback. Run ship with NO jq on PATH and assert a parseable JSON audit line is written.
+    (The review-quorum gate refuses with 'jq not found', then audits.)"""
+    import json
+
+    if not shutil.which("jq"):
+        pytest.skip("jq not installed on this host — the jq-less path is the ambient default")
+    audit = tmp_path / "audit.jsonl"
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    # jq usually lives alongside the coreutils ship needs (e.g. /usr/bin), so we can't just drop a
+    # dir. Build a symlink farm of every system executable EXCEPT jq, and use only that + fakes.
+    farm = tmp_path / "nojq-farm"
+    farm.mkdir()
+    for sysdir in ("/usr/bin", "/bin"):
+        d = Path(sysdir)
+        if not d.is_dir():
+            continue
+        for entry in d.iterdir():
+            if entry.name == "jq":
+                continue
+            link = farm / entry.name
+            if not link.exists():
+                try:
+                    link.symlink_to(entry)
+                except OSError:
+                    pass
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join([str(gh), str(rv), str(farm)])
+    assert shutil.which("jq", path=env["PATH"]) is None, "test PATH must not contain jq"
+    assert shutil.which("bash", path=env["PATH"]) and shutil.which("git", path=env["PATH"]), \
+        "test PATH must still carry bash + git"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_REVIEW_QUORUM"] = "1"
+    env["REVIEW_TASK_CODE"] = "HYP-200"
+    env["SHIP_TEST_REVIEW_ITER"] = "1"
+    env["SHIP_TEST_REVIEW_MODELS"] = "1"
+    env["SHIP_AUDIT_FILE"] = str(audit)
+    env.pop("RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM", None)
+    # A PR selector containing a double-quote: the jq-less fallback must escape it (the raw path
+    # would emit invalid JSON / a corrupt line). The fake gh accepts any PR value.
+    pr_arg = '9"x'
+    r = _sh("bash", str(_SHIP), pr_arg, "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode != 0, f"jq-missing must refuse\n{r.stdout}\n{r.stderr}"
+    assert audit.exists(), "audit file must exist even without jq"
+    lines = [ln for ln in audit.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 1, f"exactly one audit line (no injected line from the quoted PR): {lines}"
+    rec = json.loads(lines[-1])  # must be valid JSON (printf fallback, pr escaped)
+    assert rec["task_code"] == "HYP-200", rec
+    assert rec["decision"] == "refused", rec
+    assert rec["pr"] == pr_arg, rec  # round-trips through the escaping
+
+
+def test_resolve_home_uses_os_identity_not_HOME_env(tmp_path, monkeypatch):
+    """resolve_home() must key off the OS account identity (pwd.getpwuid), NOT the $HOME env var
+    — that is the P0 fix: a shipper who exports a doctored HOME cannot move the location the hatch
+    trusts for tg-ctl. Guards against a regression to `os.environ["HOME"]`."""
+    import pwd
+
+    mod = _load_hatch_module()
+    real = pwd.getpwuid(os.getuid()).pw_dir
+    monkeypatch.setenv("HOME", str(tmp_path / "doctored-home"))
+    assert mod.resolve_home() == real, "resolve_home must ignore $HOME and use the OS identity"
+
+
+def test_hatch_ignores_HOME_env_and_pr_repo_rig_yaml(tmp_path, monkeypatch):
+    """The account's REAL home (resolve_home) is the ONLY rig.yaml consulted for tg-ctl. A
+    doctored $HOME pointing at an always-approve stub — the same shape a PR could commit — must
+    be IGNORED, so with the real home carrying no override and no trusted tg-ctl, the helper does
+    NOT approve. This is the P0/P1 self-authorization fix: neither $HOME nor the repo can redirect
+    approval."""
+    # $HOME (and, equivalently, a PR-committed repo rig.yaml) points at an APPROVE stub...
+    approve = _write_fake_tg_ctl(tmp_path, name="approve", body='printf "approved\\n"\nexit 0\n')
+    doctored_home = _fake_home_with_tg_ctl(tmp_path, approve, name="doctored-home")
+    monkeypatch.setenv("HOME", str(doctored_home))
+    # ...but the REAL account home (resolve_home) has NO rig.yaml, and no trusted tg-ctl resolves.
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_hatch_main(
+        monkeypatch, tmp_path, request="Attempted bypass via a doctored HOME / repo rig.yaml.",
+        resolve_home=real_home, audit=audit, trusted=(),
+    )
+    assert rc == 1, "a doctored HOME / repo rig.yaml must NOT be able to self-approve"
+
+
+# --- ship.sh <-> helper wiring (subprocess; fake helper, no real tg-ctl) -------------------
+
+def _install_fake_hatch_helper(dst_dir: Path, *, exit_code: int, message: str = "") -> None:
+    """Write a fake review_quorum_hatch.py next to a ship.sh copy — a stand-in for the real helper
+    so the ship.sh wiring can be tested without invoking any tg-ctl. It emits the same stdout
+    VERDICT sentinel the real helper does (ship.sh authorizes only on 'APPROVED'): exit 0 ->
+    'APPROVED <msg>', exit 1 -> 'DENIED <msg>', anything else -> just the message on stderr (no
+    sentinel, simulating a crashed/aborted helper)."""
+    body = "import sys\n"
+    if exit_code == 0:
+        body += f"sys.stdout.write('APPROVED ' + {message!r} + '\\n')\n"
+    elif exit_code == 1:
+        body += f"sys.stdout.write('DENIED ' + {message!r} + '\\n')\n"
+    elif message:
+        body += f"sys.stderr.write({message!r})\n"
+    body += f"sys.exit({exit_code})\n"
+    (dst_dir / "review_quorum_hatch.py").write_text(body, encoding="utf-8")
+
+
+def _ship_copy_with_helper(tmp_path: Path, *, helper_exit, helper_msg=""):
+    """A ship.sh copied into a temp ci/ship/ dir, optionally with a fake helper beside it. When
+    `helper_exit` is None NO helper is written (simulating a bare `cp ship.sh` that can't reach
+    the hatch). Returns the ship.sh copy path."""
+    dst = tmp_path / "toolcopy" / "ci" / "ship"
+    dst.mkdir(parents=True)
+    ship_copy = dst / "ship.sh"
+    ship_copy.write_text(_SHIP.read_text(encoding="utf-8"), encoding="utf-8")
+    ship_copy.chmod(0o755)
+    if helper_exit is not None:
+        _install_fake_hatch_helper(dst, exit_code=helper_exit, message=helper_msg)
+    return ship_copy
+
+
+def _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy, *, request, audit=None):
+    """Run a ship.sh copy against a SHORT bar (1/1) with a hatch request set."""
+    env = dict(os.environ)
+    env["PATH"] = _minimal_hermetic_path(gh, rv)
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_REVIEW_QUORUM"] = "1"
+    env["REVIEW_TASK_CODE"] = "HYP-200"
+    env["SHIP_TEST_REVIEW_ITER"] = "1"
+    env["SHIP_TEST_REVIEW_MODELS"] = "1"
+    env["RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM"] = request
+    env.pop("SHIP_HATCH_TIMEOUT_S", None)
+    if audit is not None:
+        env["SHIP_AUDIT_FILE"] = str(audit)
+    return _sh("bash", str(ship_copy), "1", "--skip-ci", "--no-screenshot-ok", "test",
+               cwd=main, env=env)
+
+
+def test_ship_proceeds_when_helper_approves(tmp_path):
+    """ship.sh treats a helper exit 0 as an approved bypass and proceeds to merge."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    ship_copy = _ship_copy_with_helper(tmp_path, helper_exit=0)
+    r = _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy,
+                                 request="Approved out-of-band by Alex.")
+    assert r.returncode == 0, f"helper exit 0 must proceed\n{r.stdout}\n{r.stderr}"
+    assert "APPROVED by Alex" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_ship_refuses_when_helper_denies(tmp_path):
+    """ship.sh treats a helper exit 1 (requested-but-not-approved) as a refusal and does not
+    merge; the helper owns the bypass:denied audit so ship.sh does not double-write it."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    ship_copy = _ship_copy_with_helper(tmp_path, helper_exit=1, helper_msg="declined by Alex")
+    r = _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy,
+                                 request="Declined bypass attempt.")
+    assert r.returncode != 0, f"helper exit 1 must refuse\n{r.stdout}\n{r.stderr}"
+    assert "NOT approved" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_ship_fails_closed_when_helper_unreachable(tmp_path):
+    """A bare `cp ci/ship/ship.sh` copy with NO sibling helper (the detached-install shape the
+    codex review flagged) fails CLOSED on a hatch request: python3 can't run the missing helper,
+    ship.sh refuses and records a fail-closed bypass:denied audit."""
+    import json
+
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+    ship_copy = _ship_copy_with_helper(tmp_path, helper_exit=None)  # NO helper written
+    r = _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy,
+                                 request="genuine urgent reason", audit=audit)
+    assert r.returncode != 0, f"a missing helper must fail closed\n{r.stdout}\n{r.stderr}"
+    assert "NOT approved" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+    rec = json.loads(audit.read_text().strip().splitlines()[-1])
+    assert rec["decision"] == "bypass:denied", rec
+
+
+def test_ship_fails_closed_when_python3_exits_zero_without_sentinel(tmp_path):
+    """P0 regression (codex round 4): the hatch must not FAIL OPEN on a `python3` that merely
+    exits 0. A fake python3 first on PATH (exit 0, no output) must NOT be read as approval —
+    ship.sh authorizes only on the explicit APPROVED stdout sentinel, so this fails CLOSED and
+    records bypass:denied. (Removes the fail-open asymmetry vs the other gates, which fail closed
+    on a tool malfunction.)"""
+    import json
+
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+    # A fake python3 that exits 0 with NO sentinel (a broken/planted interpreter). Only the hatch
+    # uses python3, so shadowing it doesn't disturb the rest of the gate.
+    shim = tmp_path / "fakepy"
+    shim.mkdir()
+    (shim / "python3").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (shim / "python3").chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join([str(shim), _minimal_hermetic_path(gh, rv)])
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_REVIEW_QUORUM"] = "1"
+    env["REVIEW_TASK_CODE"] = "HYP-200"
+    env["SHIP_TEST_REVIEW_ITER"] = "1"
+    env["SHIP_TEST_REVIEW_MODELS"] = "1"
+    env["SHIP_AUDIT_FILE"] = str(audit)
+    env["RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM"] = "genuine reason but python3 is faked"
+    r = _sh("bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode != 0, f"a fake python3 exiting 0 must fail closed\n{r.stdout}\n{r.stderr}"
+    assert "NOT approved" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+    rec = json.loads(audit.read_text().strip().splitlines()[-1])
+    assert rec["decision"] == "bypass:denied", rec
 
 
 if __name__ == "__main__":

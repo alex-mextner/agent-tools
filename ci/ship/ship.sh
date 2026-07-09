@@ -11,6 +11,11 @@
 #     its questions yet — "0 unresolved threads" is vacuous if no review has posted).
 #   • A UI-touching PR has no embedded screenshot (see ci/screenshots/) — unless overridden.
 #   • The local branch has unpushed/diverged commits, or its worktree is dirty.
+#   • The review-quorum bar (Guard-B of the self-merge-authority program) is not met: the
+#     PR's task code has fewer than SHIP_REVIEW_QUORUM_MIN_ITER recorded review-cli iterations
+#     across SHIP_REVIEW_QUORUM_MIN_MODELS distinct models. There is NO self-service override —
+#     a one-time bypass goes through a live Telegram approval to Alex (see the hatch escalation
+#     below), never a reason flag.
 #
 # All project-specific coupling is OPTIONAL and configured by env/flags — no issue-tracker,
 # no path layout, no org is hard-coded.
@@ -39,6 +44,12 @@
 #   --screenshot P [D]     attach a local screenshot P (desc D) via SHIP_IMAGE_UPLOAD_CMD,
 #                          then post it as a PR comment. Repeatable.
 #
+# NOTE: the review-quorum gate (Guard-B) has NO override FLAG. When its bar is not met and you
+# genuinely need to proceed, request a one-time bypass by setting the env var
+#   RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>"
+# which asks Alex live on Telegram (via the shared agenttools_hatch_escalation lib) and proceeds
+# ONLY on his real-time approval. SHIP_REVIEW_QUORUM=0 disables the whole gate (ops off-switch).
+#
 # Knobs (env):
 #   SHIP_MAIN_CHECKOUT     path to the primary (main) checkout for the post-merge pull.
 #                          Default: first worktree in `git worktree list`.
@@ -60,12 +71,45 @@
 #   SHIP_REVIEW_DWELL      minimum seconds since the PR's last code push before a merge is
 #                          allowed, so asynchronous review (multi-model / CI-AI / human) has
 #                          time to FORM its comments. Default 600 (10 min). 0 disables the gate.
+#   REVIEW_TASK_CODE       the task/ticket code (e.g. HYP-931) this ship belongs to, for the
+#                          review-quorum gate. If unset, ship derives it from a ticket-like
+#                          token in the branch name, then the PR body. If none is found, the
+#                          gate refuses (fail-closed) with guidance.
+#   SHIP_REVIEW_QUORUM_ENABLED / SHIP_REVIEW_QUORUM  set either to 0 to disable the
+#                          review-quorum gate entirely (default: enabled).
+#   SHIP_REVIEW_QUORUM_MIN_ITER    quorum floor: recorded review-cli iterations (default 3).
+#   SHIP_REVIEW_QUORUM_MIN_MODELS  quorum floor: distinct models (default 3).
+#   RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM  one-time bypass request for the review-quorum gate:
+#                          set it to a written justification to ask Alex live on Telegram (via
+#                          the shared agenttools_hatch_escalation lib); the gate proceeds ONLY on
+#                          his real-time approval. Blank/bare-flag values are denied; unset means
+#                          no bypass requested (the gate refuses with guidance). tg-ctl is
+#                          resolved by the shared lib from a rig.yaml agent_hooks.tg_ctl_path in
+#                          the OS account's REAL home (pwd.getpwuid — NOT the $HOME env var, NOT
+#                          the PR's repo), then a trusted-paths allowlist. Neither the lib dir nor
+#                          tg-ctl is env- or repo-overridable, so nothing the shipper/PR controls
+#                          can redirect approval to a stub.
+#   SHIP_AUDIT_FILE        path for the review-quorum gate's audit JSONL (default
+#                          ~/.config/agent-tools/ship-audit.jsonl). One line is appended per
+#                          gated ship (authorized / bypass:approved / bypass:denied / refused).
 set -euo pipefail
 
 ORIG_PWD=$(pwd -P)
 PR=""; SKIP_CI=0; DRY_RUN=0; NO_SHOT_OK=""; NO_VBUMP_OK=""; NO_DWELL_OK=""; REPO_FLAG=""
 SHOT_PATHS=(); SHOT_DESCS=()
 USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--screenshot <path> [desc]]...'
+
+# Path to the review-quorum gate's hatch-escalation helper (ci/ship/review_quorum_hatch.py),
+# derived ONLY from this script's own location. That helper imports the shared
+# agenttools_hatch_escalation lib from a fixed path (lib/ two levels up) — the SAME lib the
+# pin-primary-worktree / block-reset-hard agent-hooks use — so a bypass goes through live Telegram
+# approval, never a self-service flag, and neither the lib nor tg-ctl is env-/repo-overridable
+# (see the helper's docstring). If ship.sh was copied OUT of the checkout (e.g. to ~/bin), the
+# helper import fails CLOSED — the gate still refuses; the bypass just can't run from a detached
+# copy. Run ship from within the agent-tools checkout to use the hatch.
+_SHIP_SELF_SRC="${BASH_SOURCE[0]:-$0}"
+_SHIP_SELF_DIR="$(cd "$(dirname "$_SHIP_SELF_SRC")" 2>/dev/null && pwd -P || echo /nonexistent)"
+_SHIP_HATCH_PY="$_SHIP_SELF_DIR/review_quorum_hatch.py"
 
 # --- arg parse (PR number is the lone bare arg; --screenshot takes path + optional desc) --
 args=("$@"); i=0; n=${#args[@]}
@@ -887,6 +931,210 @@ if [ "$UI_TOUCHING" = "1" ]; then
       echo "Refusing: PR #$PR touches UI but has NO embedded screenshot. Pass --screenshot <path> [desc]" >&2
       echo "  (with SHIP_IMAGE_UPLOAD_CMD set), or --no-screenshot-ok <reason> to override." >&2
       exit 1
+    fi
+  fi
+fi
+
+# --- review-quorum preflight gate (Guard-B, self-merge-authority program) --------------
+# WHY this exists: the earlier gates verify CI is green and human/AI review THREADS are
+# resolved, but neither proves an actual multi-model review RAN. This gate is the "strictly
+# controlled" guarantee — it hard-refuses the merge unless review-cli's own record shows the
+# PR's task code has enough recorded review iterations across enough distinct models (a
+# STRUCTURAL check on runs that were dispatched, not on their verdicts — see `review task
+# --help`). Fail-CLOSED: a missing `review` CLI, an unreadable store, or no derivable task
+# code all refuse rather than merge unverified.
+#
+# There is NO self-service override. When the bar is not met (or cannot be verified) and the
+# agent genuinely needs to proceed, it sets RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>";
+# that routes through the shared agenttools_hatch_escalation lib (the SAME lib the
+# pin-primary-worktree / block-reset-hard agent-hooks use) to ask Alex live on Telegram, and the
+# gate proceeds ONLY on his real-time approval. SHIP_REVIEW_QUORUM=0 disables the whole gate.
+#
+# Runs independently of --skip-ci, same posture as the review-dwell gate above.
+
+# Prints the first ticket-like token found in $1, or nothing. Tries the repo's own HYP-<n>
+# convention first (case-insensitive, normalized to uppercase), then a generic
+# UPPERCASE-PREFIX-<n> ticket token (2+ uppercase letters, a hyphen, digits) so other repos'
+# conventions (JIRA-style PROJ-123, etc.) are also picked up. The generic pattern is
+# deliberately uppercase-only so it doesn't false-match ordinary prose like "utf-8" or "step-2".
+_review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing; ALWAYS exits 0
+  local text="$1" m
+  m=$(printf '%s\n' "$text" | grep -oiE 'HYP-[0-9]+' | head -1 || true)
+  if [ -n "$m" ]; then printf '%s' "$m" | tr '[:lower:]' '[:upper:]'; return 0; fi
+  m=$(printf '%s\n' "$text" | grep -oE '[A-Z][A-Z]+-[0-9]+' | head -1 || true)
+  printf '%s' "$m"
+  return 0
+}
+
+# Append one audit line to the review-quorum audit log. Best-effort: a logging failure must
+# never block or unblock the ship, so failures here are swallowed (`|| true`).
+# $1=decision(authorized|bypass:approved|bypass:denied|refused) $2=task_code $3=iterations
+# $4=models $5=reason(optional — the hatch verdict for bypass:* decisions)
+_review_quorum_audit_log() {
+  local decision="$1" code="$2" iterations="${3:-0}" models="${4:-0}" reason="${5:-}"
+  # Honor the --dry-run contract ("print what would happen; change nothing"): a simulated ship
+  # must not create or pollute the real audit record. The gate above still evaluates and prints
+  # its authorized/refused verdict — only the persistent write is suppressed here.
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "[dry-run] would append review-quorum audit: decision=${decision} task=${code} iter=${iterations} models=${models}" >&2
+    return 0
+  fi
+  local file="${SHIP_AUDIT_FILE:-$HOME/.config/agent-tools/ship-audit.jsonl}"
+  mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
+  local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if command -v jq >/dev/null 2>&1; then
+    jq -nc --arg ts "$ts" --arg pr "$PR" --arg code "$code" --argjson it "$iterations" \
+      --argjson m "$models" --arg dec "$decision" \
+      --arg reason "$reason" \
+      '{ts:$ts, pr:$pr, task_code:$code, iterations:$it, models:$m, decision:$dec} +
+       (if $reason == "" then {} else {override_reason:$reason} end)' \
+      >> "$file" 2>/dev/null || true
+  else
+    # jq-less fallback so the audit line is never DROPPED just because jq is absent (jq-missing is
+    # itself a gate refusal that can reach the hatch, so the fail-closed bypass:denied audit must
+    # still land). Emit minimal JSON via printf. The free-text fields (pr, task_code, reason) are
+    # each made JSON-safe: newlines/CR/tab -> space and other control chars stripped (so none can
+    # inject a forged extra JSONL line), then backslash + double-quote escaped. `pr` is escaped too
+    # — it is a bare CLI arg, so a quote/control char in it must not corrupt the line (the jq path
+    # is already safe via --arg). iterations/models are validated integers; decision is internal.
+    local esc_pr esc_code esc_reason
+    esc_pr=$(printf '%s' "$PR" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    esc_code=$(printf '%s' "$code" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    esc_reason=$(printf '%s' "$reason" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    { if [ -n "$reason" ]; then
+        printf '{"ts":"%s","pr":"%s","task_code":"%s","iterations":%s,"models":%s,"decision":"%s","override_reason":"%s"}\n' \
+          "$ts" "$esc_pr" "$esc_code" "${iterations:-0}" "${models:-0}" "$decision" "$esc_reason"
+      else
+        printf '{"ts":"%s","pr":"%s","task_code":"%s","iterations":%s,"models":%s,"decision":"%s"}\n' \
+          "$ts" "$esc_pr" "$esc_code" "${iterations:-0}" "${models:-0}" "$decision"
+      fi; } >> "$file" 2>/dev/null || true
+  fi
+}
+
+# Ask Alex, live on Telegram, to approve a one-time review-quorum bypass, by invoking the
+# ci/ship/review_quorum_hatch.py helper (which delegates to the shared agenttools_hatch_escalation
+# lib exactly as the agent-hooks do). Called ONLY when RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM is set.
+# The helper prints a verdict SENTINEL + reason on stdout ("APPROVED …" / "DENIED …") and OWNS the
+# bypass:* audit line; its exit code: 0 approved, 1 requested-but-not-approved (blank/bare/denied/
+# timeout), 3 the shared lib could not be imported (fail-closed — e.g. ship.sh copied out of the
+# checkout). ship.sh authorizes ONLY on exit 0 AND a leading APPROVED sentinel.
+#
+# SECURITY: neither WHICH lib runs nor WHICH tg-ctl is asked is shipper-controllable. The helper
+# imports the lib from a fixed path, and resolves tg-ctl off the OS identity's REAL home
+# (pwd.getpwuid) — NOT the $HOME env var and NOT the repo worktree — so no ambient env var and no
+# rig.yaml a PR commits can redirect approval to an always-approve stub. (SHIP_HATCH_TIMEOUT_S can
+# only SHORTEN the wait, which fails CLOSED — a shorter wait denies, never approves — so it is a
+# safe tuning knob, not a bypass.)
+_review_quorum_hatch_check() {  # uses $TASK_CODE $QITER $QMODELS_N $PR
+  # `python3 -I` = isolated mode: ignores PYTHONPATH/PYTHONHOME, skips the user site and
+  # sitecustomize, and does not add cwd to sys.path — so a shipping agent cannot inject a
+  # malicious module or a startup hook that would self-approve. The helper additionally loads the
+  # shared lib by explicit file path (see its docstring), belt-and-suspenders.
+  SHIP_HATCH_PR="$PR" \
+  SHIP_HATCH_CODE="${TASK_CODE:-}" \
+  SHIP_HATCH_ITER="${QITER:-0}" \
+  SHIP_HATCH_MODELS="${QMODELS_N:-0}" \
+  python3 -I "$_SHIP_HATCH_PY"
+}
+
+# Terminal handler for a review-quorum refusal: either the hatch escalation approves a one-time
+# bypass (return 0 -> ship proceeds), or the ship is refused (exits 1). $1 is the human one-line
+# summary of WHY the bar wasn't met (or couldn't be verified). Uses $TASK_CODE / $QITER /
+# $QMODELS_N (set to safe defaults by the caller before any early refusal).
+_review_quorum_refuse_or_hatch() {  # $1 = refusal summary
+  local summary="$1"
+  # Distinguish TRULY-UNSET (no bypass requested) from set-but-empty (an invalid request the lib
+  # denies): `${var+x}` is empty only when the var is unset. Unset -> refuse with the how-to;
+  # set (even blank) -> route through the helper, which denies blank/bare and asks on a real reason.
+  if [ -z "${RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM+x}" ]; then
+    { echo "Refusing: review-quorum gate — ${summary}."
+      echo "  Run more independent review iterations (e.g. \`review diff --task ${TASK_CODE:-<code>}\`) across distinct models, then re-run ship."
+      echo "  There is NO self-service override. To request a ONE-TIME bypass, set:"
+      echo "    RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM=\"<justification>\""
+      echo "  which asks Alex live on Telegram and proceeds ONLY on his real-time approval."
+      echo "  SHIP_REVIEW_QUORUM=0 disables the gate entirely (ops off-switch)."; } >&2
+    _review_quorum_audit_log refused "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" ""
+    exit 1
+  fi
+  # The helper prints a verdict SENTINEL on stdout ("APPROVED <reason>" / "DENIED <reason>") and
+  # writes its own bypass:approved / bypass:denied audit line. We authorize the bypass ONLY on a
+  # clean exit 0 AND a leading APPROVED sentinel: a fake or broken `python3` that merely exits 0
+  # without the sentinel then fails CLOSED (refuse), instead of being mistaken for approval — the
+  # same fail-closed posture the other gates have on a tool malfunction. (A shipper who fully
+  # controls the ship PROCESS's PATH can defeat any gate — fake `gh`, `review`, `git` — so this is
+  # not a claim to withstand a hostile PATH; it removes the fail-OPEN asymmetry for a benign one.)
+  local hrc=0 hout
+  hout=$(_review_quorum_hatch_check 2>/dev/null) || hrc=$?
+  local hverdict="${hout%% *}" hreason=""
+  case "$hout" in *" "*) hreason="${hout#* }" ;; esac
+  if [ "$hrc" = "0" ] && [ "$hverdict" = "APPROVED" ]; then
+    echo "[ship] review-quorum gate — ${summary}; a one-time Telegram hatch escalation was APPROVED by Alex — proceeding. (${hreason})"
+    return 0
+  fi
+  { echo "Refusing: review-quorum gate — ${summary}."
+    echo "  A Telegram hatch escalation was requested but NOT approved: ${hreason:-no approval}."
+    echo "  Obtain live approval, add more independent review iterations, or set SHIP_REVIEW_QUORUM=0 (ops off-switch)."; } >&2
+  # The real helper logs bypass:denied itself only when it emitted the DENIED sentinel; in every
+  # other case (fake/broken/absent interpreter, import-fail, unexpected verdict) it did NOT audit,
+  # so record the fail-closed bypass:denied here. Never double-write.
+  case "$hverdict" in
+    DENIED) : ;;
+    *) _review_quorum_audit_log "bypass:denied" "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "$hreason" ;;
+  esac
+  exit 1
+}
+
+QUORUM_ENABLED=1
+case "${SHIP_REVIEW_QUORUM_ENABLED:-1}" in 0|false|no) QUORUM_ENABLED=0 ;; esac
+case "${SHIP_REVIEW_QUORUM:-1}" in 0|false|no) QUORUM_ENABLED=0 ;; esac
+
+if [ "$QUORUM_ENABLED" = "0" ]; then
+  echo "[ship] review-quorum gate disabled (SHIP_REVIEW_QUORUM_ENABLED/SHIP_REVIEW_QUORUM=0)."
+else
+  MIN_ITER="${SHIP_REVIEW_QUORUM_MIN_ITER:-3}"
+  MIN_MODELS="${SHIP_REVIEW_QUORUM_MIN_MODELS:-3}"
+  # Safe defaults so an early refusal (before the review query) still has these for the audit
+  # line and the hatch context.
+  QITER=0; QMODELS_N=0; QMODELS=""; QERR=""; QPASSED=false
+
+  TASK_CODE="${REVIEW_TASK_CODE:-}"
+  [ -n "$TASK_CODE" ] || TASK_CODE=$(_review_quorum_extract_ticket "$BRANCH")
+  if [ -z "$TASK_CODE" ]; then
+    PR_BODY_QC=$(gh pr view "$PR" --json body -q '.body // ""' 2>/dev/null) || PR_BODY_QC=""
+    TASK_CODE=$(_review_quorum_extract_ticket "$PR_BODY_QC")
+  fi
+
+  if [ -z "$TASK_CODE" ]; then
+    _review_quorum_refuse_or_hatch "could not derive a task code (set \$REVIEW_TASK_CODE, or put the ticket code e.g. HYP-931 in the branch name or PR body)"
+  elif ! command -v review >/dev/null 2>&1; then
+    _review_quorum_refuse_or_hatch "'review' CLI not found on PATH — cannot verify the bar for ${TASK_CODE} (install review-cli)"
+  elif ! command -v jq >/dev/null 2>&1; then
+    _review_quorum_refuse_or_hatch "jq not found — cannot evaluate the gate for ${TASK_CODE} (install jq)"
+  else
+    # Prefer --check (the review-cli rename target); fall back to --quorum-check when running
+    # against a review-cli build that hasn't picked up the rename yet. In --json mode review-cli
+    # always prints JSON to stdout (pass or fail) — only an unsupported-flag argparse error
+    # leaves stdout empty, which is the fallback trigger.
+    QUORUM_JSON=$(review task "$TASK_CODE" --check --min-iter "$MIN_ITER" --min-models "$MIN_MODELS" --json 2>/dev/null) || true
+    if [ -z "$QUORUM_JSON" ]; then
+      QUORUM_JSON=$(review task "$TASK_CODE" --quorum-check --min-iter "$MIN_ITER" --min-models "$MIN_MODELS" --json 2>/dev/null) || true
+    fi
+
+    if [ -z "$QUORUM_JSON" ]; then
+      _review_quorum_refuse_or_hatch "could not query review-cli (store unreadable / task ${TASK_CODE} unknown)"
+    else
+      QPASSED=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed // false' 2>/dev/null || echo false)
+      QITER=$(printf '%s' "$QUORUM_JSON" | jq -r '.iterations // 0' 2>/dev/null || echo 0)
+      QMODELS_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_models // 0' 2>/dev/null || echo 0)
+      QMODELS=$(printf '%s' "$QUORUM_JSON" | jq -r '(.models // []) | join(", ")' 2>/dev/null || echo "")
+      QERR=$(printf '%s' "$QUORUM_JSON" | jq -r '.error // empty' 2>/dev/null || echo "")
+
+      if [ "$QPASSED" = "true" ]; then
+        echo "[ship] AUTHORITY CONFIRMED — review quorum met: ${QITER} iterations across ${QMODELS_N} models for ${TASK_CODE}. Self-merge authorized by the review-quorum gate."
+        _review_quorum_audit_log authorized "$TASK_CODE" "$QITER" "$QMODELS_N" ""
+      else
+        _review_quorum_refuse_or_hatch "bar NOT met for ${TASK_CODE} — ${QITER}/${MIN_ITER} iterations, ${QMODELS_N}/${MIN_MODELS} distinct models${QMODELS:+ (models seen: ${QMODELS})}${QERR:+ (${QERR})}"
+      fi
     fi
   fi
 fi
