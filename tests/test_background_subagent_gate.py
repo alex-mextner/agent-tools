@@ -2,7 +2,9 @@
 
 Covers the doctrine's four cases: BLOCK (non-trivial foreground dispatch), ALLOW
 (run_in_background true / trivial one-liner), SUBAGENT-EXEMPT (agent_id present), and the
-ESCAPE hatch (env + reason allows; reasonless override still blocks).
+deny-by-default Telegram hatch escalation (the old ALLOW_FOREGROUND_SUBAGENT self-service env
+is DEAD; RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE with a written justification asks tg-ctl and
+allows only on exit 0, a bare `1` denies).
 
 Run from the repo root::
 
@@ -38,8 +40,10 @@ def _run(event, monkeypatch, env: dict | None = None) -> tuple[str, str, int]:
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
-    # Clear escape-hatch env so a stray ambient value can't leak into a test.
-    for k in ("ALLOW_FOREGROUND_SUBAGENT", "ALLOW_FOREGROUND_SUBAGENT_REASON"):
+    # Clear the (now dead) old self-service env AND the hatch env so a stray ambient value can't
+    # leak into a test.
+    for k in ("ALLOW_FOREGROUND_SUBAGENT", "ALLOW_FOREGROUND_SUBAGENT_REASON",
+              "RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE"):
         monkeypatch.delenv(k, raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
@@ -83,24 +87,70 @@ def test_subagent_exempt_allows_even_foreground(monkeypatch):
     assert _decision(out) == "allow"
 
 
-def test_escape_hatch_with_reason_allows(monkeypatch):
+# ── regression: the OLD self-service escape hatch is DEAD ──────────────────────────────────
+
+def test_old_env_escape_hatch_no_longer_bypasses(monkeypatch):
+    """ALLOW_FOREGROUND_SUBAGENT=1 + _REASON as a real env pair must NO LONGER allow the
+    foreground dispatch — the self-service bypass was removed (replaced by the Telegram hatch)."""
     out, _err, code = _run(
         {"args": {"prompt": _LONG}},
         monkeypatch,
         {"ALLOW_FOREGROUND_SUBAGENT": "1", "ALLOW_FOREGROUND_SUBAGENT_REASON": "latency probe"},
     )
-    assert code == 0
-    assert _decision(out) == "allow"
-
-
-def test_reasonless_override_still_blocks(monkeypatch):
-    out, _err, code = _run(
-        {"args": {"prompt": _LONG}},
-        monkeypatch,
-        {"ALLOW_FOREGROUND_SUBAGENT": "1"},  # no reason
-    )
     assert code == gate.BLOCK_EXIT_CODE
     assert _decision(out) == "block"
+
+
+# ── Telegram hatch escalation (deny-by-default) ────────────────────────────────────────────
+
+def _fake_tg_ctl(path: Path, body: str) -> Path:
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return path
+
+
+def test_hatch_unset_blocks_and_names_env_var(monkeypatch):
+    """No hatch env → normal block; the reminder names RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE."""
+    out, _err, code = _run({"args": {"prompt": _LONG}}, monkeypatch)
+    assert code == gate.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE" in json.loads(out)["message"]
+
+
+def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
+    """A bare `1` is not a justification → block, no tg-ctl call (fail if the fake is invoked)."""
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nexit 0\n")
+    monkeypatch.setattr(gate.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _err, code = _run(
+        {"args": {"prompt": _LONG}}, monkeypatch,
+        {"RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE": "1"},
+    )
+    assert code == gate.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert not marker.exists()
+
+
+def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nprintf approved\nexit 0\n")
+    monkeypatch.setattr(gate.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _err, code = _run(
+        {"args": {"prompt": _LONG}}, monkeypatch,
+        {"RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE": "Latency probe, must run inline now."},
+    )
+    assert code == 0 and _decision(out) == "allow"
+    assert marker.exists()
+    assert "hatch escalation" in json.loads(out)["message"].lower()
+
+
+def test_hatch_justification_exit1_blocks(tmp_path, monkeypatch):
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    monkeypatch.setattr(gate.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _err, code = _run(
+        {"args": {"prompt": _LONG}}, monkeypatch,
+        {"RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE": "Latency probe, must run inline now."},
+    )
+    assert code == gate.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "hatch escalation denied" in json.loads(out)["message"].lower()
 
 
 # ── #6: triviality is judged on the LONGEST of prompt/description, not the first non-empty ─

@@ -6,7 +6,9 @@ Covers the rule "edits only via Edit/Write; no sed/perl/awk for editing files":
   ALLOW     — read-only sed/awk/grep filters, a redirect to /tmp or a new/non-source file,
               `-i` on an untracked path, and the raw-string DECOYS that must NOT trip it
               (the flag inside a string operand / a comment / a commit message).
-  ESCAPE    — env+reason and the inline sentinel; a reasonless override still blocks.
+  HATCH     — deny-by-default Telegram escalation. The old ALLOW_SHELL_FILE_EDIT env +
+              `# shell-file-edit-ok:` sentinel are DEAD; RIG_HATCH_REQUEST_NO_SHELL_FILE_EDIT
+              with a written justification asks tg-ctl and allows only on exit 0, a bare `1` denies.
 
 The tracked-source detection is exercised against a REAL temp git repo (no mock), so the
 `git ls-files` boundary is what's actually under test.
@@ -73,7 +75,8 @@ def _run(command, repo: Path, monkeypatch, *, env: dict | None = None) -> tuple[
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
-    for k in ("ALLOW_SHELL_FILE_EDIT", "ALLOW_SHELL_FILE_EDIT_REASON"):
+    for k in ("ALLOW_SHELL_FILE_EDIT", "ALLOW_SHELL_FILE_EDIT_REASON",
+              "RIG_HATCH_REQUEST_NO_SHELL_FILE_EDIT"):
         monkeypatch.delenv(k, raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
@@ -451,42 +454,76 @@ def test_documented_scope_boundary_not_caught(command, repo, monkeypatch):
     assert _decision(out) == "allow"
 
 
-# ── ESCAPE ───────────────────────────────────────────────────────────────────────────────
+# ── regression: the OLD self-service escape hatch is DEAD (env AND inline) ──────────────────
 
-def test_escape_env_reason_allows(repo, monkeypatch):
+def test_old_env_escape_hatch_no_longer_bypasses(repo, monkeypatch):
+    """ALLOW_SHELL_FILE_EDIT=1 + _REASON as a real env pair must NO LONGER allow the shell edit
+    — the self-service bypass was removed (replaced by the Telegram hatch)."""
     out, _e, code = _run(
         "sed -i 's/a/b/' app.ts", repo, monkeypatch,
         env={"ALLOW_SHELL_FILE_EDIT": "1", "ALLOW_SHELL_FILE_EDIT_REASON": "vetted codemod"},
     )
-    assert code == 0
-    assert _decision(out) == "allow"
+    assert code == nsfe.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
 
 
-def test_escape_inline_sentinel_allows(repo, monkeypatch):
+def test_old_inline_sentinel_no_longer_bypasses(repo, monkeypatch):
+    """A `# shell-file-edit-ok: …` appended to a real edit must still BLOCK — the inline sentinel
+    is gone."""
     out, _e, code = _run(
         "sed -i 's/a/b/' app.ts  # shell-file-edit-ok: regenerated each build",
         repo, monkeypatch,
     )
-    assert code == 0
-    assert _decision(out) == "allow"
+    assert code == nsfe.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
 
 
-def test_reasonless_override_still_blocks(repo, monkeypatch):
+# ── Telegram hatch escalation (deny-by-default) ────────────────────────────────────────────
+
+def _fake_tg_ctl(path: Path, body: str) -> Path:
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return path
+
+
+def test_hatch_unset_blocks_and_names_env_var(repo, monkeypatch):
+    out, _e, code = _run("sed -i 's/a/b/' app.ts", repo, monkeypatch)
+    assert code == nsfe.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "RIG_HATCH_REQUEST_NO_SHELL_FILE_EDIT" in json.loads(out)["message"]
+
+
+def test_hatch_bare_flag_denies_without_tg_call(repo, tmp_path, monkeypatch):
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nexit 0\n")
+    monkeypatch.setattr(nsfe.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _e, code = _run("sed -i 's/a/b/' app.ts", repo, monkeypatch,
+                         env={"RIG_HATCH_REQUEST_NO_SHELL_FILE_EDIT": "1"})
+    assert code == nsfe.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert not marker.exists()
+
+
+def test_hatch_justification_exit0_allows(repo, tmp_path, monkeypatch):
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nprintf approved\nexit 0\n")
+    monkeypatch.setattr(nsfe.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     out, _e, code = _run(
         "sed -i 's/a/b/' app.ts", repo, monkeypatch,
-        env={"ALLOW_SHELL_FILE_EDIT": "1"},  # no reason
+        env={"RIG_HATCH_REQUEST_NO_SHELL_FILE_EDIT": "Vetted bulk codemod, reviewed."},
     )
-    assert code == nsfe.BLOCK_EXIT_CODE
-    assert _decision(out) == "block"
+    assert code == 0 and _decision(out) == "allow"
+    assert marker.exists()
+    assert "hatch escalation" in json.loads(out)["message"].lower()
 
 
-def test_reasonless_inline_sentinel_still_blocks(repo, monkeypatch):
-    """codex round 5: the inline sentinel requires a NON-empty reason (regex `(\\S.*)`). A bare
-    `# shell-file-edit-ok:` with no reason must still block — the env-reasonless case is covered
-    above; this pins the inline-form counterpart."""
-    out, _e, code = _run("sed -i 's/a/b/' app.ts  # shell-file-edit-ok:", repo, monkeypatch)
-    assert code == nsfe.BLOCK_EXIT_CODE
-    assert _decision(out) == "block"
+def test_hatch_justification_exit1_blocks(repo, tmp_path, monkeypatch):
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    monkeypatch.setattr(nsfe.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _e, code = _run(
+        "sed -i 's/a/b/' app.ts", repo, monkeypatch,
+        env={"RIG_HATCH_REQUEST_NO_SHELL_FILE_EDIT": "Vetted bulk codemod, reviewed."},
+    )
+    assert code == nsfe.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "hatch escalation denied" in json.loads(out)["message"].lower()
 
 
 if __name__ == "__main__":  # pragma: no cover

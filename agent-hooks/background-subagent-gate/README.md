@@ -45,15 +45,25 @@ Triviality is judged on the **prompt/description length and shape only** — not
 the gate's job is "don't block the main thread on a long foreground run", and prompt size is
 the cheap, payload-only proxy for that.
 
-## Escape hatch (controllable, not a hard wall)
+## No self-service bypass — external Telegram approval only
+
+There is **no** env-var escape hatch any more. The old `ALLOW_FOREGROUND_SUBAGENT=1` +
+`ALLOW_FOREGROUND_SUBAGENT_REASON` env let the very orchestrator this gate constrains grant
+itself an exception — security theater, not a permission gate. It was removed. (There was never
+an inline sentinel — the Agent tool carries no shell string to hide a `# ...` in.)
+
+The block is now **deny-by-default**. For a genuine exception, ASK the human, or request a
+one-time Telegram approval with a written justification:
 
 ```bash
-# session-wide override (reason REQUIRED, or it still blocks):
-ALLOW_FOREGROUND_SUBAGENT=1 ALLOW_FOREGROUND_SUBAGENT_REASON="quick probe, latency matters"
+RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE="quick probe, latency matters"
 ```
 
-A reasonless `ALLOW_FOREGROUND_SUBAGENT=1` is ignored and the dispatch stays blocked. There
-is **no inline sentinel** — the Agent tool carries no shell string to hide a `# ...` in.
+If the env var is unset, no Telegram call is made and the dispatch simply blocks. If it is
+present but blank, whitespace-only, or a bare flag value (`1`/`true`/`yes`/`on`), the hook does
+not contact Telegram and denies — a bare `1` is not a justification. A real justification runs
+`tg-ctl ask` through a trusted absolute path (never ambient `PATH`); exit 0 allows, and any
+nonzero exit, launch error, or timeout denies. An agent can *request*, not self-grant.
 
 ## Fail-open, on purpose
 

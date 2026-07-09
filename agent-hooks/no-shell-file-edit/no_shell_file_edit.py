@@ -47,11 +47,12 @@ Subagent-exempt? NO. The rule is about HOW any agent edits a file, orchestrator 
 alike — a subagent hand-editing with `sed -i` is exactly what this stops. (Contrast the
 delegation gates, which govern the orchestrator only.)
 
-Escape hatch (controllable — mirrors block-raw-pr-merge):
-  - env  ALLOW_SHELL_FILE_EDIT=1            — disable the guard for this session
-  - env  ALLOW_SHELL_FILE_EDIT_REASON=...   — REQUIRED with the override; logged
-  - inline  `# shell-file-edit-ok: <reason>`  — self-documenting per-command
-  A reasonless override still blocks.
+External approval (deny-by-default): there is NO self-service bypass. For a genuine exception,
+ASK the human, or request a one-time Telegram approval by setting
+`RIG_HATCH_REQUEST_NO_SHELL_FILE_EDIT="<written justification>"` — the hook asks via a trusted
+`tg-ctl` and allows ONLY on an explicit approval tap. A blank value or a bare `1`/`true` is
+rejected (deny), no Telegram call is made. An agent can request, not self-grant — the human
+decides.
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; the shell command is in args.command, the repo cwd in event.cwd
@@ -74,6 +75,12 @@ import subprocess  # noqa: S404 — `git ls-files` to tell a tracked source file
 import sys
 from pathlib import Path
 
+_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+import agenttools_hatch_escalation as hatch_escalation  # noqa: E402
+
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
@@ -84,8 +91,6 @@ HOOK_API = "agents-hooks/v1"
 # descriptor's timeout_ms on a very slow git. That stays correct (the descriptor's own timeout fires
 # and on_error=open → allow on the redirect case), it just isn't bounded by GIT_TIMEOUT_S alone.
 GIT_TIMEOUT_S = 5
-
-INLINE_SENTINEL = re.compile(r"#\s*shell-file-edit-ok:\s*(\S.*)")
 
 # Source-file extensions the rule protects. A redirect overwriting one of THESE (when tracked)
 # is an edit; a redirect to a .log / .md / .json-data / no-extension file is generating output,
@@ -130,60 +135,6 @@ def emit(decision: str, message: str | None = None) -> None:
 
 def warn(msg: str) -> None:
     sys.stderr.write(f"no-shell-file-edit: {msg}\n")
-
-
-def _override_reason(command: str) -> str | None:
-    if os.environ.get("ALLOW_SHELL_FILE_EDIT") == "1":
-        reason = (os.environ.get("ALLOW_SHELL_FILE_EDIT_REASON") or "").strip()
-        if reason:
-            return f"env override: {reason}"
-    # Search the sentinel only in the ACTUAL shell COMMENT text, not the raw command — so a
-    # `# shell-file-edit-ok: …` hidden inside a quoted string (`echo "…ok: x"`) cannot self-exempt
-    # an edit. This keeps the escape hatch in the same "parsed, not raw substring" discipline as
-    # the block decision (codex finding: the override was matched against the raw string).
-    m = INLINE_SENTINEL.search(_comment_text(command))
-    if m:
-        return f"inline override: {m.group(1).strip()}"
-    return None
-
-
-def _comment_text(command: str) -> str:
-    """The unquoted shell-comment portion(s) of the RAW command — everything from each
-    word-boundary, unquoted `#` to the next newline. A `#` inside quotes is not a comment. Used to
-    scope the inline-override sentinel to a real comment, never a quoted string.
-
-    Scans the raw command DIRECTLY (not via `_split_segments`, which now strips comments out): the
-    two must read `#` independently so the escape-hatch sentinel still resolves after the
-    comment-aware split change."""
-    comments: list[str] = []
-    quote: str | None = None
-    prev_space = True
-    i = 0
-    while i < len(command):
-        ch = command[i]
-        if quote:
-            if ch == quote:
-                quote = None
-            elif ch == "\\" and quote == '"' and i + 1 < len(command):
-                i += 1
-            prev_space = False
-        elif ch in ("'", '"'):
-            quote = ch
-            prev_space = False
-        elif ch == "\\" and i + 1 < len(command):
-            i += 1
-            prev_space = False
-        elif ch == "#" and prev_space:
-            end = command.find("\n", i)
-            end = len(command) if end == -1 else end
-            comments.append(command[i:end])
-            i = end
-            prev_space = True
-            continue
-        else:
-            prev_space = ch.isspace()
-        i += 1
-    return "\n".join(comments)
 
 
 def _strip_comment(segment: str) -> str:
@@ -745,8 +696,7 @@ def _strip_comments(command: str) -> str:
     removed, the newline kept. ONE shared pre-pass so segment-splitting and command-substitution
     extraction agree on what is a comment — the three earlier readers diverged (`_split_segments`
     broke the whole line, `_command_subs` ignored `#` entirely), which both bypassed a multi-line
-    edit AND falsely blocked a `$(…)`/backtick sitting in a comment (codex). The escape-hatch
-    sentinel still reads the RAW command via `_comment_text`, since it lives in a comment."""
+    edit AND falsely blocked a `$(…)`/backtick sitting in a comment (codex)."""
     out: list[str] = []
     quote: str | None = None
     prev_space = True
@@ -918,23 +868,30 @@ def main() -> int:
         emit("allow")
         return 0
 
-    reason = _override_reason(command)
-    if reason:
-        warn(f"shell file-edit allowed via escape hatch ({reason})")
-        emit("allow", f"shell file-edit allowed via escape hatch ({reason})")
-        return 0
-
-    emit(
-        "block",
+    block_message = (
         f"Edit files with the Edit/Write tools, not the shell: {matched}. The hyperide rule "
         "is 'edits only via Edit/Write; no sed/perl/awk for editing files' — a shell in-place "
         "edit (`sed -i`/`perl -i`/`gawk -i inplace`) or a `> file` redirect onto a tracked "
         "source file leaves no reviewable diff, skips the formatter, and desyncs file-state "
         "tracking. Use the Edit tool (or Write to replace the whole file). Read-only "
-        "sed/awk/grep pipelines and writes to /tmp or new files are fine. Override only with a "
-        "reason: ALLOW_SHELL_FILE_EDIT=1 + ALLOW_SHELL_FILE_EDIT_REASON='why', or append "
-        "`# shell-file-edit-ok: why`.",
+        "sed/awk/grep pipelines and writes to /tmp or new files are fine. There is NO "
+        "self-service bypass. For a genuine exception, ASK the human, or request a one-time "
+        "Telegram approval by setting "
+        "RIG_HATCH_REQUEST_NO_SHELL_FILE_EDIT=\"<written justification>\" "
+        "(deny-by-default; a bare 1 is rejected)."
     )
+
+    ctx = {"hook": "no-shell-file-edit", "command": command}
+    hatch = hatch_escalation.request_hatch_approval("no-shell-file-edit", ctx, cwd=str(cwd))
+    if hatch.should_stop:
+        if hatch.approved:
+            warn(f"no-shell-file-edit allowed via hatch escalation ({hatch.reason})")
+            emit("allow", f"allowed via hatch escalation ({hatch.reason})")
+            return 0
+        emit("block", f"hatch escalation denied: {hatch.reason}\n{block_message}")
+        return BLOCK_EXIT_CODE
+
+    emit("block", block_message)
     return BLOCK_EXIT_CODE
 
 

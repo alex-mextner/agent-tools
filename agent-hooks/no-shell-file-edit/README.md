@@ -121,20 +121,30 @@ no `agent_id` carve-out here.
 ## Why a hard block (not warn-first)
 
 A shell file-edit is unambiguous: it edits a tracked source file outside Edit/Write, every time.
-There is no borderline case to warn about — so this blocks on the first occurrence, with a real
-escape hatch for the rare deliberate exception.
+There is no borderline case to warn about — so this blocks on the first occurrence,
+deny-by-default, with an external Telegram approval for the rare deliberate exception.
 
-## Escape hatch (controllable, not a hard wall)
+## No self-service bypass — external Telegram approval only
+
+There is **no** env-var or inline escape hatch any more. The old `ALLOW_SHELL_FILE_EDIT=1` +
+`ALLOW_SHELL_FILE_EDIT_REASON` env and the `# shell-file-edit-ok:` inline sentinel let the very
+agent this gate constrains grant itself an exception — security theater, not a permission gate.
+Both were removed.
+
+The block is now **deny-by-default**. For a genuine exception (a vetted bulk codemod, a
+generated file), ASK the human, or request a one-time Telegram approval with a written
+justification:
 
 ```bash
-# session-wide override (reason REQUIRED, or it still blocks):
-ALLOW_SHELL_FILE_EDIT=1 ALLOW_SHELL_FILE_EDIT_REASON="bulk codemod across 200 files, vetted"
-
-# one-off, self-documenting:
-sed -i 's/v1/v2/' config.yaml   # shell-file-edit-ok: generated file, regenerated each build
+RIG_HATCH_REQUEST_NO_SHELL_FILE_EDIT="bulk codemod across 200 files, vetted" \
+  sed -i 's/v1/v2/' config.yaml
 ```
 
-A reasonless `ALLOW_SHELL_FILE_EDIT=1` is ignored and the command stays blocked.
+If the env var is unset, no Telegram call is made and the command simply blocks. If it is
+present but blank, whitespace-only, or a bare flag value (`1`/`true`/`yes`/`on`), the hook does
+not contact Telegram and denies — a bare `1` is not a justification. A real justification runs
+`tg-ctl ask` through a trusted absolute path (never ambient `PATH`); exit 0 allows, and any
+nonzero exit, launch error, or timeout denies. An agent can *request*, not self-grant.
 
 ## Fail-open, on purpose
 
@@ -156,6 +166,7 @@ echo "{\"args\":{\"command\":\"awk '{print}' app.ts > app.ts\"},\"cwd\":\"$CWD\"
 echo "{\"args\":{\"command\":\"sed -n '1,5p' app.ts\"},\"cwd\":\"$CWD\"}" | ./no_shell_file_edit.py; echo " exit=$?"   # → exit=0 (read-only filter)
 echo "{\"args\":{\"command\":\"awk '{print}' app.ts > /tmp/out.ts\"},\"cwd\":\"$CWD\"}" | ./no_shell_file_edit.py; echo " exit=$?"  # → exit=0 (/tmp)
 echo "{\"args\":{\"command\":\"echo \\\"use sed -i\\\"\"},\"cwd\":\"$CWD\"}" | ./no_shell_file_edit.py; echo " exit=$?"  # → exit=0 (string, not a flag)
-ALLOW_SHELL_FILE_EDIT=1 ALLOW_SHELL_FILE_EDIT_REASON=codemod \
-  bash -c "echo '{\"args\":{\"command\":\"sed -i s/a/b/ app.ts\"},\"cwd\":\"$CWD\"}' | ./no_shell_file_edit.py"; echo " exit=$?"  # → exit=0 (escape hatch)
+# deny-by-default: a bare RIG_HATCH_REQUEST value (no written justification) still blocks
+RIG_HATCH_REQUEST_NO_SHELL_FILE_EDIT=1 \
+  bash -c "echo '{\"args\":{\"command\":\"sed -i s/a/b/ app.ts\"},\"cwd\":\"$CWD\"}' | ./no_shell_file_edit.py"; echo " exit=$?"  # → exit=10 (bare 1 rejected)
 ```
