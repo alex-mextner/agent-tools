@@ -1,0 +1,374 @@
+"""The agents-hooks/v1 -> opencode plugin bridge dispatcher.
+
+opencode loads JavaScript plugins from config/plugin directories. The companion
+``plugin.js`` file calls this module for ``tool.execute.before`` and
+``tool.execute.after`` events. This dispatcher maps opencode's tool payload to the
+shared agents-hooks/v1 contract and returns a plain ``{"decision":"block"}`` JSON
+object to the plugin. The plugin throws for pre-tool blocks and logs post-write
+feedback because completed writes cannot be un-run.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import sys
+from pathlib import Path
+
+HOOK_API = "agents-hooks/v1"
+_KNOWN_EVENTS = frozenset({"tool.execute.before", "tool.execute.after"})
+_WRITE_TOOLS = frozenset({"edit", "write", "apply_patch"})
+_TASK_TOOL = "task"
+_ID_KEYS = (
+    "event_id",
+    "sessionID",
+    "sessionId",
+    "session_id",
+    "messageID",
+    "messageId",
+    "toolCallID",
+    "toolCallId",
+    "callID",
+    "callId",
+)
+_FORGED_AGENT_KEYS = (
+    "agent_id",
+    "agent_type",
+    "agentID",
+    "agentId",
+    "agentType",
+    "agent",
+)
+
+
+def point_for_event(hook_name: str, tool_name: str | None) -> str | None:
+    """Map an opencode plugin hook/tool pair to a logical v1 point."""
+    tool = (tool_name or "").lower()
+    if hook_name == "tool.execute.before":
+        if tool == "bash":
+            return "pre-bash"
+        if tool in _WRITE_TOOLS:
+            return "pre-write"
+        if tool == _TASK_TOOL:
+            return "pre-agent"
+    if hook_name == "tool.execute.after" and tool in _WRITE_TOOLS:
+        return "post-write"
+    return None
+
+
+def to_v1_event(opencode_event: dict, *, point: str) -> dict:
+    """Translate the opencode plugin payload into agents-hooks/v1."""
+    tool = _tool_name(opencode_event)
+    raw_args = _tool_args(opencode_event)
+    args = dict(raw_args)
+    for key in _FORGED_AGENT_KEYS:
+        args.pop(key, None)
+    _normalize_task_args(args)
+
+    command = _tool_command(tool, raw_args)
+    if command:
+        args["command"] = command
+
+    if point in ("pre-write", "post-write"):
+        if tool == "apply_patch":
+            if command:
+                args.setdefault("patch", command)
+                args.setdefault("patchText", command)
+                paths = _patch_file_paths(command)
+                if paths:
+                    args.setdefault("file_paths", paths)
+                if len(paths) == 1:
+                    args.setdefault("file_path", paths[0])
+                    args.setdefault("path", paths[0])
+                elif _patch_move_target(command):
+                    args.setdefault("file_path", paths[-1])
+                    args.setdefault("path", paths[-1])
+                if point == "pre-write":
+                    args["content"] = _patch_added_content(command)
+        else:
+            path = _write_path(raw_args)
+            if path:
+                args.setdefault("file_path", path)
+                args.setdefault("path", path)
+            if point == "pre-write":
+                content = _write_content(raw_args)
+                if not isinstance(args.get("content"), str):
+                    args["content"] = content
+
+    return {
+        "hook_api": HOOK_API,
+        "event_id": _event_id(opencode_event),
+        "tool": tool,
+        "point": point,
+        "command": command,
+        "cwd": _cwd(opencode_event),
+        "args": args,
+    }
+
+
+def opencode_block_output(reason: str) -> dict:
+    """The plugin consumes this shape and throws an Error with ``reason``."""
+    return {"decision": "block", "reason": reason}
+
+
+def hooks_dir() -> Path:
+    """Where opencode-installed v1 descriptors live, overridable for tests."""
+    override = os.environ.get("OPENCODE_HOOKS_DIR")
+    if override:
+        return Path(override)
+    return Path(os.path.expanduser("~/.config/opencode/hooks"))
+
+
+def dispatch(hook_name: str, opencode_event: dict) -> dict | None:
+    """Run applicable v1 hooks for this opencode event."""
+    tool = _tool_name(opencode_event)
+    point = point_for_event(hook_name, tool)
+    if point is None:
+        return None
+    runner = _load_runner()
+    if runner is None:
+        return None
+    load_descriptors, run_hook = runner
+    specs = load_descriptors(point, hooks_dir(), warn=_warn)
+    if not specs:
+        return None
+    for spec in specs:
+        for v1_event in _v1_events_for_dispatch(opencode_event, point=point):
+            outcome, reason = run_hook(spec, v1_event, warn=_warn)
+            if outcome == "block":
+                return opencode_block_output(reason)
+    return None
+
+
+def _load_runner():
+    try:
+        from agent_hooks_v1 import load_descriptors, run_hook
+    except Exception as exc:  # noqa: BLE001 - bridge-level failures fail open
+        _warn(f"could not import shared v1 runner, failing OPEN (allowing the call): {exc}")
+        return None
+    return load_descriptors, run_hook
+
+
+def main(argv: list[str]) -> int:
+    """CLI entry: ``opencode_hook_bridge <plugin-event>``.
+
+    Top-level dispatcher failures fail open: a broken bridge must not wedge every
+    opencode tool call. Deliberate hook blocks still return block JSON on stdout.
+    """
+    hook_name = argv[0] if argv else "tool.execute.before"
+    if hook_name not in _KNOWN_EVENTS:
+        _warn(f"unknown event arg {hook_name!r}; stdin's hook field will be used if present")
+    try:
+        raw = sys.stdin.read()
+        opencode_event = json.loads(raw) if raw.strip() else {}
+        if not isinstance(opencode_event, dict):
+            opencode_event = {}
+        hook_name = str(opencode_event.get("hook") or hook_name)
+        result = dispatch(hook_name, opencode_event)
+    except Exception as exc:  # noqa: BLE001 - fail-open is the bridge contract
+        _warn(f"dispatcher error, failing OPEN (allowing the call): {exc}")
+        return 0
+    if result is not None:
+        sys.stdout.write(json.dumps(result))
+        sys.stdout.flush()
+    return 0
+
+
+def _tool_name(event: dict) -> str:
+    inp = event.get("input") if isinstance(event.get("input"), dict) else {}
+    tool = inp.get("tool") or event.get("tool")
+    return str(tool or "").lower()
+
+
+def _tool_args(event: dict) -> dict:
+    out = event.get("output") if isinstance(event.get("output"), dict) else {}
+    args = out.get("args")
+    if isinstance(args, dict):
+        return dict(args)
+    inp = event.get("input") if isinstance(event.get("input"), dict) else {}
+    args = inp.get("args")
+    return dict(args) if isinstance(args, dict) else {}
+
+
+def _tool_command(tool: str, args: dict) -> str:
+    if tool == "apply_patch":
+        for key in ("patchText", "patch", "command"):
+            val = args.get(key)
+            if isinstance(val, str):
+                return val
+        return ""
+    val = args.get("command")
+    if isinstance(val, str):
+        return val
+    if isinstance(val, list):
+        return shlex.join(str(part) for part in val)
+    return ""
+
+
+def _cwd(event: dict) -> str:
+    for key in ("cwd", "directory", "worktree"):
+        val = event.get(key)
+        if isinstance(val, str) and val:
+            return val
+    inp = event.get("input") if isinstance(event.get("input"), dict) else {}
+    for key in ("cwd", "directory", "worktree"):
+        val = inp.get(key)
+        if isinstance(val, str) and val:
+            return val
+    return os.getcwd()
+
+
+def _event_id(event: dict) -> str:
+    sources = [event]
+    for key in ("input", "output"):
+        val = event.get(key)
+        if isinstance(val, dict):
+            sources.append(val)
+            nested = val.get("session")
+            if isinstance(nested, dict):
+                sources.append(nested)
+    for source in sources:
+        for key in _ID_KEYS:
+            val = source.get(key)
+            if val:
+                return str(val)
+    return ""
+
+
+def _normalize_task_args(args: dict) -> None:
+    if "subagent_type" not in args and isinstance(args.get("subagentType"), str):
+        args["subagent_type"] = args["subagentType"]
+    if not isinstance(args.get("run_in_background"), bool) and isinstance(args.get("background"), bool):
+        args["run_in_background"] = args["background"]
+
+
+def _write_path(args: dict) -> str:
+    for key in ("filePath", "file_path", "path"):
+        val = args.get(key)
+        if isinstance(val, str) and val:
+            return val
+    return ""
+
+
+def _write_content(args: dict) -> str:
+    parts: list[str] = []
+    for key in ("content", "newString", "new_string", "text"):
+        val = args.get(key)
+        if isinstance(val, str):
+            parts.append(val)
+    return "\n".join(parts)
+
+
+def _v1_events_for_dispatch(opencode_event: dict, *, point: str) -> list[dict]:
+    base = to_v1_event(opencode_event, point=point)
+    args = base.get("args")
+    if not isinstance(args, dict):
+        return [base]
+    file_paths = args.get("file_paths")
+    if (
+        point not in ("pre-write", "post-write")
+        or not isinstance(file_paths, list)
+        or len(file_paths) <= 1
+    ):
+        return [base]
+
+    events: list[dict] = []
+    content_by_path = _patch_added_content_by_path(str(args.get("patch") or ""))
+    for raw_path in file_paths:
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        event = dict(base)
+        event_args = dict(args)
+        event_args["file_path"] = raw_path
+        event_args["path"] = raw_path
+        event_args.pop("file_paths", None)
+        if point == "pre-write":
+            event_args["content"] = content_by_path.get(raw_path, "")
+        event["args"] = event_args
+        events.append(event)
+    return events or [base]
+
+
+def _patch_file_paths(patch: str) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    pending_update: str | None = None
+
+    def add(path: str) -> None:
+        if path and path not in seen:
+            seen.add(path)
+            paths.append(path)
+
+    def flush_update() -> None:
+        nonlocal pending_update
+        if pending_update:
+            add(pending_update)
+            pending_update = None
+
+    for line in patch.splitlines():
+        if line.startswith("*** Update File: "):
+            flush_update()
+            pending_update = line[len("*** Update File: ") :].strip()
+        elif line.startswith("*** Move to: "):
+            flush_update()
+            pending_update = line[len("*** Move to: ") :].strip()
+        elif line.startswith("*** Add File: "):
+            flush_update()
+            add(line[len("*** Add File: ") :].strip())
+        elif line.startswith("*** Delete File: "):
+            flush_update()
+            add(line[len("*** Delete File: ") :].strip())
+    flush_update()
+    return paths
+
+
+def _patch_added_content(patch: str) -> str:
+    lines: list[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+"):
+            lines.append(line[1:])
+    return "\n".join(lines)
+
+
+def _patch_added_content_by_path(patch: str) -> dict[str, str]:
+    content: dict[str, str] = {}
+    current_paths: list[str] = []
+    current_lines: list[str] = []
+
+    def finish() -> None:
+        nonlocal current_paths, current_lines
+        for path in current_paths:
+            content[path] = "\n".join(current_lines)
+        current_paths = []
+        current_lines = []
+
+    for line in patch.splitlines():
+        if line.startswith("*** Update File: "):
+            finish()
+            current_paths = [line[len("*** Update File: ") :].strip()]
+        elif line.startswith("*** Move to: "):
+            finish()
+            moved_to = line[len("*** Move to: ") :].strip()
+            current_paths = [moved_to] if moved_to else []
+        elif line.startswith("*** Add File: "):
+            finish()
+            current_paths = [line[len("*** Add File: ") :].strip()]
+        elif line.startswith("*** Delete File: "):
+            finish()
+            current_paths = [line[len("*** Delete File: ") :].strip()]
+        elif current_paths and line.startswith("+"):
+            current_lines.append(line[1:])
+    finish()
+    return content
+
+
+def _patch_move_target(patch: str) -> str:
+    for line in patch.splitlines():
+        if line.startswith("*** Move to: "):
+            return line[len("*** Move to: ") :].strip()
+    return ""
+
+
+def _warn(msg: str) -> None:
+    sys.stderr.write(f"opencode-hook-bridge: {msg}\n")

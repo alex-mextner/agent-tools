@@ -471,7 +471,7 @@ def test_to_v1_event_extracts_paths_with_spaces_absolute_and_dotdot():
     ]
 
 
-def test_to_v1_event_uses_move_target_as_single_patch_path():
+def test_to_v1_event_includes_move_source_and_target_patch_paths():
     patch = (
         "*** Begin Patch\n"
         "*** Update File: src/old.py\n"
@@ -492,9 +492,67 @@ def test_to_v1_event_uses_move_target_as_single_patch_path():
         point="pre-write",
     )
 
-    assert v1["args"]["file_paths"] == ["src/new.py"]
+    assert v1["args"]["file_paths"] == ["src/old.py", "src/new.py"]
     assert v1["args"]["file_path"] == "src/new.py"
     assert v1["args"]["path"] == "src/new.py"
+
+
+def test_move_apply_patch_dispatch_fans_out_source_and_target_content():
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: src/old.py\n"
+        "*** Move to: src/new.py\n"
+        "@@\n"
+        "-old()\n"
+        "+new()\n"
+        "*** End Patch\n"
+    )
+
+    events = dispatch._v1_events_for_dispatch(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"command": patch},
+            "cwd": "/repo",
+        },
+        point="pre-write",
+    )
+
+    assert [event["args"]["file_path"] for event in events] == ["src/old.py", "src/new.py"]
+    assert [event["args"]["content"] for event in events] == ["", "new()"]
+
+
+def test_move_apply_patch_secret_blocks_on_target_content(tmp_path):
+    hooks = tmp_path / "hooks"
+    _install_descriptor(
+        hooks,
+        hook_id="block-secrets-write",
+        point="pre-write",
+        cmd=BLOCK_SECRETS_WRITE,
+        on_error="closed",
+    )
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: src/old.py\n"
+        "*** Move to: src/new.py\n"
+        "@@\n"
+        "+API_KEY = 'abcd1234abcd1234'\n"
+        "*** End Patch\n"
+    )
+
+    proc = _run_dispatch(
+        "PreToolUse",
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"command": patch},
+            "cwd": str(tmp_path),
+        },
+        hooks_dir=hooks,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["decision"] == "block"
 
 
 def test_real_bash_guard_blocks_with_plain_codex_shape(tmp_path):
