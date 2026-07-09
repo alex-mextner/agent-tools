@@ -29,6 +29,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -1006,16 +1007,53 @@ def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
 
 def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
     marker = tmp_path / "asked"
+    question = tmp_path / "question.txt"
+    injected = tmp_path / "pwned-env"
+    justification = f'Need "hotfix"; pipe | amp & redir < > backtick `date`; $(touch {injected}); review is $pending.'
     tg_ctl = _fake_tg_ctl(
         tmp_path / "tg-ctl",
-        f"touch {marker}\n" 'printf "approved by Telegram tap\\n"\n' "exit 0\n",
+        f'printf "%s" "$2" > "{question}"\n'
+        f"touch {marker}\n"
+        'printf "approved by Telegram tap\\n"\n'
+        "exit 0\n",
     )
     monkeypatch.setattr(rr.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     repo = _mk_repo_with_staged(tmp_path, "src/util.py")
     out, _e, c = _run("git commit -m x", repo, monkeypatch, marker=tmp_path / "m",
-                      env={_HATCH_ENV: "Need to land a hotfix; review is mid-run."})
+                      env={_HATCH_ENV: justification})
     assert c == 0 and _decision(out) == "allow"
     assert marker.exists()
+    assert not injected.exists()
+    assert justification in question.read_text()
+
+
+def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
+    """The pre-bash hook must parse the documented inline hatch prefix from the command string."""
+    asked = tmp_path / "asked"
+    question = tmp_path / "question.txt"
+    injected = tmp_path / "pwned"
+    justification = f'Need "hotfix"; pipe | amp & redir < > backtick `date`; $(touch {injected}); review is $pending.'
+    tg_ctl = _fake_tg_ctl(
+        tmp_path / "tg-ctl",
+        f'printf "%s" "$2" > "{question}"\n'
+        f"touch {asked}\n"
+        'printf "approved by Telegram tap\\n"\n'
+        "exit 0\n",
+    )
+    clean_home = tmp_path / "_clean_home"
+    clean_home.mkdir()
+    monkeypatch.setattr(rr.hatch_escalation, "resolve_home", lambda: str(clean_home))
+    monkeypatch.setattr(rr.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
+    command = (
+        f"RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT={shlex.quote(justification)} "
+        "git commit -m x"
+    )
+    out, _e, c = _run(command, repo, monkeypatch, marker=tmp_path / "m")
+    assert c == 0 and _decision(out) == "allow"
+    assert asked.exists()
+    assert not injected.exists()
+    assert justification in question.read_text()
 
 
 def test_hatch_justification_exit1_blocks_citing_denied(tmp_path, monkeypatch):
