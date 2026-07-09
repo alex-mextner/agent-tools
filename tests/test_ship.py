@@ -2188,6 +2188,26 @@ def test_review_quorum_audit_log_records_refused(tmp_path):
     assert rec["models"] == 1, rec
 
 
+def test_review_quorum_audit_log_skipped_in_dry_run(tmp_path):
+    """--dry-run must honor its 'change nothing' contract: a bar-met (would-be authorized) run
+    still evaluates and prints the gate verdict, but MUST NOT create or append to the audit file.
+    Regression for the Codex P2 (#225) where the audit line was written even in dry-run."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    audit = tmp_path / "ship-audit.jsonl"
+    r = _run_ship_quorum(
+        main, gh, rv, extra_args=("--dry-run",),
+        env_extra={"REVIEW_TASK_CODE": "HYP-109", "SHIP_AUDIT_FILE": str(audit)},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    # The gate still evaluated and reported it would authorize...
+    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
+    assert "[dry-run] would append review-quorum audit" in r.stderr, r.stderr
+    # ...but no persistent audit record was written.
+    assert not audit.exists(), f"dry-run must not write the audit file, found: {audit.read_text()!r}"
+
+
 # --- hatch escalation: the ONLY bypass for a not-met review-quorum bar ---------------------
 # There is no self-service override flag. A short bar can only be bypassed by setting
 # RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>", which routes through the

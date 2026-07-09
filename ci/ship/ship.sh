@@ -959,6 +959,13 @@ _review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing
 # $4=models $5=reason(optional — the hatch verdict for bypass:* decisions)
 _review_quorum_audit_log() {
   local decision="$1" code="$2" iterations="${3:-0}" models="${4:-0}" reason="${5:-}"
+  # Honor the --dry-run contract ("print what would happen; change nothing"): a simulated ship
+  # must not create or pollute the real audit record. The gate above still evaluates and prints
+  # its authorized/refused verdict — only the persistent write is suppressed here.
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "[dry-run] would append review-quorum audit: decision=${decision} task=${code} iter=${iterations} models=${models}" >&2
+    return 0
+  fi
   local file="${SHIP_AUDIT_FILE:-$HOME/.config/agent-tools/ship-audit.jsonl}"
   mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
   local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
