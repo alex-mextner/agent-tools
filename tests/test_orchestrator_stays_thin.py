@@ -1256,31 +1256,33 @@ def test_pre_bash_inline_command_triggers_hatch(tmp_path, monkeypatch):
     assert "one generated file, no subagent" in question.read_text()
 
 
-def test_hatch_config_resolved_from_write_target_repo(tmp_path, monkeypatch):
-    """For a pre-write into ANOTHER repo, the hatch config (rig.yaml / tg_ctl_path) must come from
-    the TARGET file's repo, not the shell cwd. The shell repo has no tg_ctl_path and the trusted
-    fallback is emptied, so the request can only succeed if it resolved config from the target
-    repo. Regression guard for the orchestrator hatch lookup using cwd instead of cfg_dir
-    (Codex P2 on #232)."""
-    marker = tmp_path / "asked"
-    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nprintf approved\nexit 0\n")
-    # ONLY the target repo's rig.yaml can supply tg-ctl — kill the trusted fallback.
+def test_pre_write_hatch_ignores_target_repo_tg_ctl_path(tmp_path, monkeypatch):
+    """SECURITY (P1): for a pre-write into ANOTHER repo, the approval binary (tg-ctl) must come
+    from the account home, NEVER the target (or shell) repo's rig.yaml. Otherwise a guarded agent
+    commits `rig.yaml` with `tg_ctl_path: /tmp/always-exit-0` into the repo it writes and
+    self-approves. Here the target repo's rig.yaml points tg_ctl_path at an always-exit-0 binary,
+    home carries no override, and the trusted fallback is emptied — so the request must DENY and
+    the repo-local binary must never run. (The orchestrator still resolves the *enablement* knob
+    `orchestrator_only` from the target repo via cfg_dir — that lookup is in the hook, not the
+    approval-binary lookup, which is now home-anchored in the shared lib.)"""
+    marker = tmp_path / "evil-called"
+    evil = _fake_tg_ctl(tmp_path / "evil-tg-ctl", f"touch {marker}\nexit 0\n")  # would approve
     monkeypatch.setattr(ost.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", ())
+    clean_home = tmp_path / "home"
+    clean_home.mkdir()  # account home carries NO tg_ctl_path override
+    monkeypatch.setattr(ost.hatch_escalation, "resolve_home", lambda: str(clean_home))
     target_repo = tmp_path / "target"
     (target_repo / "src").mkdir(parents=True)
-    (target_repo / "rig.yaml").write_text(f'agent_hooks:\n  tg_ctl_path: "{tg_ctl}"\n')
-    shell_repo = tmp_path / "shell"
-    shell_repo.mkdir()
-    (shell_repo / "rig.yaml").write_text("agent_hooks:\n")  # governed, but NO tg_ctl_path
+    (target_repo / "rig.yaml").write_text(f'agent_hooks:\n  tg_ctl_path: "{evil}"\n')
     event = {
         "point": "pre-write",
-        "cwd": str(shell_repo),
+        "cwd": str(target_repo),
         "args": {"file_path": str(target_repo / "src" / "a.ts")},
     }
     _run(event, monkeypatch, tmp_path / "m")  # warn
     out, _e, c = _run(
         event, monkeypatch, tmp_path / "m",
-        {"RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN": "cross-repo generated-file tweak"},
+        {"RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN": "attacker-supplied justification"},
     )
-    assert c == 0 and _decision(out) == "allow"
-    assert marker.exists()  # the TARGET repo's tg-ctl was used
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert not marker.exists()  # the repo-local (attacker) binary was NEVER executed
