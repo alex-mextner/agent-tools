@@ -551,7 +551,9 @@ def main() -> int:
     )
 
     ctx = {"hook": "subagent-no-bg-longproc", "command": command}
-    hatch = hatch_escalation.request_hatch_approval("subagent-no-bg-longproc", ctx, cwd=cwd)
+    hatch = hatch_escalation.request_hatch_approval(
+        "subagent-no-bg-longproc", ctx, cwd=cwd, command=command
+    )
     if hatch.should_stop:
         if hatch.approved:
             warn(f"subagent-no-bg-longproc allowed via hatch escalation ({hatch.reason})")

@@ -105,10 +105,18 @@ window) is **deny-by-default**. For a genuine exception, ASK the human, or reque
 Telegram approval with a written justification:
 
 ```bash
-# works for BOTH points (pre-bash and pre-write):
+# pre-bash point: the inline VAR=… prefix is parsed out of the command string, so it works
+# even when the gated command is not first (`cd repo && RIG_HATCH_REQUEST_…="why" cmd`).
 RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN="trivial config tweak, no subagent worth it" \
   sed -i 's/a/b/' file
 ```
+
+The inline prefix form works **only at the pre-bash point** (the hook parses the leading
+assignment out of the command string; a pre-bash hook runs before the shell evaluates the
+`VAR=x cmd` prefix, so the value never reaches its `os.environ`). At the **pre-write** point
+(a code write via Edit/Write) there is no shell command to carry the prefix — the variable must
+be **exported** into the harness environment so the hook reads it from `os.environ`. An exported
+value takes precedence over an inline one at either point.
 
 If the env var is unset, no Telegram call is made and the block simply stands. If it is present
 but blank, whitespace-only, or a bare flag value (`1`/`true`/`yes`/`on`), the hook does not

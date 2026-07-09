@@ -53,10 +53,14 @@ itself an exception — security theater, not a permission gate. It was removed.
 an inline sentinel — the Agent tool carries no shell string to hide a `# ...` in.)
 
 The block is now **deny-by-default**. For a genuine exception, ASK the human, or request a
-one-time Telegram approval with a written justification:
+one-time Telegram approval with a written justification. Because this is a **pre-agent** hook
+(it gates the Agent/Task tool, which carries no shell command string), the inline
+`VAR=… <command>` prefix form does NOT apply here — the variable must be **exported** into the
+harness process environment so the hook reads it from `os.environ`:
 
 ```bash
-RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE="quick probe, latency matters"
+export RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE="quick probe, latency matters"
+# …then make the dispatch that would otherwise be blocked.
 ```
 
 If the env var is unset, no Telegram call is made and the dispatch simply blocks. If it is

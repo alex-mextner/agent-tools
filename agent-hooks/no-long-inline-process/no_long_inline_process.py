@@ -519,7 +519,9 @@ def main() -> int:
     )
 
     ctx = {"hook": "no-long-inline-process", "command": command}
-    hatch = hatch_escalation.request_hatch_approval("no-long-inline-process", ctx, cwd=cwd)
+    hatch = hatch_escalation.request_hatch_approval(
+        "no-long-inline-process", ctx, cwd=cwd, command=command
+    )
     if hatch.should_stop:
         if hatch.approved:
             warn(f"no-long-inline-process allowed via hatch escalation ({hatch.reason})")

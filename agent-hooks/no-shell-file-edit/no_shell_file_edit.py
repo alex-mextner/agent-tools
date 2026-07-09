@@ -882,7 +882,9 @@ def main() -> int:
     )
 
     ctx = {"hook": "no-shell-file-edit", "command": command}
-    hatch = hatch_escalation.request_hatch_approval("no-shell-file-edit", ctx, cwd=str(cwd))
+    hatch = hatch_escalation.request_hatch_approval(
+        "no-shell-file-edit", ctx, cwd=str(cwd), command=command
+    )
     if hatch.should_stop:
         if hatch.approved:
             warn(f"no-shell-file-edit allowed via hatch escalation ({hatch.reason})")

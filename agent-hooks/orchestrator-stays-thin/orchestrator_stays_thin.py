@@ -999,7 +999,17 @@ def main() -> int:
     # a first-offense WARN is advisory (allow) and needs no escalation.
     if _is_repeat(event):
         ctx = {"hook": "orchestrator-stays-thin", "point": point, "command": command}
-        hatch = hatch_escalation.request_hatch_approval("orchestrator-stays-thin", ctx, cwd=cwd)
+        # Resolve the hatch config (rig.yaml / tg_ctl_path) from the GOVERNING repo — for a
+        # pre-write that is the TARGET file's repo (`cfg_dir`), which can differ from the shell
+        # `cwd`; using `cwd` would route/deny an approval for a cross-repo write via the wrong
+        # repo's config. The inline `RIG_HATCH_REQUEST_*=` form only exists for the pre-bash
+        # point (a pre-write has no shell command to carry it — the var must be exported there).
+        hatch = hatch_escalation.request_hatch_approval(
+            "orchestrator-stays-thin",
+            ctx,
+            cwd=cfg_dir,
+            command=command if point == "pre-bash" else None,
+        )
         if hatch.should_stop:
             if hatch.approved:
                 warn(f"orchestrator-stays-thin allowed via hatch escalation ({hatch.reason})")

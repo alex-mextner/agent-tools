@@ -446,3 +446,19 @@ def test_hatch_justification_exit1_blocks(tmp_path, monkeypatch):
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
+    """The justification supplied as an inline command PREFIX (env var NOT exported) must reach
+    tg-ctl via the new `command=` contract. Regression for the documented inline form (Codex #232)."""
+    marker = tmp_path / "asked"
+    question = tmp_path / "q.txt"
+    tg_ctl = _fake_tg_ctl(
+        tmp_path / "tg-ctl", f'touch {marker}\nprintf "%s" "$2" > "{question}"\nprintf approved\nexit 0\n')
+    monkeypatch.setattr(nlip.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _e, code = _run(
+        'RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS="one-shot review, output needed now" review',
+        monkeypatch)  # env deliberately NOT set — only the inline prefix
+    assert code == 0 and _decision(out) == "allow"
+    assert marker.exists()
+    assert "one-shot review, output needed now" in question.read_text()

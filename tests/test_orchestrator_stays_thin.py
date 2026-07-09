@@ -1229,3 +1229,58 @@ def test_double_quoted_substitution_is_live_and_judged(tmp_path, monkeypatch):
     assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
     out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+# ── Inline command hatch (pre-bash) + write-target config routing (pre-write) ────────────
+
+
+def test_pre_bash_inline_command_triggers_hatch(tmp_path, monkeypatch):
+    """A pre-bash repeat offense with the justification supplied as an inline command prefix
+    (env var NOT exported) must reach tg-ctl — the hook now passes the command string through so
+    request_hatch_approval can parse the leading assignment. Regression guard for the inline form
+    being unusable (Codex P2 on #232)."""
+    marker = tmp_path / "asked"
+    question = tmp_path / "q.txt"
+    tg_ctl = _fake_tg_ctl(
+        tmp_path / "tg-ctl",
+        f'touch {marker}\nprintf "%s" "$2" > "{question}"\nprintf approved\nexit 0\n',
+    )
+    monkeypatch.setattr(ost.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    impl = "sed -i 's/a/b/' f && npm run build && echo done"
+    inline = 'RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN="one generated file, no subagent" ' + impl
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": inline}}
+    _run(event, monkeypatch, tmp_path / "m")  # warn
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")  # repeat → inline hatch → approve
+    assert c == 0 and _decision(out) == "allow"
+    assert marker.exists()
+    assert "one generated file, no subagent" in question.read_text()
+
+
+def test_hatch_config_resolved_from_write_target_repo(tmp_path, monkeypatch):
+    """For a pre-write into ANOTHER repo, the hatch config (rig.yaml / tg_ctl_path) must come from
+    the TARGET file's repo, not the shell cwd. The shell repo has no tg_ctl_path and the trusted
+    fallback is emptied, so the request can only succeed if it resolved config from the target
+    repo. Regression guard for the orchestrator hatch lookup using cwd instead of cfg_dir
+    (Codex P2 on #232)."""
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nprintf approved\nexit 0\n")
+    # ONLY the target repo's rig.yaml can supply tg-ctl — kill the trusted fallback.
+    monkeypatch.setattr(ost.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", ())
+    target_repo = tmp_path / "target"
+    (target_repo / "src").mkdir(parents=True)
+    (target_repo / "rig.yaml").write_text(f'agent_hooks:\n  tg_ctl_path: "{tg_ctl}"\n')
+    shell_repo = tmp_path / "shell"
+    shell_repo.mkdir()
+    (shell_repo / "rig.yaml").write_text("agent_hooks:\n")  # governed, but NO tg_ctl_path
+    event = {
+        "point": "pre-write",
+        "cwd": str(shell_repo),
+        "args": {"file_path": str(target_repo / "src" / "a.ts")},
+    }
+    _run(event, monkeypatch, tmp_path / "m")  # warn
+    out, _e, c = _run(
+        event, monkeypatch, tmp_path / "m",
+        {"RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN": "cross-repo generated-file tweak"},
+    )
+    assert c == 0 and _decision(out) == "allow"
+    assert marker.exists()  # the TARGET repo's tg-ctl was used

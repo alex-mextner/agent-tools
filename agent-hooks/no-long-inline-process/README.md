@@ -56,6 +56,13 @@ RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS="one-shot smoke build, output needed no
   <the command>
 ```
 
+This is a **pre-bash** hook, so the inline prefix is honored: the hook parses the leading
+`RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS=…` assignment out of the command string the event
+carries (a pre-bash hook runs in its own process *before* the shell evaluates the `VAR=x cmd`
+prefix, so the value never reaches its `os.environ`). It also works when the gated command is not
+first (`cd repo && RIG_HATCH_REQUEST_…="why" <cmd>`). Exporting the var into the harness
+environment works too and takes precedence over an inline value.
+
 If the env var is unset, no Telegram call is made and the command simply blocks. If it is
 present but blank, whitespace-only, or a bare flag value (`1`/`true`/`yes`/`on`), the hook does
 not contact Telegram and denies — a bare `1` is not a justification. A real justification runs
