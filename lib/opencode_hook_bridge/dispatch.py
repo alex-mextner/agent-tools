@@ -1,10 +1,11 @@
 """The agents-hooks/v1 -> opencode plugin bridge dispatcher.
 
-opencode loads JavaScript plugins from ``~/.config/opencode/plugins``. The companion
+opencode loads JavaScript plugins from config/plugin directories. The companion
 ``plugin.js`` file calls this module for ``tool.execute.before`` and
 ``tool.execute.after`` events. This dispatcher maps opencode's tool payload to the
 shared agents-hooks/v1 contract and returns a plain ``{"decision":"block"}`` JSON
-object to the plugin, which throws to block the opencode tool call.
+object to the plugin. The plugin throws for pre-tool blocks and logs post-write
+feedback because completed writes cannot be un-run.
 """
 
 from __future__ import annotations
@@ -80,6 +81,9 @@ def to_v1_event(opencode_event: dict, *, point: str) -> dict:
                 if len(paths) == 1:
                     args.setdefault("file_path", paths[0])
                     args.setdefault("path", paths[0])
+                elif _patch_move_target(command):
+                    args.setdefault("file_path", paths[-1])
+                    args.setdefault("path", paths[-1])
                 if point == "pre-write":
                     args["content"] = _patch_added_content(command)
         else:
@@ -89,7 +93,7 @@ def to_v1_event(opencode_event: dict, *, point: str) -> dict:
                 args.setdefault("path", path)
             if point == "pre-write":
                 content = _write_content(raw_args)
-                if content and not isinstance(args.get("content"), str):
+                if not isinstance(args.get("content"), str):
                     args["content"] = content
 
     return {
@@ -262,7 +266,6 @@ def _v1_events_for_dispatch(opencode_event: dict, *, point: str) -> list[dict]:
     file_paths = args.get("file_paths")
     if (
         point not in ("pre-write", "post-write")
-        or "file_path" in args
         or not isinstance(file_paths, list)
         or len(file_paths) <= 1
     ):
@@ -306,6 +309,7 @@ def _patch_file_paths(patch: str) -> list[str]:
             flush_update()
             pending_update = line[len("*** Update File: ") :].strip()
         elif line.startswith("*** Move to: "):
+            flush_update()
             pending_update = line[len("*** Move to: ") :].strip()
         elif line.startswith("*** Add File: "):
             flush_update()
@@ -327,34 +331,42 @@ def _patch_added_content(patch: str) -> str:
 
 def _patch_added_content_by_path(patch: str) -> dict[str, str]:
     content: dict[str, str] = {}
-    current_path: str | None = None
+    current_paths: list[str] = []
     current_lines: list[str] = []
 
     def finish() -> None:
-        nonlocal current_path, current_lines
-        if current_path is not None:
-            content[current_path] = "\n".join(current_lines)
-        current_path = None
+        nonlocal current_paths, current_lines
+        for path in current_paths:
+            content[path] = "\n".join(current_lines)
+        current_paths = []
         current_lines = []
 
     for line in patch.splitlines():
         if line.startswith("*** Update File: "):
             finish()
-            current_path = line[len("*** Update File: ") :].strip()
+            current_paths = [line[len("*** Update File: ") :].strip()]
         elif line.startswith("*** Move to: "):
-            current_path = line[len("*** Move to: ") :].strip()
+            finish()
+            moved_to = line[len("*** Move to: ") :].strip()
+            current_paths = [moved_to] if moved_to else []
         elif line.startswith("*** Add File: "):
             finish()
-            current_path = line[len("*** Add File: ") :].strip()
+            current_paths = [line[len("*** Add File: ") :].strip()]
         elif line.startswith("*** Delete File: "):
             finish()
-            current_path = line[len("*** Delete File: ") :].strip()
-        elif current_path is not None and line.startswith("+"):
+            current_paths = [line[len("*** Delete File: ") :].strip()]
+        elif current_paths and line.startswith("+"):
             current_lines.append(line[1:])
     finish()
     return content
 
 
+def _patch_move_target(patch: str) -> str:
+    for line in patch.splitlines():
+        if line.startswith("*** Move to: "):
+            return line[len("*** Move to: ") :].strip()
+    return ""
+
+
 def _warn(msg: str) -> None:
     sys.stderr.write(f"opencode-hook-bridge: {msg}\n")
-

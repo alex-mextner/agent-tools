@@ -81,11 +81,12 @@ These are the *logical* points; map them to your harness's actual tool-use event
 
 > **opencode:** opencode also needs a carrier bridge. `lib/opencode_hook_bridge` ships a
 > JavaScript plugin plus Python dispatcher: rig symlinks the plugin into
-> `~/.config/opencode/plugins/`, and the plugin calls the dispatcher for
+> `.opencode/plugins/zz-agent-tools-hook-bridge.js`, and the plugin calls the dispatcher for
 > `tool.execute.before` (`bash` -> `pre-bash`, `edit`/`write`/`apply_patch` -> `pre-write`,
 > `task` -> `pre-agent`) and `tool.execute.after` file edits (`post-write`). It reads
-> descriptors from `~/.config/opencode/hooks` and blocks by throwing an opencode plugin
-> error when a v1 hook exits 10. opencode `stop` is **not** mapped: documented session
+> descriptors from `~/.config/opencode/hooks`; pre-tool exit 10 blocks by throwing an opencode
+> plugin error, while post-write exit 10 is logged as feedback because the write already
+> landed. opencode `stop` is **not** mapped: documented session
 > events such as `session.idle` are notifications, not a pre-stop block contract.
 
 | point          | fires when…                                  | hooks                                   |
