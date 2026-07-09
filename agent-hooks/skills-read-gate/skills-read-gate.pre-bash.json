@@ -3,7 +3,7 @@
   "point": "pre-bash",
   "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/skills-read-gate/skills_read_gate.py",
   "priority": 48,
-  "timeout_ms": 3000,
+  "timeout_ms": 960000,
   "on_error": "open",
-  "description": "Before WORK (a `git commit`, or a build/test command), checks that the mandatory skills were invoked this session — a fresh per-skill marker in ~/.cache/agent-tools/skills-invoked/. MANDATORY_SKILLS (default delegate-work-to-subagents,visual-proof-cycle), freshness SKILLS_FRESH_WINDOW_S (7200s). WARN first, BLOCK on repeat (default WARN-first so it never wedges while the marker-writer is wired). A dispatched subagent (agent_id present) is exempt from the two orchestration/visual defaults (it IS the delegate; non-UI work has no visual proof) but still gated on any project-specific MANDATORY_SKILLS entry. Escape hatch: ALLOW_SKIP_SKILLS=1 + ALLOW_SKIP_SKILLS_REASON='why', or inline `# skills-ok: why`. on_error=open."
+  "description": "Before WORK (a `git commit`, or a build/test command), checks that the mandatory skills were invoked this session — a fresh per-skill marker in ~/.cache/agent-tools/skills-invoked/. MANDATORY_SKILLS (default delegate-work-to-subagents,visual-proof-cycle), freshness SKILLS_FRESH_WINDOW_S (7200s). WARN first, BLOCK on repeat (default WARN-first so it never wedges while the marker-writer is wired). A dispatched subagent (agent_id present) is exempt from the two orchestration/visual defaults (it IS the delegate; non-UI work has no visual proof) but still gated on any project-specific MANDATORY_SKILLS entry. No self-service bypass: request a one-time Telegram approval via RIG_HATCH_REQUEST_SKILLS_READ_GATE='<justification>' (deny-by-default; bare 1 rejected) — allows only on the human's tg-ctl approval, which is why timeout_ms is 960000 (tg-ctl's live-Telegram cap). on_error=open."
 }

@@ -9,12 +9,14 @@ Run::
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -25,6 +27,8 @@ _spec = importlib.util.spec_from_file_location("require_ticket", _SCRIPT)
 assert _spec and _spec.loader
 mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
+
+_HATCH_ENV = "RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT"
 
 
 def run_hook(
@@ -47,6 +51,7 @@ def run_hook(
     env.pop("REQUIRE_TICKET_STRICT", None)
     env.pop("REQUIRE_TICKET_SKIP", None)
     env.pop("REQUIRE_TICKET_EXEMPT_TYPES", None)
+    env.pop(_HATCH_ENV, None)
     if strict is True:
         env["REQUIRE_TICKET_STRICT"] = "1"
     elif strict is False:
@@ -79,6 +84,7 @@ def _run_hook_raw(command: str, **kwargs) -> dict:
     env.pop("REQUIRE_TICKET_STRICT", None)
     env.pop("REQUIRE_TICKET_SKIP", None)
     env.pop("REQUIRE_TICKET_EXEMPT_TYPES", None)
+    env.pop(_HATCH_ENV, None)
     if kwargs.get("env_extra"):
         env.update(kwargs["env_extra"])
     with tempfile.TemporaryDirectory() as isolated:
@@ -99,6 +105,60 @@ def _run_hook_raw(command: str, **kwargs) -> dict:
         "message": payload.get("message", ""),
         "stderr": proc.stderr or "",
     }
+
+
+def _fake_tg_ctl(path: Path, body: str) -> Path:
+    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _run_hook_inproc(command: str, *, env_extra: dict | None = None, tg_ctl: Path) -> dict:
+    """Run the hook in-process so the trusted tg-ctl path can be patched to a fake binary."""
+
+    env_keys = {
+        "REQUIRE_TICKET_STRICT",
+        "REQUIRE_TICKET_SKIP",
+        "REQUIRE_TICKET_EXEMPT_TYPES",
+        _HATCH_ENV,
+    } | set(env_extra or {})
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        for key in env_keys:
+            os.environ.pop(key, None)
+        for key, value in (env_extra or {}).items():
+            os.environ[key] = value
+
+        with tempfile.TemporaryDirectory() as isolated:
+            home = Path(isolated) / "home"
+            home.mkdir()
+            event = json.dumps({"args": {"command": command}, "cwd": isolated})
+            out = io.StringIO()
+            with (
+                mock.patch.object(mod, "STRICT", True),
+                mock.patch.object(mod.hatch_escalation, "resolve_home", lambda: str(home)),
+                mock.patch.object(mod.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,)),
+                mock.patch.object(sys, "stdin", io.StringIO(event)),
+                mock.patch.object(sys, "stdout", out),
+            ):
+                try:
+                    code = mod.main()
+                except SystemExit as exc:
+                    code = exc.code if isinstance(exc.code, int) else 1
+        raw = out.getvalue().strip()
+        if not raw:
+            raise AssertionError(f"empty hook stdout from in-process run; code={code}")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f"hook stdout is not protocol JSON: {raw!r}") from exc
+        return {"code": code, "decision": payload["decision"], "message": payload.get("message", "")}
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 class TicketHeuristic(unittest.TestCase):
@@ -380,15 +440,16 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(out["code"], mod.BLOCK_EXIT_CODE, "-F - is unreadable — must fail-closed")
         self.assertEqual(out["decision"], "block")
         self.assertIn(mod.BLOCK_MARKER, out["message"])
-        # the hint must name the readable ways to satisfy the gate and the WORKING escape.
+        # the hint must name the readable ways to satisfy the gate and the sanctioned live hatch.
         msg = out["message"]
         self.assertIn("stdin", msg.lower())
         self.assertIn("-m", msg)
         self.assertIn("-F <file>", msg)
         self.assertIn("branch", msg.lower())  # branch-name path is a valid way to ticket a `-F -`
-        self.assertIn("REQUIRE_TICKET_SKIP=1", msg)  # the only escape that works for stdin
-        # the hint must NOT promise the `[skip-ticket: …]` TRAILER for `-F -` — it lives in the
-        # unreadable stdin message, so it can't work; offering it would mislead.
+        self.assertIn(_HATCH_ENV, msg)
+        self.assertNotIn("REQUIRE_TICKET_SKIP=", msg)
+        # the hint must NOT promise the `[skip-ticket: …]` TRAILER — it was removed, and for `-F -`
+        # it would also live in unreadable stdin.
         self.assertNotIn("skip-ticket", msg.lower())
         # and the `-` sentinel must NOT have been treated as a file to open (no spurious read warning).
         self.assertNotIn("could not read commit-message file", out["stderr"])
@@ -400,14 +461,52 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(code, mod.BLOCK_EXIT_CODE, spelling)
             self.assertEqual(decision, "block", spelling)
 
-    def test_dash_F_dash_skip_ticket_inline_escape_still_works(self):
-        # the deliberate inline escape must still let a genuine no-ticket `-F -` commit through —
-        # it's read from the command env, not git's unreadable stdin.
+    def test_dash_F_dash_inline_skip_env_no_longer_bypasses(self):
+        # The old per-command inline escape was removed; a no-ticket `-F -` commit still blocks
+        # unless the live Telegram hatch is approved.
         code, decision = run_hook(
             "REQUIRE_TICKET_SKIP=1 git commit -F -", strict=True
         )
-        self.assertEqual(code, 0)
-        self.assertEqual(decision, "allow")
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
+
+    def test_dash_F_dash_hatch_approved_allows(self):
+        # The sanctioned hatch is consulted before the unreadable-stdin block.
+        with tempfile.TemporaryDirectory() as tmp:
+            tg_ctl = _fake_tg_ctl(Path(tmp) / "tg-ctl", 'printf "approved\\n"\nexit 0\n')
+            out = _run_hook_inproc(
+                "git commit -F -",
+                env_extra={_HATCH_ENV: "one-off backfill, no ticket"},
+                tg_ctl=tg_ctl,
+            )
+        self.assertEqual(out["code"], 0)
+        self.assertEqual(out["decision"], "allow")
+        self.assertNotIn(mod.BLOCK_MARKER, out["message"])
+
+    def test_dash_F_dash_hatch_denied_blocks(self):
+        # A requested hatch must fail closed when tg-ctl exits nonzero.
+        with tempfile.TemporaryDirectory() as tmp:
+            tg_ctl = _fake_tg_ctl(Path(tmp) / "tg-ctl", 'printf "approved?\\n"\nexit 1\n')
+            out = _run_hook_inproc(
+                "git commit -F -",
+                env_extra={_HATCH_ENV: "one-off backfill, no ticket"},
+                tg_ctl=tg_ctl,
+            )
+        self.assertEqual(out["code"], mod.BLOCK_EXIT_CODE)
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("hatch escalation denied", out["message"].lower())
+
+    def test_dash_F_dash_inline_hatch_approved_allows(self):
+        # Pre-bash hooks must parse the documented inline prefix from the command string because
+        # the shell has not exported it to the hook process yet.
+        with tempfile.TemporaryDirectory() as tmp:
+            tg_ctl = _fake_tg_ctl(Path(tmp) / "tg-ctl", 'printf "approved\\n"\nexit 0\n')
+            out = _run_hook_inproc(
+                f'{_HATCH_ENV}="one-off backfill, no ticket" git commit -F -',
+                tg_ctl=tg_ctl,
+            )
+        self.assertEqual(out["code"], 0)
+        self.assertEqual(out["decision"], "allow")
 
     def test_dash_F_dash_on_ticket_branch_allows(self):
         # A `-F -` (unreadable stdin message) commit is still ticketed by its BRANCH name — same as
@@ -480,26 +579,26 @@ class ValidRefFormsPassByDefault(unittest.TestCase):
         self._assert_allows("feat: add export [ticket: backfill-orders]")
 
 
-class PerCommitEscapes(unittest.TestCase):
-    """The two deliberate escapes must let a ticketless commit through under the strict default."""
+class RemovedSelfServiceEscapes(unittest.TestCase):
+    """Old self-service per-commit escapes must not bypass the ticket gate."""
 
-    def test_skip_ticket_trailer_allows(self):
+    def test_skip_ticket_trailer_blocks_even_with_reason(self):
         code, decision = run_hook(
             'git commit -m "feat: x [skip-ticket: one-off backfill]"'
         )
-        self.assertEqual(code, 0)
-        self.assertEqual(decision, "allow")
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
 
     def test_skip_ticket_trailer_requires_reason(self):
-        # a blank `[skip-ticket:]` is NOT a valid escape — it must still block.
+        # a blank `[skip-ticket:]` also blocks.
         code, decision = run_hook('git commit -m "feat: x [skip-ticket: ]"')
         self.assertEqual(code, mod.BLOCK_EXIT_CODE)
         self.assertEqual(decision, "block")
 
-    def test_inline_skip_env_allows(self):
+    def test_inline_skip_env_no_longer_bypasses(self):
         code, decision = run_hook('REQUIRE_TICKET_SKIP=1 git commit -m "feat: x"')
-        self.assertEqual(code, 0)
-        self.assertEqual(decision, "allow")
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
 
     def test_inline_skip_falsey_does_not_allow(self):
         code, decision = run_hook('REQUIRE_TICKET_SKIP=0 git commit -m "feat: x"')
@@ -514,33 +613,18 @@ class PerCommitEscapes(unittest.TestCase):
         self.assertEqual(code, mod.BLOCK_EXIT_CODE)
         self.assertEqual(decision, "block")
 
-    def test_skip_trailer_helper(self):
-        self.assertTrue(mod.has_skip_trailer("feat: x [skip-ticket: reason]"))
-        self.assertFalse(mod.has_skip_trailer("feat: x"))
-        self.assertFalse(mod.has_skip_trailer("feat: x [skip-ticket: ]"))
+    def test_removed_skip_helpers_are_not_exported(self):
+        self.assertFalse(hasattr(mod, "has_skip_trailer"))
+        self.assertFalse(hasattr(mod, "has_inline_skip"))
 
-    def test_inline_skip_helper(self):
-        # The helper now reads the PARSED commit segment's env (scoped by the parser to the real
-        # `git commit` segment), so a sibling-command assignment is already excluded.
-        self.assertTrue(mod.has_inline_skip(_commit_segment('REQUIRE_TICKET_SKIP=1 git commit -m x')))
-        self.assertTrue(mod.has_inline_skip(_commit_segment('REQUIRE_TICKET_SKIP=yes git commit -m x')))
-        self.assertFalse(mod.has_inline_skip(_commit_segment('REQUIRE_TICKET_SKIP=0 git commit -m x')))
-        self.assertFalse(mod.has_inline_skip(_commit_segment('git commit -m x')))
-        # the assignment on a SIBLING command does not land on the commit segment's env
-        self.assertFalse(
-            mod.has_inline_skip(_commit_segment('REQUIRE_TICKET_SKIP=1 echo x; git commit -m y'))
-        )
-
-    def test_inline_skip_with_shell_op_in_message_is_honored(self):
-        # The new quote-aware tokenizer keeps a `;` INSIDE the commit message inside the quoted token,
-        # so the inline `REQUIRE_TICKET_SKIP=1` is correctly recognized on the commit segment and the
-        # escape is honored — an improvement over the old `re.split`-based parser, which broke the
-        # segment on the message's `;` and (fail-safe but wrongly) still blocked.
+    def test_inline_skip_with_shell_op_in_message_no_longer_bypasses(self):
+        # The quote-aware tokenizer still keeps `;` inside the commit message; the old inline skip
+        # env simply is no longer a grant.
         code, decision = run_hook(
             'REQUIRE_TICKET_SKIP=1 git commit -m "fix: handle a; b edge case"'
         )
-        self.assertEqual(code, 0)
-        self.assertEqual(decision, "allow")
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
 
 
 class StrictToggle(unittest.TestCase):
@@ -954,19 +1038,19 @@ class ClusteredShortFlagDecluster(unittest.TestCase):
         self.assertEqual(code, 0, "a chore: -am commit is exempt and must be allowed")
         self.assertEqual(decision, "allow")
 
-    def test_e2e_am_skip_trailer_escape_still_works(self):
+    def test_e2e_am_skip_trailer_no_longer_bypasses(self):
         code, decision = run_hook(
             'git commit -am "no ticket [skip-ticket: deliberate]"', strict=True
         )
-        self.assertEqual(code, 0)
-        self.assertEqual(decision, "allow")
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
 
-    def test_e2e_am_inline_skip_env_escape_still_works(self):
+    def test_e2e_am_inline_skip_env_no_longer_bypasses(self):
         code, decision = run_hook(
             'REQUIRE_TICKET_SKIP=1 git commit -am "no ticket"', strict=True
         )
-        self.assertEqual(code, 0)
-        self.assertEqual(decision, "allow")
+        self.assertEqual(code, mod.BLOCK_EXIT_CODE)
+        self.assertEqual(decision, "block")
 
     def test_e2e_benign_clustered_flag_non_commit_passes(self):
         # the #37/#40 over-block cautionary tale: a benign command with a clustered short flag that
@@ -1137,6 +1221,7 @@ class AbbreviatedLongFlagPrefix(unittest.TestCase):
         )
         self.assertIn("--bogus-flag", src, "test setup: the value-long set line must have been patched")
         ns = types.ModuleType("rt_poisoned")
+        ns.__dict__["__file__"] = str(_SCRIPT)
         with self.assertRaises(RuntimeError):
             exec(compile(src, str(_SCRIPT), "exec"), ns.__dict__)
 

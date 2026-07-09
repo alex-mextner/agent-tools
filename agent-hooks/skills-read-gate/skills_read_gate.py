@@ -26,11 +26,15 @@ visual-proof-cycle) are STRUCTURALLY N/A for a dispatched subagent — the subag
 demanded set when agent_id is present (mirrors orchestrator-stays-thin's subagent detection).
 Any project-specific MANDATORY_SKILLS entry still applies to subagents.
 
-Escape hatch (controllable — mirrors block-raw-pr-merge):
-  - env  ALLOW_SKIP_SKILLS=1            — disable the guard for this session
-  - env  ALLOW_SKIP_SKILLS_REASON=...   — REQUIRED with the override; logged
-  - inline  `# skills-ok: <reason>`     — self-documenting per-command
-  A reasonless override still blocks.
+No self-service bypass. There is NO env var / inline sentinel an agent can set on its own
+command to skip this gate — a self-grant is security theater. (Previously an
+`ALLOW_SKIP_SKILLS=1` override was routinely forced onto EVERY subagent commit to dodge the
+orchestration/visual defaults; that dominant false-block is now handled structurally — those
+two defaults are dropped for a dispatched subagent, see above — so no blanket override is
+needed.) For a genuine one-off, ASK the human, or request a ONE-TIME Telegram approval via
+`RIG_HATCH_REQUEST_SKILLS_READ_GATE="<justification>"` (deny-by-default; a blank or bare `1` is
+rejected — the value must be a real written justification). The request routes to the human
+over Telegram (tg-ctl) and allows ONLY on their approval.
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; the shell command is in args.command
@@ -50,6 +54,12 @@ import shlex
 import sys
 import time
 from pathlib import Path
+
+_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+import agenttools_hatch_escalation as hatch_escalation  # noqa: E402
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
@@ -100,7 +110,9 @@ BUILD_OR_TEST = re.compile(
     r"|" + _CMD_START + r"(?:make|rake|msbuild)\b[^&;|]*\b(?:test|build|all)\b"
     r"|" + _CMD_START + r"(?:mvn|gradle)\b[^&;|]*\b(?:test|build|verify|package)\b"
 )
-INLINE_SENTINEL = re.compile(r"#\s*skills-ok:\s*(\S.*)")
+
+# Canonical hook id for the shared Telegram hatch (RIG_HATCH_REQUEST_SKILLS_READ_GATE).
+HOOK_ID = "skills-read-gate"
 
 
 def emit(decision: str, message: str | None = None) -> None:
@@ -264,11 +276,34 @@ def is_skip_commit(command: str) -> bool:
     return all(any(tok in SKIP_FLAGS for tok in flags) for flags in commit_segments_flags)
 
 
+# A leading inline `VAR=value` env-assignment run at a command head (line start or right after a
+# `|`/`&`/`;` separator). A real shell applies it as environment to the following command, so it
+# is transparent to WHICH command runs — but it pushes `git` off the command head and defeats the
+# `GIT_COMMIT` anchor. Chief case: the documented inline hatch form
+# `RIG_HATCH_REQUEST_SKILLS_READ_GATE="why" git commit …`, which must still be detected as a
+# commit (else the gate silently allows it, never reaching the Telegram hatch). Stripped only for
+# detection; the value/quote handling covers "double"/'single'/bare forms.
+_INLINE_ENV_PREFIX = re.compile(
+    r"(?P<sep>^|[|&;]\s*)"
+    r"(?:[A-Za-z_]\w*=(?:\"[^\"]*\"|'[^']*'|[^\s|&;]+)[ \t]+)+"
+)
+
+
+def _strip_leading_inline_env(command: str) -> str:
+    """Drop leading `VAR=value` env-assignment runs at each command head, so a command whose real
+    executable is prefixed by inline env (`RIG_HATCH_REQUEST_…="why" git commit`) is detected as
+    that executable. Prose stays safe: assignments inside quotes are not at a command head."""
+
+    return _INLINE_ENV_PREFIX.sub(lambda m: m.group("sep"), command)
+
+
 def _is_work_action(command: str) -> bool:
-    # Detect the commit on the comment-stripped command, and judge skip-ness from the parsed
-    # argv — so a skip token in a trailing comment / commit message can't bypass the gate.
-    stripped = _strip_shell_comment(command)
-    if GIT_COMMIT.search(stripped) and not is_skip_commit(command):
+    # Strip leading inline env first (so `RIG_HATCH_REQUEST_…="why" git commit` still trips the
+    # gate), then detect the commit on the comment-stripped command and judge skip-ness from the
+    # parsed argv — so a skip token in a trailing comment / commit message can't bypass the gate.
+    env_free = _strip_leading_inline_env(command)
+    stripped = _strip_shell_comment(env_free)
+    if GIT_COMMIT.search(stripped) and not is_skip_commit(env_free):
         return True
     return bool(BUILD_OR_TEST.search(stripped))
 
@@ -282,17 +317,6 @@ def _fresh(p: Path) -> bool:
 
 def _missing_skills(*, subagent: bool = False) -> list[str]:
     return [s for s in _mandatory_skills(subagent=subagent) if not _fresh(INVOKED_DIR / s)]
-
-
-def _override_reason(command: str) -> str | None:
-    if os.environ.get("ALLOW_SKIP_SKILLS") == "1":
-        reason = (os.environ.get("ALLOW_SKIP_SKILLS_REASON") or "").strip()
-        if reason:
-            return f"env override: {reason}"
-    m = INLINE_SENTINEL.search(command)
-    if m:
-        return f"inline override: {m.group(1).strip()}"
-    return None
 
 
 def _tier_marker(event: dict) -> Path:
@@ -337,8 +361,8 @@ def _block_message(missing: list[str]) -> str:
     examples = [_SKILL_EXAMPLE[s] for s in missing if s in _SKILL_EXAMPLE]
     example = f" (e.g. {', '.join(examples)}.)" if examples else ""
     override = (
-        " Override only with a reason: ALLOW_SKIP_SKILLS=1 + ALLOW_SKIP_SKILLS_REASON='why', or "
-        "append `# skills-ok: why`."
+        " No self-service bypass. ASK the human, or request a one-time Telegram approval via "
+        'RIG_HATCH_REQUEST_SKILLS_READ_GATE="<justification>" (deny-by-default; bare 1 rejected).'
     )
     return head + example + override
 
@@ -368,13 +392,24 @@ def main() -> int:
         emit("allow")  # every demanded skill has a fresh marker → satisfied
         return 0
 
-    reason = _override_reason(command)
-    if reason:
-        warn(f"skills gate skipped via escape hatch ({reason})")
-        emit("allow", f"skills gate skipped via escape hatch ({reason})")
-        return 0
-
     message = _block_message(missing)
+    cwd = str(event.get("cwd") or os.getcwd())
+
+    # A present hatch request is authoritative: it resolves the gate immediately (approved →
+    # allow; denied → block, regardless of the WARN/BLOCK tier — an explicit human "no" is a
+    # hard deny). An UNSET request falls through to the normal WARN-first tier below.
+    hatch = hatch_escalation.request_hatch_approval(
+        HOOK_ID, {"hook": HOOK_ID, "command": command}, cwd=cwd, command=command,
+    )
+    if hatch.should_stop:
+        if hatch.approved:
+            note = f"skills gate allowed via hatch escalation ({hatch.reason})"
+            warn(note)
+            emit("allow", note)
+            return 0
+        warn(f"skills gate hatch escalation denied: {hatch.reason}")
+        emit("block", f"hatch escalation denied: {hatch.reason}\n{message}")
+        return BLOCK_EXIT_CODE
 
     # WARN first, BLOCK on repeat within the window.
     if _is_repeat(event):

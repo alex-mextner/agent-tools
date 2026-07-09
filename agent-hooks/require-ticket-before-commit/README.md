@@ -4,7 +4,7 @@
 
 On a `git commit`, checks the commit message and branch name for a reference to a
 tracking ticket. If none is found — and the commit isn't an exempt chore/WIP/merge,
-and no per-commit escape is present — it **blocks** by default (strict), with a
+and no one-time Telegram hatch is approved — it **blocks** by default (strict), with a
 reminder that non-trivial changes should start from a ticket with acceptance criteria,
 motivation, and user-impact. Set `REQUIRE_TICKET_STRICT=0` to fall back to warn-only.
 Enforces the `strict-ticket-discipline` skill; pairs with task-cli.
@@ -55,11 +55,11 @@ Because the branch name is still readable, a `-F -` commit on a ticket-encoded b
 (`feature/ABC-12-foo`) **passes** — same as the editor-commit path (a `git commit` with no `-m`/`-F`
 is likewise unreadable pre-commit and is checked against the branch only). To satisfy the gate, put
 the ticket somewhere readable: pass the message via `-m "…Closes #123…"` or `-F <file>` (both read
-and checked), or encode it in the branch name. The deliberate escape for a *stdin*-message commit is
-`REQUIRE_TICKET_SKIP=1 git commit …` — read from the command, not stdin; a `[skip-ticket: <reason>]`
-**trailer does not work for `-F -`** (it would live in the unreadable stdin message). `-F <file>` is
-read and checked normally; only the `-` (stdin) form blocks. `REQUIRE_TICKET_STRICT=0` downgrades
-this `-F -` block to a warn-only allow, like every other no-ticket case.
+and checked), or encode it in the branch name. The **Telegram hatch is consulted BEFORE the `-F -`
+block**, so an approved `RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT` allows a genuinely
+ticketless `-F -` commit. `-F <file>` is read and checked normally; only the `-` (stdin) form
+blocks. `REQUIRE_TICKET_STRICT=0` downgrades this `-F -` block to a warn-only allow, like every
+other no-ticket case.
 
 ## What counts as a `git commit` (argv-scoped detection)
 
@@ -87,22 +87,38 @@ These commits skip the gate by default:
 - WIP / fixup markers: `wip…`, `fixup!`, `squash!`, `amend!`, `merge…`, `revert…`
 - `git commit --amend/--continue/--abort/--skip` (not authoring a fresh change)
 
-## Per-commit escapes (the deliberate, documented bypass)
+## No self-service bypass — request a Telegram approval instead
 
-For the rare legitimate ticketless commit, escape a single commit with this hook's own
-ticket-specific escape:
+There is **no** per-commit env var or message trailer an agent can set on its own command to
+skip this gate (a self-grant is security theater). For a genuinely ticketless one-off: use a
+`chore:`/`docs:` type if it is truly trivial, **ASK the human**, or request a **one-time
+Telegram approval**:
 
-- a `[skip-ticket: <reason>]` trailer in the commit message (the reason is mandatory), or
-- an inline env on the command: `REQUIRE_TICKET_SKIP=1 git commit …`.
+```bash
+RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="one-off backfill, no ticket warranted" git commit -m "feat: x"
+```
 
-The inline escape is scoped to the `git commit` segment, so an assignment on a sibling
-command (`REQUIRE_TICKET_SKIP=1 echo x; git commit …`) does **not** bypass the gate.
+This is a **pre-bash** hook, so the inline prefix is honored: the hook parses the leading
+`RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT=…` assignment out of the command string the event
+carries (a pre-bash hook runs in its own process *before* the shell evaluates the `VAR=x cmd`
+prefix, so the value never reaches its `os.environ`). It also works when the commit is not the
+first command on the line (`cd repo && RIG_HATCH_REQUEST_…="why" git commit …`). Exporting the var
+into the harness environment works too and takes precedence over an inline value.
+
+The request routes to the human over Telegram (`tg-ctl ask`) and the commit is allowed **only**
+on their approval. It is **deny-by-default**: a blank value or a bare `1`/`true` (no real
+justification) is rejected without sending the message, and any nonzero/timeout/error verdict
+denies. This replaces the old `[skip-ticket: <reason>]` trailer and inline `REQUIRE_TICKET_SKIP=1`
+self-service escapes (both removed). The repo-level `REQUIRE_TICKET_STRICT=0` warn-only dial is
+kept (a rollout policy knob, not a per-command grant).
 
 ## Configure (env)
 
 - `REQUIRE_TICKET_STRICT=0` — opt the whole gate back to **warn-only** (default: strict
-  block). Any other value, including unset, is strict.
-- `REQUIRE_TICKET_SKIP=1` (inline on the commit command) — skip THIS commit's check.
+  block). Any other value, including unset, is strict. This is a **repo-level rollout dial**,
+  not a per-command self-grant.
+- `RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="<justification>"` — request a one-time
+  Telegram approval for a genuinely ticketless commit (deny-by-default; bare `1` rejected).
 - `REQUIRE_TICKET_EXEMPT_TYPES="chore,docs"` — override the exempt commit-type set
   (comma-separated; replaces the default list).
 
@@ -142,10 +158,11 @@ hook owns exactly **one half of one of them**; the rest are not reachable from a
 The check has to happen *before* the commit, mid-session, while you can still add the
 reference. The gate **blocks** a ticketless non-chore commit by default — but it stays
 `on_error: open`, so a *crash* in the check (not a missing ticket) still fails open and
-never makes committing impossible. A no-ticket commit has clear, cheap escapes (a
-`[skip-ticket: <reason>]` trailer or `REQUIRE_TICKET_SKIP=1`), so strict-by-default
-nudges the discipline without wedging legitimate work. For a hard CI backstop, pair with
-an optional `ci/ticket-required` gate.
+never makes committing impossible. A genuinely ticketless commit has a sanctioned,
+human-in-the-loop out (a `chore:`/`docs:` type when trivial, or a one-time Telegram approval
+via `RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT`), so strict-by-default nudges the
+discipline without wedging legitimate work — and there is no env/trailer an agent can grant
+itself. For a hard CI backstop, pair with an optional `ci/ticket-required` gate.
 
 ## Install
 
@@ -168,13 +185,13 @@ echo '{"args":{"command":"git commit -m \"feat: add export\""}}' | ./require_tic
 echo '{"args":{"command":"git commit -m \"feat: add export (Closes #123)\""}}' | ./require_ticket_before_commit.py; echo " exit=$?"
 # → {"hook_api":"agents-hooks/v1","decision":"allow"}  exit=0
 
-# `[skip-ticket: reason]` escape → allow
+# removed self-service escapes no longer bypass — these now BLOCK (exit 10)
 echo '{"args":{"command":"git commit -m \"feat: x [skip-ticket: one-off backfill]\""}}' | ./require_ticket_before_commit.py; echo " exit=$?"
-# → {"hook_api":"agents-hooks/v1","decision":"allow"}  exit=0
-
-# inline REQUIRE_TICKET_SKIP=1 escape → allow
+# → {"hook_api":"agents-hooks/v1","decision":"block", ...}  exit=10
 echo '{"args":{"command":"REQUIRE_TICKET_SKIP=1 git commit -m \"feat: x\""}}' | ./require_ticket_before_commit.py; echo " exit=$?"
-# → {"hook_api":"agents-hooks/v1","decision":"allow"}  exit=0
+# → {"hook_api":"agents-hooks/v1","decision":"block", ...}  exit=10
+# for a genuine one-off, request a Telegram approval instead:
+#   RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="<justification>" git commit …   # allows on human tap
 
 # warn-only opt-out, no ticket → allow with advisory
 REQUIRE_TICKET_STRICT=0 sh -c 'echo "{\"args\":{\"command\":\"git commit -m x\"}}" | ./require_ticket_before_commit.py'; echo " exit=$?"

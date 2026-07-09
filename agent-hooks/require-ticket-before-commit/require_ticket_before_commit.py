@@ -22,10 +22,14 @@ Exempt from the gate (no ticket expected): trivial-chore commit types
 (`chore:`/`docs:`/`style:`/`ci:`/`build:`/`test:`), and `wip`/`fixup!`/`squash!`
 /`amend`/merge/revert commits. Configure via env (see README).
 
-Per-commit escapes, for the rare legit ticketless commit:
-  - a `[skip-ticket: <reason>]` trailer in the commit message, and
-  - an inline `REQUIRE_TICKET_SKIP=1 git commit …` env on the command.
-And `REQUIRE_TICKET_STRICT=0` is an explicit opt-out back to warn-only.
+No self-service bypass for a genuinely ticketless commit: there is NO per-commit env var /
+message trailer an agent can set on its own command to skip this gate (a self-grant is
+security theater). For a real one-off, use a `chore:`/`docs:` type if it is truly trivial,
+ASK the human, or request a ONE-TIME Telegram approval via
+`RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="<justification>"` (deny-by-default; a blank or
+bare `1` is rejected — the value must be a real written justification; allowed ONLY on the
+human's tg-ctl approval). `REQUIRE_TICKET_STRICT=0` remains a repo-level opt-out back to
+warn-only (a rollout policy dial, not a per-command grant).
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; the shell command is in args.command
@@ -40,10 +44,10 @@ a hard BLOCK (exit 10). Set REQUIRE_TICKET_STRICT=0 to fall back to warn-only.
 The `-F -` (message on git's STDIN) case FAILS CLOSED WITH A HINT (agent-tools#104,
 reversing the #102 fail-open): the hook cannot read git's stdin to verify a ticket, so
 rather than let `-F -` silently dodge the gate it BLOCKS with an actionable message —
-pass the message a readable way (`-m "…Closes #N…"` or `-F <file>`), or use the
-documented escape (`[skip-ticket: <reason>]` / `REQUIRE_TICKET_SKIP=1`). The escapes
-still work on a `-F -` command (they're parsed from the message text / the command env,
-not the unreadable stdin). A readable `-F <file>` is checked normally.
+pass the message a readable way (`-m "…Closes #N…"` or `-F <file>`), encode the ticket in
+the branch name, or request a one-time Telegram approval
+(`RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT`). The hatch is consulted BEFORE the `-F -`
+block, so an approved hatch allows a `-F -` commit; a readable `-F <file>` is checked normally.
 """
 
 from __future__ import annotations
@@ -54,9 +58,18 @@ import re
 import shlex
 import subprocess
 import sys
+from pathlib import Path
+
+_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+import agenttools_hatch_escalation as hatch_escalation  # noqa: E402
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
+# Canonical hook id for the shared Telegram hatch (RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT).
+HOOK_ID = "require-ticket-before-commit"
 
 # A STABLE marker embedded in every block message — a fixed string the task-cli Docker
 # test (and any external assertion) can grep for to confirm THIS gate blocked, regardless
@@ -65,23 +78,16 @@ BLOCK_MARKER = "[require-ticket] BLOCKED: no ticket reference"
 
 # Strict is now the DEFAULT: a missing ticket is a hard BLOCK. Set REQUIRE_TICKET_STRICT=0
 # (or false/no/off) to opt back out to warn-only. Any other value — including unset — is
-# strict. `os.environ.get(...)` here reads the HOOK's process env, which is the right
-# scope for a global on/off knob; the per-commit `REQUIRE_TICKET_SKIP=1 git commit` inline
-# escape is parsed from the COMMAND string instead (see has_inline_skip).
+# strict. `os.environ.get(...)` here reads the HOOK's process env, which is the right scope
+# for a repo-level on/off rollout dial (NOT a per-command self-grant — there is no per-commit
+# skip env / trailer any more; a genuine one-off routes through the Telegram hatch instead).
 _STRICT_FALSEY = frozenset({"0", "false", "no", "off"})
 STRICT = os.environ.get("REQUIRE_TICKET_STRICT", "1").strip().lower() not in _STRICT_FALSEY
 
-# Per-commit escape: a `[skip-ticket: <reason>]` trailer in the commit message. The reason
-# is mandatory (non-empty), so the escape is a deliberate, documented choice — not a blank
-# bypass.
-# Require a NON-WHITESPACE reason between the colon and the closing bracket, so a blank
-# `[skip-ticket: ]` is not a valid escape (the reason must be a deliberate, real choice).
-SKIP_TICKET_TRAILER = re.compile(r"\[skip-ticket:\s*\S[^\]]*\]", re.IGNORECASE)
-
-# A leading `VAR=value` inline-env assignment on the command (`REQUIRE_TICKET_SKIP=1 git
-# commit …`). Read from the COMMAND the agent is about to run, NOT the hook's own process env.
+# A leading `VAR=value` inline-env assignment on the command (`env HUSKY=0 git commit …`).
+# Parsed so a wrapper's inline env doesn't leak into argv; the values themselves are no longer
+# consulted for any skip decision (the old per-commit `REQUIRE_TICKET_SKIP` was removed).
 _INLINE_ENV = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
-_SKIP_FALSEY = frozenset({"", "0", "false", "no", "off"})
 
 # `git commit --continue/--abort/--skip` (merge/rebase plumbing) and `--amend`
 # are not authoring a fresh change → don't gate them. Matched against the PARSED commit
@@ -427,7 +433,8 @@ class CommitSegment:
     """A parsed real `git commit` segment.
 
     - ``env``      : the inline `VAR=value` env prefixing the command (and a wrapper's `VAR=val`
-                     operands), scoped to THIS segment — for the `REQUIRE_TICKET_SKIP` escape.
+                     operands), scoped to THIS segment — kept for parity with the wrapper parser
+                     (no skip decision reads it any more; the per-commit skip env was removed).
     - ``argv``     : the tokens AFTER `commit` — the commit's own flags/message/pathspecs.
     - ``git_argv`` : the wrapper-stripped invocation starting at `git` (`git -C <dir> commit …`) —
                      for reading the `git -C <dir>` global that targets a different repo.
@@ -486,23 +493,6 @@ def is_exempt(message: str) -> bool:
         return True
     m = CONVENTIONAL.match(subject)
     return bool(m and m.group(1).lower() in EXEMPT_TYPES)
-
-
-def has_skip_trailer(message: str) -> bool:
-    """True when the commit message carries a `[skip-ticket: <reason>]` escape trailer."""
-    return bool(SKIP_TICKET_TRAILER.search(message))
-
-
-def has_inline_skip(segment: CommitSegment) -> bool:
-    """True when the commit segment is prefixed with `REQUIRE_TICKET_SKIP=<truthy>` inline env.
-
-    Reads the inline env on the COMMAND the agent is about to run (`REQUIRE_TICKET_SKIP=1 git
-    commit …`), not the hook's process env. The env is
-    already scoped to the real `git commit` segment by the parser, so an assignment on a SIBLING
-    command (`REQUIRE_TICKET_SKIP=1 echo x; git commit …`) is NOT seen here and does not bypass.
-    Falsey values (`0`/`false`/`no`/`off`/empty) are matched case-insensitively so they don't
-    accidentally skip."""
-    return segment.env.get("REQUIRE_TICKET_SKIP", "").strip().lower() not in _SKIP_FALSEY
 
 
 # The `-F -` sentinel: git reads the commit message from its OWN stdin. A PreToolUse hook cannot
@@ -980,16 +970,57 @@ def main() -> int:
         return _allow()  # no real `git commit` segment → nothing to gate
 
     for segment in segments:
-        decision = _evaluate_commit_segment(segment, event_cwd)
+        decision = _evaluate_commit_segment(segment, event_cwd, command)
         if decision is not None:
             return decision  # a non-exempt, ticketless commit → block (or warn-allow)
-    return _allow()  # every commit segment is exempt / ticketed / escaped
+    return _allow()  # every commit segment is exempt / ticketed
 
 
-def _evaluate_commit_segment(segment: CommitSegment, event_cwd: str | None) -> int | None:
+# The shared human-facing guidance — what's wrong and how to satisfy the gate. It carries NO
+# marker: the stable BLOCK_MARKER must appear ONLY on a real block, so an external check that
+# greps stdout for the marker (the task-cli Docker test) never gets a false positive on a
+# warn-mode allow. The block path prepends the marker; the warn path uses the guidance alone.
+_GUIDANCE = (
+    "Non-trivial changes should start from a ticket "
+    "(task-cli / GitHub Issue / Linear) with acceptance criteria, motivation, and "
+    "user-impact — then reference it in the commit (e.g. `Closes #123`, `Fixes #4`, "
+    "`task:ABC-12`, `ENG-456`). If this is a trivial chore, use a `chore:`/`docs:` type "
+    "(exempt). No self-service bypass: ASK the human, or request a one-time Telegram approval "
+    'via RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="<justification>" (deny-by-default; '
+    "bare 1 rejected); opt the whole gate back to warn-only with REQUIRE_TICKET_STRICT=0."
+)
+
+# `git commit -F -` streams the message on GIT's stdin, which a PreToolUse hook CANNOT read (the
+# hook's stdin is the JSON event, not git's). When neither the message NOR the branch yields a
+# ticket, this unreadable-message case FAILS CLOSED WITH A HINT (agent-tools#104): rather than let
+# `-F -` silently dodge the gate (the #102 fail-open), BLOCK with an actionable message. The
+# trailer/inline-env escapes are gone; the only remaining sanctioned out for a genuine ticketless
+# commit is the Telegram hatch (checked BEFORE this block, so an approved hatch allows a `-F -`).
+_STDIN_HINT = (
+    f"{BLOCK_MARKER}. The commit message is on git's stdin (`-F -`), which a PreToolUse hook "
+    "cannot read — so the ticket gate cannot verify a reference (and the branch name carried "
+    "none either) and will not let `-F -` dodge it. Put the ticket somewhere readable: pass "
+    "the message via `-m \"…Closes #123…\"` or `-F <file>` (both are checked), or encode the "
+    "ticket in the branch name (e.g. `feature/ABC-12-foo`). No self-service bypass: ASK the "
+    "human, or request a one-time Telegram approval via "
+    'RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="<justification>" (deny-by-default; bare 1 '
+    "rejected); or opt the whole gate back to warn-only with REQUIRE_TICKET_STRICT=0."
+)
+
+# Warn-only opt-out advisory for a `-F -` commit (REQUIRE_TICKET_STRICT=0). Never leaks the marker.
+_STDIN_ADVISORY = (
+    "commit message is on git's stdin (`-F -`) — unreadable, so the ticket gate cannot "
+    "verify a reference; committing anyway (warn-only). Prefer `-m`/`-F <file>` so the gate "
+    "can check the ticket."
+)
+
+
+def _evaluate_commit_segment(
+    segment: CommitSegment, event_cwd: str | None, command: str,
+) -> int | None:
     """Decide ONE parsed `git commit` segment. Returns an exit code when the gate fires (block, or a
-    warn-only allow), or None when this segment is clean (exempt / ticketed / escaped) so the caller
-    moves on to the next segment in the chain."""
+    warn-only allow), or None when this segment is clean (exempt / ticketed) so the caller moves on
+    to the next segment in the chain."""
     # `--amend`/`--continue`/`--abort`/`--skip` aren't authoring a fresh change → nothing to gate.
     if is_skip_commit(segment.argv):
         return None
@@ -1001,86 +1032,70 @@ def _evaluate_commit_segment(segment: CommitSegment, event_cwd: str | None) -> i
     if is_exempt(message):
         return None  # trivial chore / WIP / merge — no ticket expected
 
-    # Per-commit escapes (the deliberate, documented bypass for a legit ticketless commit):
-    # a `[skip-ticket: <reason>]` message trailer, or an inline `REQUIRE_TICKET_SKIP=1`.
-    # `has_inline_skip` reads the COMMAND env (`REQUIRE_TICKET_SKIP=1 git commit …`), so it works even
-    # for a `-F -` commit whose message is on unreadable stdin. `has_skip_trailer` reads the parsed
-    # MESSAGE, so for `-F -` (empty readable message) it is a no-op — only the inline env escape
-    # applies to a stdin-message commit (the hint below says exactly that, no false promise).
-    if has_skip_trailer(message):
-        return None  # explicit `[skip-ticket: …]` escape
-    if has_inline_skip(segment):
-        return None  # explicit inline `REQUIRE_TICKET_SKIP=1 git commit …` escape
-
-    branch = current_branch(cwd)
     # Ticket detection is permissive: scan the commit message and the branch name (a ticket id is
-    # often encoded as `feature/ABC-12-foo`). NOTE: the OLD code also scanned the whole RAW command,
-    # which is what produced the false POSITIVE in the inverse direction — but here it would let a
-    # ticket id anywhere on the line (even in a sibling) satisfy the gate. Scoping to the parsed
-    # message + branch is both correct and tighter; a `-F` file's contents are already folded into
-    # `message`.
-    #
-    # This runs BEFORE the `-F -` stdin block on purpose: a `-F -` commit can still be ticketed via
-    # its BRANCH name (`feature/ABC-12-foo`), which IS readable. Blocking `-F -` ahead of branch
-    # detection would false-block that legit case and diverge from the editor-commit path (a `git
-    # commit` with no `-m`/`-F` is likewise unreadable and is checked against the branch only). So we
-    # only fall through to the stdin block when NEITHER the message NOR the branch yields a ticket.
+    # often encoded as `feature/ABC-12-foo`). Scoping to the parsed message + branch is both correct
+    # and tight; a `-F` file's contents are already folded into `message`. This runs BEFORE the
+    # `-F -` stdin block on purpose: a `-F -` commit can still be ticketed via its BRANCH name, which
+    # IS readable — same as the editor-commit path.
+    branch = current_branch(cwd)
     if has_ticket_reference(message) or has_ticket_reference(branch):
         return None  # a ticket reference is present (in the message or the branch) → proceed
 
-    # `git commit -F -` streams the message on GIT's stdin, which a PreToolUse hook CANNOT read (the
-    # hook's stdin is the JSON event, not git's). Reaching here means the branch carried no ticket
-    # either, so the message is our last chance to verify one — and it's unreadable. Rather than let
-    # `-F -` silently dodge the gate (the #102 fail-open), FAIL CLOSED WITH A HINT (agent-tools#104):
-    # BLOCK with an actionable message. The ONLY escape that works for a stdin-message commit is the
-    # inline `REQUIRE_TICKET_SKIP=1` (already checked above; it's read from the command, not stdin) —
-    # a `[skip-ticket: …]` TRAILER would live in the unreadable stdin message, so the hint does NOT
-    # offer it here. `-F <file>` is readable and is ticket-checked normally (it never reaches here).
-    if commit_reads_stdin_message(segment.argv):
-        hint = (
-            f"{BLOCK_MARKER}. The commit message is on git's stdin (`-F -`), which a PreToolUse hook "
-            "cannot read — so the ticket gate cannot verify a reference (and the branch name carried "
-            "none either) and will not let `-F -` dodge it. Put the ticket somewhere readable: pass "
-            "the message via `-m \"…Closes #123…\"` or `-F <file>` (both are checked), or encode the "
-            "ticket in the branch name (e.g. `feature/ABC-12-foo`). Deliberate no-ticket escape for a "
-            "stdin-message commit: run `REQUIRE_TICKET_SKIP=1 git commit …` (read from the command, "
-            "not stdin); or opt the whole gate back to warn-only with REQUIRE_TICKET_STRICT=0."
-        )
-        if STRICT:
-            warn(hint)
-            emit("block", hint)
-            return BLOCK_EXIT_CODE
-        # Warn-only opt-out: surface the reminder but allow (and DON'T leak the BLOCK_MARKER).
-        advisory = (
-            "commit message is on git's stdin (`-F -`) — unreadable, so the ticket gate cannot "
-            "verify a reference; committing anyway (warn-only). Prefer `-m`/`-F <file>` so the gate "
-            "can check the ticket."
-        )
-        warn(advisory)
-        emit("allow", advisory)
-        return 0
+    return _gate_ticketless_commit(segment, cwd, command)
 
-    # The shared human-facing guidance — what's wrong and how to satisfy the gate. It carries NO
-    # marker: the stable BLOCK_MARKER must appear ONLY on a real block, so an external check that
-    # greps stdout for the marker (the task-cli Docker test) never gets a false positive on a
-    # warn-mode allow. The block path prepends the marker; the warn path uses the guidance alone.
-    guidance = (
-        "Non-trivial changes should start from a ticket "
-        "(task-cli / GitHub Issue / Linear) with acceptance criteria, motivation, and "
-        "user-impact — then reference it in the commit (e.g. `Closes #123`, `Fixes #4`, "
-        "`task:ABC-12`, `ENG-456`). If this is a trivial chore, use a `chore:`/`docs:` type "
-        "(exempt). Deliberate escape: add a `[skip-ticket: <reason>]` trailer or run "
-        "`REQUIRE_TICKET_SKIP=1 git commit …`; opt the whole gate back to warn-only with "
-        "REQUIRE_TICKET_STRICT=0."
+
+def _gate_ticketless_commit(segment: CommitSegment, cwd: str | None, command: str) -> int:
+    """A non-exempt, ticketless commit reached the gate. Under STRICT, consult the Telegram hatch
+    FIRST — before deciding between the `-F -` stdin block and the normal block — so an approved
+    hatch allows EITHER shape (including a `-F -` commit). Non-strict never blocks, so the hatch is
+    only relevant when STRICT would block."""
+    stdin = commit_reads_stdin_message(segment.argv)
+    if STRICT:
+        verdict = _consult_hatch(command, cwd, stdin)
+        if verdict is not None:
+            return verdict
+    return _emit_gate(stdin)
+
+
+def _consult_hatch(command: str, cwd: str | None, stdin: bool) -> int | None:
+    """Run the Telegram hatch for a ticketless commit under STRICT. Returns an exit code when the
+    hatch RESOLVES the gate (approved → allow; denied → block leading with the denial reason), or
+    None when no hatch was requested (fall through to the normal block)."""
+    hatch = hatch_escalation.request_hatch_approval(
+        HOOK_ID, {"hook": HOOK_ID, "command": command}, cwd=cwd or os.getcwd(),
+        command=command,
     )
+    if not hatch.should_stop:
+        return None
+    if hatch.approved:
+        note = f"require-ticket gate allowed via hatch escalation ({hatch.reason})"
+        warn(note)
+        emit("allow", note)
+        return 0
+    warn(f"require-ticket gate hatch escalation denied: {hatch.reason}")
+    base = _STDIN_HINT if stdin else f"{BLOCK_MARKER}. {_GUIDANCE}"
+    emit("block", f"hatch escalation denied: {hatch.reason}\n{base}")
+    return BLOCK_EXIT_CODE
+
+
+def _emit_gate(stdin: bool) -> int:
+    """Emit the block (STRICT) or warn-only allow (REQUIRE_TICKET_STRICT=0) for a ticketless
+    commit, choosing the `-F -` stdin wording when the message is on git's unreadable stdin."""
+    if stdin:
+        if STRICT:
+            warn(_STDIN_HINT)
+            emit("block", _STDIN_HINT)
+            return BLOCK_EXIT_CODE
+        warn(_STDIN_ADVISORY)
+        emit("allow", _STDIN_ADVISORY)
+        return 0
     if STRICT:
         # Marker LEADS the block message so an external assertion can grep one fixed string.
-        emit("block", f"{BLOCK_MARKER}. {guidance}")
+        emit("block", f"{BLOCK_MARKER}. {_GUIDANCE}")
         return BLOCK_EXIT_CODE
-    # Warn-only opt-out: surface the reminder but let the commit proceed (and DON'T leak the
-    # BLOCK_MARKER — this is an allow). The advisory deliberately says "no ticket reference found",
-    # not "BLOCKED", so the marker is unambiguous proof of a real block.
-    advisory = f"No ticket reference found — committing anyway (warn-only). {guidance}"
+    # Warn-only opt-out: the advisory deliberately says "no ticket reference found", not "BLOCKED",
+    # so the marker is unambiguous proof of a real block.
+    advisory = f"No ticket reference found — committing anyway (warn-only). {_GUIDANCE}"
     warn(advisory)
     emit("allow", advisory)
     return 0
