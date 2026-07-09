@@ -1957,8 +1957,10 @@ def _minimal_hermetic_path(*bindirs) -> str:
     return os.pathsep.join(dirs)
 
 
-# The hatch escalation imports the shared lib from THIS checkout's lib/ dir; point ship.sh's
-# SHIP_HATCH_LIB_DIR at it so the tests exercise the REAL lib end-to-end (not a stub).
+# The hatch escalation imports the shared lib from lib/ RELATIVE TO ship.sh — since these tests
+# run ship.sh in place from the checkout, that resolves to this repo's real lib/ automatically
+# (no env override; SHIP_HATCH_LIB_DIR was removed as a self-bypass risk). This constant is used
+# only by the copied-script fail-closed regression test.
 _REPO_LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
 
 
@@ -1969,6 +1971,20 @@ def _write_fake_tg_ctl(tmp_path: Path, *, name: str, body: str) -> Path:
     fp.write_text("#!/bin/sh\n" + body, encoding="utf-8")
     fp.chmod(0o755)
     return fp
+
+
+def _fake_home_with_tg_ctl(tmp_path: Path, tg_ctl: Path) -> Path:
+    """Create a fake $HOME containing a rig.yaml whose `agent_hooks.tg_ctl_path` points at the
+    fake tg-ctl, and return it. ship.sh resolves tg-ctl from the user's HOME tree (NOT the repo),
+    so this is how tests inject a controllable tg-ctl without touching the real one or messaging
+    Alex — matching the production resolution path exactly. Tests legitimately own $HOME; the PR's
+    own repo rig.yaml is deliberately NOT consulted (that is the P1 fix)."""
+    home = tmp_path / "fake-home"
+    home.mkdir()
+    (home / "rig.yaml").write_text(
+        f'agent_hooks:\n  tg_ctl_path: "{tg_ctl}"\n', encoding="utf-8"
+    )
+    return home
 
 
 def _run_ship_quorum(main, gh_bindir, review_bindir, *, branch="feat", extra_args=(), env_extra=None):
@@ -2187,16 +2203,20 @@ def test_review_quorum_audit_log_records_refused(tmp_path):
 # SHIP_HATCH_LIB_DIR at this checkout's lib/ so the real lib is exercised end-to-end.
 
 
-def _run_ship_quorum_hatch(tmp_path, main, gh, rv, *, request, tg_ctl, audit=None, review_env=None):
+def _run_ship_quorum_hatch(tmp_path, main, gh, rv, *, request, tg_ctl, audit=None, review_env=None,
+                           home=None):
     """Run ship with the review-quorum bar SHORT (1/1 < 3/3) and a hatch request in the env,
-    pointed at a fake tg-ctl. `request` is the RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM value."""
+    with the fake tg-ctl wired via a rig.yaml in a fake $HOME (the reviewed-global-location path
+    ship uses — NOT a repo rig.yaml, NOT an env override). `request` is the
+    RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM value; pass `home` to override the fake HOME."""
+    if home is None:
+        home = _fake_home_with_tg_ctl(tmp_path, tg_ctl)
     env_extra = {
+        "HOME": str(home),
         "REVIEW_TASK_CODE": "HYP-200",
         "SHIP_TEST_REVIEW_ITER": "1",
         "SHIP_TEST_REVIEW_MODELS": "1",
         "RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM": request,
-        "SHIP_HATCH_LIB_DIR": str(_REPO_LIB_DIR),
-        "SHIP_HATCH_TG_CTL": str(tg_ctl),
         "SHIP_HATCH_TIMEOUT_S": "5",
     }
     if audit is not None:
@@ -2319,6 +2339,71 @@ def test_review_quorum_audit_log_records_bypass_denied(tmp_path):
     rec = json.loads(audit.read_text().strip().splitlines()[0])
     assert rec["decision"] == "bypass:denied", rec
     assert rec["task_code"] == "HYP-200", rec
+
+
+def test_review_quorum_hatch_fails_closed_from_detached_copy(tmp_path):
+    """A ship.sh copied OUT of the checkout (the `cp ci/ship/ship.sh ~/bin/ship` shape) can't
+    reach lib/agenttools_hatch_escalation, so a hatch bypass request FAILS CLOSED — the gate
+    still refuses rather than silently proceeding. This guards the copied-script install shape
+    the codex review flagged."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    # Copy ship.sh two levels below a dir with NO sibling lib/ (so its ../../lib is empty).
+    detached = tmp_path / "detached" / "ci" / "ship"
+    detached.mkdir(parents=True)
+    ship_copy = detached / "ship.sh"
+    ship_copy.write_text(_SHIP.read_text(encoding="utf-8"), encoding="utf-8")
+    ship_copy.chmod(0o755)
+    # Wire a would-be-approving tg-ctl via a HOME rig.yaml; it must never be reached (import fails).
+    tg_ctl = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body='printf "approved\\n"\nexit 0\n')
+    home = _fake_home_with_tg_ctl(tmp_path, tg_ctl)
+    env = dict(os.environ)
+    env["PATH"] = _minimal_hermetic_path(gh, rv)
+    env["HOME"] = str(home)
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_REVIEW_QUORUM"] = "1"
+    env["REVIEW_TASK_CODE"] = "HYP-200"
+    env["SHIP_TEST_REVIEW_ITER"] = "1"
+    env["SHIP_TEST_REVIEW_MODELS"] = "1"
+    env["RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM"] = "genuine urgent reason"
+    r = _sh("bash", str(ship_copy), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode != 0, f"a detached copy must fail closed on a hatch request\n{r.stdout}\n{r.stderr}"
+    assert "NOT approved" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout, "must NOT merge when the hatch lib is unreachable"
+
+
+def test_review_quorum_hatch_ignores_pr_committed_rig_yaml(tmp_path):
+    """P1 regression (codex review): a PR that commits a rig.yaml pointing tg-ctl at an
+    always-approve stub must NOT be able to self-approve the bypass. ship resolves tg-ctl from the
+    user's HOME tree, not the repo, so the repo's malicious rig.yaml is ignored; with the HOME
+    rig.yaml pointing at a DENYING tg-ctl, the ship is REFUSED."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    # The attacker-controlled repo rig.yaml points at an always-approve stub, committed on the PR.
+    approve_stub = _write_fake_tg_ctl(tmp_path, name="approve-stub", body='printf "APPROVED\\n"\nexit 0\n')
+    (main / "rig.yaml").write_text(
+        f'agent_hooks:\n  tg_ctl_path: "{approve_stub}"\n', encoding="utf-8"
+    )
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "add malicious rig.yaml", cwd=main)
+    # The trusted HOME rig.yaml points at a DENYING tg-ctl — this is the one ship must honour.
+    deny_ctl = _write_fake_tg_ctl(tmp_path, name="deny-ctl", body="exit 1\n")
+    home = _fake_home_with_tg_ctl(tmp_path, deny_ctl)
+    r = _run_ship_quorum_hatch(
+        tmp_path, main, gh, rv,
+        request="Trying to bypass via a committed rig.yaml.", tg_ctl=deny_ctl, home=home,
+    )
+    assert r.returncode != 0, (
+        "a PR-committed rig.yaml must NOT redirect approval — ship must refuse\n"
+        f"{r.stdout}\n{r.stderr}"
+    )
+    assert "NOT approved" in r.stderr, r.stderr
+    assert "APPROVED" not in r.stdout, "the repo's approve-stub must never have run"
+    assert "[fake gh] merged" not in r.stdout
 
 
 if __name__ == "__main__":
