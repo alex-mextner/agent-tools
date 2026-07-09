@@ -319,3 +319,32 @@ def test_empty_command_allows(monkeypatch):
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ── `\`-newline line continuation must not hide the merge (Codex review on #231) ────────────
+
+
+def test_line_continuation_does_not_hide_merge():
+    """shlex (whitespace_split=False) emits a standalone `\\n` token for a `\\`-newline line
+    continuation. After the leading `VAR=` assignment is stripped that token would become
+    argv[0], so `_is_gh_pr_merge` saw `argv[0] == '\\n'` and reported NO merge → the raw merge was
+    ALLOWED with no approval. Detection must survive the continuation."""
+    command = 'RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="x" \\\n  gh pr merge 123 --admin'
+    assert hook._command_contains_gh_pr_merge(command) is True
+
+
+def test_hatch_inline_line_continuation_reaches_tg_ctl(tmp_path, monkeypatch):
+    """End-to-end for the exact README inline-hatch shape (`VAR="why" \\`+newline+`gh pr merge`):
+    it must be DETECTED as a raw merge AND route the inline justification to tg-ctl (env var NOT
+    exported). If the `\\`-newline still hid the merge, the hook would `emit("allow")` WITHOUT
+    ever calling the mocked tg-ctl, so the question file would not be written."""
+    question = tmp_path / "q.txt"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f'printf "%s" "$2" > "{question}"\nexit 0\n')
+    monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    command = (
+        'RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="ship gate down, manual verify done" \\\n'
+        '  gh pr merge 123 --admin'
+    )
+    out, _err, code = _run(command, monkeypatch, cwd=tmp_path)  # env NOT set — inline only
+    assert code == 0 and _decision(out) == "allow"
+    assert "ship gate down, manual verify done" in question.read_text()

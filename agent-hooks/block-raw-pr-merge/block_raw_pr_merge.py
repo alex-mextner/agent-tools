@@ -116,8 +116,12 @@ def _split_segments(command: str) -> list[list[str]]:
             if current:
                 segments.append(current)
                 current = []
-        else:
+        elif tok.strip():
             current.append(tok)
+        # A pure-whitespace token is never a real argv element. shlex (whitespace_split=False)
+        # emits a standalone `'\n'` token for a `\`-newline line continuation; dropping it keeps
+        # `VAR=x \`+newline+`gh pr merge` from hiding the merge behind that stray token, which
+        # would else strip the `VAR=` assignment, see argv[0] == '\n', and ALLOW the raw merge.
     if current:
         segments.append(current)
     return segments
