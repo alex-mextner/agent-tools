@@ -3,7 +3,7 @@
   "point": "pre-bash",
   "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/block-raw-pr-merge/block_raw_pr_merge.py",
   "priority": 10,
-  "timeout_ms": 3000,
+  "timeout_ms": 960000,
   "on_error": "closed",
-  "description": "Blocks a raw `gh pr merge` (incl. `--admin`) that bypasses the ship gate. `gh ship <PR>` merges only on green CI + required screenshots; a raw merge skips both. Allows `gh ship`/`pr-ship.sh` and non-merge `gh pr` subcommands. Escape hatch: ALLOW_RAW_PR_MERGE=1 + ALLOW_RAW_PR_MERGE_REASON='why', or an inline `# no-ship-guard: why` sentinel. on_error=closed: if the check itself fails, deny rather than let a raw merge through."
+  "description": "Blocks a raw `gh pr merge` (incl. `--admin`) that bypasses the ship gate. `gh ship <PR>` merges only on green CI + required screenshots; a raw merge skips both. Allows `gh ship`/`pr-ship.sh` and non-merge `gh pr` subcommands. There is NO self-service override (the old ALLOW_RAW_PR_MERGE env and `# no-ship-guard:` sentinel are removed, deny-by-default); a one-time exception is an external Telegram approval requested via RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE=\"<why>\" (deny-by-default; only exit 0 allows). timeout_ms 960000 exceeds the hatch helper's 930s worst case (tg-ctl ask's 900s cap plus a 30s cleanup margin) so a requested exception can reach a human before the bridge's descriptor-timeout kill; on_error=closed already fails safe (a kill denies), but the short 3s default made the approval path un-answerable. Claude Code settings entries that launch cc_hook_bridge must also set timeout >960s. The common env-unset path returns immediately (no tg call). on_error=closed: if the check itself fails, deny rather than let a raw merge through."
 }

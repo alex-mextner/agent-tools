@@ -2,9 +2,11 @@
 
 Covers: TRIGGER detection (`tg --tag decision`, parsed not raw-matched, through wrappers and
 pipelines), MARKER checking (missing → advisory message; complete → silent allow), NON-TRIGGER
-cases (other tag / no tag / non-tg / flag-inside-a-string), the ESCAPE hatch (env + inline
-sentinel), and FAIL-OPEN on a malformed event. Every path returns exit 0; the signal under test
-is whether the `allow` carries an advisory `message`.
+cases (other tag / no tag / non-tg / flag-inside-a-string), the DEAD self-service escape hatch
+(`ALLOW_RAW_DECISION_REQUEST` / `# decision-request-ok:` no longer silence), the external
+Telegram hatch (`RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT`), and FAIL-OPEN on a malformed
+event. Every path returns exit 0; the signal under test is whether the `allow` carries an
+advisory `message`.
 
 Run from the repo root::
 
@@ -34,14 +36,20 @@ drf = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(drf)
 
 
-def _run(command, monkeypatch, *, env: dict | None = None, raw_event=None):
-    event = raw_event if raw_event is not None else {"args": {"command": command}}
+def _run(command, monkeypatch, *, env: dict | None = None, raw_event=None, cwd=None):
+    if raw_event is not None:
+        event = raw_event
+    else:
+        event = {"args": {"command": command}}
+        if cwd is not None:
+            event["cwd"] = str(cwd)
     payload = event if isinstance(event, str) else json.dumps(event)
     out, err = io.StringIO(), io.StringIO()
     monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
     monkeypatch.delenv("ALLOW_RAW_DECISION_REQUEST", raising=False)
+    monkeypatch.delenv("RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT", raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
     code = drf.main()
@@ -54,6 +62,12 @@ def _decision(out: str) -> str:
 
 def _message(out: str) -> str | None:
     return json.loads(out).get("message")
+
+
+def _fake_tg_ctl(path: Path, body: str) -> Path:
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return path
 
 
 # A body that mentions none of the three dimensions — the bare "A or B?".
@@ -226,23 +240,65 @@ def test_title_value_participates_in_marker_check(monkeypatch):
     assert _message(out2) is None
 
 
-# ── ESCAPE hatch ────────────────────────────────────────────────────────────────────────
+# ── REGRESSION: the OLD self-service silence is DEAD ──────────────────────────────────────
 
-def test_env_override_silences_advisory(monkeypatch):
+def test_env_override_no_longer_silences(monkeypatch):
+    """REGRESSION: `ALLOW_RAW_DECISION_REQUEST=1` used to silence the advisory — it must NO
+    LONGER; the advisory still prints."""
     out, _, code = _run(
         f'tg --tag decision "{_BARE}"', monkeypatch,
         env={"ALLOW_RAW_DECISION_REQUEST": "1"},
     )
     assert code == 0
     assert _decision(out) == "allow"
-    assert _message(out) is None
+    assert _message(out) is not None
 
 
-def test_inline_sentinel_silences_advisory(monkeypatch):
+def test_inline_sentinel_no_longer_silences(monkeypatch):
+    """REGRESSION: a `# decision-request-ok: <reason>` inline sentinel no longer silences."""
     out, _, _ = _run(
         f'tg --tag decision "{_BARE}"  # decision-request-ok: terse follow-up', monkeypatch
     )
+    assert _message(out) is not None
+
+
+# ── external Telegram hatch escalation (replaces the OLD self-service silence) ─────────────
+_HATCH_ENV = "RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT"
+
+
+def test_hatch_unset_leaves_advisory(tmp_path, monkeypatch):
+    out, _, _ = _run(f'tg --tag decision "{_BARE}"', monkeypatch, cwd=tmp_path)
+    assert _message(out) is not None
+
+
+def test_hatch_bare_flag_leaves_advisory_no_tg_call(tmp_path, monkeypatch):
+    """A bare `1` is an invalid request: denied WITHOUT contacting Telegram → advisory stays."""
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nexit 0\n")
+    monkeypatch.setattr(drf.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _, _ = _run(f'tg --tag decision "{_BARE}"', monkeypatch, cwd=tmp_path,
+                     env={_HATCH_ENV: "1"})
+    assert _message(out) is not None
+    assert not marker.exists()
+
+
+def test_hatch_justification_exit0_silences(tmp_path, monkeypatch):
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nexit 0\n")
+    monkeypatch.setattr(drf.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _, code = _run(f'tg --tag decision "{_BARE}"', monkeypatch, cwd=tmp_path,
+                        env={_HATCH_ENV: "Terse follow-up to an already-detailed thread."})
+    assert code == 0 and _decision(out) == "allow"
     assert _message(out) is None
+    assert marker.exists()
+
+
+def test_hatch_justification_exit1_leaves_advisory(tmp_path, monkeypatch):
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    monkeypatch.setattr(drf.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _, _ = _run(f'tg --tag decision "{_BARE}"', monkeypatch, cwd=tmp_path,
+                     env={_HATCH_ENV: "Terse follow-up to an already-detailed thread."})
+    assert _message(out) is not None
 
 
 # ── FAIL-OPEN ───────────────────────────────────────────────────────────────────────────

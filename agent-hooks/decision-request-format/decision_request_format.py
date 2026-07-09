@@ -23,10 +23,14 @@ NOT subagent-exempt: the self-check binds every agent, including the subagent th
 skill) drafts the request. A subagent posting a malformed decision request is exactly what
 this catches.
 
-Escape hatch (controllable — mirrors the sibling gates):
-  - env  ALLOW_RAW_DECISION_REQUEST=1            — silence the advisory for this session
-  - inline  ``# decision-request-ok: <reason>``  — self-documenting per-command
-A silenced advisory still allows (it always does); it just stops printing.
+External silence (replaces the OLD self-service escape hatch): there is NO
+``ALLOW_RAW_DECISION_REQUEST`` env or ``# decision-request-ok:`` inline sentinel any more — an
+agent could set either on its own command, so those merely silenced the nag by self-grant. A
+one-time silence is now requested by setting
+``RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT="<written justification>"``, which routes a single
+approval request to the human via Telegram (deny-by-default; a bare ``1`` is rejected). On an
+approved request the advisory is silenced; otherwise it is shown. This never changes the
+exit-0/allow contract — it only decides whether the advisory prints.
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; the shell command is in args.command
@@ -43,6 +47,13 @@ import os
 import re
 import shlex
 import sys
+from pathlib import Path
+
+_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+import agenttools_hatch_escalation as hatch_escalation  # noqa: E402
 
 HOOK_API = "agents-hooks/v1"
 
@@ -64,8 +75,6 @@ _WRAPPERS = re.compile(r"^(?:timeout|env|nice|time|stdbuf|nohup|setsid|unbuffer)
 # own prescribed call. Mirrors the same peel in no-shell-file-edit. (`env NAME=VALUE …` is
 # handled by the wrapper loop; this is the keyword-less shell assignment.)
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-
-_INLINE_SENTINEL = re.compile(r"#\s*decision-request-ok:\s*(\S.*)")
 
 # Structural markers the self-check requires in a decision-request body. Each maps a
 # human-facing label to the regex that detects its presence (case-insensitive). Kept
@@ -210,15 +219,6 @@ def _missing_markers(body: str) -> list[str]:
     return [label for label, pat in _MARKERS if not pat.search(body)]
 
 
-def _silenced(command: str) -> str | None:
-    if os.environ.get("ALLOW_RAW_DECISION_REQUEST") == "1":
-        return "env override"
-    m = _INLINE_SENTINEL.search(command)
-    if m:
-        return f"inline override: {m.group(1).strip()}"
-    return None
-
-
 def _advisory_message(missing: list[str]) -> str:
     # `missing` is only ever a subset of the three markers this hook can detect heuristically
     # (Context / Options / Recommendation). The skill asks for two more — a glossary of terms
@@ -230,19 +230,36 @@ def _advisory_message(missing: list[str]) -> str:
         f"`tg --tag decision` body appears to be missing {', '.join(missing)} (of the three "
         "markers this hook checks). The decision-request-discipline skill also wants a glossary "
         "of internal terms and a 'where to look' code ref, so the human can decide in 30s "
-        "without opening the repo. Consider rewriting before sending. Silence with "
-        "ALLOW_RAW_DECISION_REQUEST=1 or append `# decision-request-ok: <reason>`."
+        "without opening the repo. Consider rewriting before sending — or, for a genuine "
+        'one-time silence, request approval via RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT="<why>" '
+        "(Telegram approval, deny-by-default)."
     )
 
 
-def _advisory_for(command: str) -> str | None:
+def _advisory_for(command: str, cwd: str) -> str | None:
     """The advisory message for a command, or None when nothing should be said (not a decision
-    request, silenced, or a complete body). The pure inspection core, with no I/O."""
+    request, externally silenced via an approved hatch, or a complete body).
+
+    When an advisory WOULD be shown (a decision-request body missing markers), an approved
+    Telegram hatch (`RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT`) silences it; an unset / invalid /
+    denied request leaves the advisory in place. The hatch call never raises (it catches
+    internally), so this stays fail-open."""
     body = _decision_request_body(command)
-    if body is None or _silenced(command):
+    if body is None:
         return None
     missing = _missing_markers(body)
-    return _advisory_message(missing) if missing else None
+    if not missing:
+        return None
+    hatch = hatch_escalation.request_hatch_approval(
+        "decision-request-format",
+        {"hook": "decision-request-format", "command": command},
+        cwd=cwd,
+        command=command,
+    )
+    if hatch.should_stop and hatch.approved:
+        warn(f"advisory silenced via hatch escalation ({hatch.reason})")
+        return None
+    return _advisory_message(missing)
 
 
 def main() -> int:
@@ -256,7 +273,8 @@ def main() -> int:
         command = args.get("command") or args.get("cmd") or event.get("command") or ""
         if not isinstance(command, str):
             command = str(command)
-        return _allow(_advisory_for(command))
+        cwd = str(event.get("cwd") or os.getcwd())
+        return _allow(_advisory_for(command, cwd))
     except Exception as exc:  # noqa: BLE001 — deliberate catch-all: fail-open is the contract
         warn(f"could not inspect command: {exc} — allowing (fail-open)")
         return _allow()

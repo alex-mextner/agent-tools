@@ -185,8 +185,13 @@ tracked hook config — wire the main repo once and worktrees inherit it.
 
 ## Bypass / escape hatches
 
-- `REVIEW_SKIP=1 git commit ...` or `git commit --no-verify` — bypasses ALL pre-commit
-  gates (last resort).
+- Docs-only commits pass without a review stamp when every staged path is a documentation
+  extension (`*.md`, `*.mdx`, `*.markdown`, `*.rst`, `*.adoc`, `*.rdoc`, `*.pod`) or a
+  recognized prose/media file under the root `docs/` tree (`*.txt`, `*.text`, common raster
+  images, or `*.pdf`). Agent instruction Markdown (`AGENTS.md`, `CLAUDE.md`, `SKILL.md`,
+  `skills/**`, `agent-hooks/**`) and code/config-like files under `docs/` still require review.
+- `git commit --no-verify` — Git's blanket bypass for ALL pre-commit gates (last resort;
+  there is no `REVIEW_SKIP` self-service bypass in the review gate).
 - Secret-scan false positive: inline `gitleaks:allow` comment, or an `[allowlist]` in
   `~/.config/gitleaks/gitleaks.toml` (global) / the repo's `.gitleaks.toml`.
 

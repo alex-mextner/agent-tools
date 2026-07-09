@@ -27,13 +27,15 @@ Allowed (let through):
   - any non-merge `gh pr` subcommand (view, list, checkout, create, comment, ...)
   - commands whose body/arguments merely contain the text "gh pr merge" as a string
 
-Escape hatch (controllable, not a hard wall — mirrors enforce-timeout / block-process-env):
-  - env  ALLOW_RAW_PR_MERGE=1            — disable the guard for this session
-  - env  ALLOW_RAW_PR_MERGE_REASON=...   — REQUIRED with the override; the reason is logged
-  - inline sentinel  `# no-ship-guard: <reason>` anywhere in the command also overrides,
-    so a one-off deliberate merge is self-documenting in the command itself.
-  An override with no reason still blocks: a silent bypass of the bypass-guard is the very
-  thing this hook exists to prevent.
+External approval (replaces the OLD self-service escape hatch): there is NO
+`ALLOW_RAW_PR_MERGE`(+`_REASON`) env and NO `# no-ship-guard: <reason>` inline sentinel any
+more — an agent could set either on its own command, so those merely let the guarded agent
+grant itself the bypass this hook exists to stop. The block is now DENY-BY-DEFAULT. Use
+`gh ship <PR>` (the green-CI-gated, screenshot-checked path). For a genuine one-time exception,
+ASK Alex, or request a single approval by setting
+`RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="<written justification>"`, which routes one Telegram
+approval request to Alex (deny-by-default; a bare `1`/`true` is rejected). Only an approved
+`tg-ctl ask` (exit 0) allows the raw merge; anything else denies.
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; the shell command is in args.command (a few fallbacks below)
@@ -52,6 +54,13 @@ import os
 import re
 import shlex
 import sys
+from pathlib import Path
+
+_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+import agenttools_hatch_escalation as hatch_escalation  # noqa: E402
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
@@ -71,10 +80,6 @@ _INLINE_ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # because shlex can't parse it.  Only if the raw string plausibly contains a merge
 # invocation do we treat a parse error as fail-closed.
 _MERGE_HINT = re.compile(r"\bgh\b.*\bpr\b.*\bmerge\b", re.DOTALL)
-
-# Inline, self-documenting per-command override (checked on the raw string so a
-# comment stripped by shlex is still found).
-INLINE_SENTINEL = re.compile(r"#\s*no-ship-guard:\s*(\S.*)")
 
 
 def emit(decision: str, message: str | None = None) -> None:
@@ -111,8 +116,12 @@ def _split_segments(command: str) -> list[list[str]]:
             if current:
                 segments.append(current)
                 current = []
-        else:
+        elif tok.strip():
             current.append(tok)
+        # A pure-whitespace token is never a real argv element. shlex (whitespace_split=False)
+        # emits a standalone `'\n'` token for a `\`-newline line continuation; dropping it keeps
+        # `VAR=x \`+newline+`gh pr merge` from hiding the merge behind that stray token, which
+        # would else strip the `VAR=` assignment, see argv[0] == '\n', and ALLOW the raw merge.
     if current:
         segments.append(current)
     return segments
@@ -167,21 +176,18 @@ def _command_contains_gh_pr_merge(command: str) -> bool | None:
     return any(_is_gh_pr_merge(seg) for seg in segments)
 
 
-def _override_reason(command: str) -> str | None:
-    """Return the override reason if a valid escape hatch is present, else None.
-
-    An override is honored ONLY with a reason: env ALLOW_RAW_PR_MERGE=1 plus
-    ALLOW_RAW_PR_MERGE_REASON, OR an inline ``# no-ship-guard: <reason>`` sentinel.
-    A reasonless override is ignored (the merge stays blocked).
-    """
-    if os.environ.get("ALLOW_RAW_PR_MERGE") == "1":
-        reason = (os.environ.get("ALLOW_RAW_PR_MERGE_REASON") or "").strip()
-        if reason:
-            return f"env override: {reason}"
-    m = INLINE_SENTINEL.search(command)
-    if m:
-        return f"inline override: {m.group(1).strip()}"
-    return None
+def _block(prefix: str | None = None) -> int:
+    body = (
+        "Refusing a raw `gh pr merge` (incl. --admin): it bypasses the ship gates "
+        "(green CI + required screenshots). Use `gh ship <PR>` instead — it merges only "
+        "once CI is green and the mandatory screenshots are present. There is NO self-service "
+        "override any more (`ALLOW_RAW_PR_MERGE` / `# no-ship-guard:` are gone). For a genuine "
+        "one-time exception, ASK Alex, or request a single approval via "
+        'RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="<why>" — that routes a Telegram approval request '
+        "to Alex (deny-by-default; a bare `1` is rejected)."
+    )
+    emit("block", f"{prefix}\n{body}" if prefix else body)
+    return BLOCK_EXIT_CODE
 
 
 def main() -> int:
@@ -196,6 +202,7 @@ def main() -> int:
     command = args.get("command") or args.get("cmd") or event.get("command") or ""
     if not isinstance(command, str):
         command = str(command)
+    cwd = str(event.get("cwd") or os.getcwd())
 
     is_merge = _command_contains_gh_pr_merge(command)
 
@@ -212,21 +219,24 @@ def main() -> int:
         emit("allow")
         return 0
 
-    reason = _override_reason(command)
-    if reason:
-        warn(f"raw `gh pr merge` allowed via escape hatch ({reason})")
-        emit("allow", f"raw `gh pr merge` allowed via escape hatch ({reason})")
-        return 0
-
-    emit(
-        "block",
-        "Refusing a raw `gh pr merge` (incl. --admin): it bypasses the ship gates "
-        "(green CI + required screenshots). Use `gh ship <PR>` instead — it merges only "
-        "once CI is green and the mandatory screenshots are present. Override only with an "
-        "explicit reason: set ALLOW_RAW_PR_MERGE=1 and ALLOW_RAW_PR_MERGE_REASON='why', or "
-        "append `# no-ship-guard: why` to the command.",
+    # A raw merge is deny-by-default. The ONLY exception is an approved external Telegram hatch
+    # (deny-by-default); an unset env falls straight through to the block. The hatch call never
+    # raises (it catches internally), so it does not affect this hook's fail-closed contract.
+    hatch = hatch_escalation.request_hatch_approval(
+        "block-raw-pr-merge",
+        {"hook": "block-raw-pr-merge", "command": command},
+        cwd=cwd,
+        command=command,
     )
-    return BLOCK_EXIT_CODE
+    if hatch.should_stop:
+        if hatch.approved:
+            warn(f"raw `gh pr merge` allowed via hatch escalation ({hatch.reason})")
+            emit("allow", f"raw `gh pr merge` allowed via hatch escalation ({hatch.reason})")
+            return 0
+        warn(f"raw `gh pr merge` hatch escalation denied: {hatch.reason}")
+        return _block(prefix=f"hatch escalation denied: {hatch.reason}")
+
+    return _block()
 
 
 if __name__ == "__main__":

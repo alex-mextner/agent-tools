@@ -29,11 +29,27 @@ none did, it **blocks** with a reminder to review the uncommitted diff first.
   NOT fire for `git commit -a/-am`, `-p/--patch/--interactive`, `--pathspec-from-file`, an
   explicit pathspec, or a `--git-dir`/`GIT_DIR=…`-redirected commit — those can include content
   the cwd index doesn't list, so the gate stays.
-- **Explicit per-commit skip** — opt out of a single commit with either:
-  - inline env: `REVIEW_SKIP=1 git commit …` (read from the command, scoped to the commit
-    segment — `REVIEW_SKIP=1 echo x; git commit` does *not* bypass), or
-  - a commit-message trailer: `git commit -m '… [skip-review: <reason>]'` — honest, since it
-    lands in the commit.
+
+## No self-service skip — external approval only
+
+There is **no** `REVIEW_SKIP=1` inline-env bypass and **no** `[skip-review: <reason>]`
+commit-message trailer any more. An agent could set either on its own commit, so those
+"gates" were security theater — they are removed and the block is now **deny-by-default**.
+
+For a genuine one-time exception, **ask the human** — or request a single approval by setting
+`RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT="<written justification>"`. That routes one
+Telegram approval request to Alex (deny-by-default): the env var must carry a real
+justification — unset means the hook never contacts Telegram, and a blank or bare
+`1`/`true`/`yes`/`on` is rejected without a Telegram call. A real justification runs the
+trusted `tg-ctl ask`; **exit 0 allows**, and any nonzero exit / launch error / timeout denies
+(the block then leads with `hatch escalation denied: <reason>`).
+
+You can supply the justification either as an inline prefix on the gated command
+(`RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT="…" git commit …`) or by exporting the var into
+the harness environment. This is a **pre-bash** hook, so it parses the inline assignment out of
+the command string the event carries — a pre-bash hook runs in its own process *before* the shell
+evaluates the `VAR=x cmd` prefix, so the value never reaches its `os.environ`. An exported value
+takes precedence over an inline one.
 
 ## How it knows a review ran
 

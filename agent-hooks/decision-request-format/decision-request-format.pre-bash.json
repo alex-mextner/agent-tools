@@ -3,7 +3,7 @@
   "point": "pre-bash",
   "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/decision-request-format/decision_request_format.py",
   "priority": 25,
-  "timeout_ms": 3000,
+  "timeout_ms": 960000,
   "on_error": "open",
-  "description": "On a `tg --tag decision …` send, runs the decision-request-discipline self-check: parses (shlex, not raw-match) the message body and, if it is missing structural markers (Context / Options / Recommendation), emits an exit-0 ADVISORY naming what's absent. ADVISORY ONLY — never blocks; a malformed decision request must stay sendable. on_error=open: a formatting reminder, not a boundary. Silence with ALLOW_RAW_DECISION_REQUEST=1 or `# decision-request-ok: <reason>`."
+  "description": "On a `tg --tag decision …` send, runs the decision-request-discipline self-check: parses (shlex, not raw-match) the message body and, if it is missing structural markers (Context / Options / Recommendation), emits an exit-0 ADVISORY naming what's absent. ADVISORY ONLY — never blocks; a malformed decision request must stay sendable. on_error=open: a formatting reminder, not a boundary. There is NO self-service silence (the old ALLOW_RAW_DECISION_REQUEST env and `# decision-request-ok:` sentinel are removed); a one-time silence is an external Telegram approval requested via RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT=\"<why>\" (deny-by-default; only exit 0 silences). timeout_ms 960000 exceeds the hatch helper's 930s worst case (tg-ctl ask's 900s cap plus a 30s cleanup margin) so the requested silence can actually reach a human before the bridge's descriptor-timeout kill; a kill would merely SHOW the advisory (this hook never blocks), but the short 3s default made the silence path un-answerable. Claude Code settings entries that launch cc_hook_bridge must also set timeout >960s. The common env-unset path returns immediately (no tg call, no latency cost)."
 }

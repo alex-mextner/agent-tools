@@ -26,22 +26,35 @@ is the enforcement counterpart of the `ci/ship` gate and the ship usage rule.
 This guard is what makes auto-mode safe: the agent runs without babysitting, and the guard
 catches the one irreversible action (a gate-skipping merge) before the side effect.
 
-## Escape hatch (controllable, not a hard wall)
+## No self-service override — external approval only
 
-Mirrors the other configurable guards (`enforce-timeout-on-bash`, `block-raw-process-env`):
-a deliberate raw merge is allowed **with an explicit, logged reason** —
+There is **no** `ALLOW_RAW_PR_MERGE` (+`_REASON`) env and **no** `# no-ship-guard: <reason>`
+inline sentinel any more. An agent could set either on its own command, so those merely let the
+guarded agent grant itself the exact bypass this hook exists to stop. The block is now
+**deny-by-default**.
+
+Use `gh ship <PR>` (the green-CI-gated, screenshot-checked path). For a genuine one-time
+exception, **ask Alex** — or request a single approval by setting
+`RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="<written justification>"`:
 
 ```bash
-# session-wide override (reason REQUIRED, or it still blocks):
-ALLOW_RAW_PR_MERGE=1 ALLOW_RAW_PR_MERGE_REASON="ship gate down, manual verify done" \
+RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="ship gate down, manual verify done" \
   gh pr merge 123 --admin
-
-# one-off, self-documenting in the command itself:
-gh pr merge 123 --admin   # no-ship-guard: hotfix, CI provider outage, verified locally
 ```
 
-A reasonless `ALLOW_RAW_PR_MERGE=1` is ignored and the merge stays blocked — a silent bypass
-of the bypass-guard is the exact failure this hook prevents.
+The inline `VAR=… <command>` form works here because this is a **pre-bash** hook: it parses the
+leading `RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE=…` assignment out of the command string the event
+carries (a pre-bash hook runs in its own process *before* the shell evaluates that prefix, so the
+value never lands in the hook's `os.environ` — only in the command text). Exporting the same var
+into the harness environment works too and takes precedence. (For Edit/Write-gated hooks there is
+no command string, so the var **must** be exported into the hook process env — see those hooks'
+READMEs.)
+
+That routes one Telegram approval request to Alex (deny-by-default): unset means the hook never
+contacts Telegram (the merge just blocks); a blank or bare `1`/`true`/`yes`/`on` is rejected
+without a Telegram call; a real justification runs the trusted `tg-ctl ask` and allows the raw
+merge **only on exit 0** (any nonzero exit / error / timeout denies, the block leading with
+`hatch escalation denied: <reason>`).
 
 ## Fail-closed
 
@@ -65,7 +78,8 @@ echo '{"args":{"command":"gh pr merge 123 --admin"}}' | ./block_raw_pr_merge.py;
 
 echo '{"args":{"command":"gh ship 123"}}' | ./block_raw_pr_merge.py; echo "exit=$?"
 # → {"hook_api":"agents-hooks/v1","decision":"allow"}  exit=0
-
-echo '{"args":{"command":"gh pr merge 123 # no-ship-guard: provider outage"}}' | ./block_raw_pr_merge.py; echo "exit=$?"
-# → decision":"allow" (escape hatch with a reason)  exit=0
 ```
+
+A one-time exception is an external Telegram approval — set
+`RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="<why>"` (deny-by-default; only an approved `tg-ctl ask`
+exit 0 allows the raw merge).
