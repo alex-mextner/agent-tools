@@ -44,6 +44,13 @@ justification — unset means the hook never contacts Telegram, and a blank or b
 trusted `tg-ctl ask`; **exit 0 allows**, and any nonzero exit / launch error / timeout denies
 (the block then leads with `hatch escalation denied: <reason>`).
 
+You can supply the justification either as an inline prefix on the gated command
+(`RIG_HATCH_REQUEST_REQUIRE_REVIEW_BEFORE_COMMIT="…" git commit …`) or by exporting the var into
+the harness environment. This is a **pre-bash** hook, so it parses the inline assignment out of
+the command string the event carries — a pre-bash hook runs in its own process *before* the shell
+evaluates the `VAR=x cmd` prefix, so the value never reaches its `os.environ`. An exported value
+takes precedence over an inline one.
+
 ## How it knows a review ran
 
 It looks for a **marker file** that your review tool touches on a successful run, and

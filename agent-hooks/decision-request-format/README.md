@@ -92,6 +92,12 @@ RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT="terse follow-up to an already-detaile
   tg --tag decision "..."
 ```
 
+The inline `VAR=… <command>` prefix works because this is a **pre-bash** hook: it parses the
+leading `RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT=…` assignment out of the command string the
+event carries (the hook runs in its own process *before* the shell evaluates that prefix, so the
+value never reaches the hook's `os.environ`). Exporting the same var into the harness environment
+works too and takes precedence.
+
 Unset means the hook never contacts Telegram (the advisory prints as usual); a blank or bare
 `1`/`true`/`yes`/`on` is rejected without a Telegram call; a real justification runs the trusted
 `tg-ctl ask` and silences the advisory **only on exit 0**. Either way the send still goes

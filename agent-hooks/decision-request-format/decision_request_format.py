@@ -254,6 +254,7 @@ def _advisory_for(command: str, cwd: str) -> str | None:
         "decision-request-format",
         {"hook": "decision-request-format", "command": command},
         cwd=cwd,
+        command=command,
     )
     if hatch.should_stop and hatch.approved:
         warn(f"advisory silenced via hatch escalation ({hatch.reason})")

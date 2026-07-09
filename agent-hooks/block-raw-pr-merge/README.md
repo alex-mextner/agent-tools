@@ -42,6 +42,14 @@ RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="ship gate down, manual verify done" \
   gh pr merge 123 --admin
 ```
 
+The inline `VAR=… <command>` form works here because this is a **pre-bash** hook: it parses the
+leading `RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE=…` assignment out of the command string the event
+carries (a pre-bash hook runs in its own process *before* the shell evaluates that prefix, so the
+value never lands in the hook's `os.environ` — only in the command text). Exporting the same var
+into the harness environment works too and takes precedence. (For Edit/Write-gated hooks there is
+no command string, so the var **must** be exported into the hook process env — see those hooks'
+READMEs.)
+
 That routes one Telegram approval request to Alex (deny-by-default): unset means the hook never
 contacts Telegram (the merge just blocks); a blank or bare `1`/`true`/`yes`/`on` is rejected
 without a Telegram call; a real justification runs the trusted `tg-ctl ask` and allows the raw

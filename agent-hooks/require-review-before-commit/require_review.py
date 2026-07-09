@@ -800,6 +800,7 @@ def main() -> int:
         "require-review-before-commit",
         {"hook": "require-review-before-commit", "command": command},
         cwd=cwd,
+        command=command,
     )
     if hatch.should_stop:
         if hatch.approved:

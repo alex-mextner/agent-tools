@@ -639,7 +639,9 @@ def _evaluate_checkout_segment(
     # legitimately runs up to tg-ctl's 900s cap, which is why this hook's manifest timeout_ms was
     # raised to 960000. It only "stops" (should_stop=True) when an actual hatch request was made;
     # an unset env var falls through to the approval_cmd budget below.
-    hatch = hatch_escalation.request_hatch_approval("pin-primary-worktree", context, cwd=eff_cwd)
+    hatch = hatch_escalation.request_hatch_approval(
+        "pin-primary-worktree", context, cwd=eff_cwd, command=command
+    )
     if hatch.should_stop:
         if hatch.approved:
             warn(f"primary-worktree checkout approved via hatch escalation ({hatch.reason})")

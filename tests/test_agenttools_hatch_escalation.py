@@ -301,3 +301,407 @@ def test_descriptor_timeout_strictly_exceeds_helper_worst_case(descriptor):
         f"{descriptor.name}: timeout_ms={timeout_ms} must strictly exceed the helper's "
         f"worst case {worst_case_ms:.0f}ms so the helper's deny wins the race"
     )
+
+
+# --- Inline `RIG_HATCH_REQUEST_<HOOK_ID>=value` on the Bash command string ------------------
+#
+# A pre-bash hook runs in its OWN process BEFORE the shell evaluates a `VAR=x cmd` prefix, so the
+# documented inline hatch form (`RIG_HATCH_REQUEST_X="why" <gated-command>`) never reaches the
+# hook's os.environ. request_hatch_approval(command=...) must instead parse the assignment out of
+# the command string the event carries. These tests pin that behavior (env is forced empty so the
+# ONLY possible source of the justification is the inline command parse).
+
+_DESTRUCTIVE_RESET = "git reset " + "--hard"
+
+
+def test_inline_command_assignment_triggers_ask(tmp_path):
+    question_file = tmp_path / "question.txt"
+    tg_ctl = _write_tg_ctl(
+        tmp_path / "trusted" / "tg-ctl",
+        f'printf "%s" "$2" > "{question_file}"\n'
+        'printf "approved by Alex\\n"\n'
+        "exit 0\n",
+    )
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("block-reset-hard")
+    command = f'{env_var}="need to discard a disposable experiment" {_DESTRUCTIVE_RESET}'
+
+    result = request_hatch_approval(
+        "block-reset-hard",
+        {"command": command},
+        cwd=str(repo),
+        env={},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=2,
+    )
+
+    assert result.requested is True
+    assert result.approved is True
+    assert result.env_present is True
+    assert result.should_stop is True
+    question = question_file.read_text()
+    assert "need to discard a disposable experiment" in question
+    assert "block-reset-hard" in question
+
+
+def test_inline_quoted_value_with_spaces_preserved(tmp_path):
+    question_file = tmp_path / "question.txt"
+    tg_ctl = _write_tg_ctl(
+        tmp_path / "trusted" / "tg-ctl",
+        f'printf "%s" "$2" > "{question_file}"\nexit 0\n',
+    )
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("block-raw-pr-merge")
+    command = f'{env_var}="ship gate down, manual verify done" gh pr merge 123 --admin'
+
+    result = request_hatch_approval(
+        "block-raw-pr-merge",
+        {"command": command},
+        cwd=str(repo),
+        env={},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=2,
+    )
+
+    assert result.approved is True
+    assert "ship gate down, manual verify done" in question_file.read_text()
+
+
+def test_process_env_takes_precedence_over_inline(tmp_path):
+    question_file = tmp_path / "question.txt"
+    tg_ctl = _write_tg_ctl(
+        tmp_path / "trusted" / "tg-ctl",
+        f'printf "%s" "$2" > "{question_file}"\nexit 0\n',
+    )
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("block-reset-hard")
+    command = f'{env_var}="INLINE justification" {_DESTRUCTIVE_RESET}'
+
+    result = request_hatch_approval(
+        "block-reset-hard",
+        {"command": command},
+        cwd=str(repo),
+        env={env_var: "EXPORTED justification"},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=2,
+    )
+
+    assert result.approved is True
+    question = question_file.read_text()
+    # The chosen justification is the EXPORTED one, not the inline one. Assert on the specific
+    # `Justification:` line (the raw command is echoed verbatim elsewhere in the question and
+    # legitimately contains the inline text, so a bare `not in` would be a false negative).
+    assert "Justification: EXPORTED justification" in question
+    assert "Justification: INLINE justification" not in question
+
+
+def test_inline_bare_flag_is_rejected_without_tg_ctl_contact(tmp_path):
+    marker = tmp_path / "called"
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", f"touch {marker}\nexit 0\n")
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("block-reset-hard")
+    command = f"{env_var}=1 {_DESTRUCTIVE_RESET}"
+
+    result = request_hatch_approval(
+        "block-reset-hard",
+        {"command": command},
+        cwd=str(repo),
+        env={},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+    )
+
+    assert result.requested is True
+    assert result.approved is False
+    assert result.should_stop is True
+    assert "written justification" in result.reason
+    assert not marker.exists()
+
+
+def test_inline_only_matches_the_hooks_own_var(tmp_path):
+    marker = tmp_path / "called"
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", f"touch {marker}\nexit 0\n")
+    repo = _repo_with_tg_ctl(tmp_path)
+    # A DIFFERENT hook's var (and an arbitrary env) must never be consumed by this hook.
+    command = f'RIG_HATCH_REQUEST_SOME_OTHER_HOOK="why" FOO=bar {_DESTRUCTIVE_RESET}'
+
+    result = request_hatch_approval(
+        "block-reset-hard",
+        {"command": command},
+        cwd=str(repo),
+        env={},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+    )
+
+    assert result.requested is False
+    assert result.env_present is False
+    assert result.should_stop is False
+    assert not marker.exists()
+
+
+def test_inline_assignment_after_executable_is_not_consumed(tmp_path):
+    marker = tmp_path / "called"
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", f"touch {marker}\nexit 0\n")
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("block-reset-hard")
+    # The assignment appears as an ARGUMENT after the executable, not a leading env prefix — a
+    # real shell would pass it to `git` as an argument, not set it in the environment.
+    command = f'git commit -m "{env_var}=sneaky"'
+
+    result = request_hatch_approval(
+        "block-reset-hard",
+        {"command": command},
+        cwd=str(repo),
+        env={},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+    )
+
+    assert result.requested is False
+    assert result.should_stop is False
+    assert not marker.exists()
+
+
+def test_no_command_and_empty_env_is_not_requested(tmp_path):
+    marker = tmp_path / "called"
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", f"touch {marker}\nexit 0\n")
+    repo = _repo_with_tg_ctl(tmp_path)
+
+    result = request_hatch_approval(
+        "block-reset-hard",
+        {"command": _DESTRUCTIVE_RESET},
+        cwd=str(repo),
+        env={},
+        command=None,
+        tg_ctl_candidates=[tg_ctl],
+    )
+
+    assert result.requested is False
+    assert result.env_present is False
+    assert not marker.exists()
+
+
+def test_inline_malformed_quoting_is_not_requested(tmp_path):
+    marker = tmp_path / "called"
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", f"touch {marker}\nexit 0\n")
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("block-reset-hard")
+    command = f'{env_var}="unterminated {_DESTRUCTIVE_RESET}'  # unmatched quote
+
+    result = request_hatch_approval(
+        "block-reset-hard",
+        {"command": command},
+        cwd=str(repo),
+        env={},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+    )
+
+    assert result.requested is False
+    assert not marker.exists()
+
+
+# --- Segment-aware inline parsing (`&&` / `||` / `;` / `|` / newline) ------------------------
+#
+# The gated command is often not the first simple command on the line. A pre-bash hook must
+# still find the leading `RIG_HATCH_REQUEST_<HOOK_ID>=…` assignment on a later segment, exactly
+# as the shell would apply the `VAR=x cmd` prefix to that segment's command. The hook gates and
+# (on approval) allows the WHOLE command as a unit, and the full command is shown to the human
+# approver, so a leading assignment on ANY segment requests approval of the whole command.
+
+
+def _tg_ctl_recording(tmp_path, question_file):
+    return _write_tg_ctl(
+        tmp_path / "trusted" / "tg-ctl",
+        f'printf "%s" "$2" > "{question_file}"\nexit 0\n',
+    )
+
+
+def test_inline_multi_segment_after_and_triggers_ask(tmp_path):
+    question_file = tmp_path / "question.txt"
+    tg_ctl = _tg_ctl_recording(tmp_path, question_file)
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("require-review-before-commit")
+    command = f'cd {repo} && {env_var}="no reviewer available, verified by hand" git commit -m x'
+
+    result = request_hatch_approval(
+        "require-review-before-commit",
+        {"command": command},
+        cwd=str(repo),
+        env={},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=2,
+    )
+
+    assert result.approved is True
+    assert result.should_stop is True
+    assert "no reviewer available, verified by hand" in question_file.read_text()
+
+
+def test_inline_newline_separated_segment_triggers_ask(tmp_path):
+    question_file = tmp_path / "question.txt"
+    tg_ctl = _tg_ctl_recording(tmp_path, question_file)
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("require-review-before-commit")
+    command = f'cd {repo}\n{env_var}="hand-verified" git commit -m x'
+
+    result = request_hatch_approval(
+        "require-review-before-commit",
+        {"command": command},
+        cwd=str(repo),
+        env={},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=2,
+    )
+
+    assert result.approved is True
+    assert "hand-verified" in question_file.read_text()
+
+
+def test_inline_semicolon_gated_segment_carries_assignment(tmp_path):
+    question_file = tmp_path / "question.txt"
+    tg_ctl = _tg_ctl_recording(tmp_path, question_file)
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("require-review-before-commit")
+    # Assignment sits on the SECOND (gated) segment, after a harmless first one.
+    command = f'echo starting ; {env_var}="hand-verified" git commit -m x'
+
+    result = request_hatch_approval(
+        "require-review-before-commit",
+        {"command": command},
+        cwd=str(repo),
+        env={},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=2,
+    )
+
+    assert result.approved is True
+    assert "hand-verified" in question_file.read_text()
+
+
+def test_inline_whole_command_approval_from_earlier_segment(tmp_path):
+    # Documented, intentional: the hook gates/allows the WHOLE command and the human approver
+    # sees the full command in the tg-ctl question, so a leading assignment on an earlier segment
+    # is a request to approve the entire command (never a silent bypass — approval is human).
+    question_file = tmp_path / "question.txt"
+    tg_ctl = _tg_ctl_recording(tmp_path, question_file)
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("require-review-before-commit")
+    command = f'{env_var}="hand-verified" echo ok ; git commit -m x'
+
+    result = request_hatch_approval(
+        "require-review-before-commit",
+        {"command": command},
+        cwd=str(repo),
+        env={},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=2,
+    )
+
+    assert result.requested is True
+    assert result.should_stop is True
+    question = question_file.read_text()
+    assert "Justification: hand-verified" in question
+    # The full command (including the later gated segment) is shown to the approver.
+    assert "git commit -m x" in question
+
+
+def test_inline_quoted_separator_is_not_a_false_positive(tmp_path):
+    marker = tmp_path / "called"
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", f"touch {marker}\nexit 0\n")
+    repo = _repo_with_tg_ctl(tmp_path)
+    # A `;` inside a quoted argument must not be mistaken for a real leading assignment on a new
+    # segment — there is no hatch var here at all.
+    command = 'git commit -m "step one; step two"'
+
+    result = request_hatch_approval(
+        "require-review-before-commit",
+        {"command": command},
+        cwd=str(repo),
+        env={},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+    )
+
+    assert result.requested is False
+    assert not marker.exists()
+
+
+# --- Quote-aware tokenization: line continuations, single `&`, quoted separators -------------
+#
+# The documented README examples use a `VAR="…" \`<newline>`<command>` line-continuation shape,
+# and real gated commands can use a single `&` (background) separator. Quoting must be respected
+# so a `;`/`&`/`|` inside the justification value is NOT treated as a command boundary.
+
+
+def test_inline_line_continuation_triggers_ask(tmp_path):
+    question_file = tmp_path / "question.txt"
+    tg_ctl = _tg_ctl_recording(tmp_path, question_file)
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("block-raw-pr-merge")
+    # The exact README shape: `VAR="…" \` at end of line, command on the next line.
+    command = f'{env_var}="ship gate down, manual verify done" \\\n  gh pr merge 123 --admin'
+
+    result = request_hatch_approval(
+        "block-raw-pr-merge",
+        {"command": command},
+        cwd=str(repo),
+        env={},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=2,
+    )
+
+    assert result.approved is True
+    assert "ship gate down, manual verify done" in question_file.read_text()
+
+
+def test_inline_single_ampersand_separator_triggers_ask(tmp_path):
+    question_file = tmp_path / "question.txt"
+    tg_ctl = _tg_ctl_recording(tmp_path, question_file)
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("subagent-no-bg-longproc")
+    command = f'sleep 1 & {env_var}="self-managed watchdog" review diff -C /repo'
+
+    result = request_hatch_approval(
+        "subagent-no-bg-longproc",
+        {"command": command},
+        cwd=str(repo),
+        env={},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=2,
+    )
+
+    assert result.approved is True
+    assert "self-managed watchdog" in question_file.read_text()
+
+
+def test_inline_quoted_separator_in_value_preserved(tmp_path):
+    question_file = tmp_path / "question.txt"
+    tg_ctl = _tg_ctl_recording(tmp_path, question_file)
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("block-raw-pr-merge")
+    # A `&`/`;` inside the quoted justification must survive as part of the value, not split it.
+    command = f'{env_var}="ci & security both green; verified" gh pr merge 7 --admin'
+
+    result = request_hatch_approval(
+        "block-raw-pr-merge",
+        {"command": command},
+        cwd=str(repo),
+        env={},
+        command=command,
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=2,
+    )
+
+    assert result.approved is True
+    assert "Justification: ci & security both green; verified" in question_file.read_text()

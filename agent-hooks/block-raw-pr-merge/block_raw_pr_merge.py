@@ -222,6 +222,7 @@ def main() -> int:
         "block-raw-pr-merge",
         {"hook": "block-raw-pr-merge", "command": command},
         cwd=cwd,
+        command=command,
     )
     if hatch.should_stop:
         if hatch.approved:

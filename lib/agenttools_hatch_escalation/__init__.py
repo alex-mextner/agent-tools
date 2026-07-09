@@ -9,11 +9,25 @@ path. It never consults ambient PATH.
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import signal
 import subprocess  # noqa: S404 - runs an already-resolved absolute tg-ctl path
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
+
+# A valid shell env-assignment variable name (`RIG_HATCH_REQUEST_FOO`, `LANG`). Used to tell a
+# leading `VAR=value` inline assignment apart from the executable / a `--flag=value` argument
+# when peeling the documented inline hatch form off a Bash command string.
+_ASSIGNMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# The shell control-operator characters that separate one simple command from the next. A token
+# made up solely of these (`;`, `&`, `|`, `&&`, `||`, `|&`, `;;`) is a separator, so a leading
+# `VAR=value` inline assignment can appear at the head of ANY resulting segment (`cd repo &&
+# VAR=x git commit`, `foo ; VAR=x bar`, `sleep 1 & VAR=x cmd`, `VAR=x cmd | pager`). shlex tags
+# these OUTSIDE quotes only, so a `;`/`&`/`|` inside a quoted value is never mistaken for one.
+_SEPARATOR_CHARS = frozenset(";&|")
 
 MAX_TG_CTL_TIMEOUT_S = 900.0
 DEFAULT_TG_CTL_TIMEOUT_S = MAX_TG_CTL_TIMEOUT_S
@@ -53,26 +67,121 @@ def hatch_env_var(hook_id: str) -> str:
     return f"RIG_HATCH_REQUEST_{canonical}"
 
 
+def _parse_inline_hatch_value(env_var: str, command: str) -> str | None:
+    """Extract the value of a leading inline `<env_var>=<value>` assignment from a Bash command.
+
+    Mirrors how a POSIX shell applies a `VAR=value cmd` prefix: only assignments at the very
+    start of a simple command — before its executable token — are environment assignments;
+    anything after the executable is an argument, not an assignment. The command is tokenized
+    quote-aware (shlex, honoring quotes and `\\`-newline line continuations) and split into simple
+    commands at the shell control operators (`;`, `&`, `|`, `&&`, `||`, `|&`), so the documented
+    inline form works even when the gated command is not the first one on the line
+    (`cd repo && RIG_HATCH_REQUEST_X="why" git commit …`, `RIG_HATCH_REQUEST_X="why" \\` + newline
+    + ` gh pr merge …`). A command that cannot be tokenized (unbalanced quotes) yields None.
+
+    The hook gates and — on approval — allows the ENTIRE Bash command as one unit, and the
+    resolved justification is shown verbatim to the human approver (the full `command` is echoed
+    in the tg-ctl question), so a leading `<env_var>=…` assignment on ANY segment is treated as a
+    request to approve the whole command. ONLY the hook's own `env_var` is honored; other leading
+    assignments are skipped, never consumed. Returns None when the var is not present as any
+    segment's leading assignment.
+
+    SCOPE: this recognizes the documented bare inline form (`RIG_HATCH_REQUEST_X="why" <cmd>`,
+    including behind `&&`/`||`/`;`/`&`/`|`/newline separators and `\\`-newline continuations). It
+    deliberately does NOT peel command wrappers (`env VAR=x cmd`, `sudo`, `timeout …`) or a
+    subshell/`export` prefix — for those, export the variable into the harness environment (the
+    `os.environ` path), which always works.
+    """
+
+    segments = _split_command_segments(command)
+    if segments is None:
+        return None
+    for tokens in segments:
+        value = _leading_assignment_value(env_var, tokens)
+        if value is not None:
+            return value
+    return None
+
+
+def _split_command_segments(command: str) -> list[list[str]] | None:
+    """Tokenize `command` quote-aware and split it into per-simple-command token lists at the
+    shell control operators that begin a new command. Returns None if it cannot be tokenized.
+
+    Uses `shlex` with `punctuation_chars` so `;`/`&`/`|` (and their runs `&&`/`||`/`|&`) are
+    recognized as operators only OUTSIDE quotes — a separator inside a quoted argument stays part
+    of that token. A `\\`-newline line continuation is first folded to a space, and a remaining
+    bare newline (a real shell separates commands on it, same as `;`) is normalized to `;`;
+    shlex still keeps a newline inside quotes literal, so neither normalization can split a
+    quoted argument into a spurious leading assignment.
+    """
+
+    normalized = command.replace("\\\n", " ").replace("\n", ";")
+    lexer = shlex.shlex(normalized, posix=True, punctuation_chars="".join(_SEPARATOR_CHARS))
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token and set(token) <= _SEPARATOR_CHARS:
+            segments.append([])  # a control operator ends the current simple command.
+        else:
+            segments[-1].append(token)
+    return segments
+
+
+def _leading_assignment_value(env_var: str, tokens: list[str]) -> str | None:
+    """The value of a leading `<env_var>=<value>` assignment among one segment's leading tokens."""
+
+    for token in tokens:
+        name, sep, value = token.partition("=")
+        if not sep or not _ASSIGNMENT_NAME_RE.match(name):
+            break  # reached the executable / a non-assignment argument — stop scanning.
+        if name == env_var:
+            return value
+    return None
+
+
 def request_hatch_approval(
     hook_id: str,
     context: Mapping[str, object] | None,
     *,
     cwd: str,
     env: Mapping[str, str] | None = None,
+    command: str | None = None,
     tg_ctl_candidates: Sequence[Path | str] | None = None,
     timeout_s: float = DEFAULT_TG_CTL_TIMEOUT_S,
     process_margin_s: float = DEFAULT_PROCESS_MARGIN_S,
 ) -> HatchApprovalResult:
     """Request Telegram approval when this hook's hatch env var carries a real justification.
 
-    Unset env vars mean "hatch not requested" and do not block later mechanisms. A present but
-    blank/bare-flag env var is an invalid request: no Telegram call is made and the hook should
-    deny rather than falling through to `approval_cmd`.
+    The justification is read from EITHER of two sources, checked in this precedence order:
+
+    1. The hook process environment (`env`, defaulting to `os.environ`) — set when the agent
+       harness itself was launched with the var exported. This is the ONLY source available to
+       pre-write (Edit/Write) hooks, which have no shell command string to parse.
+    2. A leading inline `RIG_HATCH_REQUEST_<HOOK_ID>=<value>` assignment on the Bash `command`
+       string (pass `command=` from a pre-bash hook). This is the documented inline form
+       (`RIG_HATCH_REQUEST_X="why" <gated-command>`). A pre-bash hook runs in its OWN process
+       BEFORE the shell evaluates that `VAR=x cmd` prefix, so the value never reaches the hook's
+       `os.environ` — it must be parsed out of the command string that the event carries. Only
+       this hook's specific var is honored; arbitrary leading assignments are ignored.
+
+    A process-env value takes precedence over an inline one (an explicit export is the more
+    deliberate signal), so passing `command=` is purely additive and never changes the behavior
+    of an already-exported var.
+
+    Unset (in both sources) means "hatch not requested" and does not block later mechanisms. A
+    present but blank/bare-flag value is an invalid request: no Telegram call is made and the
+    hook should deny rather than falling through to `approval_cmd`.
     """
 
     env_map = env if env is not None else os.environ
     env_var = hatch_env_var(hook_id)
     raw = env_map.get(env_var)
+    if raw is None and command is not None:
+        raw = _parse_inline_hatch_value(env_var, command)
     if raw is None:
         return HatchApprovalResult(
             requested=False,

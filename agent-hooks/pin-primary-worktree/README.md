@@ -62,7 +62,12 @@ The block is now **deny-by-default**. A repo owner can wire a real external-appr
 the committed, code-reviewed `rig.yaml`. A one-time Telegram hatch can also be requested
 with a written justification in `RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE`; that request path
 runs before `approval_cmd`, so an invalid/denied Telegram request does not fall through to a
-configured `approval_cmd`.
+configured `approval_cmd`. Because this is a **pre-bash** hook, the justification can be
+supplied inline on the gated command itself
+(`RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE="…" git checkout …`): the hook parses the leading
+assignment out of the command string the event carries (a pre-bash hook runs in its own process
+*before* the shell evaluates that prefix, so the value never reaches its `os.environ`). An
+exported value takes precedence over an inline one.
 
 ```yaml
 agent_hooks:
