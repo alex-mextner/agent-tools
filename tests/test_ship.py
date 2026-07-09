@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1957,13 +1958,6 @@ def _minimal_hermetic_path(*bindirs) -> str:
     return os.pathsep.join(dirs)
 
 
-# The hatch escalation imports the shared lib from lib/ RELATIVE TO ship.sh — since these tests
-# run ship.sh in place from the checkout, that resolves to this repo's real lib/ automatically
-# (no env override; SHIP_HATCH_LIB_DIR was removed as a self-bypass risk). This constant is used
-# only by the copied-script fail-closed regression test.
-_REPO_LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
-
-
 def _write_fake_tg_ctl(tmp_path: Path, *, name: str, body: str) -> Path:
     """A fake `tg-ctl` the hatch lib will invoke as `tg-ctl ask <question> --timeout <s>`.
     `body` is the shell after the shebang; $2 is the question text."""
@@ -1973,13 +1967,12 @@ def _write_fake_tg_ctl(tmp_path: Path, *, name: str, body: str) -> Path:
     return fp
 
 
-def _fake_home_with_tg_ctl(tmp_path: Path, tg_ctl: Path) -> Path:
-    """Create a fake $HOME containing a rig.yaml whose `agent_hooks.tg_ctl_path` points at the
-    fake tg-ctl, and return it. ship.sh resolves tg-ctl from the user's HOME tree (NOT the repo),
-    so this is how tests inject a controllable tg-ctl without touching the real one or messaging
-    Alex — matching the production resolution path exactly. Tests legitimately own $HOME; the PR's
-    own repo rig.yaml is deliberately NOT consulted (that is the P1 fix)."""
-    home = tmp_path / "fake-home"
+def _fake_home_with_tg_ctl(tmp_path: Path, tg_ctl: Path, *, name: str = "fake-home") -> Path:
+    """A fake HOME dir carrying a rig.yaml whose `agent_hooks.tg_ctl_path` points at the fake
+    tg-ctl. The hatch helper resolves tg-ctl from the OS account's real home (pwd.getpwuid), so
+    in-process module tests monkeypatch `resolve_home` to return THIS dir — a controllable tg-ctl
+    that never touches the real one or messages Alex, matching the production resolution path."""
+    home = tmp_path / name
     home.mkdir()
     (home / "rig.yaml").write_text(
         f'agent_hooks:\n  tg_ctl_path: "{tg_ctl}"\n', encoding="utf-8"
@@ -2197,170 +2190,189 @@ def test_review_quorum_audit_log_records_refused(tmp_path):
 
 # --- hatch escalation: the ONLY bypass for a not-met review-quorum bar ---------------------
 # There is no self-service override flag. A short bar can only be bypassed by setting
-# RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>", which routes through the shared
-# agenttools_hatch_escalation lib to ask Alex live on Telegram (`tg-ctl ask`). These tests drive
-# that path with a FAKE tg-ctl (via SHIP_HATCH_TG_CTL) so no real message is ever sent, and point
-# SHIP_HATCH_LIB_DIR at this checkout's lib/ so the real lib is exercised end-to-end.
+# RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>", which routes through the
+# ci/ship/review_quorum_hatch.py helper -> the shared agenttools_hatch_escalation lib ->
+# `tg-ctl ask` Alex live. The helper resolves tg-ctl from the OS account's REAL home
+# (pwd.getpwuid), NOT $HOME and NOT the repo, so nothing the shipper/PR controls can redirect
+# approval. The hatch MECHANICS (approve/deny/timeout/empty + the bypass:* audit + the
+# HOME-is-ignored guarantee) are tested IN-PROCESS against the real helper with `resolve_home`
+# monkeypatched to a fake home — this is the only way to exercise a controllable tg-ctl through a
+# subprocess without touching the real one (mirrors how pin-primary-worktree tests the shared
+# lib). The ship.sh<->helper WIRING (proceed on exit 0, refuse otherwise, fail-closed when the
+# helper is unreachable) is tested via the subprocess with a fake helper, so no real tg-ctl is
+# ever invoked.
+
+_HATCH_MOD_DIR = str(Path(__file__).resolve().parents[1] / "ci" / "ship")
 
 
-def _run_ship_quorum_hatch(tmp_path, main, gh, rv, *, request, tg_ctl, audit=None, review_env=None,
-                           home=None):
-    """Run ship with the review-quorum bar SHORT (1/1 < 3/3) and a hatch request in the env,
-    with the fake tg-ctl wired via a rig.yaml in a fake $HOME (the reviewed-global-location path
-    ship uses — NOT a repo rig.yaml, NOT an env override). `request` is the
-    RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM value; pass `home` to override the fake HOME."""
-    if home is None:
-        home = _fake_home_with_tg_ctl(tmp_path, tg_ctl)
-    env_extra = {
-        "HOME": str(home),
-        "REVIEW_TASK_CODE": "HYP-200",
-        "SHIP_TEST_REVIEW_ITER": "1",
-        "SHIP_TEST_REVIEW_MODELS": "1",
-        "RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM": request,
-        "SHIP_HATCH_TIMEOUT_S": "5",
-    }
-    if audit is not None:
-        env_extra["SHIP_AUDIT_FILE"] = str(audit)
-    if review_env:
-        env_extra.update(review_env)
-    return _run_ship_quorum(main, gh, rv, env_extra=env_extra)
+def _load_hatch_module():
+    """Import ci/ship/review_quorum_hatch as a module (fresh each call so a monkeypatched
+    resolve_home never leaks between tests)."""
+    import importlib
+
+    if _HATCH_MOD_DIR not in sys.path:
+        sys.path.insert(0, _HATCH_MOD_DIR)
+    mod = importlib.import_module("review_quorum_hatch")
+    return importlib.reload(mod)
 
 
-def test_review_quorum_hatch_empty_value_is_denied(tmp_path):
-    """A hatch request with an EMPTY value is an invalid request: the lib denies it without ever
-    contacting tg-ctl, and ship refuses (no self-service '=1'-style bypass)."""
-    main, _wt = _make_repo_with_branch(tmp_path, "feat")
-    gh = _fake_gh_quorum_dir(tmp_path)
-    rv = _fake_review_dir(tmp_path)
+def _run_hatch_main(monkeypatch, tmp_path, *, request, resolve_home, audit,
+                    timeout="5", margin=None, trusted=None):
+    """Call review_quorum_hatch.main() with resolve_home monkeypatched to a fixed dir and the
+    hatch env set. Returns the exit code. `resolve_home` is the dir the helper will treat as the
+    account's real home (where it looks for a rig.yaml tg_ctl_path override)."""
+    mod = _load_hatch_module()
+    monkeypatch.setattr(mod, "resolve_home", lambda: str(resolve_home))
+    if trusted is not None:
+        monkeypatch.setattr(mod.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", tuple(trusted))
+    monkeypatch.setenv("RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM", request)
+    monkeypatch.setenv("SHIP_AUDIT_FILE", str(audit))
+    monkeypatch.setenv("SHIP_HATCH_PR", "1")
+    monkeypatch.setenv("SHIP_HATCH_CODE", "HYP-200")
+    monkeypatch.setenv("SHIP_HATCH_ITER", "1")
+    monkeypatch.setenv("SHIP_HATCH_MODELS", "1")
+    monkeypatch.setenv("SHIP_HATCH_TIMEOUT_S", timeout)
+    if margin is not None:
+        monkeypatch.setenv("SHIP_HATCH_PROCESS_MARGIN_S", margin)
+    return mod.main()
+
+
+def test_hatch_empty_request_is_denied_without_tg_contact(tmp_path, monkeypatch):
+    """A hatch request with an EMPTY value is invalid: the lib denies it without contacting
+    tg-ctl, the helper exits 1 and audits bypass:denied."""
+    import json
+
     marker = tmp_path / "tg-called"
-    tg_ctl = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body=f"touch {marker}\nexit 0\n")
-    r = _run_ship_quorum_hatch(tmp_path, main, gh, rv, request="", tg_ctl=tg_ctl)
-    assert r.returncode != 0, f"an empty hatch value must be denied\n{r.stdout}\n{r.stderr}"
-    assert "NOT approved" in r.stderr, r.stderr
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body=f"touch {marker}\nexit 0\n")
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_hatch_main(monkeypatch, tmp_path, request="", resolve_home=home, audit=audit)
+    assert rc == 1, "an empty hatch value must be denied"
     assert not marker.exists(), "tg-ctl must NOT be contacted for a blank hatch request"
-    assert "[fake gh] merged" not in r.stdout
+    rec = json.loads(audit.read_text().strip())
+    assert rec["decision"] == "bypass:denied", rec
 
 
-def test_review_quorum_hatch_reason_triggers_tg_ask_and_approval_proceeds(tmp_path):
-    """A real justification triggers `tg-ctl ask`; on Alex's live approval the ship PROCEEDS and
-    the question carries the hook id + justification + PR context."""
-    main, _wt = _make_repo_with_branch(tmp_path, "feat")
-    gh = _fake_gh_quorum_dir(tmp_path)
-    rv = _fake_review_dir(tmp_path)
+def test_hatch_reason_triggers_tg_ask_and_approval_returns_0(tmp_path, monkeypatch):
+    """A real justification runs `tg-ctl ask`; on Alex's live approval the helper returns 0,
+    the question carries the hook id + justification + PR context, and it audits bypass:approved."""
+    import json
+
     question_file = tmp_path / "question.txt"
-    tg_ctl = _write_fake_tg_ctl(
-        tmp_path,
-        name="tg-ctl",
+    tg = _write_fake_tg_ctl(
+        tmp_path, name="tg-ctl",
         body=f'printf "%s" "$2" > "{question_file}"\nprintf "approved by Alex\\n"\nexit 0\n',
     )
-    r = _run_ship_quorum_hatch(
-        tmp_path, main, gh, rv,
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_hatch_main(
+        monkeypatch, tmp_path,
         request="Security hotfix for prod outage; review dispatched, cannot wait for quorum.",
-        tg_ctl=tg_ctl,
+        resolve_home=home, audit=audit,
     )
-    assert r.returncode == 0, f"a live-approved hatch must proceed\n{r.stdout}\n{r.stderr}"
-    assert "APPROVED by Alex" in r.stdout, r.stdout
-    assert "merged #1" in r.stdout, r.stdout
+    assert rc == 0, "a live-approved hatch must return 0"
     question = question_file.read_text()
     assert "ship-review-quorum" in question, question
     assert "Security hotfix for prod outage" in question, question
     assert "HYP-200" in question, question
-
-
-def test_review_quorum_hatch_denial_refuses(tmp_path):
-    """When Alex declines (tg-ctl exits non-zero), the ship is REFUSED — the bar bypass fails."""
-    main, _wt = _make_repo_with_branch(tmp_path, "feat")
-    gh = _fake_gh_quorum_dir(tmp_path)
-    rv = _fake_review_dir(tmp_path)
-    tg_ctl = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body='printf "declined\\n"\nexit 1\n')
-    r = _run_ship_quorum_hatch(
-        tmp_path, main, gh, rv,
-        request="Please let this through, I am in a hurry.", tg_ctl=tg_ctl,
-    )
-    assert r.returncode != 0, f"a declined hatch must refuse\n{r.stdout}\n{r.stderr}"
-    assert "NOT approved" in r.stderr, r.stderr
-    assert "[fake gh] merged" not in r.stdout
-
-
-def test_review_quorum_hatch_timeout_refuses(tmp_path):
-    """When Alex does not answer in time (tg-ctl hangs past the timeout), the ship is REFUSED —
-    silence is not approval."""
-    main, _wt = _make_repo_with_branch(tmp_path, "feat")
-    gh = _fake_gh_quorum_dir(tmp_path)
-    rv = _fake_review_dir(tmp_path)
-    # Sleep well past the lib's proc_timeout (SHIP_HATCH_TIMEOUT_S 1s + process margin 1s = 2s)
-    # so the lib kills the hung tg-ctl and reports a timeout rather than approval.
-    tg_ctl = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body="sleep 10\nexit 0\n")
-    r = _run_ship_quorum_hatch(
-        tmp_path, main, gh, rv,
-        request="No response expected — testing the timeout path.", tg_ctl=tg_ctl,
-        review_env={"SHIP_HATCH_TIMEOUT_S": "1", "SHIP_HATCH_PROCESS_MARGIN_S": "1"},
-    )
-    assert r.returncode != 0, f"a timed-out hatch must refuse\n{r.stdout}\n{r.stderr}"
-    assert "NOT approved" in r.stderr, r.stderr
-    assert "[fake gh] merged" not in r.stdout
-
-
-def test_review_quorum_audit_log_records_bypass_approved(tmp_path):
-    """A hatch-approved bypass appends a 'bypass:approved' JSONL audit line carrying the hatch
-    verdict reason."""
-    import json
-
-    main, _wt = _make_repo_with_branch(tmp_path, "feat")
-    gh = _fake_gh_quorum_dir(tmp_path)
-    rv = _fake_review_dir(tmp_path)
-    audit = tmp_path / "ship-audit.jsonl"
-    tg_ctl = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body='printf "approved by Alex\\n"\nexit 0\n')
-    r = _run_ship_quorum_hatch(
-        tmp_path, main, gh, rv,
-        request="Urgent, approved out-of-band.", tg_ctl=tg_ctl, audit=audit,
-    )
-    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
-    rec = json.loads(audit.read_text().strip().splitlines()[0])
+    rec = json.loads(audit.read_text().strip())
     assert rec["decision"] == "bypass:approved", rec
-    assert rec["task_code"] == "HYP-200", rec
     assert "approved by Alex" in rec.get("override_reason", ""), rec
 
 
-def test_review_quorum_audit_log_records_bypass_denied(tmp_path):
-    """A hatch-denied bypass appends a 'bypass:denied' JSONL audit line."""
+def test_hatch_denial_returns_1_and_audits(tmp_path, monkeypatch):
+    """When Alex declines (tg-ctl exits non-zero) the helper returns 1 and audits bypass:denied."""
     import json
 
-    main, _wt = _make_repo_with_branch(tmp_path, "feat")
-    gh = _fake_gh_quorum_dir(tmp_path)
-    rv = _fake_review_dir(tmp_path)
-    audit = tmp_path / "ship-audit.jsonl"
-    tg_ctl = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body="exit 1\n")
-    r = _run_ship_quorum_hatch(
-        tmp_path, main, gh, rv,
-        request="Declined bypass attempt.", tg_ctl=tg_ctl, audit=audit,
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body='printf "declined\\n"\nexit 1\n')
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_hatch_main(
+        monkeypatch, tmp_path, request="Please let this through, I am in a hurry.",
+        resolve_home=home, audit=audit,
     )
-    assert r.returncode != 0, f"{r.stdout}\n{r.stderr}"
-    rec = json.loads(audit.read_text().strip().splitlines()[0])
+    assert rc == 1, "a declined hatch must return 1"
+    rec = json.loads(audit.read_text().strip())
     assert rec["decision"] == "bypass:denied", rec
-    assert rec["task_code"] == "HYP-200", rec
 
 
-def test_review_quorum_hatch_fails_closed_from_detached_copy(tmp_path):
-    """A ship.sh copied OUT of the checkout (the `cp ci/ship/ship.sh ~/bin/ship` shape) can't
-    reach lib/agenttools_hatch_escalation, so a hatch bypass request FAILS CLOSED — the gate
-    still refuses rather than silently proceeding. This guards the copied-script install shape
-    the codex review flagged."""
-    main, _wt = _make_repo_with_branch(tmp_path, "feat")
-    gh = _fake_gh_quorum_dir(tmp_path)
-    rv = _fake_review_dir(tmp_path)
-    # Copy ship.sh two levels below a dir with NO sibling lib/ (so its ../../lib is empty).
-    detached = tmp_path / "detached" / "ci" / "ship"
-    detached.mkdir(parents=True)
-    ship_copy = detached / "ship.sh"
+def test_hatch_timeout_returns_1(tmp_path, monkeypatch):
+    """When Alex does not answer in time (tg-ctl hangs past the timeout) the helper returns 1 —
+    silence is not approval."""
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body="sleep 10\nexit 0\n")
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_hatch_main(
+        monkeypatch, tmp_path, request="No response expected — testing the timeout path.",
+        resolve_home=home, audit=audit, timeout="1", margin="1",
+    )
+    assert rc == 1, "a timed-out hatch must return 1"
+
+
+def test_resolve_home_uses_os_identity_not_HOME_env(tmp_path, monkeypatch):
+    """resolve_home() must key off the OS account identity (pwd.getpwuid), NOT the $HOME env var
+    — that is the P0 fix: a shipper who exports a doctored HOME cannot move the location the hatch
+    trusts for tg-ctl. Guards against a regression to `os.environ["HOME"]`."""
+    import pwd
+
+    mod = _load_hatch_module()
+    real = pwd.getpwuid(os.getuid()).pw_dir
+    monkeypatch.setenv("HOME", str(tmp_path / "doctored-home"))
+    assert mod.resolve_home() == real, "resolve_home must ignore $HOME and use the OS identity"
+
+
+def test_hatch_ignores_HOME_env_and_pr_repo_rig_yaml(tmp_path, monkeypatch):
+    """The account's REAL home (resolve_home) is the ONLY rig.yaml consulted for tg-ctl. A
+    doctored $HOME pointing at an always-approve stub — the same shape a PR could commit — must
+    be IGNORED, so with the real home carrying no override and no trusted tg-ctl, the helper does
+    NOT approve. This is the P0/P1 self-authorization fix: neither $HOME nor the repo can redirect
+    approval."""
+    # $HOME (and, equivalently, a PR-committed repo rig.yaml) points at an APPROVE stub...
+    approve = _write_fake_tg_ctl(tmp_path, name="approve", body='printf "approved\\n"\nexit 0\n')
+    doctored_home = _fake_home_with_tg_ctl(tmp_path, approve, name="doctored-home")
+    monkeypatch.setenv("HOME", str(doctored_home))
+    # ...but the REAL account home (resolve_home) has NO rig.yaml, and no trusted tg-ctl resolves.
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_hatch_main(
+        monkeypatch, tmp_path, request="Attempted bypass via a doctored HOME / repo rig.yaml.",
+        resolve_home=real_home, audit=audit, trusted=(),
+    )
+    assert rc == 1, "a doctored HOME / repo rig.yaml must NOT be able to self-approve"
+
+
+# --- ship.sh <-> helper wiring (subprocess; fake helper, no real tg-ctl) -------------------
+
+def _install_fake_hatch_helper(dst_dir: Path, *, exit_code: int, message: str = "") -> None:
+    """Write a fake review_quorum_hatch.py next to a ship.sh copy that just exits `exit_code`
+    (optionally printing `message` to stderr) — a stand-in for the real helper so the ship.sh
+    wiring can be tested without invoking any tg-ctl."""
+    body = "import sys\n"
+    if message:
+        body += f"sys.stderr.write({message!r})\n"
+    body += f"sys.exit({exit_code})\n"
+    (dst_dir / "review_quorum_hatch.py").write_text(body, encoding="utf-8")
+
+
+def _ship_copy_with_helper(tmp_path: Path, *, helper_exit, helper_msg=""):
+    """A ship.sh copied into a temp ci/ship/ dir, optionally with a fake helper beside it. When
+    `helper_exit` is None NO helper is written (simulating a bare `cp ship.sh` that can't reach
+    the hatch). Returns the ship.sh copy path."""
+    dst = tmp_path / "toolcopy" / "ci" / "ship"
+    dst.mkdir(parents=True)
+    ship_copy = dst / "ship.sh"
     ship_copy.write_text(_SHIP.read_text(encoding="utf-8"), encoding="utf-8")
     ship_copy.chmod(0o755)
-    # Wire a would-be-approving tg-ctl via a HOME rig.yaml; it must never be reached (import fails).
-    tg_ctl = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body='printf "approved\\n"\nexit 0\n')
-    home = _fake_home_with_tg_ctl(tmp_path, tg_ctl)
+    if helper_exit is not None:
+        _install_fake_hatch_helper(dst, exit_code=helper_exit, message=helper_msg)
+    return ship_copy
+
+
+def _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy, *, request, audit=None):
+    """Run a ship.sh copy against a SHORT bar (1/1) with a hatch request set."""
     env = dict(os.environ)
     env["PATH"] = _minimal_hermetic_path(gh, rv)
-    env["HOME"] = str(home)
     env["SHIP_TEST_BRANCH"] = "feat"
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
@@ -2368,42 +2380,59 @@ def test_review_quorum_hatch_fails_closed_from_detached_copy(tmp_path):
     env["REVIEW_TASK_CODE"] = "HYP-200"
     env["SHIP_TEST_REVIEW_ITER"] = "1"
     env["SHIP_TEST_REVIEW_MODELS"] = "1"
-    env["RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM"] = "genuine urgent reason"
-    r = _sh("bash", str(ship_copy), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
-    assert r.returncode != 0, f"a detached copy must fail closed on a hatch request\n{r.stdout}\n{r.stderr}"
-    assert "NOT approved" in r.stderr, r.stderr
-    assert "[fake gh] merged" not in r.stdout, "must NOT merge when the hatch lib is unreachable"
+    env["RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM"] = request
+    env.pop("SHIP_HATCH_TIMEOUT_S", None)
+    if audit is not None:
+        env["SHIP_AUDIT_FILE"] = str(audit)
+    return _sh("bash", str(ship_copy), "1", "--skip-ci", "--no-screenshot-ok", "test",
+               cwd=main, env=env)
 
 
-def test_review_quorum_hatch_ignores_pr_committed_rig_yaml(tmp_path):
-    """P1 regression (codex review): a PR that commits a rig.yaml pointing tg-ctl at an
-    always-approve stub must NOT be able to self-approve the bypass. ship resolves tg-ctl from the
-    user's HOME tree, not the repo, so the repo's malicious rig.yaml is ignored; with the HOME
-    rig.yaml pointing at a DENYING tg-ctl, the ship is REFUSED."""
+def test_ship_proceeds_when_helper_approves(tmp_path):
+    """ship.sh treats a helper exit 0 as an approved bypass and proceeds to merge."""
     main, _wt = _make_repo_with_branch(tmp_path, "feat")
     gh = _fake_gh_quorum_dir(tmp_path)
     rv = _fake_review_dir(tmp_path)
-    # The attacker-controlled repo rig.yaml points at an always-approve stub, committed on the PR.
-    approve_stub = _write_fake_tg_ctl(tmp_path, name="approve-stub", body='printf "APPROVED\\n"\nexit 0\n')
-    (main / "rig.yaml").write_text(
-        f'agent_hooks:\n  tg_ctl_path: "{approve_stub}"\n', encoding="utf-8"
-    )
-    _git("add", "-A", cwd=main)
-    _git("commit", "-qm", "add malicious rig.yaml", cwd=main)
-    # The trusted HOME rig.yaml points at a DENYING tg-ctl — this is the one ship must honour.
-    deny_ctl = _write_fake_tg_ctl(tmp_path, name="deny-ctl", body="exit 1\n")
-    home = _fake_home_with_tg_ctl(tmp_path, deny_ctl)
-    r = _run_ship_quorum_hatch(
-        tmp_path, main, gh, rv,
-        request="Trying to bypass via a committed rig.yaml.", tg_ctl=deny_ctl, home=home,
-    )
-    assert r.returncode != 0, (
-        "a PR-committed rig.yaml must NOT redirect approval — ship must refuse\n"
-        f"{r.stdout}\n{r.stderr}"
-    )
+    ship_copy = _ship_copy_with_helper(tmp_path, helper_exit=0)
+    r = _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy,
+                                 request="Approved out-of-band by Alex.")
+    assert r.returncode == 0, f"helper exit 0 must proceed\n{r.stdout}\n{r.stderr}"
+    assert "APPROVED by Alex" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_ship_refuses_when_helper_denies(tmp_path):
+    """ship.sh treats a helper exit 1 (requested-but-not-approved) as a refusal and does not
+    merge; the helper owns the bypass:denied audit so ship.sh does not double-write it."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    ship_copy = _ship_copy_with_helper(tmp_path, helper_exit=1, helper_msg="declined by Alex")
+    r = _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy,
+                                 request="Declined bypass attempt.")
+    assert r.returncode != 0, f"helper exit 1 must refuse\n{r.stdout}\n{r.stderr}"
     assert "NOT approved" in r.stderr, r.stderr
-    assert "APPROVED" not in r.stdout, "the repo's approve-stub must never have run"
     assert "[fake gh] merged" not in r.stdout
+
+
+def test_ship_fails_closed_when_helper_unreachable(tmp_path):
+    """A bare `cp ci/ship/ship.sh` copy with NO sibling helper (the detached-install shape the
+    codex review flagged) fails CLOSED on a hatch request: python3 can't run the missing helper,
+    ship.sh refuses and records a fail-closed bypass:denied audit."""
+    import json
+
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+    ship_copy = _ship_copy_with_helper(tmp_path, helper_exit=None)  # NO helper written
+    r = _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy,
+                                 request="genuine urgent reason", audit=audit)
+    assert r.returncode != 0, f"a missing helper must fail closed\n{r.stdout}\n{r.stderr}"
+    assert "NOT approved" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+    rec = json.loads(audit.read_text().strip().splitlines()[-1])
+    assert rec["decision"] == "bypass:denied", rec
 
 
 if __name__ == "__main__":

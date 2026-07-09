@@ -85,10 +85,10 @@
 #                          his real-time approval. Blank/bare-flag values are denied; unset means
 #                          no bypass requested (the gate refuses with guidance). tg-ctl is
 #                          resolved by the shared lib from a rig.yaml agent_hooks.tg_ctl_path in
-#                          the user's HOME tree (a reviewed global location — NOT the PR's own
-#                          repo), then a trusted-paths allowlist. Neither the lib dir nor tg-ctl
-#                          is env- or repo-overridable, so nothing the shipper/PR controls can
-#                          redirect approval to a stub.
+#                          the OS account's REAL home (pwd.getpwuid — NOT the $HOME env var, NOT
+#                          the PR's repo), then a trusted-paths allowlist. Neither the lib dir nor
+#                          tg-ctl is env- or repo-overridable, so nothing the shipper/PR controls
+#                          can redirect approval to a stub.
 #   SHIP_AUDIT_FILE        path for the review-quorum gate's audit JSONL (default
 #                          ~/.config/agent-tools/ship-audit.jsonl). One line is appended per
 #                          gated ship (authorized / bypass:approved / bypass:denied / refused).
@@ -99,17 +99,17 @@ PR=""; SKIP_CI=0; DRY_RUN=0; NO_SHOT_OK=""; NO_VBUMP_OK=""; NO_DWELL_OK=""; REPO
 SHOT_PATHS=(); SHOT_DESCS=()
 USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--screenshot <path> [desc]]...'
 
-# Absolute path to this repo's lib/ dir (where agenttools_hatch_escalation lives), derived ONLY
-# from this script's own location (ci/ship/ship.sh -> ../../lib). The review-quorum gate's hatch
-# escalation imports the shared lib from here — the SAME lib the pin-primary-worktree /
-# block-reset-hard agent-hooks use — so a bypass goes through live Telegram approval, never a
-# self-service flag. It is deliberately NOT overridable by an env var: letting the shipper choose
-# the lib dir would let an agent point it at an always-approve stub and self-authorize. If the
-# path can't be resolved (e.g. ship.sh was copied OUT of the checkout to ~/bin, so lib/ is not
-# two levels up), the hatch import fails CLOSED — the gate still refuses, the bypass just can't
-# run from a detached copy; run ship from within the agent-tools checkout to use the hatch.
+# Path to the review-quorum gate's hatch-escalation helper (ci/ship/review_quorum_hatch.py),
+# derived ONLY from this script's own location. That helper imports the shared
+# agenttools_hatch_escalation lib from a fixed path (lib/ two levels up) — the SAME lib the
+# pin-primary-worktree / block-reset-hard agent-hooks use — so a bypass goes through live Telegram
+# approval, never a self-service flag, and neither the lib nor tg-ctl is env-/repo-overridable
+# (see the helper's docstring). If ship.sh was copied OUT of the checkout (e.g. to ~/bin), the
+# helper import fails CLOSED — the gate still refuses; the bypass just can't run from a detached
+# copy. Run ship from within the agent-tools checkout to use the hatch.
 _SHIP_SELF_SRC="${BASH_SOURCE[0]:-$0}"
-_SHIP_REPO_LIB="$(cd "$(dirname "$_SHIP_SELF_SRC")/../.." 2>/dev/null && pwd -P || echo /nonexistent)/lib"
+_SHIP_SELF_DIR="$(cd "$(dirname "$_SHIP_SELF_SRC")" 2>/dev/null && pwd -P || echo /nonexistent)"
+_SHIP_HATCH_PY="$_SHIP_SELF_DIR/review_quorum_hatch.py"
 
 # --- arg parse (PR number is the lone bare arg; --screenshot takes path + optional desc) --
 args=("$@"); i=0; n=${#args[@]}
@@ -972,84 +972,36 @@ _review_quorum_audit_log() {
   fi
 }
 
-# Ask Alex, live on Telegram, to approve a one-time review-quorum bypass — delegating to the
-# shared agenttools_hatch_escalation lib exactly as the agent-hooks do. Called ONLY when
-# RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM is set (present). Prints the lib's verdict reason on
-# stderr; exit code: 0 approved, 1 requested-but-not-approved (blank/bare/denied/timeout),
-# 3 the lib could not be imported (fail-closed).
+# Ask Alex, live on Telegram, to approve a one-time review-quorum bypass, by invoking the
+# ci/ship/review_quorum_hatch.py helper (which delegates to the shared agenttools_hatch_escalation
+# lib exactly as the agent-hooks do). Called ONLY when RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM is set.
+# The helper prints the verdict reason on stderr and OWNS the bypass:* audit line; its exit code:
+# 0 approved, 1 requested-but-not-approved (blank/bare/denied/timeout), 3 the shared lib could not
+# be imported (fail-closed — e.g. ship.sh copied out of the checkout).
 #
-# SECURITY: the two things that decide the verdict — WHICH lib is imported and WHICH tg-ctl is
-# invoked — are NOT taken from the shipper's control surface, on purpose. The lib is imported
-# from a FIXED path derived from this script's own location ($_SHIP_REPO_LIB), not an env var.
-# tg-ctl is resolved by the lib from `agent_hooks.tg_ctl_path` in a rig.yaml found by walking up
-# from cwd — and we pass cwd=$HOME (see below), NOT the repo, so the ONLY rig.yaml that can
-# override tg-ctl is one in the user's HOME tree (a global, reviewed location); with none, the
-# lib's hard-coded trusted-absolute-paths allowlist (the real tg-ctl) is used. The PR being
-# merged CANNOT influence tg-ctl: a rig.yaml it commits is in the repo worktree, which is out of
-# the resolution path. If either the lib dir or tg-ctl were shipper-controllable (an env var, or
-# the PR's own rig.yaml), an agent could point them at an always-approve stub and self-authorize
-# — exactly the self-service bypass this gate exists to forbid. (SHIP_HATCH_TIMEOUT_S can only
-# shorten the wait, which fails CLOSED — a shorter timeout denies, never approves — so it is a
+# SECURITY: neither WHICH lib runs nor WHICH tg-ctl is asked is shipper-controllable. The helper
+# imports the lib from a fixed path, and resolves tg-ctl off the OS identity's REAL home
+# (pwd.getpwuid) — NOT the $HOME env var and NOT the repo worktree — so no ambient env var and no
+# rig.yaml a PR commits can redirect approval to an always-approve stub. (SHIP_HATCH_TIMEOUT_S can
+# only SHORTEN the wait, which fails CLOSED — a shorter wait denies, never approves — so it is a
 # safe tuning knob, not a bypass.)
 _review_quorum_hatch_check() {  # uses $TASK_CODE $QITER $QMODELS_N $PR
-  SHIP_HATCH_LIBDIR="$_SHIP_REPO_LIB" \
   SHIP_HATCH_PR="$PR" \
   SHIP_HATCH_CODE="${TASK_CODE:-}" \
   SHIP_HATCH_ITER="${QITER:-0}" \
   SHIP_HATCH_MODELS="${QMODELS_N:-0}" \
-  python3 -c '
-import os, sys
-sys.path.insert(0, os.environ["SHIP_HATCH_LIBDIR"])
-try:
-    import agenttools_hatch_escalation as h
-except Exception as e:  # lib missing / uninstalled -> fail closed
-    sys.stderr.write("hatch escalation lib unavailable: %s" % e)
-    sys.exit(3)
-ctx = {
-    "pr": os.environ.get("SHIP_HATCH_PR", ""),
-    "task_code": os.environ.get("SHIP_HATCH_CODE", ""),
-    "iterations": os.environ.get("SHIP_HATCH_ITER", ""),
-    "distinct_models": os.environ.get("SHIP_HATCH_MODELS", ""),
-    "repo": os.getcwd(),
-    "gate": "ship review-quorum (self-merge-authority Guard-B)",
-}
-# tg-ctl resolution is left to the lib (rig.yaml agent_hooks.tg_ctl_path, then the lib
-# trusted-paths allowlist) — NOT an env-provided candidate. CRUCIALLY we pass cwd=$HOME, NOT the
-# repo, so the lib reads a tg_ctl_path override ONLY from the user`s HOME-tree rig.yaml (a global,
-# reviewed location), never from the PR being merged. A PR that commits its own rig.yaml pointing
-# at an always-approve stub therefore CANNOT redirect approval — the repo config is out of scope
-# for tg-ctl resolution. With no HOME rig.yaml (the normal case) the lib falls back to its
-# hard-coded trusted-paths allowlist, i.e. the real tg-ctl. Only the (fail-closed) timeout tuning
-# is honoured from the environment.
-resolve_cwd = os.environ.get("HOME") or "/"
-kw = {}
-tmo = os.environ.get("SHIP_HATCH_TIMEOUT_S")
-if tmo:
-    try:
-        kw["timeout_s"] = float(tmo)
-    except ValueError:
-        pass
-pmg = os.environ.get("SHIP_HATCH_PROCESS_MARGIN_S")
-if pmg:
-    try:
-        kw["process_margin_s"] = float(pmg)
-    except ValueError:
-        pass
-res = h.request_hatch_approval("ship-review-quorum", ctx, cwd=resolve_cwd, **kw)
-sys.stderr.write(res.reason or "")
-sys.exit(0 if res.approved else (1 if res.env_present else 2))
-'
+  python3 "$_SHIP_HATCH_PY"
 }
 
-# Terminal handler for a review-quorum refusal: either the shared hatch escalation approves a
-# one-time bypass (return 0 -> ship proceeds), or the ship is refused (exits 1). $1 is the human
-# one-line summary of WHY the bar wasn't met (or couldn't be verified). Uses $TASK_CODE / $QITER
-# / $QMODELS_N (set to safe defaults by the caller before any early refusal).
+# Terminal handler for a review-quorum refusal: either the hatch escalation approves a one-time
+# bypass (return 0 -> ship proceeds), or the ship is refused (exits 1). $1 is the human one-line
+# summary of WHY the bar wasn't met (or couldn't be verified). Uses $TASK_CODE / $QITER /
+# $QMODELS_N (set to safe defaults by the caller before any early refusal).
 _review_quorum_refuse_or_hatch() {  # $1 = refusal summary
   local summary="$1"
   # Distinguish TRULY-UNSET (no bypass requested) from set-but-empty (an invalid request the lib
   # denies): `${var+x}` is empty only when the var is unset. Unset -> refuse with the how-to;
-  # set (even blank) -> route through the lib, which denies blank/bare and asks on a real reason.
+  # set (even blank) -> route through the helper, which denies blank/bare and asks on a real reason.
   if [ -z "${RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM+x}" ]; then
     { echo "Refusing: review-quorum gate — ${summary}."
       echo "  Run more independent review iterations (e.g. \`review diff --task ${TASK_CODE:-<code>}\`) across distinct models, then re-run ship."
@@ -1060,17 +1012,22 @@ _review_quorum_refuse_or_hatch() {  # $1 = refusal summary
     _review_quorum_audit_log refused "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" ""
     exit 1
   fi
+  # The helper writes its own bypass:approved / bypass:denied audit line for exit 0/1. Only when
+  # it could NOT run at all (exit 3 import-fail, or a missing python3) does ship.sh record the
+  # fail-closed bypass:denied here, so the audit is never doubled nor dropped.
   local hrc=0 hreason
   hreason=$(_review_quorum_hatch_check 2>&1 >/dev/null) || hrc=$?
   if [ "$hrc" = "0" ]; then
     echo "[ship] review-quorum gate — ${summary}; a one-time Telegram hatch escalation was APPROVED by Alex — proceeding. (${hreason})"
-    _review_quorum_audit_log "bypass:approved" "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "$hreason"
     return 0
   fi
   { echo "Refusing: review-quorum gate — ${summary}."
     echo "  A Telegram hatch escalation was requested but NOT approved: ${hreason:-no approval}."
     echo "  Obtain live approval, add more independent review iterations, or set SHIP_REVIEW_QUORUM=0 (ops off-switch)."; } >&2
-  _review_quorum_audit_log "bypass:denied" "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "$hreason"
+  case "$hrc" in
+    1) : ;;  # the helper already wrote bypass:denied
+    *) _review_quorum_audit_log "bypass:denied" "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "$hreason" ;;
+  esac
   exit 1
 }
 
