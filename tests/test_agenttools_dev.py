@@ -152,6 +152,16 @@ def test_run_allows_shell_wrapper_argument_named_c_after_script_path(tmp_path, m
         "python -c 'open(\"pwned\", \"w\").write(\"x\")'",
         "node -e 'require(\"fs\").writeFileSync(\"pwned\", \"x\")'",
         "uv run python -c 'open(\"pwned\", \"w\").write(\"x\")'",
+        "uv run --with foo python -c 'open(\"pwned\", \"w\").write(\"x\")'",
+        "uv run --with=foo python -c 'open(\"pwned\", \"w\").write(\"x\")'",
+        "uv run -p 3.11 python -c 'open(\"pwned\", \"w\").write(\"x\")'",
+        "uv run -p3.11 python -c 'open(\"pwned\", \"w\").write(\"x\")'",
+        "uv run -vp 3.11 python -c 'open(\"pwned\", \"w\").write(\"x\")'",
+        "uv run --python-preference system python -c 'open(\"pwned\", \"w\").write(\"x\")'",
+        "uv run --unknown-uv-flag value python -c 'open(\"pwned\", \"w\").write(\"x\")'",
+        "uv run --unknown-uv-flag value --with foo python -c 'open(\"pwned\", \"w\").write(\"x\")'",
+        "uv run --u1 v1 --u2 v2 python -c 'open(\"pwned\", \"w\").write(\"x\")'",
+        "uv run -- python -c 'open(\"pwned\", \"w\").write(\"x\")'",
         "pnpm exec node -e 'require(\"fs\").writeFileSync(\"pwned\", \"x\")'",
         "npm test > ~/.zshrc",
         "npm test 2>&1",
@@ -172,6 +182,55 @@ def test_run_rejects_unsafe_lifecycle_payloads(tmp_path, monkeypatch, capsys, co
     captured = capsys.readouterr()
     assert "not a permitted development/e2e command" in captured.err
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "uv run --with rm pytest tests/",
+        "uv run --with=rm pytest tests/",
+        "uv run --env-file .env pytest tests/",
+        "uv run --frozen pytest tests/",
+        "uv run -p 3.11 pytest tests/",
+        "uv run -p3.11 pytest tests/",
+    ],
+)
+def test_run_allows_uv_runner_option_values_that_look_like_commands(
+    tmp_path, monkeypatch, command
+):
+    cli = _import_cli()
+    calls: list[tuple[str, Path]] = []
+
+    monkeypatch.setattr(cli, "_find_repo_root", lambda _start: tmp_path)
+    monkeypatch.setattr(cli, "_load_rig_config", lambda _root: {"scripts": {"test": command}})
+    monkeypatch.setattr(cli, "_run_shell", lambda command, cwd: calls.append((command, cwd)) or 0)
+
+    assert cli.main(["run", "test"]) == 0
+    assert calls == [(command, tmp_path)]
+
+
+@pytest.mark.parametrize(
+    ("command", "payload"),
+    [
+        ("uv run --with foo python -c pass", ["python", "-c", "pass"]),
+        ("uv run --with=foo python -c pass", ["python", "-c", "pass"]),
+        ("uv run --env-file .env python -c pass", ["python", "-c", "pass"]),
+        ("uv run -p 3.11 python -c pass", ["python", "-c", "pass"]),
+        ("uv run -p3.11 python -c pass", ["python", "-c", "pass"]),
+        ("uv run -vp 3.11 python -c pass", ["python", "-c", "pass"]),
+        ("uv run -- python -c pass", ["python", "-c", "pass"]),
+        ("uv run --python-preference system python -c pass", ["python", "-c", "pass"]),
+        ("uv run --unknown-uv-flag value python -c pass", ["python", "-c", "pass"]),
+        ("uv run --unknown-uv-flag value --with foo python -c pass", ["python", "-c", "pass"]),
+        ("uv run --u1 v1 --u2 v2 python -c pass", ["python", "-c", "pass"]),
+    ],
+)
+def test_uv_run_payload_starts_skip_runner_flags(command, payload):
+    cli = _import_cli()
+    tokens = cli._split_command(command)
+    starts = list(cli._runner_payload_starts(tokens))
+
+    assert any(tokens[start:] == payload for start in starts)
 
 
 @pytest.mark.parametrize("command", ["bash -lc 'npm test'", "uv run bash -lc 'pytest tests/'"])
@@ -308,7 +367,7 @@ def test_start_server_writes_state_file(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         cli,
         "_start_process",
-        lambda command, cwd: started.append((command, cwd)) or 2468,
+        lambda command, cwd, log_path=None: started.append((command, cwd)) or 2468,
     )
 
     assert cli.main(["start", "server"]) == 0
@@ -323,6 +382,35 @@ def test_start_server_writes_state_file(tmp_path, monkeypatch, capsys):
     assert record["name"] == "server"
     assert record["port"] == 5173
     assert record["ports"] == [5173]
+
+
+def test_start_uses_configured_logs_root_for_detached_output(tmp_path, monkeypatch):
+    cli = _import_cli()
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    repo.mkdir()
+    started: list[tuple[str, Path, Path | None]] = []
+
+    monkeypatch.setattr(cli, "_find_repo_root", lambda _start: repo)
+    monkeypatch.setattr(
+        cli,
+        "_load_rig_config",
+        lambda _root: {
+            "scripts": {"server": "pnpm run dev"},
+            "dev": {"server": {"script": "server", "logs_root": ".dev/logs/server"}},
+        },
+    )
+    monkeypatch.setattr(cli, "_state_dir", lambda _root: state)
+    monkeypatch.setattr(
+        cli,
+        "_start_process",
+        lambda command, cwd, log_path=None: started.append((command, cwd, log_path)) or 2468,
+    )
+
+    assert cli.main(["start", "server"]) == 0
+    assert started == [
+        ("pnpm run dev", repo, repo / ".dev/logs/server" / "server-server.log")
+    ]
 
 
 def test_start_e2e_job_writes_state_file(tmp_path, monkeypatch):
@@ -341,13 +429,87 @@ def test_start_e2e_job_writes_state_file(tmp_path, monkeypatch):
         },
     )
     monkeypatch.setattr(cli, "_state_dir", lambda _root: state)
-    monkeypatch.setattr(cli, "_start_process", lambda command, cwd: 1357)
+    monkeypatch.setattr(cli, "_start_process", lambda command, cwd, log_path=None: 1357)
 
     assert cli.main(["start", "smoke", "--", "--debug"]) == 0
 
     record = json.loads((state / "e2e-smoke.json").read_text(encoding="utf-8"))
     assert record["kind"] == "e2e"
     assert record["command"] == "pnpm exec playwright test --debug"
+
+
+def test_start_process_redirects_stdio_to_configured_log_and_closes_parent_fd(
+    tmp_path, monkeypatch
+):
+    cli = _import_cli()
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 2468
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    log_path = tmp_path / "logs" / "server.log"
+    pid = cli._start_process("pnpm run dev", tmp_path, log_path)
+
+    assert pid == 2468
+    assert captured["command"] == "pnpm run dev"
+    assert captured["cwd"] == str(tmp_path)
+    assert captured["shell"] is True
+    assert captured["start_new_session"] is True
+    assert captured["stdin"] is subprocess.DEVNULL
+    assert Path(captured["stdout"].name) == log_path
+    assert captured["stdout"].closed is True
+    assert captured["stderr"] is subprocess.STDOUT
+    assert captured["close_fds"] is True
+
+
+def test_start_process_redirects_stdio_to_devnull_without_log(tmp_path, monkeypatch):
+    cli = _import_cli()
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 2468
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    assert cli._start_process("pnpm run dev", tmp_path) == 2468
+    assert captured["stdin"] is subprocess.DEVNULL
+    assert captured["stdout"] is subprocess.DEVNULL
+    assert captured["stderr"] is subprocess.DEVNULL
+    assert captured["close_fds"] is True
+
+
+def test_start_process_falls_back_to_devnull_when_log_cannot_open(tmp_path, monkeypatch):
+    cli = _import_cli()
+    captured: dict[str, object] = {}
+    blocked_parent = tmp_path / "not-a-directory"
+    blocked_parent.write_text("file\n", encoding="utf-8")
+
+    class FakeProcess:
+        pid = 2468
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    assert cli._start_process("pnpm run dev", tmp_path, blocked_parent / "server.log") == 2468
+    assert captured["stdin"] is subprocess.DEVNULL
+    assert captured["stdout"] is subprocess.DEVNULL
+    assert captured["stderr"] is subprocess.DEVNULL
 
 
 def test_list_reports_configured_and_running_targets(tmp_path, monkeypatch, capsys):
@@ -518,7 +680,11 @@ def test_start_rejects_destructive_lifecycle_command(tmp_path, monkeypatch, caps
             "dev": {"server": {"script": "wipe"}},
         },
     )
-    monkeypatch.setattr(cli, "_start_process", lambda command, cwd: started.append(command) or 1)
+    monkeypatch.setattr(
+        cli,
+        "_start_process",
+        lambda command, cwd, log_path=None: started.append(command) or 1,
+    )
 
     code = cli.main(["start", "server"])
 
@@ -547,7 +713,11 @@ def test_start_rejects_destructive_lifecycle_companion(
             "dev": {"server": {"script": "server"}},
         },
     )
-    monkeypatch.setattr(cli, "_start_process", lambda command, cwd: started.append(command) or 1)
+    monkeypatch.setattr(
+        cli,
+        "_start_process",
+        lambda command, cwd, log_path=None: started.append(command) or 1,
+    )
 
     code = cli.main(["start", "server"])
 
@@ -586,7 +756,11 @@ def test_start_rejects_non_dev_lifecycle_companion(tmp_path, monkeypatch, capsys
             "dev": {"server": {"script": "server"}},
         },
     )
-    monkeypatch.setattr(cli, "_start_process", lambda command, cwd: started.append(command) or 1)
+    monkeypatch.setattr(
+        cli,
+        "_start_process",
+        lambda command, cwd, log_path=None: started.append(command) or 1,
+    )
 
     code = cli.main(["start", "server"])
 
@@ -632,7 +806,11 @@ def test_lifecycle_allows_timeout_signal_wrapper(tmp_path, monkeypatch):
             "dev": {"server": {"script": "server"}},
         },
     )
-    monkeypatch.setattr(cli, "_start_process", lambda command, cwd: started.append((command, cwd)) or 1)
+    monkeypatch.setattr(
+        cli,
+        "_start_process",
+        lambda command, cwd, log_path=None: started.append((command, cwd)) or 1,
+    )
 
     assert cli.main(["start", "server"]) == 0
     assert started == [("timeout -s TERM 5 npm run dev", repo)]
@@ -952,6 +1130,185 @@ def test_e2e_logs_prints_configured_log_tail(tmp_path, monkeypatch, capsys):
 
     captured = capsys.readouterr()
     assert captured.out.splitlines() == ["two", "three"]
+
+
+def test_logs_prefers_target_start_log_over_newer_shared_log(tmp_path, monkeypatch, capsys):
+    cli = _import_cli()
+    repo = tmp_path / "repo"
+    logs = repo / ".dev" / "logs"
+    logs.mkdir(parents=True)
+    server_log = logs / "server-server.log"
+    other_log = logs / "e2e-smoke.log"
+    server_log.write_text("server one\nserver two\n", encoding="utf-8")
+    other_log.write_text("smoke newer\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "_find_repo_root", lambda _start: repo)
+    monkeypatch.setattr(
+        cli,
+        "_load_rig_config",
+        lambda _root: {
+            "scripts": {"server": "pnpm run dev", "e2e-smoke": "pnpm exec playwright test"},
+            "dev": {
+                "server": {"script": "server", "logs_root": ".dev/logs"},
+                "e2e": {"jobs": {"smoke": {"script": "e2e-smoke", "logs_root": ".dev/logs"}}},
+            },
+        },
+    )
+
+    assert cli.main(["logs", "server", "--tail", "1"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == ["server two"]
+
+
+def test_e2e_logs_prefers_latest_run_log_over_detached_start_log(
+    tmp_path, monkeypatch, capsys
+):
+    cli = _import_cli()
+    repo = tmp_path / "repo"
+    root = repo / "e2e" / "docker-artifacts"
+    latest = root / "run-grp-002"
+    latest.mkdir(parents=True)
+    (root / "e2e-smoke.log").write_text("detached stale\n", encoding="utf-8")
+    (latest / "playwright.log").write_text("latest one\nlatest two\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "_find_repo_root", lambda _start: repo)
+    monkeypatch.setattr(
+        cli,
+        "_load_rig_config",
+        lambda _root: {
+            "scripts": {"e2e-smoke": "pnpm exec playwright test"},
+            "dev": {
+                "e2e": {
+                    "jobs": {
+                        "smoke": {
+                            "script": "e2e-smoke",
+                            "artifacts_root": "e2e/docker-artifacts",
+                            "logs_root": "e2e/docker-artifacts",
+                        },
+                    }
+                }
+            },
+        },
+    )
+
+    assert cli.main(["e2e", "logs", "smoke", "--tail", "1"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == ["latest two"]
+
+
+def test_e2e_logs_prefers_start_log_over_shared_artifact_root_without_run_dir(
+    tmp_path, monkeypatch, capsys
+):
+    cli = _import_cli()
+    repo = tmp_path / "repo"
+    root = repo / "e2e" / "docker-artifacts"
+    root.mkdir(parents=True)
+    start_log = root / "e2e-smoke.log"
+    sibling_log = root / "e2e-other.log"
+    start_log.write_text("smoke one\nsmoke two\n", encoding="utf-8")
+    sibling_log.write_text("other newer\n", encoding="utf-8")
+    os.utime(start_log, (100, 100))
+    os.utime(sibling_log, (200, 200))
+
+    monkeypatch.setattr(cli, "_find_repo_root", lambda _start: repo)
+    monkeypatch.setattr(
+        cli,
+        "_load_rig_config",
+        lambda _root: {
+            "scripts": {"e2e-smoke": "pnpm exec playwright test"},
+            "dev": {
+                "e2e": {
+                    "jobs": {
+                        "smoke": {
+                            "script": "e2e-smoke",
+                            "artifacts_root": "e2e/docker-artifacts",
+                            "logs_root": "e2e/docker-artifacts",
+                        },
+                    }
+                }
+            },
+        },
+    )
+
+    assert cli.main(["e2e", "logs", "smoke", "--tail", "1"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == ["smoke two"]
+
+
+def test_e2e_logs_prefers_configured_log_file_over_latest_run_log(
+    tmp_path, monkeypatch, capsys
+):
+    cli = _import_cli()
+    repo = tmp_path / "repo"
+    latest = repo / "e2e" / "docker-artifacts" / "run-grp-002"
+    latest.mkdir(parents=True)
+    configured_log = repo / ".dev" / "smoke.log"
+    configured_log.parent.mkdir()
+    configured_log.write_text("configured one\nconfigured two\n", encoding="utf-8")
+    (latest / "playwright.log").write_text("latest run\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "_find_repo_root", lambda _start: repo)
+    monkeypatch.setattr(
+        cli,
+        "_load_rig_config",
+        lambda _root: {
+            "scripts": {"e2e-smoke": "pnpm exec playwright test"},
+            "dev": {
+                "e2e": {
+                    "jobs": {
+                        "smoke": {
+                            "script": "e2e-smoke",
+                            "artifacts_root": "e2e/docker-artifacts",
+                            "logs_root": ".dev/smoke.log",
+                        },
+                    }
+                }
+            },
+        },
+    )
+
+    assert cli.main(["e2e", "logs", "smoke", "--tail", "1"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == ["configured two"]
+
+
+def test_e2e_logs_ignores_missing_configured_log_file_for_latest_run_log(
+    tmp_path, monkeypatch, capsys
+):
+    cli = _import_cli()
+    repo = tmp_path / "repo"
+    latest = repo / "e2e" / "docker-artifacts" / "run-grp-002"
+    latest.mkdir(parents=True)
+    (latest / "playwright.log").write_text("latest one\nlatest two\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "_find_repo_root", lambda _start: repo)
+    monkeypatch.setattr(
+        cli,
+        "_load_rig_config",
+        lambda _root: {
+            "scripts": {"e2e-smoke": "pnpm exec playwright test"},
+            "dev": {
+                "e2e": {
+                    "jobs": {
+                        "smoke": {
+                            "script": "e2e-smoke",
+                            "artifacts_root": "e2e/docker-artifacts",
+                            "logs_root": ".dev/missing-smoke.log",
+                        },
+                    }
+                }
+            },
+        },
+    )
+
+    assert cli.main(["e2e", "logs", "smoke", "--tail", "1"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == ["latest two"]
 
 
 def test_e2e_logs_prefers_e2e_target_when_server_name_matches(tmp_path, monkeypatch, capsys):

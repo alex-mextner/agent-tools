@@ -272,7 +272,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     target = _configured_target(config, args.target)
     command = _with_extra_args(_target_command(target), _strip_arg_separator(args.target_args))
     _ensure_lifecycle_command(command, repo_root)
-    pid = _start_process(command, repo_root)
+    pid = _start_process(command, repo_root, _start_log_path(repo_root, target))
     record = {
         "kind": target["kind"],
         "name": target["name"],
@@ -654,12 +654,36 @@ def _target_log_path(
     repo_root: Path, target: dict, *, latest_run: Optional[Path] = None
 ) -> Optional[Path]:
     status_cfg = target.get("status") if isinstance(target.get("status"), dict) else {}
+    artifacts_root_path = None
+    if isinstance(target.get("artifacts_root"), str):
+        artifacts_root_path = _project_scoped_config_path(
+            repo_root, target["artifacts_root"], "artifacts_root"
+        )
     if latest_run is None:
         latest_run = _latest_run_dir(repo_root, status_cfg)
+    if latest_run is None and artifacts_root_path is not None:
+        latest_run = _latest_child_dir(repo_root, target["artifacts_root"], "artifacts_root")
+    latest_run_is_artifacts_root = (
+        latest_run is not None
+        and artifacts_root_path is not None
+        and latest_run == artifacts_root_path
+    )
     status_path = _status_path(repo_root, status_cfg, "log", latest_run)
     if status_path is not None:
         return status_path
     if isinstance(target.get("logs_root"), str):
+        direct_log = _configured_existing_log_file_path(repo_root, target["logs_root"])
+        if direct_log is not None:
+            return direct_log
+        start_log = _start_log_path(repo_root, target)
+        if latest_run_is_artifacts_root and start_log is not None and start_log.is_file():
+            return start_log
+        if latest_run is not None:
+            latest_run_log = _latest_log_path(repo_root, str(latest_run))
+            if latest_run_log is not None:
+                return latest_run_log
+        if start_log is not None and start_log.is_file():
+            return start_log
         return _latest_log_path(repo_root, target["logs_root"])
     return None
 
@@ -761,9 +785,58 @@ def _run_shell(command: str, cwd: Path) -> int:
     return int(result.returncode)
 
 
-def _start_process(command: str, cwd: Path) -> int:
-    proc = subprocess.Popen(command, shell=True, cwd=str(cwd), start_new_session=True)  # noqa: S602
-    return int(proc.pid)
+def _start_log_path(repo_root: Path, target: dict) -> Optional[Path]:
+    raw = target.get("logs_root")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    direct_log = _configured_log_file_path(repo_root, raw)
+    if direct_log is not None:
+        return direct_log
+    root = _project_scoped_config_path(repo_root, raw, "logs_root")
+    name = f"{_state_safe(str(target['kind']))}-{_state_safe(str(target['name']))}.log"
+    return _project_scoped_path(repo_root, root / name, "logs_root")
+
+
+def _configured_log_file_path(repo_root: Path, raw: str) -> Optional[Path]:
+    root = _project_scoped_config_path(repo_root, raw, "logs_root")
+    if root.exists() and root.is_file():
+        return root
+    return root if root.suffix == ".log" else None
+
+
+def _configured_existing_log_file_path(repo_root: Path, raw: str) -> Optional[Path]:
+    root = _project_scoped_config_path(repo_root, raw, "logs_root")
+    return root if root.is_file() else None
+
+
+def _start_process(command: str, cwd: Path, log_path: Optional[Path] = None) -> int:
+    stdout = subprocess.DEVNULL
+    stderr = subprocess.DEVNULL
+    stdout_handle = None
+    try:
+        if log_path is not None:
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                stdout_handle = log_path.open("ab")
+                stdout = stdout_handle
+                stderr = subprocess.STDOUT
+            except OSError:
+                stdout_handle = None
+        proc = subprocess.Popen(  # noqa: S602
+            command,
+            shell=True,
+            cwd=str(cwd),
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            close_fds=True,
+        )
+        return int(proc.pid)
+    finally:
+        if stdout_handle is not None:
+            # Popen duped the fd for the child; close the parent's copy before returning.
+            stdout_handle.close()
 
 
 def _state_dir(repo_root: Path) -> Path:
@@ -1127,6 +1200,100 @@ def _segment_has_destructive_head(segment: str, repo_root: Optional[Path] = None
 
 
 _RUNNER_PAYLOAD_SUBCOMMANDS = frozenset({"exec", "x", "dlx"})
+_UV_RUN_SHORT_FLAGS_WITH_VALUE = frozenset({"C", "P", "b", "c", "f", "i", "p", "w"})
+# Keep these uv option tables in sync with orchestrator-stays-thin's _UV_TEST_* copies.
+# Derived from `uv help run` on 2026-07-09. Unknown flags also emit speculative
+# value-skip payload starts, so future value-taking uv flags cannot hide inline or
+# destructive payloads behind an unrecognized option operand.
+_UV_RUN_BOOLEAN_FLAGS = frozenset({
+    "--active",
+    "--all-extras",
+    "--all-groups",
+    "--all-packages",
+    "--compile-bytecode",
+    "--exact",
+    "--frozen",
+    "--gui-script",
+    "--help",
+    "--isolated",
+    "--locked",
+    "--managed-python",
+    "--module",
+    "--native-tls",
+    "--no-build",
+    "--no-build-isolation",
+    "--no-binary",
+    "--no-cache",
+    "--no-config",
+    "--no-default-groups",
+    "--no-dev",
+    "--no-editable",
+    "--no-env-file",
+    "--no-index",
+    "--no-managed-python",
+    "--no-progress",
+    "--no-project",
+    "--no-python-downloads",
+    "--no-sources",
+    "--no-sync",
+    "--offline",
+    "--only-dev",
+    "--refresh",
+    "--reinstall",
+    "--script",
+    "--upgrade",
+    "-U",
+    "-h",
+    "-m",
+    "-n",
+    "-q",
+    "-s",
+    "-v",
+})
+_UV_RUN_FLAGS_WITH_VALUE = frozenset({
+    "--allow-insecure-host",
+    "--build-constraint",
+    "--cache-dir",
+    "--color",
+    "--config-file",
+    "--config-setting",
+    "--config-settings-package",
+    "--constraint",
+    "--default-index",
+    "--directory",
+    "--env-file",
+    "--exclude-newer",
+    "--exclude-newer-package",
+    "--extra",
+    "--extra-index-url",
+    "--find-links",
+    "--fork-strategy",
+    "--group",
+    "--index",
+    "--index-strategy",
+    "--index-url",
+    "--keyring-provider",
+    "--link-mode",
+    "--no-binary-package",
+    "--no-build-isolation-package",
+    "--no-build-package",
+    "--no-extra",
+    "--no-group",
+    "--only-group",
+    "--package",
+    "--prerelease",
+    "--project",
+    "--python",
+    "--python-preference",
+    "--python-platform",
+    "--refresh-package",
+    "--reinstall-package",
+    "--resolution",
+    "--upgrade-package",
+    "--with",
+    "--with-editable",
+    "--with-requirements",
+})
 
 
 def _runner_payload_is_destructive(segment: str, repo_root: Optional[Path] = None) -> bool:
@@ -1208,7 +1375,75 @@ def _runner_payload_starts(tokens: Sequence[str]) -> Iterable[int]:
         if head in ("npm", "pnpm", "yarn", "bun") and subcommand in _RUNNER_PAYLOAD_SUBCOMMANDS:
             yield index + 2
         if head == "uv" and subcommand == "run":
-            yield index + 2
+            yield from _uv_run_payload_starts(tokens, index + 2)
+
+
+def _uv_run_payload_starts(tokens: Sequence[str], index: int) -> Iterable[int]:
+    pending = [index]
+    visited: set[int] = set()
+    yielded: set[int] = set()
+    while pending:
+        cursor = min(pending.pop(), len(tokens))
+        if cursor in visited:
+            continue
+        visited.add(cursor)
+        while cursor < len(tokens):
+            token = tokens[cursor]
+            if token == "--":
+                cursor += 1
+                break
+            if token == "-" or not token.startswith("-"):
+                break
+            if token.startswith("--"):
+                flag = token.split("=", 1)[0]
+                if "=" in token:
+                    cursor += 1
+                elif flag in _UV_RUN_FLAGS_WITH_VALUE:
+                    cursor += 2
+                elif flag in _UV_RUN_BOOLEAN_FLAGS:
+                    cursor += 1
+                else:
+                    pending.append(cursor + 2)
+                    cursor += 1
+            elif _uv_short_flag_takes_following_value(token):
+                cursor += 2
+            elif _uv_short_flag_has_attached_value(token):
+                cursor += 1
+            elif _uv_short_flag_is_known_boolean(token):
+                cursor += 1
+            else:
+                pending.append(cursor + 2)
+                cursor += 1
+        cursor = min(cursor, len(tokens))
+        if cursor not in yielded:
+            yielded.add(cursor)
+            yield cursor
+
+
+def _uv_short_flag_takes_following_value(token: str) -> bool:
+    if token.startswith("--") or not token.startswith("-") or token == "-":
+        return False
+    flags = token[1:]
+    for pos, flag in enumerate(flags):
+        if flag in _UV_RUN_SHORT_FLAGS_WITH_VALUE:
+            return pos == len(flags) - 1
+    return False
+
+
+def _uv_short_flag_has_attached_value(token: str) -> bool:
+    if token.startswith("--") or not token.startswith("-") or token == "-":
+        return False
+    flags = token[1:]
+    return any(
+        flag in _UV_RUN_SHORT_FLAGS_WITH_VALUE and pos < len(flags) - 1
+        for pos, flag in enumerate(flags)
+    )
+
+
+def _uv_short_flag_is_known_boolean(token: str) -> bool:
+    if token.startswith("--") or not token.startswith("-") or token == "-":
+        return False
+    return all(f"-{flag}" in _UV_RUN_BOOLEAN_FLAGS for flag in token[1:])
 
 
 def _command_segments(command: str) -> List[str]:

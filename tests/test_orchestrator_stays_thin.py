@@ -812,6 +812,12 @@ def test_read_only_system_verification_pipes_allow(command, tmp_path, monkeypatc
     "uv run --with pytest pytest tests/",       # uv-wrapped test run (codex)
     "uv run --with pytest python -m pytest",    # uv-wrapped python -m pytest (codex)
     "uv run tox",                                # uv-wrapped tox
+    "uv run --with=pytest python -m pytest",
+    "uv run --python-preference system pytest tests/",
+    "uv run --future-value-flag value pytest tests/",
+    "uv run --future-value-flag value --with pytest python -m pytest",
+    "uv run -p3.11 pytest tests/",
+    "uv run -vp 3.11 python -m pytest",
     "env -u FOO git commit -m x",   # env option WITH operand (codex round 4)
     "env -C /tmp pytest tests/",    # env --chdir operand
     "timeout 60 pytest tests/",     # the MANDATED timeout wrapper (codex round 6)
@@ -846,6 +852,8 @@ def test_commit_push_test_blocks_on_repeat(command, tmp_path, monkeypatch):
 @pytest.mark.parametrize("command", [
     "uv run rig status",              # read-only tool, not a test
     "uv run rg pytest docs",         # SEARCHING for "pytest" — not running it (codex round 5)
+    "uv run --frozen rig status",
+    "uv run --with rg rg pytest docs",
 ])
 def test_uv_run_readonly_tool_not_overblocked(command, tmp_path, monkeypatch):
     """The uv-test detector is shlex-based: only the COMMAND uv runs counts, not an argument.
