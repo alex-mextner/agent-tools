@@ -668,6 +668,90 @@ def test_opencode_bridge_allows_background_nontrivial_task(tmp_path):
                     "Inspect the provisioning code, implement the bridge, run tests, and report.\n"
                     "Include evidence for Claude, Codex, and opencode, and do not mutate unrelated files."
                 ),
+                "background": True,
+            }
+        },
+    }
+
+    proc = _run_dispatch("tool.execute.before", event, hooks_dir=hooks_dir)
+
+    assert proc.returncode == 0
+    assert proc.stdout == ""
+
+
+def test_opencode_bridge_keeps_run_in_background_precedence():
+    args = {"run_in_background": False, "background": True}
+
+    dispatch._normalize_task_args(args)
+
+    assert args["run_in_background"] is False
+    assert args["background"] is True
+
+
+def test_opencode_bridge_maps_background_when_native_flag_is_null():
+    args = {"run_in_background": None, "background": True}
+
+    dispatch._normalize_task_args(args)
+
+    assert args["run_in_background"] is True
+
+
+def test_opencode_bridge_maps_background_when_native_flag_is_not_boolean():
+    true_args = {"run_in_background": "true", "background": True}
+    false_args = {"run_in_background": "1", "background": False}
+
+    dispatch._normalize_task_args(true_args)
+    dispatch._normalize_task_args(false_args)
+
+    assert true_args["run_in_background"] is True
+    assert false_args["run_in_background"] is False
+
+
+def test_opencode_bridge_ignores_non_boolean_background_values():
+    args = {"background": "true"}
+
+    dispatch._normalize_task_args(args)
+
+    assert "run_in_background" not in args
+
+
+def test_opencode_bridge_ignores_null_background_value():
+    args = {"background": None}
+
+    dispatch._normalize_task_args(args)
+
+    assert "run_in_background" not in args
+
+
+def test_opencode_bridge_leaves_missing_background_flag_absent():
+    args = {"description": "inspect the bridge"}
+
+    dispatch._normalize_task_args(args)
+
+    assert "run_in_background" not in args
+
+
+def test_opencode_bridge_preserves_native_run_in_background_flag(tmp_path):
+    hooks_dir = tmp_path / "hooks"
+    _install_descriptor(
+        hooks_dir,
+        hook_id="background-subagent-gate",
+        point="pre-agent",
+        cmd=BACKGROUND_SUBAGENT_GATE,
+        on_error="open",
+    )
+    event = {
+        "hook": "tool.execute.before",
+        "cwd": str(tmp_path),
+        "input": {"tool": "task", "sessionID": "ses_1"},
+        "output": {
+            "args": {
+                "subagent_type": "general",
+                "description": "implement the missing bridge and tests",
+                "prompt": (
+                    "Inspect the provisioning code, implement the bridge, run tests, and report.\n"
+                    "Include evidence for Claude, Codex, and opencode, and do not mutate unrelated files."
+                ),
                 "run_in_background": True,
             }
         },
@@ -677,6 +761,40 @@ def test_opencode_bridge_allows_background_nontrivial_task(tmp_path):
 
     assert proc.returncode == 0
     assert proc.stdout == ""
+
+
+def test_opencode_bridge_treats_background_false_as_foreground(tmp_path):
+    hooks_dir = tmp_path / "hooks"
+    _install_descriptor(
+        hooks_dir,
+        hook_id="background-subagent-gate",
+        point="pre-agent",
+        cmd=BACKGROUND_SUBAGENT_GATE,
+        on_error="open",
+    )
+    event = {
+        "hook": "tool.execute.before",
+        "cwd": str(tmp_path),
+        "input": {"tool": "task", "sessionID": "ses_1"},
+        "output": {
+            "args": {
+                "subagent_type": "general",
+                "description": "implement the missing bridge and tests",
+                "prompt": (
+                    "Inspect the provisioning code, implement the bridge, run tests, and report.\n"
+                    "Include evidence for Claude, Codex, and opencode, and do not mutate unrelated files."
+                ),
+                "background": False,
+            }
+        },
+    }
+
+    proc = _run_dispatch("tool.execute.before", event, hooks_dir=hooks_dir)
+
+    assert proc.returncode == 0
+    out = json.loads(proc.stdout)
+    assert out["decision"] == "block"
+    assert "BACKGROUND" in out["reason"]
 
 
 def test_opencode_bridge_dispatches_post_write_descriptor(tmp_path):

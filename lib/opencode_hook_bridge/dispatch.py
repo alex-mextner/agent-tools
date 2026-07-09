@@ -239,6 +239,8 @@ def _event_id(event: dict) -> str:
 def _normalize_task_args(args: dict) -> None:
     if "subagent_type" not in args and isinstance(args.get("subagentType"), str):
         args["subagent_type"] = args["subagentType"]
+    if not isinstance(args.get("run_in_background"), bool) and isinstance(args.get("background"), bool):
+        args["run_in_background"] = args["background"]
 
 
 def _write_path(args: dict) -> str:
