@@ -27,25 +27,44 @@ timeout), 2 not requested (should not happen — ship only calls this when the e
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import pwd
 import sys
 from pathlib import Path
 
-# Import the shared lib from a FIXED location relative to this file (ci/ship/ -> ../../lib),
-# never an env var. If it can't be imported (e.g. this script was copied out of the checkout),
-# fail closed with exit 3 so ship refuses rather than proceeding unverified.
-_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
-if str(_LIB_DIR) not in sys.path:
-    sys.path.insert(0, str(_LIB_DIR))
+# Load the shared lib from its EXACT file path (ci/ship/ -> ../../lib/agenttools_hatch_escalation/
+# __init__.py), NOT by name off sys.path. A by-name `import` would let a shipping agent hijack the
+# module via PYTHONPATH (an earlier same-named module) — which, since approval is just a truthy
+# result, would self-authorize the bypass. spec_from_file_location loads THE file regardless of
+# sys.path / PYTHONPATH / sys.modules. ship.sh additionally runs this under `python3 -I` (isolated:
+# ignores PYTHONPATH/PYTHONHOME/user-site and skips sitecustomize), so no startup hook can run
+# first either. If the file is absent (e.g. ship.sh copied out of the checkout) the import fails
+# CLOSED with exit 3 and ship refuses rather than proceeding unverified.
+_LIB_INIT = Path(__file__).resolve().parents[2] / "lib" / "agenttools_hatch_escalation" / "__init__.py"
 
-try:  # pragma: no cover - exercised via the detached-copy integration test
-    import agenttools_hatch_escalation as hatch_escalation
+try:  # pragma: no cover - failure path exercised via the detached-copy integration test
+    _spec = importlib.util.spec_from_file_location("agenttools_hatch_escalation", _LIB_INIT)
+    if _spec is None or _spec.loader is None:
+        raise ImportError(f"cannot build a module spec from {_LIB_INIT}")
+    hatch_escalation = importlib.util.module_from_spec(_spec)
+    # Register the freshly-loaded module in sys.modules under its canonical name BEFORE exec: the
+    # lib's @dataclass resolves its own module via sys.modules[cls.__module__], and this also
+    # OVERWRITES any same-named module a PYTHONPATH/sitecustomize hook may have pre-imported, so
+    # the real file wins unconditionally.
+    sys.modules["agenttools_hatch_escalation"] = hatch_escalation
+    _spec.loader.exec_module(hatch_escalation)
 except Exception as exc:  # noqa: BLE001 - any import failure must fail closed
     sys.stderr.write(f"hatch escalation lib unavailable: {exc}")
     raise SystemExit(3)
 
 _HOOK_ID = "ship-review-quorum"
+
+# Verdict sentinels printed on stdout — ship.sh gates the bypass on the APPROVED one (a positive
+# signal), so a fake/broken interpreter that just exits 0 without it fails closed.
+_VERDICT_APPROVED = "APPROVED"
+_VERDICT_DENIED = "DENIED"
+_VERDICT_NOT_REQUESTED = "NOTREQUESTED"
 
 
 def resolve_home() -> str:
@@ -111,13 +130,20 @@ def main() -> int:
         kw["process_margin_s"] = margin_s
 
     result = hatch_escalation.request_hatch_approval(_HOOK_ID, ctx, cwd=resolve_home(), **kw)
-    sys.stderr.write(result.reason or "")
+    # Emit an explicit verdict SENTINEL on stdout (single-lined) as a POSITIVE approval signal.
+    # ship.sh authorizes the bypass only on exit 0 AND a leading "APPROVED " here, so a fake or
+    # broken `python3` that merely exits 0 without producing the sentinel fails CLOSED (refuse) —
+    # matching how the other gates fail closed on a tool malfunction, rather than fail open.
+    reason = (result.reason or "").replace("\r", " ").replace("\n", " ")
     if result.approved:
         _audit("bypass:approved", result.reason or "")
+        sys.stdout.write(f"{_VERDICT_APPROVED} {reason}\n")
         return 0
     if result.env_present:
         _audit("bypass:denied", result.reason or "")
+        sys.stdout.write(f"{_VERDICT_DENIED} {reason}\n")
         return 1
+    sys.stdout.write(f"{_VERDICT_NOT_REQUESTED} {reason}\n")
     return 2  # not requested — ship.sh only calls this when the env var is present
 
 

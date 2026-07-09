@@ -52,6 +52,17 @@ gh alias set ship '!bash ~/bin/ship'    # then: gh ship 123
 > **fails closed** (the gate still enforces; you just can't hatch-bypass) — run `ship` from the
 > checkout, or point `AGENT_TOOLS_ROOT` at it, to use the bypass.
 
+> **Trust model — run `gh ship` from a protected checkout.** Every gate here (CI, threads,
+> version-bump, review-quorum) trusts the ship PROCESS's execution environment: the tools it
+> resolves on `PATH` (`gh`, `git`, `jq`, `python3`, `review`, `tg-ctl`) and the `ci/ship/ship.sh`
+> + `lib/` code it runs. A party who controls that environment — a hostile `PATH`, or a PR
+> worktree whose own `ci/ship/ship.sh` is executed — can weaken any gate, not just the hatch.
+> So `gh ship` is meant to run from the **orchestrator's canonical/main checkout**, never from an
+> untrusted PR worktree. Within that trust model the review-quorum bypass is closed: nothing the
+> PR contents or the `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM` value carries can forge approval — the
+> lib loads by fixed file path under `python3 -I`, tg-ctl resolves off the OS-identity home, and
+> approval requires the helper's explicit stdout sentinel (a benign/broken `python3` fails closed).
+
 ## All project coupling is OPTIONAL (env knobs)
 
 Nothing org-/tracker-/layout-specific is hard-coded. Configure via env:

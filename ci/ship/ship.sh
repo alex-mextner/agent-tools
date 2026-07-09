@@ -969,15 +969,35 @@ _review_quorum_audit_log() {
       '{ts:$ts, pr:$pr, task_code:$code, iterations:$it, models:$m, decision:$dec} +
        (if $reason == "" then {} else {override_reason:$reason} end)' \
       >> "$file" 2>/dev/null || true
+  else
+    # jq-less fallback so the audit line is never DROPPED just because jq is absent (jq-missing is
+    # itself a gate refusal that can reach the hatch, so the fail-closed bypass:denied audit must
+    # still land). Emit minimal JSON via printf. The free-text fields (pr, task_code, reason) are
+    # each made JSON-safe: newlines/CR/tab -> space and other control chars stripped (so none can
+    # inject a forged extra JSONL line), then backslash + double-quote escaped. `pr` is escaped too
+    # — it is a bare CLI arg, so a quote/control char in it must not corrupt the line (the jq path
+    # is already safe via --arg). iterations/models are validated integers; decision is internal.
+    local esc_pr esc_code esc_reason
+    esc_pr=$(printf '%s' "$PR" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    esc_code=$(printf '%s' "$code" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    esc_reason=$(printf '%s' "$reason" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    { if [ -n "$reason" ]; then
+        printf '{"ts":"%s","pr":"%s","task_code":"%s","iterations":%s,"models":%s,"decision":"%s","override_reason":"%s"}\n' \
+          "$ts" "$esc_pr" "$esc_code" "${iterations:-0}" "${models:-0}" "$decision" "$esc_reason"
+      else
+        printf '{"ts":"%s","pr":"%s","task_code":"%s","iterations":%s,"models":%s,"decision":"%s"}\n' \
+          "$ts" "$esc_pr" "$esc_code" "${iterations:-0}" "${models:-0}" "$decision"
+      fi; } >> "$file" 2>/dev/null || true
   fi
 }
 
 # Ask Alex, live on Telegram, to approve a one-time review-quorum bypass, by invoking the
 # ci/ship/review_quorum_hatch.py helper (which delegates to the shared agenttools_hatch_escalation
 # lib exactly as the agent-hooks do). Called ONLY when RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM is set.
-# The helper prints the verdict reason on stderr and OWNS the bypass:* audit line; its exit code:
-# 0 approved, 1 requested-but-not-approved (blank/bare/denied/timeout), 3 the shared lib could not
-# be imported (fail-closed — e.g. ship.sh copied out of the checkout).
+# The helper prints a verdict SENTINEL + reason on stdout ("APPROVED …" / "DENIED …") and OWNS the
+# bypass:* audit line; its exit code: 0 approved, 1 requested-but-not-approved (blank/bare/denied/
+# timeout), 3 the shared lib could not be imported (fail-closed — e.g. ship.sh copied out of the
+# checkout). ship.sh authorizes ONLY on exit 0 AND a leading APPROVED sentinel.
 #
 # SECURITY: neither WHICH lib runs nor WHICH tg-ctl is asked is shipper-controllable. The helper
 # imports the lib from a fixed path, and resolves tg-ctl off the OS identity's REAL home
@@ -986,11 +1006,15 @@ _review_quorum_audit_log() {
 # only SHORTEN the wait, which fails CLOSED — a shorter wait denies, never approves — so it is a
 # safe tuning knob, not a bypass.)
 _review_quorum_hatch_check() {  # uses $TASK_CODE $QITER $QMODELS_N $PR
+  # `python3 -I` = isolated mode: ignores PYTHONPATH/PYTHONHOME, skips the user site and
+  # sitecustomize, and does not add cwd to sys.path — so a shipping agent cannot inject a
+  # malicious module or a startup hook that would self-approve. The helper additionally loads the
+  # shared lib by explicit file path (see its docstring), belt-and-suspenders.
   SHIP_HATCH_PR="$PR" \
   SHIP_HATCH_CODE="${TASK_CODE:-}" \
   SHIP_HATCH_ITER="${QITER:-0}" \
   SHIP_HATCH_MODELS="${QMODELS_N:-0}" \
-  python3 "$_SHIP_HATCH_PY"
+  python3 -I "$_SHIP_HATCH_PY"
 }
 
 # Terminal handler for a review-quorum refusal: either the hatch escalation approves a one-time
@@ -1012,20 +1036,29 @@ _review_quorum_refuse_or_hatch() {  # $1 = refusal summary
     _review_quorum_audit_log refused "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" ""
     exit 1
   fi
-  # The helper writes its own bypass:approved / bypass:denied audit line for exit 0/1. Only when
-  # it could NOT run at all (exit 3 import-fail, or a missing python3) does ship.sh record the
-  # fail-closed bypass:denied here, so the audit is never doubled nor dropped.
-  local hrc=0 hreason
-  hreason=$(_review_quorum_hatch_check 2>&1 >/dev/null) || hrc=$?
-  if [ "$hrc" = "0" ]; then
+  # The helper prints a verdict SENTINEL on stdout ("APPROVED <reason>" / "DENIED <reason>") and
+  # writes its own bypass:approved / bypass:denied audit line. We authorize the bypass ONLY on a
+  # clean exit 0 AND a leading APPROVED sentinel: a fake or broken `python3` that merely exits 0
+  # without the sentinel then fails CLOSED (refuse), instead of being mistaken for approval — the
+  # same fail-closed posture the other gates have on a tool malfunction. (A shipper who fully
+  # controls the ship PROCESS's PATH can defeat any gate — fake `gh`, `review`, `git` — so this is
+  # not a claim to withstand a hostile PATH; it removes the fail-OPEN asymmetry for a benign one.)
+  local hrc=0 hout
+  hout=$(_review_quorum_hatch_check 2>/dev/null) || hrc=$?
+  local hverdict="${hout%% *}" hreason=""
+  case "$hout" in *" "*) hreason="${hout#* }" ;; esac
+  if [ "$hrc" = "0" ] && [ "$hverdict" = "APPROVED" ]; then
     echo "[ship] review-quorum gate — ${summary}; a one-time Telegram hatch escalation was APPROVED by Alex — proceeding. (${hreason})"
     return 0
   fi
   { echo "Refusing: review-quorum gate — ${summary}."
     echo "  A Telegram hatch escalation was requested but NOT approved: ${hreason:-no approval}."
     echo "  Obtain live approval, add more independent review iterations, or set SHIP_REVIEW_QUORUM=0 (ops off-switch)."; } >&2
-  case "$hrc" in
-    1) : ;;  # the helper already wrote bypass:denied
+  # The real helper logs bypass:denied itself only when it emitted the DENIED sentinel; in every
+  # other case (fake/broken/absent interpreter, import-fail, unexpected verdict) it did NOT audit,
+  # so record the fail-closed bypass:denied here. Never double-write.
+  case "$hverdict" in
+    DENIED) : ;;
     *) _review_quorum_audit_log "bypass:denied" "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "$hreason" ;;
   esac
   exit 1

@@ -2309,6 +2309,100 @@ def test_hatch_timeout_returns_1(tmp_path, monkeypatch):
     assert rc == 1, "a timed-out hatch must return 1"
 
 
+def test_hatch_helper_import_resists_pythonpath_hijack(tmp_path):
+    """P0 regression (codex review): a shipping agent must not be able to swap the shared lib via
+    PYTHONPATH. The helper loads agenttools_hatch_escalation by EXPLICIT FILE PATH (and ship.sh
+    additionally runs it under `python3 -I`), so a same-named module planted on PYTHONPATH is NOT
+    imported — even with PYTHONPATH active and no isolation flag, the REAL lib wins."""
+    mal = tmp_path / "mal"
+    mal.mkdir()
+    (mal / "agenttools_hatch_escalation.py").write_text(
+        "MALICIOUS = True\n"
+        "def request_hatch_approval(*a, **k):\n"
+        "    class R:\n        approved = True\n        env_present = True\n        reason = 'EVIL'\n"
+        "    return R()\n",
+        encoding="utf-8",
+    )
+    real_lib_dir = Path(__file__).resolve().parents[1] / "lib"
+    real_init = real_lib_dir / "agenttools_hatch_escalation" / "__init__.py"
+    hatch_dir = str(Path(__file__).resolve().parents[1] / "ci" / "ship")
+    probe = (
+        f"import sys; sys.path.insert(0, {hatch_dir!r}); "
+        "import review_quorum_hatch as m; "
+        "print(m.hatch_escalation.__file__); "
+        "print('MAL' if getattr(m.hatch_escalation, 'MALICIOUS', False) else 'REAL')"
+    )
+    env = dict(os.environ)
+    # The exact attack shape: PYTHONPATH lists the MALICIOUS dir BEFORE the real lib dir. A naive
+    # "insert real lib only if not already in sys.path" would then skip the prepend (the real lib
+    # is already present via PYTHONPATH) and import the malicious module first. The by-path load
+    # must beat this. No -I here: prove the by-path import alone defeats it (belt); ship.sh runs
+    # the helper under -I too (suspenders).
+    env["PYTHONPATH"] = os.pathsep.join([str(mal), str(real_lib_dir)])
+    r = _sh("python3", "-c", probe, cwd=tmp_path, env=env)
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert str(real_init) in r.stdout, f"helper loaded the wrong lib:\n{r.stdout}"
+    assert r.stdout.strip().splitlines()[-1] == "REAL", r.stdout
+
+
+def test_audit_line_written_without_jq(tmp_path):
+    """P2 regression (codex review): the audit line must not be DROPPED when jq is absent —
+    jq-missing is itself a hatchable gate refusal, so its fail-closed audit must still land via the
+    printf fallback. Run ship with NO jq on PATH and assert a parseable JSON audit line is written.
+    (The review-quorum gate refuses with 'jq not found', then audits.)"""
+    import json
+
+    if not shutil.which("jq"):
+        pytest.skip("jq not installed on this host — the jq-less path is the ambient default")
+    audit = tmp_path / "audit.jsonl"
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    # jq usually lives alongside the coreutils ship needs (e.g. /usr/bin), so we can't just drop a
+    # dir. Build a symlink farm of every system executable EXCEPT jq, and use only that + fakes.
+    farm = tmp_path / "nojq-farm"
+    farm.mkdir()
+    for sysdir in ("/usr/bin", "/bin"):
+        d = Path(sysdir)
+        if not d.is_dir():
+            continue
+        for entry in d.iterdir():
+            if entry.name == "jq":
+                continue
+            link = farm / entry.name
+            if not link.exists():
+                try:
+                    link.symlink_to(entry)
+                except OSError:
+                    pass
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join([str(gh), str(rv), str(farm)])
+    assert shutil.which("jq", path=env["PATH"]) is None, "test PATH must not contain jq"
+    assert shutil.which("bash", path=env["PATH"]) and shutil.which("git", path=env["PATH"]), \
+        "test PATH must still carry bash + git"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_REVIEW_QUORUM"] = "1"
+    env["REVIEW_TASK_CODE"] = "HYP-200"
+    env["SHIP_TEST_REVIEW_ITER"] = "1"
+    env["SHIP_TEST_REVIEW_MODELS"] = "1"
+    env["SHIP_AUDIT_FILE"] = str(audit)
+    env.pop("RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM", None)
+    # A PR selector containing a double-quote: the jq-less fallback must escape it (the raw path
+    # would emit invalid JSON / a corrupt line). The fake gh accepts any PR value.
+    pr_arg = '9"x'
+    r = _sh("bash", str(_SHIP), pr_arg, "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode != 0, f"jq-missing must refuse\n{r.stdout}\n{r.stderr}"
+    assert audit.exists(), "audit file must exist even without jq"
+    lines = [ln for ln in audit.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 1, f"exactly one audit line (no injected line from the quoted PR): {lines}"
+    rec = json.loads(lines[-1])  # must be valid JSON (printf fallback, pr escaped)
+    assert rec["task_code"] == "HYP-200", rec
+    assert rec["decision"] == "refused", rec
+    assert rec["pr"] == pr_arg, rec  # round-trips through the escaping
+
+
 def test_resolve_home_uses_os_identity_not_HOME_env(tmp_path, monkeypatch):
     """resolve_home() must key off the OS account identity (pwd.getpwuid), NOT the $HOME env var
     — that is the P0 fix: a shipper who exports a doctored HOME cannot move the location the hatch
@@ -2345,11 +2439,17 @@ def test_hatch_ignores_HOME_env_and_pr_repo_rig_yaml(tmp_path, monkeypatch):
 # --- ship.sh <-> helper wiring (subprocess; fake helper, no real tg-ctl) -------------------
 
 def _install_fake_hatch_helper(dst_dir: Path, *, exit_code: int, message: str = "") -> None:
-    """Write a fake review_quorum_hatch.py next to a ship.sh copy that just exits `exit_code`
-    (optionally printing `message` to stderr) — a stand-in for the real helper so the ship.sh
-    wiring can be tested without invoking any tg-ctl."""
+    """Write a fake review_quorum_hatch.py next to a ship.sh copy — a stand-in for the real helper
+    so the ship.sh wiring can be tested without invoking any tg-ctl. It emits the same stdout
+    VERDICT sentinel the real helper does (ship.sh authorizes only on 'APPROVED'): exit 0 ->
+    'APPROVED <msg>', exit 1 -> 'DENIED <msg>', anything else -> just the message on stderr (no
+    sentinel, simulating a crashed/aborted helper)."""
     body = "import sys\n"
-    if message:
+    if exit_code == 0:
+        body += f"sys.stdout.write('APPROVED ' + {message!r} + '\\n')\n"
+    elif exit_code == 1:
+        body += f"sys.stdout.write('DENIED ' + {message!r} + '\\n')\n"
+    elif message:
         body += f"sys.stderr.write({message!r})\n"
     body += f"sys.exit({exit_code})\n"
     (dst_dir / "review_quorum_hatch.py").write_text(body, encoding="utf-8")
@@ -2429,6 +2529,43 @@ def test_ship_fails_closed_when_helper_unreachable(tmp_path):
     r = _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy,
                                  request="genuine urgent reason", audit=audit)
     assert r.returncode != 0, f"a missing helper must fail closed\n{r.stdout}\n{r.stderr}"
+    assert "NOT approved" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+    rec = json.loads(audit.read_text().strip().splitlines()[-1])
+    assert rec["decision"] == "bypass:denied", rec
+
+
+def test_ship_fails_closed_when_python3_exits_zero_without_sentinel(tmp_path):
+    """P0 regression (codex round 4): the hatch must not FAIL OPEN on a `python3` that merely
+    exits 0. A fake python3 first on PATH (exit 0, no output) must NOT be read as approval —
+    ship.sh authorizes only on the explicit APPROVED stdout sentinel, so this fails CLOSED and
+    records bypass:denied. (Removes the fail-open asymmetry vs the other gates, which fail closed
+    on a tool malfunction.)"""
+    import json
+
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+    # A fake python3 that exits 0 with NO sentinel (a broken/planted interpreter). Only the hatch
+    # uses python3, so shadowing it doesn't disturb the rest of the gate.
+    shim = tmp_path / "fakepy"
+    shim.mkdir()
+    (shim / "python3").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (shim / "python3").chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join([str(shim), _minimal_hermetic_path(gh, rv)])
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_REVIEW_QUORUM"] = "1"
+    env["REVIEW_TASK_CODE"] = "HYP-200"
+    env["SHIP_TEST_REVIEW_ITER"] = "1"
+    env["SHIP_TEST_REVIEW_MODELS"] = "1"
+    env["SHIP_AUDIT_FILE"] = str(audit)
+    env["RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM"] = "genuine reason but python3 is faked"
+    r = _sh("bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode != 0, f"a fake python3 exiting 0 must fail closed\n{r.stdout}\n{r.stderr}"
     assert "NOT approved" in r.stderr, r.stderr
     assert "[fake gh] merged" not in r.stdout
     rec = json.loads(audit.read_text().strip().splitlines()[-1])
