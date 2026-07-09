@@ -10,10 +10,11 @@ the contract the task-cli Docker test and the orchestration swarm depend on:
     reference`, so an external check can assert on one fixed string.
   - EVERY accepted ticket-reference form PASSES (Closes #N / Fixes #N / #N / a KEY-NUM
     task-cli id / a `task:` form / a `[ticket: …]` trailer) — a legit commit is never wedged.
-  - the two deliberate escapes work: a `[skip-ticket: <reason>]` message trailer and an
-    inline `REQUIRE_TICKET_SKIP=1 git commit …` — and a blank reason / falsey value / a
-    sibling-scoped assignment do NOT bypass.
-  - `REQUIRE_TICKET_STRICT=0` opts back to warn-only (allow with advisory).
+  - the OLD per-commit self-service escapes are DEAD: a `[skip-ticket: <reason>]` message
+    trailer and an inline `REQUIRE_TICKET_SKIP=1 git commit …` no longer bypass (both removed).
+  - the only sanctioned out for a genuinely ticketless commit is the Telegram hatch
+    `RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT` (deny-by-default; approved via tg-ctl only).
+  - `REQUIRE_TICKET_STRICT=0` opts back to warn-only (allow with advisory) — repo-level dial kept.
 
 The hook reads only the command + cwd from the stdin event (the cwd is an isolated empty
 temp dir so branch detection finds no incidental ticket pattern). Pure parse — no temp repo.
@@ -46,18 +47,39 @@ rt = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rt)
 
 
-def _run(command: str, *, strict: bool | None = None, env_extra: dict | None = None) -> dict:
+_HATCH_ENV = "RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT"
+
+
+def _fake_tg_ctl(path: Path, body: str) -> Path:
+    """A throwaway executable standing in for `tg-ctl ask` — its exit code is the human verdict."""
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return path
+
+
+def _run(
+    command: str,
+    *,
+    strict: bool | None = None,
+    env_extra: dict | None = None,
+    tg_ctl: Path | None = None,
+) -> dict:
     """End-to-end: feed the stdin JSON event to the script; return {code, decision, message}.
 
     strict=None leaves REQUIRE_TICKET_STRICT UNSET (the real default → strict block);
     True sets `=1`; False sets `=0` (the warn-only opt-out). cwd is an isolated empty dir.
+
+    The hook runs as a SUBPROCESS, so the shared hatch helper's trusted tg-ctl path can't be
+    monkeypatched in-process — instead, when ``tg_ctl`` is given, a rig.yaml pointing
+    ``agent_hooks.tg_ctl_path`` at it is written into the isolated cwd (the helper reads that
+    committed-config path, walking up from cwd).
     """
     import os
 
     env = dict(os.environ)
-    env.pop("REQUIRE_TICKET_STRICT", None)
-    env.pop("REQUIRE_TICKET_SKIP", None)
-    env.pop("REQUIRE_TICKET_EXEMPT_TYPES", None)
+    for k in ("REQUIRE_TICKET_STRICT", "REQUIRE_TICKET_SKIP", "REQUIRE_TICKET_EXEMPT_TYPES",
+              _HATCH_ENV):
+        env.pop(k, None)
     if strict is True:
         env["REQUIRE_TICKET_STRICT"] = "1"
     elif strict is False:
@@ -65,6 +87,10 @@ def _run(command: str, *, strict: bool | None = None, env_extra: dict | None = N
     if env_extra:
         env.update(env_extra)
     with tempfile.TemporaryDirectory() as isolated:
+        if tg_ctl is not None:
+            (Path(isolated) / "rig.yaml").write_text(
+                f"agent_hooks:\n  tg_ctl_path: {tg_ctl}\n", encoding="utf-8",
+            )
         event = json.dumps({"args": {"command": command}, "cwd": isolated})
         proc = subprocess.run(
             [sys.executable, str(_HOOK)],
@@ -134,37 +160,74 @@ def test_valid_ref_forms_pass(subject):
     assert r["decision"] == "allow"
 
 
-# ── THE TWO DELIBERATE ESCAPES ──────────────────────────────────────────────────────────────────
+# ── regression: the OLD per-commit self-service escapes are DEAD ─────────────────────────────────
+# The `[skip-ticket: <reason>]` message trailer and the inline `REQUIRE_TICKET_SKIP=1` env were
+# removed — an agent could set either on its own command, so they were self-grants, not controls.
+# The only sanctioned out for a genuinely ticketless commit is now the Telegram hatch (below).
 
 
-def test_skip_ticket_trailer_allows():
+def test_old_skip_ticket_trailer_no_longer_bypasses():
+    """A `[skip-ticket: <reason>]` trailer (even with a real reason) must NO LONGER bypass —
+    it is now just message text, and the ticketless commit still BLOCKs under the strict default."""
     r = _run('git commit -m "feat: x [skip-ticket: one-off backfill]"')
-    assert r["code"] == 0
-    assert r["decision"] == "allow"
-
-
-def test_blank_skip_ticket_reason_still_blocks():
-    r = _run('git commit -m "feat: x [skip-ticket: ]"')
     assert r["code"] == 10
     assert r["decision"] == "block"
 
 
-def test_inline_skip_env_allows():
+def test_old_inline_skip_env_no_longer_bypasses():
+    """An inline `REQUIRE_TICKET_SKIP=1 git commit …` must NO LONGER bypass — the per-commit
+    env is gone; the commit still BLOCKs."""
     r = _run('REQUIRE_TICKET_SKIP=1 git commit -m "feat: x"')
-    assert r["code"] == 0
-    assert r["decision"] == "allow"
-
-
-def test_inline_skip_falsey_still_blocks():
-    r = _run('REQUIRE_TICKET_SKIP=0 git commit -m "feat: x"')
     assert r["code"] == 10
     assert r["decision"] == "block"
 
 
-def test_inline_skip_on_sibling_does_not_bypass():
-    r = _run('REQUIRE_TICKET_SKIP=1 echo hi && git commit -m "feat: x"')
-    assert r["code"] == 10
-    assert r["decision"] == "block"
+# ── Telegram hatch escalation (RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT) ───────────────────
+
+
+def test_hatch_unset_blocks_and_names_env_var():
+    """No hatch requested → the normal strict block, and the guidance names the hatch env var so
+    an agent knows the only sanctioned escape."""
+    r = _run('git commit -m "feat: add export"')
+    assert r["code"] == 10 and r["decision"] == "block"
+    assert _HATCH_ENV in r["message"]
+
+
+def test_hatch_bare_flag_denies_without_tg_call(tmp_path):
+    """A bare `1` (no written justification) is an invalid request → deny (block), and NO tg-ctl
+    is invoked (a never-callable would-ALLOW proves no Telegram round-trip)."""
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 0\n")  # would ALLOW if ever called
+    r = _run('git commit -m "feat: x"', env_extra={_HATCH_ENV: "1"}, tg_ctl=tg_ctl)
+    assert r["code"] == 10 and r["decision"] == "block"
+    assert "hatch escalation denied" in r["message"].lower()
+
+
+def test_hatch_justification_exit0_allows(tmp_path):
+    """A written justification + tg-ctl exit 0 (the human approved) → allow."""
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved by tap\\n"\nexit 0\n')
+    r = _run('git commit -m "feat: x"',
+             env_extra={_HATCH_ENV: "one-off backfill, no ticket warranted"}, tg_ctl=tg_ctl)
+    assert r["code"] == 0 and r["decision"] == "allow"
+    assert "hatch escalation" in r["message"].lower()
+    assert rt.BLOCK_MARKER not in r["message"]
+
+
+def test_hatch_justification_exit1_blocks_citing_denial(tmp_path):
+    """A written justification + tg-ctl exit 1 (the human declined / timed out) → block, leading
+    with the denial reason."""
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    r = _run('git commit -m "feat: x"',
+             env_extra={_HATCH_ENV: "one-off backfill, no ticket warranted"}, tg_ctl=tg_ctl)
+    assert r["code"] == 10 and r["decision"] == "block"
+    assert "hatch escalation denied" in r["message"].lower()
+
+
+def test_hatch_ignored_under_warn_only():
+    """The hatch is only relevant when STRICT would block: under REQUIRE_TICKET_STRICT=0 the gate
+    never blocks, so a ticketless commit warn-allows regardless of the hatch env (no tg call)."""
+    r = _run('git commit -m "feat: x"', strict=False, env_extra={_HATCH_ENV: "whatever"})
+    assert r["code"] == 0 and r["decision"] == "allow"
+    assert rt.BLOCK_MARKER not in r["message"]
 
 
 # ── -F MESSAGE SOURCE: file readable, stdin (-F -) fail-CLOSED with a hint ───────────────────────
@@ -172,7 +235,7 @@ def test_inline_skip_on_sibling_does_not_bypass():
 # agent-tools#104 reverses that: git streams a `-F -` message on its OWN stdin, which a PreToolUse
 # hook cannot read, and silently allowing it made `-F -` a free bypass of the ticket gate. So for
 # `-F -` ONLY the gate now FAILS CLOSED (block, exit 10, the marker) with an actionable hint —
-# unless a readable escape (`[skip-ticket]` / `REQUIRE_TICKET_SKIP=1`) or warn-only mode applies.
+# unless an approved Telegram hatch (consulted BEFORE this block) or warn-only mode applies.
 
 
 # Every readable `-F`/`--file` SPELLING (separate, glued, long, `=`) must actually READ the file and
@@ -212,21 +275,19 @@ def test_dash_F_stdin_fails_closed_with_hint(command):
     assert "stdin" in msg.lower(), "the hint must name the unreadable-stdin cause"
     assert "-m" in msg and "-F <file>" in msg, "the hint must name the readable ways to satisfy it"
     assert "branch" in msg.lower(), "the hint must mention the branch-name path"
-    assert "REQUIRE_TICKET_SKIP=1" in msg, "the hint must name the escape that actually works"
-    # the `[skip-ticket: …]` trailer can't work for `-F -` (it lives in the unreadable stdin
-    # message) — the hint must not falsely promise it.
-    assert "skip-ticket" not in msg.lower(), "the hint must not offer the trailer escape for `-F -`"
+    assert _HATCH_ENV in msg, "the hint must name the Telegram hatch (the sanctioned out)"
+    # the old `[skip-ticket: …]` trailer escape is gone — the hint must not offer it.
+    assert "skip-ticket" not in msg.lower(), "the removed trailer escape must not be advertised"
+    assert "REQUIRE_TICKET_SKIP" not in msg, "the removed inline-env escape must not be advertised"
 
 
-@pytest.mark.parametrize("command", [
-    "REQUIRE_TICKET_SKIP=1 git commit -F -",
-    "REQUIRE_TICKET_SKIP=1 git commit --file=-",
-])
-def test_dash_F_stdin_inline_skip_escape_still_works(command):
-    # the deliberate inline escape still lets a genuine no-ticket `-F -` commit through — it's read
-    # from the command env, not git's unreadable stdin (agent-tools#104).
-    r = _run(command)
-    assert r["code"] == 0, f"{command!r} carries REQUIRE_TICKET_SKIP=1 — must allow"
+def test_dash_F_stdin_hatch_approved_allows(tmp_path):
+    # THE spec requirement: the hatch is consulted BEFORE the `-F -` stdin block, so an approved
+    # hatch lets a genuinely ticketless `-F -` commit through (read from the command env + tg-ctl,
+    # never git's unreadable stdin).
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved\\n"\nexit 0\n')
+    r = _run("git commit -F -", env_extra={_HATCH_ENV: "one-off backfill, no ticket"}, tg_ctl=tg_ctl)
+    assert r["code"] == 0, f"an approved hatch must allow a `-F -` commit ({r['message']})"
     assert r["decision"] == "allow"
     assert rt.BLOCK_MARKER not in r["message"]
 
@@ -360,13 +421,15 @@ def test_am_glued_ticket_allows():
 
 
 @pytest.mark.parametrize("command", [
-    'git commit -am "no ticket [skip-ticket: deliberate]"',  # `[skip-ticket: …]` trailer escape
-    'REQUIRE_TICKET_SKIP=1 git commit -am "no ticket"',      # inline-env escape
+    'git commit -am "no ticket [skip-ticket: deliberate]"',  # removed `[skip-ticket: …]` trailer
+    'REQUIRE_TICKET_SKIP=1 git commit -am "no ticket"',      # removed inline-env escape
 ])
-def test_am_escapes_still_work(command):
+def test_am_old_escapes_no_longer_bypass(command):
+    """The removed per-commit escapes must NOT bypass even on a clustered `-am` commit — a
+    ticketless `-am` still BLOCKs under the strict default."""
     r = _run(command)
-    assert r["code"] == 0, f"{command!r} carries a deliberate escape — must allow"
-    assert r["decision"] == "allow"
+    assert r["code"] == 10, f"{command!r} used a removed self-service escape — must still block"
+    assert r["decision"] == "block"
 
 
 @pytest.mark.parametrize("sep", [" ", ""])  # `-aF <file>` (next token) and `-aF<file>` (glued)

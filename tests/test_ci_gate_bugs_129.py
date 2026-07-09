@@ -75,11 +75,10 @@ def _make_repo(tmp_path: Path) -> Path:
 
 def _commit(repo: Path, msg: str) -> None:
     _git(repo, "add", "-A")
-    # Bypass any machine-global hooks (require-ticket etc.) — these are throwaway fixtures.
-    env = dict(os.environ, REQUIRE_TICKET_SKIP="1")
+    # `--no-verify` bypasses any machine-global git hooks — these are throwaway fixtures.
     subprocess.run(
         ["git", "commit", "-q", "--no-verify", "-m", msg],
-        cwd=repo, check=True, capture_output=True, text=True, env=env,
+        cwd=repo, check=True, capture_output=True, text=True,
     )
 
 

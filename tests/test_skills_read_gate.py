@@ -52,8 +52,7 @@ def _run(command, monkeypatch, *, invoked: Path, tier: Path,
     monkeypatch.setattr(srg, "INVOKED_DIR", invoked)
     monkeypatch.setattr(srg, "TIER_DIR", tier)
     monkeypatch.setenv("MANDATORY_SKILLS", mandatory)
-    for k in ("ALLOW_SKIP_SKILLS", "ALLOW_SKIP_SKILLS_REASON"):
-        monkeypatch.delenv(k, raising=False)
+    monkeypatch.delenv("RIG_HATCH_REQUEST_SKILLS_READ_GATE", raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
     code = srg.main()
@@ -62,6 +61,12 @@ def _run(command, monkeypatch, *, invoked: Path, tier: Path,
 
 def _decision(out: str) -> str:
     return json.loads(out)["decision"]
+
+
+def _fake_tg_ctl(path: Path, body: str) -> Path:
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return path
 
 
 def _touch_all_skills(invoked: Path) -> None:
@@ -116,32 +121,76 @@ def test_allow_when_all_mandatory_skills_invoked(tmp_path, monkeypatch):
     assert c2 == 0 and _decision(out2) == "allow"
 
 
-# ── ESCAPE ─────────────────────────────────────────────────────────────────────────────
+# ── regression: the OLD self-service escape hatch is DEAD (env AND inline sentinel) ───────
 
-def test_escape_env_reason_allows(tmp_path, monkeypatch):
+def test_old_env_escape_hatch_no_longer_bypasses(tmp_path, monkeypatch):
+    """`ALLOW_SKIP_SKILLS=1` (+ _REASON) as a real process env must NO LONGER bypass the gate —
+    on a repeat it still BLOCKs. The self-service override was removed for the Telegram hatch."""
     invoked, tier = tmp_path / "inv", tmp_path / "tier"
     _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier)  # prime warn marker
     out, _e, c = _run(
         "git commit -m x", monkeypatch, invoked=invoked, tier=tier,
         env={"ALLOW_SKIP_SKILLS": "1", "ALLOW_SKIP_SKILLS_REASON": "docs-only"},
     )
-    assert c == 0 and _decision(out) == "allow"
+    assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-def test_escape_inline_sentinel_allows(tmp_path, monkeypatch):
+def test_old_inline_sentinel_no_longer_bypasses(tmp_path, monkeypatch):
+    """An inline `# skills-ok: <reason>` comment must NO LONGER bypass — the per-command
+    sentinel is gone; on a repeat it still BLOCKs."""
     invoked, tier = tmp_path / "inv", tmp_path / "tier"
     _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier)  # warn
     out, _e, c = _run("git commit -m x  # skills-ok: trivial bump",
                       monkeypatch, invoked=invoked, tier=tier)
-    assert c == 0 and _decision(out) == "allow"
+    assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-def test_reasonless_override_still_blocks_on_repeat(tmp_path, monkeypatch):
+# ── Telegram hatch escalation (RIG_HATCH_REQUEST_SKILLS_READ_GATE) ───────────────────────
+
+def test_hatch_unset_blocks_and_names_env_var(tmp_path, monkeypatch):
+    """No hatch requested → the normal WARN-then-BLOCK tier, and the block message names the
+    hatch env var so an agent knows the only sanctioned escape."""
     invoked, tier = tmp_path / "inv", tmp_path / "tier"
     _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier)  # warn
-    out, _e, c = _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier,
-                      env={"ALLOW_SKIP_SKILLS": "1"})  # no reason
+    out, _e, c = _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier)
     assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "RIG_HATCH_REQUEST_SKILLS_READ_GATE" in json.loads(out)["message"]
+
+
+def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
+    """A bare `1` (no written justification) is an invalid request → deny (block) on the FIRST
+    action, regardless of tier, and NO tg-ctl is invoked (a never-callable would-ALLOW proves
+    no Telegram round-trip)."""
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 0\n")  # would ALLOW if ever called
+    monkeypatch.setattr(srg.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    out, _e, c = _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier,
+                      env={"RIG_HATCH_REQUEST_SKILLS_READ_GATE": "1"})
+    assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
+    """A written justification + tg-ctl exit 0 (human approved) → allow, even on the first
+    action and with no fresh markers."""
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved\\n"\nexit 0\n')
+    monkeypatch.setattr(srg.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    out, _e, c = _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier,
+                      env={"RIG_HATCH_REQUEST_SKILLS_READ_GATE": "docs-only, skills N/A"})
+    assert c == 0 and _decision(out) == "allow"
+    assert "hatch escalation" in json.loads(out)["message"].lower()
+
+
+def test_hatch_justification_exit1_blocks_citing_denial(tmp_path, monkeypatch):
+    """A written justification + tg-ctl exit 1 (human declined / timed out) → block leading
+    with the denial reason."""
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    monkeypatch.setattr(srg.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    out, _e, c = _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier,
+                      env={"RIG_HATCH_REQUEST_SKILLS_READ_GATE": "docs-only, skills N/A"})
+    assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "hatch escalation denied" in json.loads(out)["message"].lower()
 
 
 # ── B2: the GIT_COMMIT regex must NOT match `git`+`commit` in plain prose ────────────────
@@ -425,9 +474,8 @@ def test_only_args_agent_id_is_read_not_other_surfaces(tmp_path, monkeypatch):
         monkeypatch.setattr(srg, "INVOKED_DIR", invoked)
         monkeypatch.setattr(srg, "TIER_DIR", tier)
         monkeypatch.setenv("MANDATORY_SKILLS", _MANDATORY)
-        # isolate from a developer/CI env that sets the escape hatch (else this would falsely allow).
-        for k in ("ALLOW_SKIP_SKILLS", "ALLOW_SKIP_SKILLS_REASON"):
-            monkeypatch.delenv(k, raising=False)
+        # isolate from a developer/CI env that sets the hatch (else this would falsely allow).
+        monkeypatch.delenv("RIG_HATCH_REQUEST_SKILLS_READ_GATE", raising=False)
         code = srg.main()
     assert code == srg.BLOCK_EXIT_CODE and _decision(out.getvalue()) == "block"
 

@@ -19,15 +19,16 @@ The marker contract (how it knows a screenshot was looked at):
   Configure the dir with VISUAL_PROOF_DIR.
 
 This gate straight-BLOCKs (doctrine: "block a commit ... with no attached screenshot"), but
-is satisfiable (touch the marker after you VIEW the capture) and escapable.
+is satisfiable (touch the marker after you VIEW the capture).
 
 NOTE: NOT subagent-exempt — a subagent committing UI work must also have looked at the result.
 
-Escape hatch (controllable — mirrors block-raw-pr-merge):
-  - env  ALLOW_NO_VISUAL_PROOF=1            — disable the guard for this session
-  - env  ALLOW_NO_VISUAL_PROOF_REASON=...   — REQUIRED with the override; logged
-  - inline  `# visual-proof-ok: <reason>`   — self-documenting per-command
-  A reasonless override still blocks.
+No self-service bypass. There is NO env var / inline sentinel an agent can set on its own
+command to skip this gate — a self-grant is security theater. If you have a genuine reason to
+commit UI work without a fresh screenshot marker, ASK the human, or request a ONE-TIME Telegram
+approval via `RIG_HATCH_REQUEST_VISUAL_PROOF_GATE="<justification>"` (deny-by-default; a blank
+or bare `1` is rejected — the value must be a real written justification). The request routes to
+the human over Telegram (tg-ctl) and allows ONLY on their approval.
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; the shell command is in args.command, the repo cwd in event.cwd
@@ -48,6 +49,12 @@ import subprocess  # noqa: S404 — listing staged files is the whole job
 import sys
 import time
 from pathlib import Path
+
+_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+import agenttools_hatch_escalation as hatch_escalation  # noqa: E402
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
@@ -76,7 +83,9 @@ VISUAL_EXT = re.compile(
     re.IGNORECASE,
 )
 VISUAL_DIR = re.compile(r"(?:^|/)(?:components|ui|pages|app|views|public|assets)/", re.IGNORECASE)
-INLINE_SENTINEL = re.compile(r"#\s*visual-proof-ok:\s*(\S.*)")
+
+# Canonical hook id for the shared Telegram hatch (RIG_HATCH_REQUEST_VISUAL_PROOF_GATE).
+HOOK_ID = "visual-proof-gate"
 
 
 def emit(decision: str, message: str | None = None) -> None:
@@ -651,15 +660,38 @@ def _proof_fresh() -> bool:
     return False
 
 
-def _override_reason(command: str) -> str | None:
-    if os.environ.get("ALLOW_NO_VISUAL_PROOF") == "1":
-        reason = (os.environ.get("ALLOW_NO_VISUAL_PROOF_REASON") or "").strip()
-        if reason:
-            return f"env override: {reason}"
-    m = INLINE_SENTINEL.search(command)
-    if m:
-        return f"inline override: {m.group(1).strip()}"
-    return None
+def _block_message(visual: list[str]) -> str:
+    """The BLOCK message: what's wrong, how to satisfy the marker, and the hatch how-to."""
+    sample = ", ".join(visual[:3]) + (", …" if len(visual) > 3 else "")
+    return (
+        f"This commit changes user-visible files ({sample}) but no screenshot was captured "
+        "and looked at. Per visual-proof-cycle: capture the rendered result, read the capture "
+        f"back, verify it, THEN commit. Touch a file under {PROOF_DIR} when you've reviewed a "
+        "screenshot. No self-service bypass. ASK the human, or request a one-time Telegram "
+        'approval via RIG_HATCH_REQUEST_VISUAL_PROOF_GATE="<justification>" (deny-by-default; '
+        "bare 1 rejected)."
+    )
+
+
+def _decide_block(command: str, cwd: str, visual: list[str]) -> int:
+    """The gate has decided this commit needs proof and none is present. Consult the Telegram
+    hatch: an unset request is the normal BLOCK; a present request allows on the human's
+    approval (tg-ctl exit 0) and blocks (leading with the denial reason) otherwise."""
+    message = _block_message(visual)
+    hatch = hatch_escalation.request_hatch_approval(
+        HOOK_ID, {"hook": HOOK_ID, "command": command}, cwd=cwd,
+    )
+    if hatch.should_stop:
+        if hatch.approved:
+            note = f"visual-proof gate allowed via hatch escalation ({hatch.reason})"
+            warn(note)
+            emit("allow", note)
+            return 0
+        warn(f"visual-proof gate hatch escalation denied: {hatch.reason}")
+        emit("block", f"hatch escalation denied: {hatch.reason}\n{message}")
+        return BLOCK_EXIT_CODE
+    emit("block", message)
+    return BLOCK_EXIT_CODE
 
 
 def main() -> int:
@@ -700,22 +732,7 @@ def main() -> int:
         emit("allow")  # a screenshot was captured and looked at recently → satisfied
         return 0
 
-    reason = _override_reason(command)
-    if reason:
-        warn(f"visual-proof gate skipped via escape hatch ({reason})")
-        emit("allow", f"visual-proof gate skipped via escape hatch ({reason})")
-        return 0
-
-    sample = ", ".join(visual[:3]) + (", …" if len(visual) > 3 else "")
-    emit(
-        "block",
-        f"This commit changes user-visible files ({sample}) but no screenshot was captured "
-        "and looked at. Per visual-proof-cycle: capture the rendered result, read the capture "
-        f"back, verify it, THEN commit. Touch a file under {PROOF_DIR} when you've reviewed a "
-        "screenshot, or override with a reason: ALLOW_NO_VISUAL_PROOF=1 + "
-        "ALLOW_NO_VISUAL_PROOF_REASON='why', or append `# visual-proof-ok: why`.",
-    )
-    return BLOCK_EXIT_CODE
+    return _decide_block(command, cwd, visual)
 
 
 if __name__ == "__main__":

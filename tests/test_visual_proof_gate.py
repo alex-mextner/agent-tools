@@ -66,8 +66,7 @@ def _run(command, cwd, monkeypatch, *, proof_dir: Path,
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
     monkeypatch.setattr(vpg, "PROOF_DIR", proof_dir)
-    for k in ("ALLOW_NO_VISUAL_PROOF", "ALLOW_NO_VISUAL_PROOF_REASON"):
-        monkeypatch.delenv(k, raising=False)
+    monkeypatch.delenv("RIG_HATCH_REQUEST_VISUAL_PROOF_GATE", raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
     code = vpg.main()
@@ -81,6 +80,12 @@ def _decision(out: str) -> str:
 def _touch_proof(proof_dir: Path) -> None:
     proof_dir.mkdir(parents=True, exist_ok=True)
     (proof_dir / "looked").write_text("x")
+
+
+def _fake_tg_ctl(path: Path, body: str) -> Path:
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return path
 
 
 # ── EFFECTIVE_CWD (cross-repo `cd`/`-C` resolution) ────────────────────────────────────
@@ -634,29 +639,71 @@ def test_allow_when_proof_marker_fresh(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
 
 
-# ── ESCAPE ─────────────────────────────────────────────────────────────────────────────
+# ── regression: the OLD self-service escape hatch is DEAD (env AND inline sentinel) ───────
 
-def test_escape_env_reason_allows(tmp_path, monkeypatch):
+def test_old_env_escape_hatch_no_longer_bypasses(tmp_path, monkeypatch):
+    """`ALLOW_NO_VISUAL_PROOF=1` (+ _REASON) as a real process env must NO LONGER allow the
+    commit — the self-service bypass was removed in favor of the Telegram hatch."""
     repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
     out, _e, c = _run(
         "git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof",
         env={"ALLOW_NO_VISUAL_PROOF": "1", "ALLOW_NO_VISUAL_PROOF_REASON": "css var rename"},
     )
-    assert c == 0 and _decision(out) == "allow"
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-def test_escape_inline_sentinel_allows(tmp_path, monkeypatch):
+def test_old_inline_sentinel_no_longer_bypasses(tmp_path, monkeypatch):
+    """An inline `# visual-proof-ok: <reason>` comment must NO LONGER allow the commit — the
+    self-documenting per-command sentinel is gone."""
     repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
     out, _e, c = _run("git commit -m x  # visual-proof-ok: deleting a dead component",
                       repo, monkeypatch, proof_dir=tmp_path / "proof")
-    assert c == 0 and _decision(out) == "allow"
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-def test_reasonless_override_still_blocks(tmp_path, monkeypatch):
+# ── Telegram hatch escalation (RIG_HATCH_REQUEST_VISUAL_PROOF_GATE) ──────────────────────
+
+def test_hatch_unset_blocks_and_names_env_var(tmp_path, monkeypatch):
+    """No hatch requested → the normal block, and the message names the hatch env var so an
+    agent knows the only sanctioned escape."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "RIG_HATCH_REQUEST_VISUAL_PROOF_GATE" in json.loads(out)["message"]
+
+
+def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
+    """A bare `1` (no written justification) is an invalid request → deny (block), and NO
+    tg-ctl is ever invoked. A never-callable path proves no Telegram round-trip happens."""
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 0\n")  # would ALLOW if ever called
+    monkeypatch.setattr(vpg.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
     out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof",
-                      env={"ALLOW_NO_VISUAL_PROOF": "1"})  # no reason
+                      env={"RIG_HATCH_REQUEST_VISUAL_PROOF_GATE": "1"})
     assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
+    """A written justification + tg-ctl exit 0 (the human approved) → allow."""
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved by tap\\n"\nexit 0\n')
+    monkeypatch.setattr(vpg.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof",
+                      env={"RIG_HATCH_REQUEST_VISUAL_PROOF_GATE": "Deleting a dead component."})
+    assert c == 0 and _decision(out) == "allow"
+    assert "hatch escalation" in json.loads(out)["message"].lower()
+
+
+def test_hatch_justification_exit1_blocks_citing_denial(tmp_path, monkeypatch):
+    """A written justification + tg-ctl exit 1 (the human declined / timed out) → block, and
+    the message leads with the denial reason."""
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    monkeypatch.setattr(vpg.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("git commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof",
+                      env={"RIG_HATCH_REQUEST_VISUAL_PROOF_GATE": "Deleting a dead component."})
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "hatch escalation denied" in json.loads(out)["message"].lower()
 
 
 # ── B2: the GIT_COMMIT regex must NOT match `git`+`commit` in plain prose ────────────────
@@ -799,8 +846,7 @@ def test_blocks_even_with_agent_id_present(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
     monkeypatch.setattr(vpg, "PROOF_DIR", tmp_path / "proof")
-    for k in ("ALLOW_NO_VISUAL_PROOF", "ALLOW_NO_VISUAL_PROOF_REASON"):
-        monkeypatch.delenv(k, raising=False)
+    monkeypatch.delenv("RIG_HATCH_REQUEST_VISUAL_PROOF_GATE", raising=False)
     code = vpg.main()
     assert code == vpg.BLOCK_EXIT_CODE and _decision(out.getvalue()) == "block"
 

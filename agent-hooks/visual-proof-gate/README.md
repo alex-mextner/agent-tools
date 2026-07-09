@@ -37,21 +37,28 @@ look at the screenshot, the capture step records that you did.
 
 Doctrine says "block a commit that changes UI with no attached screenshot", so this is a
 straight block on the first occurrence — but it is **satisfiable** (touch the marker after you
-review the capture) and **escapable** (below).
+review the capture).
 
 ## Not subagent-exempt
 
 A subagent committing UI work must also have looked at the result, so this gate does **not**
 exempt subagents (unlike the orchestration gates 1–3).
 
-## Escape hatch (controllable, not a hard wall)
+## No self-service bypass — request a Telegram approval instead
+
+There is **no** env var or inline sentinel an agent can set on its own command to skip this
+gate (a self-grant is security theater). If you have a genuine reason to commit UI work with
+no fresh screenshot marker, **ASK the human**, or request a **one-time Telegram approval**:
 
 ```bash
-ALLOW_NO_VISUAL_PROOF=1 ALLOW_NO_VISUAL_PROOF_REASON="CSS var rename, no visual change"   # session
-git commit -m x   # visual-proof-ok: deleting a dead component, nothing to render
+RIG_HATCH_REQUEST_VISUAL_PROOF_GATE="deleting a dead component, nothing to render" git commit -m x
 ```
 
-A reasonless `ALLOW_NO_VISUAL_PROOF=1` is ignored and the commit stays blocked.
+The request routes to the human over Telegram (`tg-ctl ask`) and the commit is allowed **only**
+on their approval. It is **deny-by-default**: a blank value or a bare `1`/`true` (no real
+justification) is rejected without even sending the message, and any nonzero/timeout/error
+verdict denies. This replaces the old `ALLOW_NO_VISUAL_PROOF` / `# visual-proof-ok:` self-service
+hatch (removed — an agent setting its own bypass is not a control).
 
 ## Fail-open, on purpose
 

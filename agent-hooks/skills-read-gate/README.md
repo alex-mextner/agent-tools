@@ -69,14 +69,23 @@ orchestration/visual defaults are dropped. The orchestrator (no `agent_id`) gets
 > for a subagent by their nature, not by config). If you want a subagent gated on visual proof,
 > add a **differently-named** project skill to `MANDATORY_SKILLS` — that one is not dropped.
 
-## Escape hatch (controllable, not a hard wall)
+## No self-service bypass — request a Telegram approval instead
+
+There is **no** env var or inline sentinel an agent can set on its own command to skip this
+gate (a self-grant is security theater). The dominant reason one used to be forced —
+`ALLOW_SKIP_SKILLS=1` on every subagent commit to dodge the orchestration/visual defaults — is
+now handled **structurally** (those two defaults are dropped for a dispatched subagent, see
+above), so no blanket override is needed. For a genuine one-off, **ASK the human**, or request
+a **one-time Telegram approval**:
 
 ```bash
-ALLOW_SKIP_SKILLS=1 ALLOW_SKIP_SKILLS_REASON="docs-only commit, skills N/A"   # session-wide
-git commit -m x   # skills-ok: trivial config bump
+RIG_HATCH_REQUEST_SKILLS_READ_GATE="docs-only commit, the mandatory skills are N/A here" npm test
 ```
 
-A reasonless `ALLOW_SKIP_SKILLS=1` is ignored and the action stays gated.
+The request routes to the human over Telegram (`tg-ctl ask`) and the action is allowed **only**
+on their approval. It is **deny-by-default**: a blank value or a bare `1`/`true` (no real
+justification) is rejected without sending the message, and any nonzero/timeout/error verdict
+denies. This replaces the old `ALLOW_SKIP_SKILLS` / `# skills-ok:` self-service hatch (removed).
 
 ## Fail-open, on purpose
 
