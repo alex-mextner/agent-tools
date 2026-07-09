@@ -105,6 +105,38 @@ def _run(
     return {"code": proc.returncode, "decision": payload["decision"], "message": payload.get("message", "")}
 
 
+def _run_inproc(command, monkeypatch, tmp_path, *, strict=None, env_extra=None, tg_ctl):
+    """In-process variant for tests that must exercise a CONTROLLABLE tg-ctl. The shared lib
+    resolves the approval binary from the account's real home (`resolve_home`), which a subprocess
+    can't redirect — so these run the hook's `main()` in-process with `resolve_home` pointed at a
+    clean fake home (no rig.yaml) and `_TRUSTED_TG_CTL_PATHS` monkeypatched to the fake tg-ctl.
+    That is the ONLY safe way to reach a mocked tg-ctl; a subprocess would hit the real one."""
+    import io
+
+    home = tmp_path / "_home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setattr(rt.hatch_escalation, "resolve_home", lambda: str(home))
+    monkeypatch.setattr(rt.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    for k in ("REQUIRE_TICKET_STRICT", "REQUIRE_TICKET_SKIP", "REQUIRE_TICKET_EXEMPT_TYPES",
+              _HATCH_ENV):
+        monkeypatch.delenv(k, raising=False)
+    if strict is True:
+        monkeypatch.setenv("REQUIRE_TICKET_STRICT", "1")
+    elif strict is False:
+        monkeypatch.setenv("REQUIRE_TICKET_STRICT", "0")
+    for k, v in (env_extra or {}).items():
+        monkeypatch.setenv(k, v)
+    isolated = tmp_path / "_iso"
+    isolated.mkdir(exist_ok=True)
+    event = json.dumps({"args": {"command": command}, "cwd": str(isolated)})
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(event))
+    monkeypatch.setattr(sys, "stdout", out)
+    code = rt.main()
+    payload = json.loads(out.getvalue().strip())
+    return {"code": code, "decision": payload["decision"], "message": payload.get("message", "")}
+
+
 # ── STRICT BY DEFAULT ─────────────────────────────────────────────────────────────────────────
 
 
@@ -202,22 +234,22 @@ def test_hatch_bare_flag_denies_without_tg_call(tmp_path):
     assert "hatch escalation denied" in r["message"].lower()
 
 
-def test_hatch_justification_exit0_allows(tmp_path):
+def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
     """A written justification + tg-ctl exit 0 (the human approved) → allow."""
     tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved by tap\\n"\nexit 0\n')
-    r = _run('git commit -m "feat: x"',
-             env_extra={_HATCH_ENV: "one-off backfill, no ticket warranted"}, tg_ctl=tg_ctl)
+    r = _run_inproc('git commit -m "feat: x"', monkeypatch, tmp_path,
+                    env_extra={_HATCH_ENV: "one-off backfill, no ticket warranted"}, tg_ctl=tg_ctl)
     assert r["code"] == 0 and r["decision"] == "allow"
     assert "hatch escalation" in r["message"].lower()
     assert rt.BLOCK_MARKER not in r["message"]
 
 
-def test_hatch_justification_exit1_blocks_citing_denial(tmp_path):
+def test_hatch_justification_exit1_blocks_citing_denial(tmp_path, monkeypatch):
     """A written justification + tg-ctl exit 1 (the human declined / timed out) → block, leading
     with the denial reason."""
     tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
-    r = _run('git commit -m "feat: x"',
-             env_extra={_HATCH_ENV: "one-off backfill, no ticket warranted"}, tg_ctl=tg_ctl)
+    r = _run_inproc('git commit -m "feat: x"', monkeypatch, tmp_path,
+                    env_extra={_HATCH_ENV: "one-off backfill, no ticket warranted"}, tg_ctl=tg_ctl)
     assert r["code"] == 10 and r["decision"] == "block"
     assert "hatch escalation denied" in r["message"].lower()
 
@@ -281,12 +313,13 @@ def test_dash_F_stdin_fails_closed_with_hint(command):
     assert "REQUIRE_TICKET_SKIP" not in msg, "the removed inline-env escape must not be advertised"
 
 
-def test_dash_F_stdin_hatch_approved_allows(tmp_path):
+def test_dash_F_stdin_hatch_approved_allows(tmp_path, monkeypatch):
     # THE spec requirement: the hatch is consulted BEFORE the `-F -` stdin block, so an approved
     # hatch lets a genuinely ticketless `-F -` commit through (read from the command env + tg-ctl,
     # never git's unreadable stdin).
     tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved\\n"\nexit 0\n')
-    r = _run("git commit -F -", env_extra={_HATCH_ENV: "one-off backfill, no ticket"}, tg_ctl=tg_ctl)
+    r = _run_inproc("git commit -F -", monkeypatch, tmp_path,
+                    env_extra={_HATCH_ENV: "one-off backfill, no ticket"}, tg_ctl=tg_ctl)
     assert r["code"] == 0, f"an approved hatch must allow a `-F -` commit ({r['message']})"
     assert r["decision"] == "allow"
     assert rt.BLOCK_MARKER not in r["message"]
@@ -619,7 +652,7 @@ def test_glued_short_message_ending_in_value_letter_is_not_a_next_token_consumer
     assert rt.is_skip_commit(["-amC", "--amend"]) is True
 
 
-def test_hatch_inline_command_justification_allows(tmp_path):
+def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     """The justification supplied as an inline command PREFIX (env var NOT exported) must reach
     tg-ctl — a pre-bash hook parses the leading RIG_HATCH_REQUEST_… assignment out of the command
     string the event carries. Regression guard for the documented inline form being unusable
@@ -629,12 +662,13 @@ def test_hatch_inline_command_justification_allows(tmp_path):
         'RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="one-off backfill, no ticket warranted" '
         'git commit -m "feat: x"'
     )
-    r = _run(command, tg_ctl=tg_ctl)  # env var deliberately NOT set — only the inline prefix
+    # env var deliberately NOT set — only the inline prefix
+    r = _run_inproc(command, monkeypatch, tmp_path, tg_ctl=tg_ctl)
     assert r["code"] == 0 and r["decision"] == "allow"
     assert "hatch escalation" in r["message"].lower()
 
 
-def test_hatch_inline_command_after_separator_allows(tmp_path):
+def test_hatch_inline_command_after_separator_allows(tmp_path, monkeypatch):
     """The inline prefix is honored even when the commit is not the first command on the line."""
     tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 0\n")
     command = (
@@ -642,5 +676,5 @@ def test_hatch_inline_command_after_separator_allows(tmp_path):
         '&& RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="one-off backfill" '
         'git commit -m "feat: x"'
     )
-    r = _run(command, tg_ctl=tg_ctl)
+    r = _run_inproc(command, monkeypatch, tmp_path, tg_ctl=tg_ctl)
     assert r["code"] == 0 and r["decision"] == "allow"
