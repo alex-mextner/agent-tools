@@ -115,6 +115,7 @@ def _run_inproc(command, monkeypatch, tmp_path, *, strict=None, env_extra=None, 
 
     home = tmp_path / "_home"
     home.mkdir(exist_ok=True)
+    monkeypatch.setattr(rt, "STRICT", strict is not False)
     monkeypatch.setattr(rt.hatch_escalation, "resolve_home", lambda: str(home))
     monkeypatch.setattr(rt.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     for k in ("REQUIRE_TICKET_STRICT", "REQUIRE_TICKET_SKIP", "REQUIRE_TICKET_EXEMPT_TYPES",
@@ -323,6 +324,16 @@ def test_dash_F_stdin_hatch_approved_allows(tmp_path, monkeypatch):
     assert r["code"] == 0, f"an approved hatch must allow a `-F -` commit ({r['message']})"
     assert r["decision"] == "allow"
     assert rt.BLOCK_MARKER not in r["message"]
+
+
+def test_dash_F_stdin_hatch_denied_blocks(tmp_path, monkeypatch):
+    # A requested hatch must fail closed when tg-ctl exits nonzero, even for the otherwise special
+    # unreadable `-F -` path.
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved?\\n"\nexit 1\n')
+    r = _run_inproc("git commit -F -", monkeypatch, tmp_path,
+                    env_extra={_HATCH_ENV: "one-off backfill, no ticket"}, tg_ctl=tg_ctl)
+    assert r["code"] == 10 and r["decision"] == "block"
+    assert "hatch escalation denied" in r["message"].lower()
 
 
 def test_dash_F_stdin_warn_only_downgrades_to_allow():
@@ -663,6 +674,18 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
         'git commit -m "feat: x"'
     )
     # env var deliberately NOT set — only the inline prefix
+    r = _run_inproc(command, monkeypatch, tmp_path, tg_ctl=tg_ctl)
+    assert r["code"] == 0 and r["decision"] == "allow"
+    assert "hatch escalation" in r["message"].lower()
+
+
+def test_hatch_inline_command_justification_allows_dash_F_stdin(tmp_path, monkeypatch):
+    """The inline prefix also works for `-F -`, proving the hatch is consulted before stdin blocks."""
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved by tap\\n"\nexit 0\n')
+    command = (
+        'RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="one-off backfill, no ticket warranted" '
+        "git commit -F -"
+    )
     r = _run_inproc(command, monkeypatch, tmp_path, tg_ctl=tg_ctl)
     assert r["code"] == 0 and r["decision"] == "allow"
     assert "hatch escalation" in r["message"].lower()

@@ -4,7 +4,7 @@
 
 On a `git commit`, checks the commit message and branch name for a reference to a
 tracking ticket. If none is found — and the commit isn't an exempt chore/WIP/merge,
-and no per-commit escape is present — it **blocks** by default (strict), with a
+and no one-time Telegram hatch is approved — it **blocks** by default (strict), with a
 reminder that non-trivial changes should start from a ticket with acceptance criteria,
 motivation, and user-impact. Set `REQUIRE_TICKET_STRICT=0` to fall back to warn-only.
 Enforces the `strict-ticket-discipline` skill; pairs with task-cli.
