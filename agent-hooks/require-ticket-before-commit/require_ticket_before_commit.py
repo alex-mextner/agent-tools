@@ -1063,6 +1063,7 @@ def _consult_hatch(command: str, cwd: str | None, stdin: bool) -> int | None:
     None when no hatch was requested (fall through to the normal block)."""
     hatch = hatch_escalation.request_hatch_approval(
         HOOK_ID, {"hook": HOOK_ID, "command": command}, cwd=cwd or os.getcwd(),
+        command=command,
     )
     if not hatch.should_stop:
         return None

@@ -54,6 +54,12 @@ no fresh screenshot marker, **ASK the human**, or request a **one-time Telegram 
 RIG_HATCH_REQUEST_VISUAL_PROOF_GATE="deleting a dead component, nothing to render" git commit -m x
 ```
 
+This is a **pre-bash** hook, so the inline prefix is honored: the hook parses the leading
+`RIG_HATCH_REQUEST_VISUAL_PROOF_GATE=…` assignment out of the command string the event carries
+(a pre-bash hook runs in its own process *before* the shell evaluates the `VAR=x cmd` prefix, so
+the value never reaches its `os.environ`). Exporting the var into the harness environment works
+too and takes precedence over an inline value.
+
 The request routes to the human over Telegram (`tg-ctl ask`) and the commit is allowed **only**
 on their approval. It is **deny-by-default**: a blank value or a bare `1`/`true` (no real
 justification) is rejected without even sending the message, and any nonzero/timeout/error

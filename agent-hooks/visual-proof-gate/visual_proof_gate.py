@@ -113,6 +113,27 @@ def _strip_shell_comment(command: str) -> str:
     return " ".join(tokens)
 
 
+# A leading inline `VAR=value` env-assignment run at a command head (line start or right after a
+# `|`/`&`/`;` separator). A real shell applies it as environment to the following command, so it
+# is transparent to WHICH command runs — but it pushes `git` off the command head and defeats the
+# `GIT_COMMIT` anchor. Chief case: the documented inline hatch form
+# `RIG_HATCH_REQUEST_VISUAL_PROOF_GATE="why" git commit …`, which must still be detected as a
+# commit (else the gate silently allows it, never reaching the Telegram hatch). Stripped only for
+# detection. SYNC with skills_read_gate.py's `_strip_leading_inline_env`.
+_INLINE_ENV_PREFIX = re.compile(
+    r"(?P<sep>^|[|&;]\s*)"
+    r"(?:[A-Za-z_]\w*=(?:\"[^\"]*\"|'[^']*'|[^\s|&;]+)[ \t]+)+"
+)
+
+
+def _strip_leading_inline_env(command: str) -> str:
+    """Drop leading `VAR=value` env-assignment runs at each command head, so a command whose real
+    executable is prefixed by inline env (`RIG_HATCH_REQUEST_…="why" git commit`) is detected as
+    that executable. Prose stays safe: assignments inside quotes are not at a command head."""
+
+    return _INLINE_ENV_PREFIX.sub(lambda m: m.group("sep"), command)
+
+
 # SYNC: the commit-segment parser below (_segments / _commit_flags / is_skip_commit) is mirrored
 # in skills-read-gate/skills_read_gate.py — each hook is a self-contained standalone script run as
 # its own subprocess (no shared import path), so the logic is duplicated by design. Keep both in
@@ -679,7 +700,7 @@ def _decide_block(command: str, cwd: str, visual: list[str]) -> int:
     approval (tg-ctl exit 0) and blocks (leading with the denial reason) otherwise."""
     message = _block_message(visual)
     hatch = hatch_escalation.request_hatch_approval(
-        HOOK_ID, {"hook": HOOK_ID, "command": command}, cwd=cwd,
+        HOOK_ID, {"hook": HOOK_ID, "command": command}, cwd=cwd, command=command,
     )
     if hatch.should_stop:
         if hatch.approved:
@@ -708,9 +729,11 @@ def main() -> int:
         command = str(command)
     session_cwd = str(event.get("cwd") or os.getcwd())
 
-    # Detect the commit on the comment-stripped command, and judge skip-ness from the parsed
-    # argv — so a skip token in a trailing comment / commit message can't bypass the gate.
-    if not GIT_COMMIT.search(_strip_shell_comment(command)) or is_skip_commit(command):
+    # Strip leading inline env first (so `RIG_HATCH_REQUEST_…="why" git commit` still trips the
+    # gate), then detect the commit on the comment-stripped command and judge skip-ness from the
+    # parsed argv — so a skip token in a trailing comment / commit message can't bypass the gate.
+    env_free = _strip_leading_inline_env(command)
+    if not GIT_COMMIT.search(_strip_shell_comment(env_free)) or is_skip_commit(env_free):
         emit("allow")  # not a normal commit → nothing to gate
         return 0
 

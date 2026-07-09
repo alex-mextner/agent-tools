@@ -617,3 +617,30 @@ def test_glued_short_message_ending_in_value_letter_is_not_a_next_token_consumer
     # the exact reviewer repro: a real --amend after a glued -am message IS still a skip commit.
     assert rt.is_skip_commit(["-amFixIt", "--amend"]) is True
     assert rt.is_skip_commit(["-amC", "--amend"]) is True
+
+
+def test_hatch_inline_command_justification_allows(tmp_path):
+    """The justification supplied as an inline command PREFIX (env var NOT exported) must reach
+    tg-ctl — a pre-bash hook parses the leading RIG_HATCH_REQUEST_… assignment out of the command
+    string the event carries. Regression guard for the documented inline form being unusable
+    (Codex P1 on #233): before the fix the var was only read from os.environ and this blocked."""
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved by tap\\n"\nexit 0\n')
+    command = (
+        'RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="one-off backfill, no ticket warranted" '
+        'git commit -m "feat: x"'
+    )
+    r = _run(command, tg_ctl=tg_ctl)  # env var deliberately NOT set — only the inline prefix
+    assert r["code"] == 0 and r["decision"] == "allow"
+    assert "hatch escalation" in r["message"].lower()
+
+
+def test_hatch_inline_command_after_separator_allows(tmp_path):
+    """The inline prefix is honored even when the commit is not the first command on the line."""
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 0\n")
+    command = (
+        'echo staging '
+        '&& RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="one-off backfill" '
+        'git commit -m "feat: x"'
+    )
+    r = _run(command, tg_ctl=tg_ctl)
+    assert r["code"] == 0 and r["decision"] == "allow"

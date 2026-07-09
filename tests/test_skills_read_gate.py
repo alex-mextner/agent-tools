@@ -494,3 +494,17 @@ def test_every_default_is_dropped_for_subagents():
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
+    """The justification supplied as an inline command PREFIX (env var NOT exported) must reach
+    tg-ctl via the new `command=` contract. Regression for the documented inline form (Codex #233)."""
+    question = tmp_path / "q.txt"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f'printf "%s" "$2" > "{question}"\nprintf approved\nexit 0\n')
+    monkeypatch.setattr(srg.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    out, _e, c = _run(
+        'RIG_HATCH_REQUEST_SKILLS_READ_GATE="docs-only commit, mandatory skills N/A" git commit -m x',
+        monkeypatch, invoked=invoked, tier=tier)  # env NOT set — inline only
+    assert c == 0 and _decision(out) == "allow"
+    assert "docs-only commit, mandatory skills N/A" in question.read_text()

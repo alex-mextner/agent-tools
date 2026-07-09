@@ -98,6 +98,13 @@ Telegram approval**:
 RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT="one-off backfill, no ticket warranted" git commit -m "feat: x"
 ```
 
+This is a **pre-bash** hook, so the inline prefix is honored: the hook parses the leading
+`RIG_HATCH_REQUEST_REQUIRE_TICKET_BEFORE_COMMIT=…` assignment out of the command string the event
+carries (a pre-bash hook runs in its own process *before* the shell evaluates the `VAR=x cmd`
+prefix, so the value never reaches its `os.environ`). It also works when the commit is not the
+first command on the line (`cd repo && RIG_HATCH_REQUEST_…="why" git commit …`). Exporting the var
+into the harness environment works too and takes precedence over an inline value.
+
 The request routes to the human over Telegram (`tg-ctl ask`) and the commit is allowed **only**
 on their approval. It is **deny-by-default**: a blank value or a bare `1`/`true` (no real
 justification) is rejected without sending the message, and any nonzero/timeout/error verdict

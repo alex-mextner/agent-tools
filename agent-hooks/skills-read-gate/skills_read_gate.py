@@ -276,11 +276,34 @@ def is_skip_commit(command: str) -> bool:
     return all(any(tok in SKIP_FLAGS for tok in flags) for flags in commit_segments_flags)
 
 
+# A leading inline `VAR=value` env-assignment run at a command head (line start or right after a
+# `|`/`&`/`;` separator). A real shell applies it as environment to the following command, so it
+# is transparent to WHICH command runs — but it pushes `git` off the command head and defeats the
+# `GIT_COMMIT` anchor. Chief case: the documented inline hatch form
+# `RIG_HATCH_REQUEST_SKILLS_READ_GATE="why" git commit …`, which must still be detected as a
+# commit (else the gate silently allows it, never reaching the Telegram hatch). Stripped only for
+# detection; the value/quote handling covers "double"/'single'/bare forms.
+_INLINE_ENV_PREFIX = re.compile(
+    r"(?P<sep>^|[|&;]\s*)"
+    r"(?:[A-Za-z_]\w*=(?:\"[^\"]*\"|'[^']*'|[^\s|&;]+)[ \t]+)+"
+)
+
+
+def _strip_leading_inline_env(command: str) -> str:
+    """Drop leading `VAR=value` env-assignment runs at each command head, so a command whose real
+    executable is prefixed by inline env (`RIG_HATCH_REQUEST_…="why" git commit`) is detected as
+    that executable. Prose stays safe: assignments inside quotes are not at a command head."""
+
+    return _INLINE_ENV_PREFIX.sub(lambda m: m.group("sep"), command)
+
+
 def _is_work_action(command: str) -> bool:
-    # Detect the commit on the comment-stripped command, and judge skip-ness from the parsed
-    # argv — so a skip token in a trailing comment / commit message can't bypass the gate.
-    stripped = _strip_shell_comment(command)
-    if GIT_COMMIT.search(stripped) and not is_skip_commit(command):
+    # Strip leading inline env first (so `RIG_HATCH_REQUEST_…="why" git commit` still trips the
+    # gate), then detect the commit on the comment-stripped command and judge skip-ness from the
+    # parsed argv — so a skip token in a trailing comment / commit message can't bypass the gate.
+    env_free = _strip_leading_inline_env(command)
+    stripped = _strip_shell_comment(env_free)
+    if GIT_COMMIT.search(stripped) and not is_skip_commit(env_free):
         return True
     return bool(BUILD_OR_TEST.search(stripped))
 
@@ -376,7 +399,7 @@ def main() -> int:
     # allow; denied → block, regardless of the WARN/BLOCK tier — an explicit human "no" is a
     # hard deny). An UNSET request falls through to the normal WARN-first tier below.
     hatch = hatch_escalation.request_hatch_approval(
-        HOOK_ID, {"hook": HOOK_ID, "command": command}, cwd=cwd,
+        HOOK_ID, {"hook": HOOK_ID, "command": command}, cwd=cwd, command=command,
     )
     if hatch.should_stop:
         if hatch.approved:

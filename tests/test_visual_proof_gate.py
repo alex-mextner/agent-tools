@@ -853,3 +853,17 @@ def test_blocks_even_with_agent_id_present(tmp_path, monkeypatch):
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
+    """The justification supplied as an inline command PREFIX (env var NOT exported) must reach
+    tg-ctl via the new `command=` contract. Regression for the documented inline form (Codex #233)."""
+    question = tmp_path / "q.txt"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f'printf "%s" "$2" > "{question}"\nprintf approved\nexit 0\n')
+    monkeypatch.setattr(vpg.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(
+        'RIG_HATCH_REQUEST_VISUAL_PROOF_GATE="deleting a dead component, nothing to render" git commit -m x',
+        repo, monkeypatch, proof_dir=tmp_path / "proof")  # env NOT set — inline only
+    assert c == 0 and _decision(out) == "allow"
+    assert "deleting a dead component, nothing to render" in question.read_text()
