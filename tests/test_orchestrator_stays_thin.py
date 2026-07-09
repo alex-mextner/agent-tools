@@ -416,11 +416,24 @@ def test_sed_in_place_anywhere_still_implementation(tmp_path, monkeypatch):
     "review diff",                                  # multi-model review CLI
     "review diff && tg done",                       # review + report chain
     "git worktree list | grep wt | head",           # worktree inspection piped into read-only filter
+    "dev start web",                                # configured dev/e2e lifecycle
+    "dev list",                                     # inspect configured/running dev targets
+    "dev status smoke",                             # e2e/dev progress/status
+    "dev logs smoke --tail 50",                     # configured logs, not raw docker logs
+    "dev e2e run smoke",                            # first-class e2e run
+    "dev e2e status smoke",                         # first-class e2e status
+    "dev e2e logs smoke",                           # first-class e2e logs
+    "dev has-script --repo-only test",               # read-only script existence probe
+    "dev run test",                                  # project-scoped rig.yaml scripts
+    "dev run --repo-only test",                      # repo-owned hook/ship test runner
+    "dev stop --port 5173",                          # project-scoped dev process control
+    "dev stop --pgid 5001",                          # validated dev/e2e process group stop
+    "dev env --add-project ../api",                  # session-scoped multi-project setup
 ])
 def test_orchestration_chain_never_blocks(command, tmp_path, monkeypatch):
-    """`tg` / `review` / `git worktree list` are orchestration, never implementation — a chain of
-    only these (plus read-only tails) must not warn OR block. `gh` is deliberately EXCLUDED now
-    (tg#7103): see test_gh_is_now_delegated_warn_then_blocks."""
+    """`tg` / `review` / `git worktree list` / known `dev` commands are orchestration, never
+    implementation — a chain of only these (plus read-only tails) must not warn OR block. `gh` is
+    deliberately EXCLUDED now (tg#7103): see test_gh_is_now_delegated_warn_then_blocks."""
     event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
     out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
     assert c1 == 0 and _decision(out1) == "allow", command
@@ -517,6 +530,65 @@ def test_gh_env_prefix_is_delegated_after_strip():
     assert ost._is_gh_command("GH_PAGER=cat GH_TOKEN=x gh ship 605 'oops") is True
     # ...and a non-gh env-prefixed unbalanced segment is still NOT mis-flagged as gh
     assert ost._is_gh_command("FOO=bar echo 'oops") is False
+
+
+def test_dev_head_does_not_launder_impl_tail(tmp_path, monkeypatch):
+    """`dev` is allowed only as its own sanctioned segment; a real build chained after it
+    is still implementation-shaped and warn-then-blocks."""
+    assert ost._is_all_inline_allowed("dev run test && npm run build") is False
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "dev run test && npm run build"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_dev_run_only_known_safe_scripts_are_orchestration(tmp_path, monkeypatch):
+    """`dev run test` is sanctioned, but `dev run <anything>` must not become a blanket
+    implementation bypass for configured scripts with side effects."""
+    assert ost._is_all_inline_allowed("dev run test") is True
+    assert ost._is_all_inline_allowed("dev run build") is False
+    assert ost._is_implementation_bash("dev run build") is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": "dev run build"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_dev_e2e_is_allowed_inside_command_substitution():
+    assert ost._dev_segment_is_unknown("dev e2e run smoke") is False
+    assert ost._is_implementation_bash('tg "$(dev e2e status smoke)"') is False
+
+
+def test_dev_unknown_subcommand_is_not_allowlisted(tmp_path, monkeypatch):
+    """A blanket `dev` head would launder arbitrary argv; only known orchestration
+    subcommands get the carve-out."""
+    assert ost._is_all_inline_allowed("dev npm run build") is False
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "dev npm run build && cat out"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+@pytest.mark.parametrize("command", ["dev help", "dev e2e help"])
+def test_dev_help_name_is_not_a_fake_subcommand(command):
+    assert ost._dev_segment_is_allowed(command) is False
+    assert ost._dev_segment_is_unknown(command) is True
+
+
+def test_dev_e2e_unknown_nested_subcommand_is_not_allowlisted(tmp_path, monkeypatch):
+    """`dev e2e` is first-class, but it cannot launder arbitrary nested argv."""
+    assert ost._is_all_inline_allowed("dev e2e npm run build") is False
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "dev e2e npm run build && cat out"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
 
 
 def test_gh_head_with_impl_tail_still_blocks_on_repeat(tmp_path, monkeypatch):
@@ -740,6 +812,12 @@ def test_read_only_system_verification_pipes_allow(command, tmp_path, monkeypatc
     "uv run --with pytest pytest tests/",       # uv-wrapped test run (codex)
     "uv run --with pytest python -m pytest",    # uv-wrapped python -m pytest (codex)
     "uv run tox",                                # uv-wrapped tox
+    "uv run --with=pytest python -m pytest",
+    "uv run --python-preference system pytest tests/",
+    "uv run --future-value-flag value pytest tests/",
+    "uv run --future-value-flag value --with pytest python -m pytest",
+    "uv run -p3.11 pytest tests/",
+    "uv run -vp 3.11 python -m pytest",
     "env -u FOO git commit -m x",   # env option WITH operand (codex round 4)
     "env -C /tmp pytest tests/",    # env --chdir operand
     "timeout 60 pytest tests/",     # the MANDATED timeout wrapper (codex round 6)
@@ -774,6 +852,8 @@ def test_commit_push_test_blocks_on_repeat(command, tmp_path, monkeypatch):
 @pytest.mark.parametrize("command", [
     "uv run rig status",              # read-only tool, not a test
     "uv run rg pytest docs",         # SEARCHING for "pytest" — not running it (codex round 5)
+    "uv run --frozen rig status",
+    "uv run --with rg rg pytest docs",
 ])
 def test_uv_run_readonly_tool_not_overblocked(command, tmp_path, monkeypatch):
     """The uv-test detector is shlex-based: only the COMMAND uv runs counts, not an argument.

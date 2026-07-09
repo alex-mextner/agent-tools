@@ -58,6 +58,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
+from typing import Iterable
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
@@ -101,6 +102,11 @@ ORCH_ALLOW = re.compile(
     r"|git\s+worktree\s+list\b"                           # worktree inspection
     r")"
 )
+_DEV_ALLOWED_SUBCOMMANDS = frozenset({"start", "run", "list", "status", "logs", "has-script", "stop", "e2e", "env"})
+_DEV_ALLOWED_E2E_SUBCOMMANDS = frozenset({"run", "status", "logs", "stop"})
+# Intentionally narrower than `dev run <script>` itself: only common test/e2e script names are
+# orchestration; other script names remain implementation-shaped so `dev run deploy` is not a bypass.
+_DEV_ALLOWED_RUN_SCRIPTS = frozenset({"test", "tests", "e2e", "smoke"})
 #
 # WRAPPER STRIPPING (`_strip_wrappers`): a leading `VAR=val` assignment or a passthrough command
 # wrapper (env / time / timeout / nice / nohup / stdbuf / ionice / setsid, basename-matched so
@@ -433,7 +439,12 @@ def _seg_is_allowed(segment: str) -> bool:
         return False
     if _git_subcommand(segment) == "branch" and _git_branch_has_arg(segment):
         return False
-    if READ_ONLY_BASH.search(segment) or ORCH_ALLOW.search(segment) or CD_HEAD.match(segment):
+    if (
+        READ_ONLY_BASH.search(segment)
+        or ORCH_ALLOW.search(segment)
+        or _dev_segment_is_allowed(segment)
+        or CD_HEAD.match(segment)
+    ):
         return True
     return _git_subcommand(segment) in _GIT_READ_SUBS  # `git -C d status`, `/usr/bin/git log`, …
 
@@ -473,11 +484,47 @@ def _is_gh_command(segment: str) -> bool:
 def _seg_is_impl_signal(segment: str) -> bool:
     """A single (env-stripped) segment is implementation on its own: a build/edit head (sed -i, tee,
     npm/…), a `git commit`/`push` or a `pytest`/`python -m pytest` test (all spellings), a
-    `uv run … pytest` wrapper, OR ANY `gh` command (ship/pr/run/api — all delegated, tg#7103).
-    Caught even unchained (codex P1)."""
-    if BUILD_EDIT.search(segment) or _is_uv_test(segment) or _is_git_or_python_impl(segment):
+    `uv run … pytest` wrapper, an unknown `dev` command, OR ANY `gh` command (ship/pr/run/api —
+    all delegated, tg#7103). Caught even unchained (codex P1)."""
+    if (
+        BUILD_EDIT.search(segment)
+        or _is_uv_test(segment)
+        or _is_git_or_python_impl(segment)
+        or _dev_segment_is_unknown(segment)
+    ):
         return True
     return _is_gh_command(segment)
+
+
+def _dev_tokens(segment: str) -> list[str] | None:
+    try:
+        toks = shlex.split(segment)
+    except ValueError:
+        return None
+    if not toks or toks[0].rsplit("/", 1)[-1] != "dev":
+        return None
+    return toks
+
+
+def _dev_segment_is_allowed(segment: str) -> bool:
+    toks = _dev_tokens(segment)
+    if not toks:
+        return False
+    if len(toks) == 1 or toks[1] in ("-h", "--help"):
+        return True
+    if toks[1] == "run":
+        args = toks[2:]
+        while args and args[0] == "--repo-only":
+            args = args[1:]
+        return bool(args) and (args[0] in _DEV_ALLOWED_RUN_SCRIPTS or args[0] in ("-h", "--help"))
+    if toks[1] == "e2e":
+        return len(toks) == 2 or toks[2] in _DEV_ALLOWED_E2E_SUBCOMMANDS or toks[2] in ("-h", "--help")
+    return toks[1] in _DEV_ALLOWED_SUBCOMMANDS
+
+
+def _dev_segment_is_unknown(segment: str) -> bool:
+    toks = _dev_tokens(segment)
+    return toks is not None and not _dev_segment_is_allowed(segment)
 
 
 # git global options that take a SEPARATE operand (so `git -C /repo commit` finds `commit`, not `/repo`).
@@ -551,6 +598,99 @@ def _is_git_or_python_impl(segment: str) -> bool:
     return cmd in ("pytest", "tox")
 
 
+_UV_TEST_SHORT_FLAGS_WITH_VALUE = frozenset({"C", "P", "b", "c", "f", "i", "p", "w"})
+# Keep these uv option tables in sync with agenttools_dev.cli's _UV_RUN_* copies.
+_UV_TEST_BOOLEAN_FLAGS = frozenset({
+    "--active",
+    "--all-extras",
+    "--all-groups",
+    "--all-packages",
+    "--compile-bytecode",
+    "--exact",
+    "--frozen",
+    "--gui-script",
+    "--help",
+    "--isolated",
+    "--locked",
+    "--managed-python",
+    "--module",
+    "--native-tls",
+    "--no-build",
+    "--no-build-isolation",
+    "--no-binary",
+    "--no-cache",
+    "--no-config",
+    "--no-default-groups",
+    "--no-dev",
+    "--no-editable",
+    "--no-env-file",
+    "--no-index",
+    "--no-managed-python",
+    "--no-progress",
+    "--no-project",
+    "--no-python-downloads",
+    "--no-sources",
+    "--no-sync",
+    "--offline",
+    "--only-dev",
+    "--refresh",
+    "--reinstall",
+    "--script",
+    "--upgrade",
+    "-U",
+    "-h",
+    "-m",
+    "-n",
+    "-q",
+    "-s",
+    "-v",
+})
+_UV_TEST_FLAGS_WITH_VALUE = frozenset({
+    "--allow-insecure-host",
+    "--build-constraint",
+    "--cache-dir",
+    "--color",
+    "--config-file",
+    "--config-setting",
+    "--config-settings-package",
+    "--constraint",
+    "--default-index",
+    "--directory",
+    "--env-file",
+    "--exclude-newer",
+    "--exclude-newer-package",
+    "--extra",
+    "--extra-index-url",
+    "--find-links",
+    "--fork-strategy",
+    "--group",
+    "--index",
+    "--index-strategy",
+    "--index-url",
+    "--keyring-provider",
+    "--link-mode",
+    "--no-binary-package",
+    "--no-build-isolation-package",
+    "--no-build-package",
+    "--no-extra",
+    "--no-group",
+    "--only-group",
+    "--package",
+    "--prerelease",
+    "--project",
+    "--python",
+    "--python-preference",
+    "--python-platform",
+    "--refresh-package",
+    "--reinstall-package",
+    "--resolution",
+    "--upgrade-package",
+    "--with",
+    "--with-editable",
+    "--with-requirements",
+})
+
+
 def _is_uv_test(segment: str) -> bool:
     """True when a segment is a `uv run … pytest`/`tox`/`python -m pytest|unittest` TEST run.
 
@@ -562,21 +702,83 @@ def _is_uv_test(segment: str) -> bool:
         return False
     if len(toks) < 3 or toks[0] != "uv" or toks[1] != "run":
         return False
-    i = 2
-    _UV_OPTS_WITH_ARG = (
-        "--with", "--with-editable", "--python", "-p", "--project", "--directory", "--env-file",
-    )
-    while i < len(toks) and toks[i].startswith("-"):
-        opt = toks[i]
-        i += 1
-        if opt in _UV_OPTS_WITH_ARG and i < len(toks):
-            i += 1  # skip the option's operand
-    if i >= len(toks):
+    for i in _uv_test_payload_starts(toks, 2):
+        if i >= len(toks):
+            continue
+        cmd = toks[i]
+        if cmd in ("pytest", "tox"):
+            return True
+        if cmd == "python" and toks[i + 1:i + 3] in (["-m", "pytest"], ["-m", "unittest"]):
+            return True
+    return False
+
+
+def _uv_test_payload_starts(toks: list[str], index: int) -> Iterable[int]:
+    pending = [index]
+    visited: set[int] = set()
+    yielded: set[int] = set()
+    while pending:
+        cursor = min(pending.pop(), len(toks))
+        if cursor in visited:
+            continue
+        visited.add(cursor)
+        while cursor < len(toks):
+            opt = toks[cursor]
+            if opt == "--":
+                cursor += 1
+                break
+            if opt == "-" or not opt.startswith("-"):
+                break
+            if opt.startswith("--"):
+                flag = opt.split("=", 1)[0]
+                if "=" in opt:
+                    cursor += 1
+                elif flag in _UV_TEST_FLAGS_WITH_VALUE:
+                    cursor += 2
+                elif flag in _UV_TEST_BOOLEAN_FLAGS:
+                    cursor += 1
+                else:
+                    pending.append(cursor + 2)
+                    cursor += 1
+            elif _uv_test_short_flag_takes_following_value(opt):
+                cursor += 2
+            elif _uv_test_short_flag_has_attached_value(opt):
+                cursor += 1
+            elif _uv_test_short_flag_is_known_boolean(opt):
+                cursor += 1
+            else:
+                pending.append(cursor + 2)
+                cursor += 1
+        cursor = min(cursor, len(toks))
+        if cursor not in yielded:
+            yielded.add(cursor)
+            yield cursor
+
+
+def _uv_test_short_flag_takes_following_value(token: str) -> bool:
+    if token.startswith("--") or not token.startswith("-") or token == "-":
         return False
-    cmd = toks[i]
-    if cmd in ("pytest", "tox"):
-        return True
-    return cmd == "python" and toks[i + 1:i + 3] in (["-m", "pytest"], ["-m", "unittest"])
+    flags = token[1:]
+    for pos, flag in enumerate(flags):
+        if flag in _UV_TEST_SHORT_FLAGS_WITH_VALUE:
+            return pos == len(flags) - 1
+    return False
+
+
+def _uv_test_short_flag_has_attached_value(token: str) -> bool:
+    if token.startswith("--") or not token.startswith("-") or token == "-":
+        return False
+    flags = token[1:]
+    return any(
+        flag in _UV_TEST_SHORT_FLAGS_WITH_VALUE and pos < len(flags) - 1
+        for pos, flag in enumerate(flags)
+    )
+
+
+def _uv_test_short_flag_is_known_boolean(token: str) -> bool:
+    if token.startswith("--") or not token.startswith("-") or token == "-":
+        return False
+    return all(f"-{flag}" in _UV_TEST_BOOLEAN_FLAGS for flag in token[1:])
 
 
 def _is_all_read_only(command: str) -> bool:

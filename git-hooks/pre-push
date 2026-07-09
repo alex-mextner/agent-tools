@@ -11,6 +11,26 @@ cd "$ROOT"
 
 echo "pre-push: running full test suite..."
 
+# The fallback branches below are tests-only too; this replaces the full-suite test command,
+# not lint/typecheck gates (those belong in pre-commit for this portable hook).
+if [ -f "$ROOT/rig.yaml" ] && command -v dev >/dev/null 2>&1 && dev --agenttools-dev-probe >/dev/null 2>&1; then
+  if dev has-script --repo-only test >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "$status" -eq 0 ]; then
+    echo "pre-push → dev run --repo-only test"
+    dev run --repo-only test || { echo "FAIL: tests"; exit 1; }
+    echo "pre-push: OK"
+    exit 0
+  fi
+  if [ "$status" -ne 1 ]; then
+    echo "FAIL: dev has-script --repo-only test failed; refusing to guess a fallback test runner"
+    exit 1
+  fi
+fi
+
 if [ -f "$ROOT/package.json" ]; then
   if [ -f "$ROOT/bun.lockb" ] || [ -f "$ROOT/bunfig.toml" ]; then PM="bun run";
   elif [ -f "$ROOT/pnpm-lock.yaml" ]; then PM="pnpm run";

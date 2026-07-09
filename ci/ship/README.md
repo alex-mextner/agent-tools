@@ -28,6 +28,17 @@ Then it squash-merges, deletes the remote branch, removes the local branch+workt
 (unless you're *inside* that worktree — then it's left so your session keeps a cwd), and
 fast-forwards your main checkout.
 
+When ship decides CI is structurally unavailable and runs its local fallback gates, the
+test runner first prefers `dev run --repo-only test` if the repo has a committed `rig.yaml`,
+that file declares top-level `scripts.test`, and `dev` is on PATH. Probe/runtime errors from
+`dev has-script --repo-only test` block instead of silently guessing a fallback runner. If
+the repo script is absent, ship falls back to the portable pyproject/package/Cargo
+auto-detection in `ship.sh`. If `dev` is installed, install it with its runtime dependencies
+(`agenttools-config`/PyYAML); repos with `rig.yaml` fail closed on dependency or config errors
+so a declared script is not bypassed by auto-detection. A PATH `dev` must answer the hidden
+`dev --agenttools-dev-probe`; unrelated tools named `dev` are ignored and ship falls back to
+stack detection.
+
 ## Quick start
 
 ```bash
