@@ -79,23 +79,33 @@ These are the *logical* points; map them to your harness's actual tool-use event
 > Codex `pre-agent` is **not** mapped yet: `SubagentStart` / `SubagentStop` need a
 > trustworthy payload fixture before this catalog can safely enforce that point.
 
+> **opencode:** opencode also needs a carrier bridge. `lib/opencode_hook_bridge` ships a
+> JavaScript plugin plus Python dispatcher: rig symlinks the plugin into
+> `~/.config/opencode/plugins/`, and the plugin calls the dispatcher for
+> `tool.execute.before` (`bash` -> `pre-bash`, `edit`/`write`/`apply_patch` -> `pre-write`,
+> `task` -> `pre-agent`) and `tool.execute.after` file edits (`post-write`). It reads
+> descriptors from `~/.config/opencode/hooks` and blocks by throwing an opencode plugin
+> error when a v1 hook exits 10. opencode `stop` is **not** mapped: documented session
+> events such as `session.idle` are notifications, not a pre-stop block contract.
+
 | point          | fires when…                                  | hooks                                   |
 | -------------- | -------------------------------------------- | --------------------------------------- |
-| `pre-agent` **(bridge-ready; NOT yet live in CC — needs the rig-cli `Agent\|Task` matcher; NOT mapped in Codex yet)** | before a subagent dispatch (Agent/Task tool) | background-subagent-gate                 |
+| `pre-agent` **(live in Claude Code and opencode when rig provisions their bridges; NOT mapped in Codex yet)** | before a subagent dispatch (Agent/Task/opencode task tool) | background-subagent-gate                 |
 | `pre-bash`     | before a shell command runs                  | block-no-verify, block-raw-pr-merge, block-reset-hard, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash, orchestrator-stays-thin, no-long-inline-process, subagent-no-bg-longproc, no-shell-file-edit, skills-read-gate, visual-proof-gate, decision-request-format |
 | `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env, orchestrator-stays-thin, worktree-only-writes |
 | `post-write`   | after a file write/edit has landed on disk   | format-on-write, lint-on-write          |
 | `stop`         | when the agent is about to end its turn      | stop-completion-selfcheck               |
 
-### `pre-agent` — gate a subagent dispatch (bridge-ready; NOT yet live in CC — needs the rig-cli `Agent|Task` matcher)
+### `pre-agent` — gate a subagent dispatch
 
 `pre-agent` fires before the orchestrator dispatches a subagent (CC's `Agent`/`Task` tool),
 so a hook can shape *how* work is fanned out — block a non-trivial **foreground** dispatch and
 require `run_in_background: true` (or a Workflow). The bridge maps it from CC's `PreToolUse`
 on `Agent`/`Task` and forwards CC's `agent_id`/`agent_type` (present only inside a dispatched
 subagent) into `args`, so a subagent-exempt gate can tell the orchestrator's dispatch apart
-from a worker's. For CC to fire this point, rig-cli must wire an `Agent|Task` PreToolUse
-matcher (a rig-cli follow-up; the bridge half lives here).
+from a worker's. opencode maps its `task` tool to the same logical point, but does not expose
+a trusted subagent identity in the plugin payload, so forged `agent_id` / `agent_type` values
+inside tool args are stripped.
 
 ### `post-write` — react to a *completed* write
 
