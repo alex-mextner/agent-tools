@@ -57,14 +57,19 @@ A merge-blocking gate must not run a script the PR can edit. This gate also need
 add a build/test/install step to that workflow — that would execute PR code under the
 privileged trigger.
 
-**Fail-closed on a missing diff base (agent-tools#129).** The added-lines diff is the
-three-dot `base...HEAD`, which needs a real **merge-base**. A `--depth=1` head shares no
-common ancestor with the base, so the workflow now fetches enough head history and
-**verifies a merge-base exists**, failing the gate if it can't — a blocking gate must not
-silently scan nothing. The script likewise fails closed: it computes the lines into a temp
-file and checks the exit status instead of reading them through a process substitution that
-swallowed `git diff` errors, and it refuses an explicitly-requested base that doesn't
-resolve (rather than falling back to a full-tree flood).
+**Fail-closed on a missing diff base (agent-tools#129/#130).** The official workflow fetches
+the base and PR head with enough history for a real three-dot `base...HEAD` diff, verifies
+that a merge-base exists, and fails before running the script if the added-lines diff would be
+untrustworthy. The script keeps its own fallback for direct callers or older copied workflows:
+when both refs resolve but the merge-base is unreachable, it uses the conservative two-dot
+`base..HEAD` diff so it keeps scanning instead of passing on an empty scan. A truly
+uncomputable diff still fails closed. The script also computes the lines into a temp file and
+checks the exit status instead of reading them through a process substitution that swallowed
+`git diff` errors, and it refuses an explicitly-requested base that doesn't resolve (rather
+than falling back to a full-tree flood).
+
+Direct callers should treat the two-dot fallback as intentional fail-closed behavior: do not
+depend on an unreachable merge-base producing a no-op scan.
 
 ## Diff-scoped by default
 

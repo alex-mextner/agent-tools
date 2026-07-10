@@ -83,7 +83,6 @@ jobs:
       - name: Fetch the PR head commit as DATA (not checked out / not executed)
         # For push events there is no PR — audit the pushed tree in place (CHECKOUT_DIR=.).
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
         run: |
           set -eu
