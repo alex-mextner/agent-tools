@@ -14,8 +14,9 @@ Invariants (why a bypass here can't be self-authorized):
     rig.yaml a PR commits can redirect approval; only a rig.yaml in the real account home (a
     global, reviewed location) may override tg-ctl, else the lib's hard-coded trusted-paths
     allowlist (the real tg-ctl) is used.
-  * This module writes its OWN audit line for the hatch outcome (bypass:approved / bypass:denied),
-    so the record is single-source and testable in-process.
+  * In a real run this module writes its OWN audit line for the hatch outcome
+    (bypass:approved / bypass:denied), so the record is single-source and testable in-process.
+    In dry-run it writes no persistent audit; ship.sh prints the would-be audit line.
 
 Past bug: an earlier revision resolved tg-ctl from the repo worktree (cwd=os.getcwd()) and then
 from $HOME — both shipper/PR-controllable, letting a committed or env-pointed rig.yaml self-approve
@@ -86,6 +87,10 @@ def _float_env(name: str) -> float | None:
         return None
 
 
+def _truthy_env(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _audit(decision: str, reason: str) -> None:
     """Append one hatch-outcome audit line to SHIP_AUDIT_FILE. Best-effort: a logging failure
     must never change the ship decision, so all errors are swallowed. Mirrors the JSON shape of
@@ -112,6 +117,17 @@ def _audit(decision: str, reason: str) -> None:
         pass
 
 
+def _dry_run_denial_reason() -> str:
+    env_var = hatch_escalation.hatch_env_var(_HOOK_ID)
+    raw = os.environ.get(env_var)
+    justification = (raw or "").strip()
+    if not justification:
+        return f"{env_var} is blank; Telegram hatch escalation denied"
+    if justification.lower() in hatch_escalation._BARE_FLAG_VALUES:
+        return f"{env_var} needs a written justification, not bare {justification!r}"
+    return "dry-run: would request Telegram hatch escalation; no request sent"
+
+
 def main() -> int:
     ctx = {
         "pr": os.environ.get("SHIP_HATCH_PR", ""),
@@ -128,6 +144,10 @@ def main() -> int:
     margin_s = _float_env("SHIP_HATCH_PROCESS_MARGIN_S")
     if margin_s is not None:
         kw["process_margin_s"] = margin_s
+
+    if _truthy_env("SHIP_DRY_RUN"):
+        sys.stdout.write(f"{_VERDICT_DENIED} {_dry_run_denial_reason()}\n")
+        return 1
 
     result = hatch_escalation.request_hatch_approval(_HOOK_ID, ctx, cwd=resolve_home(), **kw)
     # Emit an explicit verdict SENTINEL on stdout (single-lined) as a POSITIVE approval signal.

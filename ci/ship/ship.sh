@@ -91,7 +91,8 @@
 #                          can redirect approval to a stub.
 #   SHIP_AUDIT_FILE        path for the review-quorum gate's audit JSONL (default
 #                          ~/.config/agent-tools/ship-audit.jsonl). One line is appended per
-#                          gated ship (authorized / bypass:approved / bypass:denied / refused).
+#                          non-dry-run gated ship (authorized / bypass:approved /
+#                          bypass:denied / refused); --dry-run prints the would-be audit.
 set -euo pipefail
 
 ORIG_PWD=$(pwd -P)
@@ -1014,10 +1015,11 @@ _review_quorum_audit_log() {
 # Ask Alex, live on Telegram, to approve a one-time review-quorum bypass, by invoking the
 # ci/ship/review_quorum_hatch.py helper (which delegates to the shared agenttools_hatch_escalation
 # lib exactly as the agent-hooks do). Called ONLY when RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM is set.
-# The helper prints a verdict SENTINEL + reason on stdout ("APPROVED …" / "DENIED …") and OWNS the
-# bypass:* audit line; its exit code: 0 approved, 1 requested-but-not-approved (blank/bare/denied/
-# timeout), 3 the shared lib could not be imported (fail-closed — e.g. ship.sh copied out of the
-# checkout). ship.sh authorizes ONLY on exit 0 AND a leading APPROVED sentinel.
+# The helper prints a verdict SENTINEL + reason on stdout ("APPROVED …" / "DENIED …") and owns the
+# non-dry-run bypass:* audit line; in dry-run it writes no persistent audit and ship.sh prints the
+# would-be audit preview. Its exit code: 0 approved, 1 requested-but-not-approved
+# (blank/bare/denied/timeout), 3 the shared lib could not be imported (fail-closed — e.g. ship.sh
+# copied out of the checkout). ship.sh authorizes ONLY on exit 0 AND a leading APPROVED sentinel.
 #
 # SECURITY: neither WHICH lib runs nor WHICH tg-ctl is asked is shipper-controllable. The helper
 # imports the lib from a fixed path, and resolves tg-ctl off the OS identity's REAL home
@@ -1034,6 +1036,7 @@ _review_quorum_hatch_check() {  # uses $TASK_CODE $QITER $QMODELS_N $PR
   SHIP_HATCH_CODE="${TASK_CODE:-}" \
   SHIP_HATCH_ITER="${QITER:-0}" \
   SHIP_HATCH_MODELS="${QMODELS_N:-0}" \
+  SHIP_DRY_RUN="$DRY_RUN" \
   python3 -I "$_SHIP_HATCH_PY"
 }
 
@@ -1057,10 +1060,10 @@ _review_quorum_refuse_or_hatch() {  # $1 = refusal summary
     exit 1
   fi
   # The helper prints a verdict SENTINEL on stdout ("APPROVED <reason>" / "DENIED <reason>") and
-  # writes its own bypass:approved / bypass:denied audit line. We authorize the bypass ONLY on a
-  # clean exit 0 AND a leading APPROVED sentinel: a fake or broken `python3` that merely exits 0
-  # without the sentinel then fails CLOSED (refuse), instead of being mistaken for approval — the
-  # same fail-closed posture the other gates have on a tool malfunction. (A shipper who fully
+  # writes its own non-dry-run bypass:approved / bypass:denied audit line. We authorize the bypass
+  # ONLY on a clean exit 0 AND a leading APPROVED sentinel: a fake or broken `python3` that merely
+  # exits 0 without the sentinel then fails CLOSED (refuse), instead of being mistaken for approval
+  # — the same fail-closed posture the other gates have on a tool malfunction. (A shipper who fully
   # controls the ship PROCESS's PATH can defeat any gate — fake `gh`, `review`, `git` — so this is
   # not a claim to withstand a hostile PATH; it removes the fail-OPEN asymmetry for a benign one.)
   local hrc=0 hout
@@ -1074,11 +1077,13 @@ _review_quorum_refuse_or_hatch() {  # $1 = refusal summary
   { echo "Refusing: review-quorum gate — ${summary}."
     echo "  A Telegram hatch escalation was requested but NOT approved: ${hreason:-no approval}."
     echo "  Obtain live approval, add more independent review iterations, or set SHIP_REVIEW_QUORUM=0 (ops off-switch)."; } >&2
-  # The real helper logs bypass:denied itself only when it emitted the DENIED sentinel; in every
-  # other case (fake/broken/absent interpreter, import-fail, unexpected verdict) it did NOT audit,
-  # so record the fail-closed bypass:denied here. Never double-write.
+  # The real helper logs bypass:denied itself only when it emitted the DENIED sentinel during a
+  # real run. Under --dry-run it deliberately writes nothing, so ask the shared audit helper to
+  # print the would-be audit line. In every other non-DENIED case (fake/broken/absent interpreter,
+  # import-fail, unexpected verdict), the helper did NOT audit, so record the fail-closed
+  # bypass:denied here. Never double-write.
   case "$hverdict" in
-    DENIED) : ;;
+    DENIED) [ "$DRY_RUN" = "1" ] && _review_quorum_audit_log "bypass:denied" "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "$hreason" ;;
     *) _review_quorum_audit_log "bypass:denied" "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "$hreason" ;;
   esac
   exit 1
