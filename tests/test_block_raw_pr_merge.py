@@ -346,5 +346,213 @@ def test_hatch_inline_line_continuation_reaches_tg_ctl(tmp_path, monkeypatch):
     assert "ship gate down, manual verify done" in question.read_text()
 
 
+# ── bare-newline command separator: a merge on the 2nd line must not evade detection ────────
+
+
+def test_bare_newline_second_line_merge_is_detected(monkeypatch):
+    """A BARE newline separates commands in shell, so `echo ok`+newline+`gh pr merge 1` is a real
+    raw merge on the second line and must BLOCK. shlex consumes a bare newline as whitespace, so
+    without normalizing it to a `;` separator the two lines collapse into one `echo`-headed
+    segment and the merge evades the gate (Codex review on #231)."""
+    out, _err, code = _run("echo ok\ngh pr merge 1 --admin", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_bare_newline_after_env_assignment_merge_is_detected(monkeypatch):
+    """`cd repo`+newline+`gh pr merge` — the merge on the second line is still detected."""
+    out, _err, code = _run("cd repo\ngh pr merge 7 --squash", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_newline_inside_quoted_message_is_not_a_merge(monkeypatch):
+    """A newline INSIDE a quoted argument must NOT be treated as a command separator — a two-line
+    commit message merely mentioning a merge is not a `gh pr merge` invocation and must ALLOW."""
+    out, _err, code = _run('git commit -m "line one\ngh pr merge in prose"', monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_comment_on_first_line_does_not_swallow_second_line_merge(monkeypatch):
+    """A `#` comment runs only to the END OF ITS LINE. `echo ok # comment`+newline+`gh pr merge`
+    must still BLOCK the merge on the second line. A naive `newline → ;` normalization that ignores
+    comments regresses here: shlex then treats `#` as a comment to end-of-INPUT and swallows the
+    merge, ALLOWING it (Codex review on the bare-newline follow-up)."""
+    out, _err, code = _run("echo ok # comment\ngh pr merge 1 --admin", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_comment_containing_a_merge_on_one_line_is_not_a_merge(monkeypatch):
+    """A `#` comment that merely MENTIONS a merge on a single line is not a real invocation and must
+    ALLOW — the comment (incl. any `;`/`gh pr merge` text inside it) is stripped to end of line."""
+    out, _err, code = _run("echo done # then gh pr merge 5 --admin", monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "g\\\nh pr merge 1 --admin",  # continuation INSIDE `gh`
+        "gh p\\\nr merge 1 --admin",  # continuation INSIDE `pr`
+        "gh pr m\\\nerge 1 --admin",  # continuation INSIDE `merge`
+    ],
+)
+def test_line_continuation_inside_the_command_word_is_detected(command, monkeypatch):
+    """A `\\`-newline is REMOVED by the shell (the parts join with NO space), so `g\\`+newline+`h pr
+    merge` executes as `gh pr merge`. Normalizing the continuation to a SPACE instead would split it
+    into `g h pr merge` (argv[0] == 'g') and ALLOW the raw merge — the continuation must be removed,
+    not spaced (Codex review on the bare-newline follow-up)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_escaped_quote_outside_quotes_does_not_spoof_quote_state(monkeypatch):
+    r"""A backslash-escaped `\"` is a LITERAL `"`, not an opening quote. `echo \"`+newline+`gh pr
+    merge 1\"` runs a real merge on the second line; a scanner that ignores the `\` would treat the
+    `"` as opening a quote, swallow the newline as quoted content, and ALLOW the merge (Codex review
+    on the bare-newline follow-up)."""
+    out, _err, code = _run('echo \\"\ngh pr merge 1 \\"', monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_escaped_quote_inside_double_quotes_does_not_close_the_string(monkeypatch):
+    r"""Inside a double-quoted string a `\"` is an escaped literal `"` that does NOT close the
+    string. `echo "a \" b"`+newline+`gh pr merge 1`: the string closes at the SECOND real `"`, the
+    newline is then unquoted and separates the real merge on line 2 — must BLOCK."""
+    out, _err, code = _run('echo "a \\" b"\ngh pr merge 1 --admin', monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo foo#bar && gh pr merge 1 --admin",  # mid-word `#`, same-line `&&` merge
+        "echo foo#bar\ngh pr merge 1 --admin",  # mid-word `#`, second-line merge
+        "echo http://x/#frag\ngh pr merge 1 --admin",  # `#` fragment in a URL, second-line merge
+    ],
+)
+def test_midword_hash_is_not_a_comment_and_does_not_hide_merge(command, monkeypatch):
+    """A `#` that is NOT at a word boundary (`foo#bar`, a URL `#frag`) is LITERAL in a real shell,
+    not a comment. shlex's default commenter would truncate the whole line at that `#` and drop a
+    following `gh pr merge`, allowing it. Must BLOCK (Codex review on the bare-newline follow-up)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_escaped_space_before_hash_does_not_start_a_comment(monkeypatch):
+    r"""An ESCAPED space (`foo\ `) is a literal space still INSIDE the word, so a following `#` is
+    NOT a comment boundary. `echo foo\ # x ; gh pr merge 1` runs the merge in a real shell; a
+    scanner keying comment-start off the last emitted char (a space) would wrongly treat `#` as a
+    comment, drop the rest, and ALLOW the merge (Codex review on the bare-newline follow-up)."""
+    out, _err, code = _run("echo foo\\ # x ; gh pr merge 1 --admin", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat <<EOF\ngh pr merge 1 --admin\nEOF",  # body text is not a command
+        "cat <<'EOF'\ngh pr merge 1\nEOF",  # quoted delimiter
+        "git commit -F - <<-EOF\n\tgh pr merge 1 in the message\n\tEOF",  # `<<-` tab-stripped
+    ],
+)
+def test_heredoc_body_mentioning_merge_is_not_blocked(command, monkeypatch):
+    """A `gh pr merge` inside a HEREDOC BODY is document text, not an executed command, and must
+    ALLOW — the body's newlines must not be split into `;` segments (Codex review on the follow-up)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_real_merge_before_a_heredoc_is_still_detected(monkeypatch):
+    """The heredoc skip must not blind the gate to a REAL merge on the SAME line before the body."""
+    out, _err, code = _run("gh pr merge 1 --admin <<EOF\nunrelated body\nEOF", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_real_merge_after_a_heredoc_is_still_detected(monkeypatch):
+    """A real merge on a line AFTER the heredoc terminator must still be detected."""
+    out, _err, code = _run("cat <<EOF\nbody\nEOF\ngh pr merge 1 --admin", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_punctuated_heredoc_delimiter_does_not_hide_a_later_merge(monkeypatch):
+    """A punctuated delimiter (`EOF-MSG`) must be captured WHOLE. Capturing only `EOF` would never
+    match the real `EOF-MSG` terminator, skip to end of input, and hide the real merge on the line
+    AFTER the heredoc — the exact bypass this gate prevents (Codex review on the follow-up)."""
+    out, _err, code = _run(
+        "cat <<EOF-MSG\nbody mentions gh pr merge\nEOF-MSG\ngh pr merge 1 --admin", monkeypatch
+    )
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_punctuated_heredoc_delimiter_body_is_still_skipped(monkeypatch):
+    """The whole-word delimiter capture must still skip the body of a punctuated-delimiter heredoc:
+    a `gh pr merge` inside the body is document text and must ALLOW."""
+    out, _err, code = _run("cat <<EOF-MSG\ngh pr merge 1 in body\nEOF-MSG", monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+@pytest.mark.parametrize(
+    "opener",
+    [
+        "<<\\EOF",  # escaped delimiter — terminates on `EOF`
+        '<<E"OF"',  # mixed quoting within the word — terminates on `EOF`
+        "<<'EOF'",  # fully single-quoted
+    ],
+)
+def test_quote_removed_heredoc_delimiter_does_not_hide_a_later_merge(opener, monkeypatch):
+    r"""The delimiter word is quote-removed the way the shell does (`\EOF`, `E"OF"`, `'EOF'` all
+    terminate on `EOF`). Capturing the raw form would never match the `EOF` terminator, skip the
+    body to end of input, and hide the real merge after the heredoc (Codex review on the follow-up)."""
+    out, _err, code = _run(f"cat {opener}\nbody\nEOF\ngh pr merge 1 --admin", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "(( 1 << 2 ))\ngh pr merge 1 --admin",  # arithmetic left-shift, NOT a heredoc opener
+        "echo $((1 << 2))\ngh pr merge 1 --admin",  # arithmetic expansion
+    ],
+)
+def test_arithmetic_left_shift_is_not_a_heredoc(command, monkeypatch):
+    """`<<` inside `(( … ))` / `$(( … ))` is a left-shift operator, not a heredoc. Mis-reading it as
+    a heredoc opener and skipping to a never-found terminator would swallow the real merge on the
+    next line and ALLOW it. Must BLOCK (Codex review on the bare-newline follow-up)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo $(true)\ngh pr merge 1 --admin",  # prior line ends in `)` from command substitution
+        "(echo x)\ngh pr merge 1 --admin",  # prior line ends in `)` from a subshell
+    ],
+)
+def test_prior_line_ending_in_paren_does_not_glue_the_separator(command, monkeypatch):
+    """The inserted `;` must be a standalone split point. If a prior line ends in `)`, gluing it to
+    `;` yields a `);` punctuation run that `_split_segments` does not treat as a separator, keeping
+    the merge in the previous segment and ALLOWING it. Must BLOCK (Codex review on the follow-up)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-v"]))
