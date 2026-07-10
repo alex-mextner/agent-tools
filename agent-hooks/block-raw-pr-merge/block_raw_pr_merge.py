@@ -260,15 +260,52 @@ def _read_heredoc(command: str, i: int) -> tuple[str, bool, bool, int] | None:
     return delim, dash, quoted, end
 
 
+def _extract_expanding_substitutions(text: str) -> list[str]:
+    r"""Extract `$( … )` and backtick bodies from UNQUOTED-heredoc-body text. In such a body quotes
+    (`'`, `"`) and `#` are LITERAL DATA and only `$( … )` / backticks (and `$var`, not detected)
+    EXPAND — unlike a normal command line. So, unlike `_extract_command_substitutions`, this does
+    NOT suppress single-quoted spans or strip comments; it only honours a backslash escape (`\$`,
+    `` \` `` prevent expansion). This closes the asymmetry where `# $(gh pr merge 1)` /
+    `'$(gh pr merge 1)'` in an unquoted heredoc body were wrongly allowed (coordinator ship review)."""
+    subs: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:  # `\$` / `` \` `` → escaped, no expansion
+            i += 2
+            continue
+        if ch == "$" and i + 1 < n and text[i + 1] == "(":
+            inner, i = _read_paren_substitution(text, i + 2)
+            subs.append(inner)
+            continue
+        if ch == "`":
+            inner, i = _read_backtick_substitution(text, i + 1)
+            subs.append(inner)
+            continue
+        i += 1
+    return subs
+
+
 def _body_line_is_merge(line: str, quoted: bool) -> bool:
     """True iff a SKIPPED heredoc body line should be salvaged as a merge. For a QUOTED (literal)
     delimiter only an ARGV-position merge line counts (`$( … )` in the body is literal, not
-    executed). For an UNQUOTED delimiter the body IS expanded, so a `$( … )`/backtick that runs a
-    merge counts too — `_command_contains_gh_pr_merge(...) is True` (strict, so a parse failure like
-    a `don't` apostrophe returns None and is NOT salvaged) (codex reviews 3 & 4)."""
+    executed). For an UNQUOTED delimiter the body IS expanded, so an argv-position merge OR a
+    `$( … )` / backtick that runs a merge counts too. The expansion scan uses
+    `_extract_expanding_substitutions` (quotes and `#` are literal DATA in a heredoc body — only
+    `$()`/backticks expand), so `# $(gh pr merge 1)` and `'$(gh pr merge 1)'` are caught while a
+    prose/apostrophe line without a substitution is not (codex reviews 3 & 4; coordinator review)."""
     if quoted:
         return _line_has_executable_merge(line)
-    return _command_contains_gh_pr_merge(line) is True
+    if _line_has_executable_merge(line):
+        return True
+    # Fail CLOSED (`is not False`, not `is True`): a merge-like but unparseable expanded body (an
+    # unbalanced quote inside `$( … )`) returns None and must still BLOCK, matching the top-level
+    # `return sub` fail-closed contract — otherwise `$(gh pr merge 1 "x)` in an unquoted heredoc
+    # would slip through (Opus ship review). A benign unparseable body returns False and passes.
+    return any(
+        _command_contains_gh_pr_merge(inner) is not False
+        for inner in _extract_expanding_substitutions(line)
+    )
 
 
 def _skip_heredoc_bodies(
@@ -446,11 +483,15 @@ def _split_segments(command: str) -> list[list[str]]:
     lex = shlex.shlex(command, posix=True, punctuation_chars=True)
     lex.whitespace_split = False
     # Keep chars that are LITERAL inside a shell word but not already word-chars as part of the
-    # token, so a gh-api field value does not fragment: without this, `punctuation_chars=True`
-    # splits `-F query=@merge.graphql` into `query=`, `@`, `merge.graphql`, and `_gh_api_endpoint`
-    # then reads `@` as the endpoint instead of `graphql`, MISSING a file-backed graphql merge
-    # (codex review 5). Separators (`;&|()<>`) live in punctuation_chars and are unaffected.
-    lex.wordchars += "@:,{}%+"
+    # token, so a gh-api field/flag value does not fragment: without this, `punctuation_chars=True`
+    # splits `-F query=@merge.graphql` into `query=`, `@`, `merge.graphql` (→ `_gh_api_endpoint`
+    # reads `@` as the endpoint, codex review 5) and `--method=$METHOD` into `--method=`, `$`,
+    # `METHOD` (→ the glued-value regex sees an empty method and the shell-expanded `$METHOD` slips
+    # through, coordinator ship review). Adding `$` keeps `--method=$METHOD` / `query=$Q` whole so
+    # the unprovable-value checks fire. A `$( … )` command substitution is still detected by the raw
+    # `_extract_command_substitutions` scan (independent of shlex). Separators (`;&|()<>`) live in
+    # punctuation_chars and are unaffected.
+    lex.wordchars += "@:,{}%+$"
     # `_normalize_newlines` already stripped real (word-boundary, to-end-of-line) `#` comments, so
     # shlex's own commenter must be OFF — otherwise it truncates a MID-WORD `#` (literal in a real
     # shell) to end of input, e.g. `echo foo#bar && gh pr merge 1` would parse as just `['echo',
@@ -556,8 +597,14 @@ def _rest_method_is_unprovable(rest: list[str]) -> bool:
         if a in ("-X", "--method") and j + 1 < len(rest) and value_is_expansion(rest[j + 1]):
             return True
         m = re.match(r"^(?:--method|-X)=(.*)$", a)
-        if m and value_is_expansion(m.group(1)):
-            return True
+        if m:
+            val = m.group(1)
+            # An EMPTY glued value (`--method=` / `-X=`) means the real value was fragmented off by
+            # a `$( … )` / backtick that the tokenizer split away (e.g. `--method=`+`` ` ``+`echo`);
+            # on a merge endpoint that method is unprovable → fail closed (codex ship review). A `$`
+            # stays glued via wordchars, so this fires for the backtick-fragmented form.
+            if val == "" or value_is_expansion(val):
+                return True
         if a.startswith("-X") and len(a) > 2 and value_is_expansion(a[2:]):  # glued `-X$METHOD`
             return True
     return False

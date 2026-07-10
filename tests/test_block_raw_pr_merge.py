@@ -1032,6 +1032,65 @@ def test_gh_api_graphql_filebacked_query_with_flags_before_endpoint_is_blocked(c
     assert _decision(out) == "block"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api repos/o/r/pulls/1/merge --method=$METHOD",  # glued long form, shell var
+        "gh api repos/o/r/pulls/1/merge -X=$METHOD",  # glued -X= form
+        "gh api repos/o/r/pulls/1/merge --method=$(echo PUT)",  # glued, substitution
+    ],
+)
+def test_gh_api_rest_merge_with_glued_unprovable_method_fails_closed(command, monkeypatch):
+    """A GLUED shell-expanded method on a literal merge endpoint (`--method=$METHOD`, `-X=$METHOD`)
+    must fail closed and BLOCK — the `$` must not fragment the token into an empty method value that
+    slips through (coordinator ship review P1)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api repos/o/r/pulls/1/merge --method=`echo PUT`",  # glued long backtick method
+        "gh api repos/o/r/pulls/1/merge -X=`echo PUT`",  # glued -X= backtick method
+    ],
+)
+def test_gh_api_rest_merge_with_glued_backtick_method_fails_closed(command, monkeypatch):
+    """A GLUED backtick method value (`--method=\\`echo PUT\\``) fragments to an EMPTY `--method=`
+    token; on a merge endpoint that empty/unprovable method must fail closed and BLOCK, not slip
+    through (codex ship review round 2)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_unquoted_heredoc_unparseable_substitution_fails_closed(monkeypatch):
+    """An unquoted heredoc body whose `$( … )` is merge-like but UNPARSEABLE (an unbalanced quote
+    inside) must fail CLOSED and BLOCK — matching the top-level contract, not fail open (Opus ship
+    review round 2)."""
+    out, _err, code = _run('cat <<EOF\n$(gh pr merge 1 "x)\nEOF', monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat <<EOF\n# $(gh pr merge 1)\nEOF",  # `#` is LITERAL data in an unquoted heredoc body
+        "cat <<EOF\n'$(gh pr merge 1)'\nEOF",  # `'` is LITERAL data; $() still expands
+    ],
+)
+def test_unquoted_heredoc_literal_hash_or_quote_still_expands_substitution(command, monkeypatch):
+    """In an UNQUOTED heredoc body a `#` and `'` are literal DATA while `$( … )` STILL EXPANDS and
+    executes — so `# $(gh pr merge 1)` / `'$(gh pr merge 1)'` run the merge and must BLOCK. The body
+    scan must not comment-strip or single-quote-inert an unquoted heredoc body (coordinator ship
+    review P1; mirrors the confirmed asymmetry where bare `$(gh pr merge 1)` already blocks)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
 def test_unparseable_substitution_body_with_parseable_top_level_fails_closed(monkeypatch):
     """When the TOP-LEVEL command parses but a command-substitution BODY is merge-like yet
     unparseable (an unbalanced quote), the fail-closed `return sub` (None) branch must BLOCK — the
