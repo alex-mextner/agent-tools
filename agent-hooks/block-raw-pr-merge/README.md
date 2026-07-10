@@ -4,16 +4,39 @@
 
 Denies a shell command that merges a PR directly and bypasses the ship gate:
 
-- `gh pr merge <PR>` (squash/merge/rebase, any flags)
+- `gh pr merge <PR>` (squash/merge/rebase, any flags; `gh -R o/r pr merge` too)
 - `gh pr merge --admin <PR>` (the admin bypass is the most dangerous case)
+- `gh api …/pulls/<n>/merge` with a write method (`-X PUT` / `--method POST`) — the REST merge route
+- `gh api graphql` running a `mergePullRequest` / `enablePullRequestAutoMerge` mutation (inline, or
+  a file/stdin-backed query, which is over-blocked because it can't be inspected at pre-exec time)
+- any of the above behind a **wrapper** command (`env gh pr merge`, `sudo … gh pr merge`,
+  `timeout 60 gh pr merge`, `nohup`, `command`, …) — the wrapped `gh` is still an invoked merge
+- any of the above wrapped in a **command substitution** — `` `gh pr merge 1` ``, `$(gh pr merge 1)`,
+  `echo "$(gh pr merge 1)"` (executed even inside double quotes), or a process substitution
+  `<(gh pr merge 1)` — the substitution body is extracted and re-scanned. A `$( … )` inside a `#`
+  comment or a **quoted** heredoc body (`<<'EOF'`) is NOT executed and stays allowed; an **unquoted**
+  heredoc body (`<<EOF`) IS expanded, so a merge substitution there is blocked
 
 Lets the sanctioned merge path through:
 
 - `gh ship <PR>` (and a `gh alias` that runs ship)
 - `pr-ship.sh` / `ship.sh` (the script the ship alias points at)
 - any non-merge `gh pr` subcommand (`view`, `list`, `checkout`, `create`, `comment`, …)
-- a **prose mention** of `gh pr merge` — in an argument, a commit message, or a heredoc body —
-  where `gh` is not the command word (argv[0]) of a segment
+- a non-merge `gh api` call: a GET on `…/pulls/<n>/merge` (a merge-**status read**, no write method),
+  or an **inline** `gh api graphql` **read** query with no `$` (`-f query='query { … }'`, no merge
+  mutation). A query whose value contains any `$` — a GraphQL variable (`query($owner:…){…}`) OR a
+  shell expansion (`"$Q"`) — is over-blocked (see below): the two are indistinguishable once the
+  shell strips quotes, so the safe choice is to block both
+- a **prose mention** of a merge route — in an argument, a commit message, or a heredoc body — where
+  `gh` is not the command word (argv[0]) of a segment (`tg "…gh pr merge…"`, `echo mergePullRequest`)
+
+**Over-block on an uninspectable graphql query:** a `gh api graphql` whose `query` value comes from a
+file (`-F query=@f`), stdin, or contains ANY `$`/backtick is blocked, because the hook cannot prove
+at pre-exec time that it carries no merge mutation. A shell expansion (`-f query="$Q"`) is genuinely
+opaque; a GraphQL variable (`-f query='query($owner:String!){ … }'`) is over-blocked too, since once
+the shell strips quotes it is indistinguishable from `"$Q"`. To run such a query, inline it with no
+`$` (spell out the values), or use `gh ship` / the Telegram hatch below. A shell-expanded REST method
+(`-X $METHOD`) on a `…/merge` endpoint is over-blocked for the same reason.
 
 ## Shell-faithful command parsing
 
@@ -21,6 +44,19 @@ Detection is argv-based: the command is normalized (quote-, escape-, comment- an
 and split into shell segments, and each segment's argv[0] is checked. This closes evasions that a
 naive parse misses — a merge on a **second line** (a bare newline is a command separator), after a
 `\`-newline continuation, behind a `#` comment on a prior line, or after a subshell/`$(...)`.
+
+Command/process substitutions (`$( … )`, backticks, `<( … )` / `>( … )`) execute their body — even
+`$( … )` and backticks **inside double quotes** — so each body is extracted (quote-aware:
+single-quoted spans suppress substitution and stay inert) and re-scanned with the same detector,
+recursively for nesting. This is why `echo "$(gh pr merge 1)"` blocks but `echo '$(gh pr merge 1)'`
+(single-quoted, inert) and `tg "…gh pr merge…"` (a plain string, no substitution) both pass.
+
+**Prose-mention allow vs. unparseable fail-closed:** the "prose mention is allowed" rule applies to
+a command that PARSES. If a command cannot be parsed (an unbalanced quote / shell syntax error) AND
+its raw text contains a merge-route keyword (`gh` + `pr merge` / `pulls/<n>/merge` / `mergePullRequest`
+/ `enablePullRequestAutoMerge`), it fails **closed** and is blocked — even a would-be prose mention —
+because the hook cannot prove it is not a merge. A benign unparseable command with no such keyword
+(`grep won't file`) still passes.
 
 **Deliberate over-block (accepted rare false-positive — the safe direction for a security gate):**
 a `gh pr merge` at the **executable position** of a **heredoc body line** is blocked, even though a
