@@ -13,8 +13,8 @@ test and still leave the watchdog silently non-functional in production.
 
 This test launches the real ``python -m agenttools_stall_watchdog watch`` CLI as a
 subprocess (no monkeypatching of time, no monkeypatching of ``Watchdog``) against a real
-file, with short (2s/4s) thresholds and a real (private-socket) tmux pane as the
-``--tmux-target``. It asserts:
+file whose mtime has been pushed into the past, with short (2s/4s) thresholds and a real
+(private-socket) tmux pane as the ``--tmux-target``. It asserts:
 
 * the WARN tier reaches the real pane as an ENGLISH nudge line (Tier-1 is agent-facing-only
   — Alex's tg#6967 correction, see ``actions.py`` module docstring), and
@@ -22,16 +22,16 @@ file, with short (2s/4s) thresholds and a real (private-socket) tmux pane as the
 
 How a real stall is actually simulated — the non-obvious part
 -------------------------------------------------------------
-The naive idea "backdate the watched file's mtime into the past so the first poll is
-instantly stale" does NOT work here, ON PURPOSE. ``core.Watchdog._observe`` clamps a
+Backdating the watched file's mtime proves the CLI handles the exact "old transcript" input,
+but it must NOT make the first poll instantly stale. ``core.Watchdog._observe`` clamps a
 PRE-EXISTING old mtime up to ``started_at`` (see core.py's ``_baseline`` clamp and the
 ``test_preexisting_stale_file_counts_from_watchdog_start_not_old_mtime`` unit test): a
 leftover log from a previous run must not make a freshly-started watch cross ``abort_after``
 on poll #1 and SIGKILL a process that just started. So staleness is measured from
-watchdog-START, not from the file's last write. A genuine stall is therefore simulated the
-only way it happens in production: start the watch, then let real wall-clock time pass with
-NO further writes to the file for longer than the (here scaled-down) thresholds. This test
-does exactly that — it really sleeps inside the subprocess's poll loop.
+watchdog-START, not from the file's last write. A genuine stall is therefore simulated by
+launching the real watch process against that backdated file, then letting real wall-clock
+time pass with NO further writes for longer than the scaled-down thresholds. This test does
+exactly that — it really sleeps inside the subprocess's poll loop.
 
 OPT-IN / hermeticity: like the real-tmux tests in ``test_agenttools_tmux_inject.py``, these
 run only when ``ASW_REAL_TMUX_TESTS`` is set (locally or a dedicated integration job), never
@@ -146,7 +146,12 @@ def test_real_cli_subprocess_fires_warn_nudge_and_aborts_on_a_real_stall(tmp_pat
     session, _tmux, shim = live_pane
 
     transcript = tmp_path / "agent-e2e.jsonl"
-    transcript.write_text("hello\n")  # mtime ~= now; staleness is measured from watch START
+    transcript.write_text("hello\n")
+    # Old enough to be unquestionably backdated, while still expecting Watchdog to clamp the
+    # first observation to process start rather than instantly crossing the abort threshold.
+    old_mtime = time.time() - 3600
+    os.utime(transcript, (old_mtime, old_mtime))
+    assert transcript.stat().st_mtime < time.time() - 300
 
     warn_after = 2.0
     abort_after = 4.0
@@ -173,6 +178,7 @@ def test_real_cli_subprocess_fires_warn_nudge_and_aborts_on_a_real_stall(tmp_pat
     # No `--pid`: this run doesn't need a real process to kill to prove tier delivery; the
     # subprocess's OWN exit code (2 on abort) is the abort-side proof instead. The watch loop
     # really sleeps through two poll intervals (past 2s -> WARN, past 4s -> ABORT).
+    started = time.monotonic()
     proc = subprocess.run(
         argv,
         cwd=_REPO_ROOT,
@@ -181,11 +187,16 @@ def test_real_cli_subprocess_fires_warn_nudge_and_aborts_on_a_real_stall(tmp_pat
         text=True,
         timeout=30,
     )
+    duration = time.monotonic() - started
 
     # --- Tier-2/ABORT: the real process must actually exit 2 -----------------------------
     assert proc.returncode == 2, (
         f"watchdog did not abort on a real stall past abort_after={abort_after}s; "
         f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert duration >= abort_after, (
+        "backdated pre-existing mtime caused an immediate abort instead of being clamped to "
+        f"watch start; duration={duration:.2f}s stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
     assert "ABORT" in proc.stdout, proc.stdout
     assert "WARN" in proc.stdout, "the WARN tier must fire before the ABORT tier does"
