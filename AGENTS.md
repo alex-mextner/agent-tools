@@ -177,8 +177,8 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   CLI / readable store all refuse). There is **NO self-service override flag** — a one-time bypass
   is requested via `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>"`, which asks Alex live
   on Telegram (shared `agenttools_hatch_escalation` lib) and proceeds ONLY on his real-time
-  approval. Disable the whole gate with `SHIP_REVIEW_QUORUM=0`. Every gated ship is audited to
-  `SHIP_AUDIT_FILE`;
+  approval. Disable the whole gate with `SHIP_REVIEW_QUORUM=0`. Every non-dry-run gated ship is
+  audited to `SHIP_AUDIT_FILE`; dry-runs print the would-be audit without writing it;
 - the local branch has **no unpushed/diverged commits** and a **clean worktree**.
 
 Then it squash-merges, deletes the remote branch, removes the local worktree + branch (unless

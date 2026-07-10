@@ -2404,7 +2404,7 @@ def _load_hatch_module():
 
 
 def _run_hatch_main(monkeypatch, tmp_path, *, request, resolve_home, audit,
-                    timeout="5", margin=None, trusted=None):
+                    timeout="5", margin=None, trusted=None, dry_run=None):
     """Call review_quorum_hatch.main() with resolve_home monkeypatched to a fixed dir and the
     hatch env set. Returns the exit code. `resolve_home` is the dir the helper will treat as the
     account's real home (where it looks for a rig.yaml tg_ctl_path override)."""
@@ -2425,6 +2425,10 @@ def _run_hatch_main(monkeypatch, tmp_path, *, request, resolve_home, audit,
     monkeypatch.setenv("SHIP_HATCH_TIMEOUT_S", timeout)
     if margin is not None:
         monkeypatch.setenv("SHIP_HATCH_PROCESS_MARGIN_S", margin)
+    if dry_run is None:
+        monkeypatch.delenv("SHIP_DRY_RUN", raising=False)
+    else:
+        monkeypatch.setenv("SHIP_DRY_RUN", dry_run)
     return mod.main()
 
 
@@ -2498,6 +2502,75 @@ def test_hatch_timeout_returns_1(tmp_path, monkeypatch):
         resolve_home=home, audit=audit, timeout="1", margin="1",
     )
     assert rc == 1, "a timed-out hatch must return 1"
+
+
+def test_hatch_dry_run_skips_tg_contact_and_audit(tmp_path, monkeypatch, capsys):
+    """A ship --dry-run with a hatch request must not send a live tg-ctl ask or append the
+    helper-owned bypass audit line."""
+    marker = tmp_path / "tg-called"
+    tg = _write_fake_tg_ctl(
+        tmp_path, name="tg-ctl",
+        body=f"touch {marker}\nprintf 'approved despite dry-run\\n'\nexit 0\n",
+    )
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_hatch_main(
+        monkeypatch, tmp_path,
+        request="Dry-run validation; must not ask Alex.",
+        resolve_home=home,
+        audit=audit,
+        dry_run="1",
+    )
+    out = capsys.readouterr().out
+    assert rc == 1, "dry-run must not approve a hatch because no live request was sent"
+    assert "DENIED" in out and "dry-run" in out, out
+    assert not marker.exists(), "dry-run hatch must NOT contact tg-ctl"
+    assert not audit.exists(), f"dry-run hatch must NOT write audit file: {audit.read_text()!r}"
+
+
+@pytest.mark.parametrize(
+    ("hatch_request", "expected"),
+    [
+        ("", "is blank"),
+        ("1", "needs a written justification"),
+        ("true", "needs a written justification"),
+    ],
+)
+def test_hatch_dry_run_still_validates_blank_and_bare_requests(
+    tmp_path, monkeypatch, capsys, hatch_request, expected
+):
+    """Dry-run suppresses side effects, not local validation of invalid hatch requests."""
+    tg = _write_fake_tg_ctl(
+        tmp_path, name="tg-ctl",
+        body="printf 'should not be called\\n'\nexit 0\n",
+    )
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_hatch_main(
+        monkeypatch, tmp_path,
+        request=hatch_request,
+        resolve_home=home,
+        audit=audit,
+        dry_run="1",
+    )
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert expected in out
+    assert "would request Telegram hatch escalation" not in out
+    assert not audit.exists()
+
+
+def test_hatch_truthy_env_contract(monkeypatch):
+    """The helper's env boolean parser is deliberately narrow and case-insensitive."""
+    mod = _load_hatch_module()
+    for value in ("1", "true", "TRUE", " yes ", "on", "On"):
+        monkeypatch.setenv("SHIP_DRY_RUN", value)
+        assert mod._truthy_env("SHIP_DRY_RUN")
+    for value in ("", "0", "false", "no", "off", "disabled"):
+        monkeypatch.setenv("SHIP_DRY_RUN", value)
+        assert not mod._truthy_env("SHIP_DRY_RUN")
+    monkeypatch.delenv("SHIP_DRY_RUN", raising=False)
+    assert not mod._truthy_env("SHIP_DRY_RUN")
 
 
 def test_hatch_helper_import_resists_pythonpath_hijack(tmp_path):
@@ -2660,7 +2733,8 @@ def _ship_copy_with_helper(tmp_path: Path, *, helper_exit, helper_msg=""):
     return ship_copy
 
 
-def _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy, *, request, audit=None):
+def _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy, *, request, audit=None,
+                             extra_args=(), env_extra=None):
     """Run a ship.sh copy against a SHORT bar (1/1) with a hatch request set."""
     env = dict(os.environ)
     env["PATH"] = _minimal_hermetic_path(gh, rv)
@@ -2675,7 +2749,10 @@ def _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy, *, request, audi
     env.pop("SHIP_HATCH_TIMEOUT_S", None)
     if audit is not None:
         env["SHIP_AUDIT_FILE"] = str(audit)
+    if env_extra:
+        env.update(env_extra)
     return _sh("bash", str(ship_copy), "1", "--skip-ci", "--no-screenshot-ok", "test",
+               *extra_args,
                cwd=main, env=env)
 
 
@@ -2704,6 +2781,60 @@ def test_ship_refuses_when_helper_denies(tmp_path):
     assert r.returncode != 0, f"helper exit 1 must refuse\n{r.stdout}\n{r.stderr}"
     assert "NOT approved" in r.stderr, r.stderr
     assert "[fake gh] merged" not in r.stdout
+
+
+def test_ship_dry_run_passes_marker_to_hatch_helper(tmp_path):
+    """ship.sh must tell the helper when --dry-run is active so the helper can avoid its own
+    tg-ctl and audit side effects."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    ship_copy = _ship_copy_with_helper(tmp_path, helper_exit=None)
+    log = tmp_path / "helper-dry-run-env.txt"
+    audit = tmp_path / "audit.jsonl"
+    (ship_copy.parent / "review_quorum_hatch.py").write_text(
+        "import os, pathlib, sys\n"
+        "pathlib.Path(os.environ['SHIP_TEST_HATCH_ENV_LOG']).write_text("
+        "os.environ.get('SHIP_DRY_RUN', '<unset>'), encoding='utf-8')\n"
+        "sys.stdout.write('DENIED dry-run wiring probe\\n')\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    r = _run_ship_copy_short_bar(
+        tmp_path, main, gh, rv, ship_copy,
+        request="Dry-run wiring probe.",
+        audit=audit,
+        extra_args=("--dry-run",),
+        env_extra={"SHIP_TEST_HATCH_ENV_LOG": str(log)},
+    )
+    assert r.returncode != 0, f"probe helper denies; ship should refuse\n{r.stdout}\n{r.stderr}"
+    assert log.read_text(encoding="utf-8") == "1"
+    assert "would append review-quorum audit: decision=bypass:denied" in r.stderr
+    assert not audit.exists(), "ship --dry-run must not write the real audit file"
+
+
+def test_ship_non_dry_run_passes_falsey_marker_to_hatch_helper(tmp_path):
+    """A normal ship must still reach the helper with a falsey dry-run marker."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    ship_copy = _ship_copy_with_helper(tmp_path, helper_exit=None)
+    log = tmp_path / "helper-dry-run-env.txt"
+    (ship_copy.parent / "review_quorum_hatch.py").write_text(
+        "import os, pathlib, sys\n"
+        "pathlib.Path(os.environ['SHIP_TEST_HATCH_ENV_LOG']).write_text("
+        "os.environ.get('SHIP_DRY_RUN', '<unset>'), encoding='utf-8')\n"
+        "sys.stdout.write('APPROVED normal wiring probe\\n')\n"
+        "sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    r = _run_ship_copy_short_bar(
+        tmp_path, main, gh, rv, ship_copy,
+        request="Normal wiring probe.",
+        env_extra={"SHIP_TEST_HATCH_ENV_LOG": str(log)},
+    )
+    assert r.returncode == 0, f"helper approves; ship should proceed\n{r.stdout}\n{r.stderr}"
+    assert log.read_text(encoding="utf-8") == "0"
 
 
 def test_ship_fails_closed_when_helper_unreachable(tmp_path):
