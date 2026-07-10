@@ -25,7 +25,20 @@ Allowed (let through):
   - `gh ship <PR>` / a `gh alias` that runs ship
   - `pr-ship.sh` / `ship.sh` (the script the ship alias points at)
   - any non-merge `gh pr` subcommand (view, list, checkout, create, comment, ...)
-  - commands whose body/arguments merely contain the text "gh pr merge" as a string
+  - a PROSE mention of "gh pr merge" as text — in an argument (`gh pr create --body "run gh
+    pr merge to land it"`), a commit message, or a heredoc body — where `gh` is NOT the
+    command word (argv[0]) of a segment / body line
+
+Deliberate over-block (a rare, accepted false-positive — the SAFE direction for a security gate):
+a `gh pr merge` sitting at the EXECUTABLE position (argv[0]) of a HEREDOC BODY line IS blocked,
+even though a heredoc body is data, not an executed command. This is defense-in-depth: the command
+parser cannot perfectly classify every shell construct, and a crafted heredoc can plant a matching
+terminator to make a real merge LOOK like body text (`(( 0 << merge ))` / `gh pr merge 1` / `merge`).
+Rather than chase every mis-classification, any executable-position `gh pr merge` on a skipped body
+line is re-injected and blocked. A legitimate heredoc almost never opens a line with a literal
+`gh pr merge`; a prose mention (gh not at argv[0]) still passes. This is a conscious divergence from
+the "heredoc bodies are pure data" convention, made because the cost of a bypass here is a gate
+breach and the cost of the false-positive is re-phrasing a heredoc (or using the Telegram hatch).
 
 External approval (replaces the OLD self-service escape hatch): there is NO
 `ALLOW_RAW_PR_MERGE`(+`_REASON`) env and NO `# no-ship-guard: <reason>` inline sentinel any
@@ -190,21 +203,27 @@ def _read_heredoc(command: str, i: int) -> tuple[str, bool, int] | None:
     return delim, dash, end
 
 
-def _skip_heredoc_bodies(command: str, i: int, delimiters: list[tuple[str, bool]]) -> int:
-    """Advance past the bodies of the heredocs opened on the just-ended line. `i` points at the
-    first body character (right after the line's newline). For each delimiter in order, consume
-    whole lines until a line whose content equals the delimiter (leading tabs ignored when the
-    heredoc used `<<-`).
+def _skip_heredoc_bodies(command: str, i: int, delimiters: list[tuple[str, bool]]) -> tuple[int, int]:
+    """Advance past the bodies of the heredocs opened on the just-ended line, returning
+    `(new_index, salvaged_merge_line_count)`. `i` points at the first body character (right after
+    the line's newline). For each delimiter in order, consume whole lines until a line whose content
+    equals the delimiter (leading tabs ignored when the heredoc used `<<-`).
 
-    FAIL-CLOSED: if a terminator line is NOT found ahead, skip NOTHING (return the original `i`).
-    That way a `<<` that was NOT really a heredoc opener — arithmetic left-shift `(( a << b ))`, or a
-    genuinely unterminated heredoc — does not swallow the rest of the input; the following lines are
-    scanned normally, so a real `gh pr merge` after it is still detected (a missed skip only
-    over-blocks a body-text mention, the SAFE direction; swallowing would be a BYPASS)."""
+    Two safety nets, both erring toward BLOCK:
+    - FAIL-CLOSED: if a terminator line is NOT found ahead, skip NOTHING (return the original `i`, 0).
+      A `<<` that was NOT really a heredoc opener — arithmetic left-shift, an unterminated heredoc —
+      then does not swallow the rest of the input; the following lines are scanned normally.
+    - DEFENSE-IN-DEPTH: every SKIPPED body line is still scanned for an executable `gh pr merge`
+      invocation, and each hit is counted. A crafted heredoc can plant a matching terminator AFTER a
+      real merge (`(( 0 << merge ))` / `gh pr merge 1` / `merge`) to skip past it — counting the
+      merge lines lets the caller re-inject a detectable merge so the gate still blocks. A merge at a
+      body line's executable position is over-blocked (safe); a plain prose mention is not counted."""
     n = len(command)
     pos = i
+    salvaged = 0
     for delim, dash in delimiters:
         found = False
+        local = 0
         while pos < n:
             nl = command.find("\n", pos)
             line_end = n if nl == -1 else nl
@@ -213,9 +232,17 @@ def _skip_heredoc_bodies(command: str, i: int, delimiters: list[tuple[str, bool]
             if (line.lstrip("\t") if dash else line) == delim:
                 found = True
                 break
+            # Count ONLY a line that parses to a genuine `gh pr merge` invocation (strict True). A
+            # parse failure returns None (e.g. an apostrophe in a commit-message heredoc, `don't`) —
+            # such a line is not a valid executable merge, so it must NOT be salvaged, else a normal
+            # commit-message heredoc that merely mentions a merge would be over-blocked (claude/gemini
+            # review). A real merge line always parses cleanly to True.
+            if _command_contains_gh_pr_merge(line) is True:
+                local += 1
         if not found:
-            return i
-    return pos
+            return i, 0
+        salvaged += local
+    return pos, salvaged
 
 
 def _normalize_newlines(command: str) -> str:  # noqa: C901 — a small quote/escape/comment scanner
@@ -243,11 +270,16 @@ def _normalize_newlines(command: str) -> str:  # noqa: C901 — a small quote/es
 
     Heredoc bodies (`cat <<EOF` … `EOF`) are NOT command lines, so they are skipped whole — else the
     body's newlines would become `;` separators and a `gh pr merge` mentioned in a commit-message
-    heredoc would be falsely blocked.
+    heredoc would be falsely blocked. Two backstops keep that from becoming a bypass: `<<` inside an
+    arithmetic context (`(( … ))` / `$(( … ))`) is a left-shift, NOT a heredoc opener (tracked by
+    `arith_depth`); and any executable `gh pr merge` on a SKIPPED body line is re-injected so the
+    gate still blocks (see `_skip_heredoc_bodies`), defeating a crafted `(( 0 << merge ))` / `gh pr
+    merge` / `merge` that plants a matching terminator after the real merge.
     """
     out: list[str] = []
     quote: str | None = None  # "'" or '"' when inside that quote
     boundary = True  # at an unquoted word boundary (where a `#` may start a comment)
+    arith_depth = 0  # inside `((`/`$((` — a `<<` there is left-shift, not a heredoc opener
     pending_heredocs: list[tuple[str, bool]] = []
     i, n = 0, len(command)
     while i < n:
@@ -276,6 +308,18 @@ def _normalize_newlines(command: str) -> str:  # noqa: C901 — a small quote/es
             while i < n and command[i] != "\n":  # comment → end of line (drop it)
                 i += 1
             continue
+        elif ch == "(" and i + 1 < n and command[i + 1] == "(":  # `((` / `$((` — arithmetic opens
+            arith_depth += 1
+            out.append("((")
+            boundary = True
+            i += 2
+            continue
+        elif ch == ")" and i + 1 < n and command[i + 1] == ")" and arith_depth > 0:
+            arith_depth -= 1
+            out.append("))")
+            boundary = True
+            i += 2
+            continue
         elif ch == "\n":
             # bare newline → command separator. Spaces around the `;` keep shlex from GLUING it to a
             # neighbouring punctuation char into one run — `echo $(true)`+newline+`gh pr merge` would
@@ -283,12 +327,21 @@ def _normalize_newlines(command: str) -> str:  # noqa: C901 — a small quote/es
             # the merge inside the `echo` segment and ALLOWING it (Codex review).
             out.append(" ; ")
             boundary = True
+            # A bare newline is a command boundary — reset arithmetic depth so an unbalanced or
+            # whitespace-split `((` (e.g. `(( x = 1 ) )`) cannot leave `arith_depth > 0` and pollute
+            # heredoc detection for the REST of the input (which could blind a later real merge or
+            # over-block a later heredoc). Arithmetic `(( … ))` never spans an unquoted newline in
+            # practice, so per-line scoping is both safe and correct (claude/gemini review).
+            arith_depth = 0
             i += 1
             if pending_heredocs:
-                i = _skip_heredoc_bodies(command, i, pending_heredocs)
+                i, salvaged = _skip_heredoc_bodies(command, i, pending_heredocs)
+                # Re-inject a detectable merge segment for each executable merge found on a skipped
+                # body line — so a crafted heredoc can't hide a real `gh pr merge` in its body.
+                out.append(" ; gh pr merge ; " * salvaged)
                 pending_heredocs = []
             continue
-        elif (heredoc := _read_heredoc(command, i)) is not None:
+        elif arith_depth == 0 and (heredoc := _read_heredoc(command, i)) is not None:
             delim, dash, i = heredoc
             pending_heredocs.append((delim, dash))
             boundary = False

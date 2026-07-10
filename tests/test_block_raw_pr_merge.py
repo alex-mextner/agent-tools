@@ -459,14 +459,33 @@ def test_escaped_space_before_hash_does_not_start_a_comment(monkeypatch):
 @pytest.mark.parametrize(
     "command",
     [
-        "cat <<EOF\ngh pr merge 1 --admin\nEOF",  # body text is not a command
+        "cat <<EOF\ngh pr merge 1 --admin\nEOF",  # executable-position merge in body
         "cat <<'EOF'\ngh pr merge 1\nEOF",  # quoted delimiter
-        "git commit -F - <<-EOF\n\tgh pr merge 1 in the message\n\tEOF",  # `<<-` tab-stripped
+        "git commit -F - <<-EOF\n\tgh pr merge 1 --admin\n\tEOF",  # `<<-` tab-stripped
     ],
 )
-def test_heredoc_body_mentioning_merge_is_not_blocked(command, monkeypatch):
-    """A `gh pr merge` inside a HEREDOC BODY is document text, not an executed command, and must
-    ALLOW — the body's newlines must not be split into `;` segments (Codex review on the follow-up)."""
+def test_heredoc_body_with_executable_merge_is_over_blocked(command, monkeypatch):
+    """DEFENSE-IN-DEPTH: a heredoc BODY line that is itself a `gh pr merge` invocation at executable
+    position is over-blocked. A crafted heredoc can plant a matching terminator AFTER a real merge to
+    skip past it, so skipped body lines are still scanned for an executable merge and re-injected.
+    Over-blocking a merge at a body line's command position is the SAFE direction (coordinator 3×3
+    review found the `(( 0 << merge ))` crafted-delimiter bypass)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat <<EOF\nsee the gh pr merge docs for details\nEOF",  # prose mention (not argv[0])
+        "git commit -F - <<EOF\nfix: note about gh pr merge behaviour\nEOF",  # commit-message heredoc
+    ],
+)
+def test_heredoc_body_prose_mention_of_merge_is_allowed(command, monkeypatch):
+    """A PROSE mention of `gh pr merge` in a heredoc body — where `gh` is NOT at the command position
+    (argv[0]) — is document text and must ALLOW. The defense-in-depth salvage counts only executable
+    positions, so a commit-message heredoc that merely talks about a merge is not over-blocked."""
     out, _err, code = _run(command, monkeypatch)
     assert code == 0
     assert _decision(out) == "allow"
@@ -497,10 +516,10 @@ def test_punctuated_heredoc_delimiter_does_not_hide_a_later_merge(monkeypatch):
     assert _decision(out) == "block"
 
 
-def test_punctuated_heredoc_delimiter_body_is_still_skipped(monkeypatch):
-    """The whole-word delimiter capture must still skip the body of a punctuated-delimiter heredoc:
-    a `gh pr merge` inside the body is document text and must ALLOW."""
-    out, _err, code = _run("cat <<EOF-MSG\ngh pr merge 1 in body\nEOF-MSG", monkeypatch)
+def test_punctuated_heredoc_delimiter_body_prose_is_skipped(monkeypatch):
+    """The whole-word delimiter capture still skips the body of a punctuated-delimiter heredoc: a
+    PROSE mention of a merge in the body (not at the command position) must ALLOW."""
+    out, _err, code = _run("cat <<EOF-MSG\nplease do a gh pr merge later\nEOF-MSG", monkeypatch)
     assert code == 0
     assert _decision(out) == "allow"
 
@@ -534,6 +553,62 @@ def test_arithmetic_left_shift_is_not_a_heredoc(command, monkeypatch):
     a heredoc opener and skipping to a never-found terminator would swallow the real merge on the
     next line and ALLOW it. Must BLOCK (Codex review on the bare-newline follow-up)."""
     out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_crafted_arith_delimiter_planting_matching_terminator_is_blocked(monkeypatch):
+    """The coordinator's 3×3-review bypass: `(( 0 << merge ))` makes `_read_heredoc` (if it treated
+    the arith `<<` as a heredoc) capture delimiter `merge`, and a planted `merge` terminator line
+    AFTER the real merge would let `_skip_heredoc_bodies` swallow it — rc=0 ALLOW. BOTH backstops
+    must kill it: arithmetic-depth tracking (the `<<` is not a heredoc) AND the defense-in-depth
+    salvage of an executable merge on a skipped body line. Must BLOCK."""
+    out, _err, code = _run("(( 0 << merge ))\ngh pr merge 1 --admin\nmerge", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_arithmetic_left_shift_with_no_merge_is_not_blocked(monkeypatch):
+    """Arithmetic `$(( x << 2 ))` with no merge anywhere must NOT be blocked — the `<<` is a
+    left-shift, and treating it as a heredoc must not manufacture a false positive."""
+    out, _err, code = _run("echo $((1 << 2))\necho done", monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_real_heredoc_planting_own_delimiter_after_merge_is_salvaged(monkeypatch):
+    """Pure defense-in-depth case (arithmetic tracking does NOT apply): a heredoc whose delimiter IS
+    `merge` — `cat <<merge` — with a `merge` terminator planted AFTER an executable-position
+    `gh pr merge` line. `_skip_heredoc_bodies` finds the terminator and would swallow that line; only
+    the salvage of the executable-position merge blocks it (a deliberate, documented over-block of a
+    body line that opens with `gh pr merge`, not a claim the body is executed). Must BLOCK."""
+    out, _err, code = _run("cat <<merge\ngh pr merge 1 --admin\nmerge", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git commit -F - <<EOF\nfix: don't auto-merge anything\nEOF",  # apostrophe, no merge
+        "git commit -F - <<EOF\ndon't forget to gh pr merge later\nEOF",  # apostrophe + prose mention
+    ],
+)
+def test_commit_message_heredoc_with_apostrophe_is_not_over_blocked(command, monkeypatch):
+    """A commit-message heredoc body line with an apostrophe fails shlex parse (`don't`). The salvage
+    must count ONLY lines that parse to a genuine executable merge (strict True), never a parse
+    failure (None) — else a normal commit message that merely mentions a merge would be falsely
+    blocked. Must ALLOW (claude/gemini 3×3 review)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_unbalanced_arith_paren_does_not_blind_a_later_real_merge(monkeypatch):
+    """An unbalanced / whitespace-split `((` must not leave `arith_depth > 0` polluting the rest of
+    the input. `arith_depth` resets at each command boundary (newline), so a later real heredoc is
+    still skipped AND a real `gh pr merge` after it is still detected. Must BLOCK."""
+    out, _err, code = _run("(( x = 1 ) )\ncat <<EOF\nbody\nEOF\ngh pr merge 1 --admin", monkeypatch)
     assert code == hook.BLOCK_EXIT_CODE
     assert _decision(out) == "block"
 

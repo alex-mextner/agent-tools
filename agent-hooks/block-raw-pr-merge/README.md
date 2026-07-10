@@ -12,6 +12,25 @@ Lets the sanctioned merge path through:
 - `gh ship <PR>` (and a `gh alias` that runs ship)
 - `pr-ship.sh` / `ship.sh` (the script the ship alias points at)
 - any non-merge `gh pr` subcommand (`view`, `list`, `checkout`, `create`, `comment`, …)
+- a **prose mention** of `gh pr merge` — in an argument, a commit message, or a heredoc body —
+  where `gh` is not the command word (argv[0]) of a segment
+
+## Shell-faithful command parsing
+
+Detection is argv-based: the command is normalized (quote-, escape-, comment- and heredoc-aware)
+and split into shell segments, and each segment's argv[0] is checked. This closes evasions that a
+naive parse misses — a merge on a **second line** (a bare newline is a command separator), after a
+`\`-newline continuation, behind a `#` comment on a prior line, or after a subshell/`$(...)`.
+
+**Deliberate over-block (accepted rare false-positive — the safe direction for a security gate):**
+a `gh pr merge` at the **executable position** of a **heredoc body line** is blocked, even though a
+heredoc body is data. A `<<` inside arithmetic (`(( a << b ))`) is treated as a left-shift, not a
+heredoc; but because no parser classifies every shell construct perfectly, a crafted heredoc can
+plant a matching terminator to make a real merge look like body text (`(( 0 << merge ))` / `gh pr
+merge 1` / `merge`). Rather than chase every mis-classification, any executable-position merge on a
+skipped body line is re-injected and blocked. A legitimate heredoc almost never opens a line with a
+literal `gh pr merge`; a prose mention still passes. If a genuine heredoc trips this, re-phrase it or
+use the Telegram hatch below.
 
 ## Why an agent-hook (not a skill, not a git-hook)
 
