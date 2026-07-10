@@ -65,20 +65,19 @@ fi
 emit_lines() {
   if [ -n "$base" ]; then
     # Pick the diff range. The three-dot form ("base...HEAD") scans only the lines ADDED
-    # since the branch point, but it needs the MERGE BASE — which a shallow CI checkout
-    # (the PR head is fetched with --depth=1 under pull_request_target) often cannot reach.
-    # When the merge base is unreachable, fall back to the two-dot form ("base..HEAD"): it
-    # diffs the two commits directly, needs no merge base, and so KEEPS SCANNING the PR's
-    # added lines instead of fataling every shallow PR (agent-tools#130). A truly
-    # uncomputable diff (a bogus/missing head object) still fatals below and is caught
+    # since the branch point, but it needs the MERGE BASE. The official workflow fetches
+    # enough history and verifies that merge-base before this script runs. Direct callers,
+    # local repros, or older copied workflows may still provide refs whose merge-base is
+    # unreachable; in that case, fall back to the two-dot form ("base..HEAD") so the gate
+    # keeps scanning instead of passing on an empty scan (agent-tools#130). A truly
+    # uncomputable diff (a bogus/missing head object) still fails below and is caught
     # fail-closed by the `if ! emit_lines` materialization gate.
     # Tradeoff: two-dot ("in HEAD, absent from base") differs from three-dot ("added since the
     # branch point"). On a base that diverged after the branch point it can surface lines the PR
     # did not add (a false POSITIVE / over-block) — the SAFE direction for a security gate, it
     # blocks rather than passes. It catches every PR-added leftover EXCEPT the degenerate case
     # where the identical line already exists in `base` in the same file (then it is not a '+').
-    # So two-dot is a best-effort scan for the shallow path the merge-base probe already detected;
-    # `fetch-depth: 0` restores exact three-dot semantics, and the full-fetch path is unaffected.
+    # So two-dot is a best-effort scan for callers outside the full-fetch workflow path.
     range="$base...$LEFTOVER_HEAD"
     if ! git merge-base "$base" "$LEFTOVER_HEAD" >/dev/null 2>&1; then
       range="$base..$LEFTOVER_HEAD"

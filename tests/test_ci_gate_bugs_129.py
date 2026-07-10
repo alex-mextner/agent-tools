@@ -138,6 +138,31 @@ def _executable_lines(text: str) -> str:
     return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
 
 
+def _permissions_blocks(text: str) -> list[list[str]]:
+    """Return every YAML permissions mapping block, including job-level overrides."""
+    lines = text.splitlines()
+    blocks: list[list[str]] = []
+    for i, line in enumerate(lines):
+        match = re.match(r"^(\s*)permissions:\s*(.*)$", line)
+        if not match:
+            continue
+        inline = match.group(2).strip()
+        if inline:
+            blocks.append([inline])
+            continue
+        indent = len(match.group(1))
+        block: list[str] = []
+        for next_line in lines[i + 1:]:
+            if not next_line.strip() or next_line.lstrip().startswith("#"):
+                continue
+            next_indent = len(next_line) - len(next_line.lstrip())
+            if next_indent <= indent:
+                break
+            block.append(next_line.split("#", 1)[0].strip())
+        blocks.append(block)
+    return blocks
+
+
 def test_dependency_review_never_executes_pr_code():
     """Hard rule: no install/build step and no checkout of the PR head onto the workspace
     under the privileged trigger — that would execute PR-controlled code. Asserted against
@@ -167,6 +192,30 @@ def test_dependency_review_installs_bun_toolchain():
     assert uses, "setup-bun must be an active (uncommented) `uses:` step, not a comment example"
     for ln in uses:
         assert re.search(r"@[0-9a-f]{40}\b", ln), f"setup-bun must be SHA-pinned: {ln!r}"
+
+
+@pytest.mark.parametrize("workflow", [DEP_WF, LEFTOVER_WF])
+def test_dependency_and_leftover_workflows_are_read_only_without_explicit_secret_env(workflow: Path):
+    """The #130 trusted-base gates stay least-privileged: read-only permissions and no explicit
+    secret env. PR data fetches rely on actions/checkout's persisted read-only git credential,
+    not a GH_TOKEN env var, gh CLI call, or tokenized URL."""
+    text = workflow.read_text()
+    permissions = _permissions_blocks(text)
+    assert permissions, "workflow must declare explicit read-only permissions"
+    assert any("contents: read" in block for block in permissions), permissions
+    for block in permissions:
+        assert "write-all" not in block, block
+        assert all(ln.endswith(": read") for ln in block), block
+
+    code = _executable_lines(text)
+    assert "env:" in code, "_executable_lines must include YAML env blocks for this guard"
+    if "with:" in text:
+        assert "with:" in code, "_executable_lines must include YAML with blocks for this guard"
+    assert "secrets." not in code
+    assert "GH_TOKEN" not in code
+    assert "persist-credentials: false" not in code
+    assert not re.search(r"(?m)^\s*gh\s+", code), "fetch must not rely on gh CLI auth"
+    assert "x-access-token" not in code
 
 
 def test_dep_audit_fails_closed_on_bun_lock_without_bun(tmp_path: Path):
@@ -555,6 +604,31 @@ def test_leftover_script_has_two_dot_fallback(tmp_path: Path):
     assert '"$base..$LEFTOVER_HEAD"' in code, "must fall back to the two-dot range"
 
 
+def test_leftover_workflow_pr_head_fetch_is_not_shallow():
+    """agent-tools#130: the pull_request_target workflow must fetch the PR head with enough
+    history for merge-base, not `--depth=1`, so the real three-dot added-lines diff can run."""
+    code = _executable_lines(LEFTOVER_WF.read_text())
+    head_fetch_lines = [ln.strip() for ln in code.splitlines() if "git fetch" in ln and '"$HEAD_SHA"' in ln]
+    assert head_fetch_lines, "workflow must fetch the PR head object before scanning"
+    assert all("--depth=1" not in ln for ln in head_fetch_lines), head_fetch_lines
+
+
+def test_leftover_docs_match_full_fetch_and_script_fallback_contract():
+    """The shipped workflow should promise full-fetch three-dot semantics, while the script
+    documents two-dot as a fallback only for direct/local or stale copied callers."""
+    readme = LEFTOVER_WF.with_name("README.md").read_text()
+    script = LEFTOVER.read_text()
+    workflow = LEFTOVER_WF.read_text()
+    readme_flat = " ".join(readme.split())
+    assert "official workflow fetches" in readme
+    assert "fallback for direct callers or older copied workflows" in readme
+    assert "do not depend on an unreachable merge-base producing a no-op scan" in readme_flat
+    assert "official workflow fetches" in script
+    assert "older copied workflows" in script
+    assert "two-dot fallback is for direct/local callers or older copied workflows" in workflow
+    assert "PR head is fetched with --depth=1 under pull_request_target" not in script
+
+
 def test_leftover_two_dot_fallback_catches_leftover_in_real_shallow_checkout(tmp_path: Path):
     """The faithful CI scenario (agent-tools#130), not just an orphan stand-in: an origin with a
     SHARED ancestor `base0`, `main` advanced past it, and a `pr` branch off `base0` carrying a
@@ -673,13 +747,15 @@ def test_leftover_script_does_not_read_emit_lines_via_process_substitution():
 
 def test_codeql_detect_does_not_use_pipe_grep_q():
     """The buggy `git ls-files | grep -qiE` (dies of SIGPIPE under pipefail -> false negative)
-    must be gone; the detect materializes the list and reads grep's exit code explicitly."""
+    must be gone; the detect materializes the list and uses a full-consuming count."""
     code = "\n".join(
         ln for ln in CODEQL_WF.read_text().splitlines() if not ln.lstrip().startswith("#")
     )
-    assert "git ls-files | grep -qiE" not in code
-    assert 'tracked="$(git ls-files)"' in code
-    assert 'grep -qiE "$pattern" <<<"$tracked"' in code
+    detect = code.split("- name: Detect source for this language", 1)[1].split("- name: Initialize CodeQL", 1)[0]
+    assert "git ls-files | grep -qiE" not in detect
+    assert "grep -q" not in detect
+    assert 'tracked="$(git ls-files)"' in detect
+    assert 'match_count="$(grep -ciE "$pattern" <<<"$tracked")"' in detect
 
 
 def test_codeql_detect_pattern_detects_present_source_under_pipefail():
@@ -689,14 +765,43 @@ def test_codeql_detect_pattern_detects_present_source_under_pipefail():
     script = r'''
     set -uo pipefail
     tracked=$(seq 1 100000 | sed "s/.*/file&.ts/")
-    match_rc=0
-    grep -qiE "\.ts$" <<<"$tracked" || match_rc=$?
-    if [ "$match_rc" -gt 1 ]; then echo ERROR
-    elif [ "$match_rc" -eq 0 ]; then echo DETECTED
+    match_count="$(grep -ciE "\.ts$" <<<"$tracked")"
+    if [ "$match_count" -gt 0 ]; then echo DETECTED
     else echo MISSED; fi
     '''
     proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
     assert proc.stdout.strip() == "DETECTED", proc.stdout + proc.stderr
+
+
+def test_codeql_detect_pattern_reports_absent_source():
+    """The full-consuming count must preserve the no-match branch: grep rc 1 with count 0 is a
+    clean absence signal, not an error and not a false positive."""
+    script = r'''
+    set -uo pipefail
+    tracked="README.md"
+    grep_rc=0
+    match_count="$(grep -ciE "\.ts$" <<<"$tracked")" || grep_rc=$?
+    if [ "$grep_rc" -gt 1 ]; then echo ERROR
+    elif [ "${match_count:-0}" -gt 0 ]; then echo DETECTED
+    else echo MISSED; fi
+    '''
+    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+    assert proc.stdout.strip() == "MISSED", proc.stdout + proc.stderr
+
+
+def test_codeql_detect_pattern_fails_closed_on_grep_error():
+    """A grep rc > 1 is a detector error and must fail closed, not look like absent source."""
+    script = r'''
+    set -uo pipefail
+    tracked="file.ts"
+    grep_rc=0
+    match_count="$(grep -ciE "[" <<<"$tracked" 2>/dev/null)" || grep_rc=$?
+    if [ "$grep_rc" -gt 1 ]; then echo ERROR
+    elif [ "${match_count:-0}" -gt 0 ]; then echo DETECTED
+    else echo MISSED; fi
+    '''
+    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+    assert proc.stdout.strip() == "ERROR", proc.stdout + proc.stderr
 
 
 def test_codeql_old_pipe_pattern_self_disables_proving_the_bug():

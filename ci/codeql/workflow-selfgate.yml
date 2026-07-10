@@ -115,16 +115,15 @@ jobs:
             echo "::error::CodeQL detect: 'git ls-files' failed for ${LANGUAGE} — cannot determine source presence. Failing closed." >&2
             exit 1
           }
-          # grep WITHOUT -q and WITHOUT a pipe: feed the file list as a here-string so nothing
-          # can die of SIGPIPE, and read grep's own exit code (0 = matched, 1 = no match, >1 =
-          # grep error). `|| match_rc=$?` keeps `set -e` from aborting on the no-match case.
-          match_rc=0
-          grep -qiE "$pattern" <<<"$tracked" || match_rc=$?
-          if [ "$match_rc" -gt 1 ]; then
-            echo "::error::CodeQL detect: grep errored (rc=$match_rc) for ${LANGUAGE} — cannot determine source presence. Failing closed." >&2
+          # Count matches from the materialized list; rc still distinguishes no-match from
+          # grep error.
+          grep_rc=0
+          match_count="$(grep -ciE "$pattern" <<<"$tracked")" || grep_rc=$?
+          if [ "$grep_rc" -gt 1 ]; then
+            echo "::error::CodeQL detect: grep errored (rc=$grep_rc) for ${LANGUAGE} — cannot determine source presence. Failing closed." >&2
             exit 1
           fi
-          if [ "$match_rc" -eq 0 ]; then
+          if [ "${match_count:-0}" -gt 0 ]; then
             echo "has_source=true" >> "$GITHUB_OUTPUT"
             echo "Found ${LANGUAGE} source — running CodeQL."
           else
