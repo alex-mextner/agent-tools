@@ -25,7 +25,20 @@ Allowed (let through):
   - `gh ship <PR>` / a `gh alias` that runs ship
   - `pr-ship.sh` / `ship.sh` (the script the ship alias points at)
   - any non-merge `gh pr` subcommand (view, list, checkout, create, comment, ...)
-  - commands whose body/arguments merely contain the text "gh pr merge" as a string
+  - a PROSE mention of "gh pr merge" as text — in an argument (`gh pr create --body "run gh
+    pr merge to land it"`), a commit message, or a heredoc body — where `gh` is NOT the
+    command word (argv[0]) of a segment / body line
+
+Deliberate over-block (a rare, accepted false-positive — the SAFE direction for a security gate):
+a `gh pr merge` sitting at the EXECUTABLE position (argv[0]) of a HEREDOC BODY line IS blocked,
+even though a heredoc body is data, not an executed command. This is defense-in-depth: the command
+parser cannot perfectly classify every shell construct, and a crafted heredoc can plant a matching
+terminator to make a real merge LOOK like body text (`(( 0 << merge ))` / `gh pr merge 1` / `merge`).
+Rather than chase every mis-classification, any executable-position `gh pr merge` on a skipped body
+line is re-injected and blocked. A legitimate heredoc almost never opens a line with a literal
+`gh pr merge`; a prose mention (gh not at argv[0]) still passes. This is a conscious divergence from
+the "heredoc bodies are pure data" convention, made because the cost of a bypass here is a gate
+breach and the cost of the false-positive is re-phrasing a heredoc (or using the Telegram hatch).
 
 External approval (replaces the OLD self-service escape hatch): there is NO
 `ALLOW_RAW_PR_MERGE`(+`_REASON`) env and NO `# no-ship-guard: <reason>` inline sentinel any
@@ -131,8 +144,223 @@ def warn(msg: str) -> None:
     sys.stderr.write(f"block-raw-pr-merge: {msg}\n")
 
 
+# Separators after which a `#` can begin a comment (an unquoted word boundary).
+_SEGMENT_SEPS = frozenset(";&|()")
+# Chars that end an UNQUOTED heredoc delimiter word (whitespace or a shell metacharacter).
+_HEREDOC_DELIM_END = frozenset(" \t\n;&|()<>")
+
+
+def _read_heredoc_delimiter(command: str, j: int) -> tuple[str, int] | None:
+    """Read ONE shell word starting at `command[j]` and return `(dequoted_word, end_index)`, or None
+    on an unterminated quote / empty word. The word is quote-removed exactly as the shell does for a
+    heredoc delimiter: `\\EOF`, `E"OF"`, `'EOF'` and `EOF` all yield the terminator `EOF`. Quoting
+    the WHOLE word (not just a `'…'`/`"…"` prefix) matters — otherwise `<<\\EOF` / `<<E"OF"` never
+    match the unquoted `EOF` terminator, the body skips to end of input, and a real merge after the
+    heredoc is ALLOWED (Codex review)."""
+    n = len(command)
+    out: list[str] = []
+    k = j
+    while k < n:
+        ch = command[k]
+        if ch in _HEREDOC_DELIM_END:
+            break
+        if ch == "\\" and k + 1 < n:
+            out.append(command[k + 1])  # backslash-escaped char → literal
+            k += 2
+            continue
+        if ch in ("'", '"'):
+            close = command.find(ch, k + 1)
+            if close == -1:
+                return None  # unterminated quote in the delimiter word → decline (fail toward block)
+            out.append(command[k + 1 : close])  # single quotes: verbatim; good enough for a delim
+            k = close + 1
+            continue
+        out.append(ch)
+        k += 1
+    word = "".join(out)
+    return (word, k) if word else None
+
+
+def _read_heredoc(command: str, i: int) -> tuple[str, bool, int] | None:
+    """If `command[i:]` opens a heredoc (`<<WORD` / `<<-WORD`), return `(delimiter, dash,
+    index_after_the_operator)`; else None. `<<<` (a here-STRING, one line) is not a heredoc. The
+    delimiter is the quote-removed shell word (see `_read_heredoc_delimiter`)."""
+    if not command.startswith("<<", i) or command.startswith("<<<", i):
+        return None
+    n = len(command)
+    j = i + 2
+    dash = j < n and command[j] == "-"
+    if dash:
+        j += 1
+    while j < n and command[j] in " \t":
+        j += 1
+    if j >= n:
+        return None
+    parsed = _read_heredoc_delimiter(command, j)
+    if parsed is None:
+        return None
+    delim, end = parsed
+    return delim, dash, end
+
+
+def _skip_heredoc_bodies(command: str, i: int, delimiters: list[tuple[str, bool]]) -> tuple[int, int]:
+    """Advance past the bodies of the heredocs opened on the just-ended line, returning
+    `(new_index, salvaged_merge_line_count)`. `i` points at the first body character (right after
+    the line's newline). For each delimiter in order, consume whole lines until a line whose content
+    equals the delimiter (leading tabs ignored when the heredoc used `<<-`).
+
+    Two safety nets, both erring toward BLOCK:
+    - FAIL-CLOSED: if a terminator line is NOT found ahead, skip NOTHING (return the original `i`, 0).
+      A `<<` that was NOT really a heredoc opener — arithmetic left-shift, an unterminated heredoc —
+      then does not swallow the rest of the input; the following lines are scanned normally.
+    - DEFENSE-IN-DEPTH: every SKIPPED body line is still scanned for an executable `gh pr merge`
+      invocation, and each hit is counted. A crafted heredoc can plant a matching terminator AFTER a
+      real merge (`(( 0 << merge ))` / `gh pr merge 1` / `merge`) to skip past it — counting the
+      merge lines lets the caller re-inject a detectable merge so the gate still blocks. A merge at a
+      body line's executable position is over-blocked (safe); a plain prose mention is not counted."""
+    n = len(command)
+    pos = i
+    salvaged = 0
+    for delim, dash in delimiters:
+        found = False
+        local = 0
+        while pos < n:
+            nl = command.find("\n", pos)
+            line_end = n if nl == -1 else nl
+            line = command[pos:line_end]
+            pos = line_end + 1 if nl != -1 else n
+            if (line.lstrip("\t") if dash else line) == delim:
+                found = True
+                break
+            # Count ONLY a line that parses to a genuine `gh pr merge` invocation (strict True). A
+            # parse failure returns None (e.g. an apostrophe in a commit-message heredoc, `don't`) —
+            # such a line is not a valid executable merge, so it must NOT be salvaged, else a normal
+            # commit-message heredoc that merely mentions a merge would be over-blocked (claude/gemini
+            # review). A real merge line always parses cleanly to True.
+            if _command_contains_gh_pr_merge(line) is True:
+                local += 1
+        if not found:
+            return i, 0
+        salvaged += local
+    return pos, salvaged
+
+
+def _normalize_newlines(command: str) -> str:  # noqa: C901 — a small quote/escape/comment scanner
+    r"""Remove `\`-newline line continuations (the shell joins the parts with no space) and turn
+    each BARE (unquoted) newline into a `;` command separator, quote-, escape-, comment- and
+    heredoc-aware.
+
+    In a real shell a bare newline separates commands (like `;`) and a `#` comment runs only to the
+    end of its LINE. shlex, fed the whole blob, instead (a) consumes a bare newline as whitespace —
+    so `echo ok`+newline+`gh pr merge` collapses into one `echo`-headed segment and the merge on the
+    second line evades detection — and (b) runs a `#` comment to the end of the whole INPUT once the
+    newlines are gone, so a `# comment` on line 1 would swallow a merge on line 2. This pass fixes
+    both BEFORE tokenizing: it drops `#` comments per-line and converts bare newlines to `;`, while
+    leaving newlines/`#`/`;` that sit INSIDE quotes literal (so a two-line commit message merely
+    mentioning a merge stays one quoted token and is not mis-detected).
+
+    A `#` starts a comment ONLY at an unquoted word boundary (start, or after unescaped whitespace /
+    a `;&|()` separator) — tracked by `boundary`, NOT by inspecting the last emitted char, so an
+    escaped space (`echo foo\ # x`) keeps the `#` in-word and does not hide a later merge.
+
+    Backslash escaping is honored the way the shell does: an escaped quote can't spoof quote state
+    (`echo \"`+newline+`gh pr merge` runs a real merge on line 2 — `\"` is a literal `"`, not an
+    opening quote). Outside quotes and inside double quotes a `\` escapes the next char (emitted
+    verbatim so shlex, in posix mode, applies the same escape); inside single quotes a `\` is literal.
+
+    Heredoc bodies (`cat <<EOF` … `EOF`) are NOT command lines, so they are skipped whole — else the
+    body's newlines would become `;` separators and a `gh pr merge` mentioned in a commit-message
+    heredoc would be falsely blocked. Two backstops keep that from becoming a bypass: `<<` inside an
+    arithmetic context (`(( … ))` / `$(( … ))`) is a left-shift, NOT a heredoc opener (tracked by
+    `arith_depth`); and any executable `gh pr merge` on a SKIPPED body line is re-injected so the
+    gate still blocks (see `_skip_heredoc_bodies`), defeating a crafted `(( 0 << merge ))` / `gh pr
+    merge` / `merge` that plants a matching terminator after the real merge.
+    """
+    out: list[str] = []
+    quote: str | None = None  # "'" or '"' when inside that quote
+    boundary = True  # at an unquoted word boundary (where a `#` may start a comment)
+    arith_depth = 0  # inside `((`/`$((` — a `<<` there is left-shift, not a heredoc opener
+    pending_heredocs: list[tuple[str, bool]] = []
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\" and i + 1 < n and quote != "'":  # backslash escape (not in single quotes)
+            if command[i + 1] == "\n":  # `\`-newline continuation: REMOVED (parts join, no space)
+                i += 2
+                continue
+            out.append(ch)  # `\<char>`: emit both verbatim; the escaped char is inert and in-word
+            out.append(command[i + 1])
+            boundary = False
+            i += 2
+            continue
+        if quote is not None:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            boundary = False
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            boundary = False
+        elif ch == "#" and boundary:
+            while i < n and command[i] != "\n":  # comment → end of line (drop it)
+                i += 1
+            continue
+        elif ch == "(" and i + 1 < n and command[i + 1] == "(":  # `((` / `$((` — arithmetic opens
+            arith_depth += 1
+            out.append("((")
+            boundary = True
+            i += 2
+            continue
+        elif ch == ")" and i + 1 < n and command[i + 1] == ")" and arith_depth > 0:
+            arith_depth -= 1
+            out.append("))")
+            boundary = True
+            i += 2
+            continue
+        elif ch == "\n":
+            # bare newline → command separator. Spaces around the `;` keep shlex from GLUING it to a
+            # neighbouring punctuation char into one run — `echo $(true)`+newline+`gh pr merge` would
+            # else tokenize as `);` (a run `_split_segments` doesn't treat as a separator), keeping
+            # the merge inside the `echo` segment and ALLOWING it (Codex review).
+            out.append(" ; ")
+            boundary = True
+            # A bare newline is a command boundary — reset arithmetic depth so an unbalanced or
+            # whitespace-split `((` (e.g. `(( x = 1 ) )`) cannot leave `arith_depth > 0` and pollute
+            # heredoc detection for the REST of the input (which could blind a later real merge or
+            # over-block a later heredoc). Arithmetic `(( … ))` never spans an unquoted newline in
+            # practice, so per-line scoping is both safe and correct (claude/gemini review).
+            arith_depth = 0
+            i += 1
+            if pending_heredocs:
+                i, salvaged = _skip_heredoc_bodies(command, i, pending_heredocs)
+                # Re-inject a detectable merge segment for each executable merge found on a skipped
+                # body line — so a crafted heredoc can't hide a real `gh pr merge` in its body.
+                out.append(" ; gh pr merge ; " * salvaged)
+                pending_heredocs = []
+            continue
+        elif arith_depth == 0 and (heredoc := _read_heredoc(command, i)) is not None:
+            delim, dash, i = heredoc
+            pending_heredocs.append((delim, dash))
+            boundary = False
+            continue
+        elif ch in " \t":
+            out.append(ch)
+            boundary = True
+        elif ch in _SEGMENT_SEPS:
+            out.append(ch)
+            boundary = True
+        else:
+            out.append(ch)
+            boundary = False
+        i += 1
+    return "".join(out)
+
+
 def _split_segments(command: str) -> list[list[str]]:
-    """Tokenize `command` via shlex and split into per-segment token lists.
+    r"""Tokenize `command` via shlex and split into per-segment token lists.
 
     Uses ``punctuation_chars=True`` so that `;`, `&&`, `||`, `|` etc. are
     returned as standalone separator tokens rather than being glued to adjacent
@@ -142,9 +370,19 @@ def _split_segments(command: str) -> list[list[str]]:
     Each segment is one independent command (the shell atoms between separators).
     Returns a list of token lists; raises ValueError on unbalanced quotes
     (caller treats this as fail-closed).
+
+    `_normalize_newlines` first folds `\`-newline continuations and turns bare newlines into `;`
+    (quote- and comment-aware) so a raw merge on a second line cannot evade detection while shell
+    comment semantics are preserved.
     """
+    command = _normalize_newlines(command)
     lex = shlex.shlex(command, posix=True, punctuation_chars=True)
     lex.whitespace_split = False
+    # `_normalize_newlines` already stripped real (word-boundary, to-end-of-line) `#` comments, so
+    # shlex's own commenter must be OFF — otherwise it truncates a MID-WORD `#` (literal in a real
+    # shell) to end of input, e.g. `echo foo#bar && gh pr merge 1` would parse as just `['echo',
+    # 'foo']` and ALLOW the raw merge. `block-reset-hard` disables it for the same reason.
+    lex.commenters = ""
     tokens = list(lex)  # raises ValueError on unbalanced quotes
     segments: list[list[str]] = []
     current: list[str] = []
