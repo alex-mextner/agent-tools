@@ -37,6 +37,7 @@ discipline reminder, not a security boundary. (Contrast block-no-verify, fail-cl
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -47,11 +48,47 @@ import time
 from pathlib import Path
 from typing import NamedTuple
 
-_LIB_DIR = Path(__file__).resolve().parents[2] / "lib"
-if str(_LIB_DIR) not in sys.path:
-    sys.path.insert(0, str(_LIB_DIR))
+# SYNC: duplicated in every hatch-using hook so each hook does not need
+# a shared helper file under agent-hooks/. Edit every copy together;
+# tests/test_hatch_import_hardening.py guards the shared behavior.
+_HATCH_MODULE = "agenttools_hatch_escalation"
 
-import agenttools_hatch_escalation as hatch_escalation  # noqa: E402
+
+def _load_hatch_escalation():
+    hatch_init = Path(__file__).resolve().parents[2] / "lib" / _HATCH_MODULE / "__init__.py"
+    if not hatch_init.is_file():
+        raise ImportError(f"cannot load hatch escalation helper from {hatch_init}")
+    spec = importlib.util.spec_from_file_location(_HATCH_MODULE, hatch_init)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load hatch escalation helper from {hatch_init}")
+    module = importlib.util.module_from_spec(spec)
+    previous_modules = {
+        name: sys.modules[name]
+        for name in tuple(sys.modules)
+        if name == _HATCH_MODULE or name.startswith(f"{_HATCH_MODULE}.")
+    }
+    for name in previous_modules:
+        if name != _HATCH_MODULE:
+            sys.modules.pop(name, None)
+    sys.modules[_HATCH_MODULE] = module
+    # Leave the repo-local module installed on success so later imports in this
+    # hook process cannot regain a preloaded user/site package or submodule.
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        for name in tuple(sys.modules):
+            if name == _HATCH_MODULE or name.startswith(f"{_HATCH_MODULE}."):
+                sys.modules.pop(name, None)
+        sys.modules.update(previous_modules)
+        # A helper that calls sys.exit() at import must not make the hook exit 0 (allow);
+        # convert it to an import failure after cleanup. Ctrl-C still propagates.
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        raise ImportError(f"cannot execute hatch escalation helper from {hatch_init}: {exc}") from exc
+    return module
+
+
+hatch_escalation = _load_hatch_escalation()
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"

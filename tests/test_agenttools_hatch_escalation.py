@@ -775,11 +775,17 @@ def test_inline_quoted_separator_in_value_preserved(tmp_path):
 # anchor; these pin that it does NOT.
 
 
+@pytest.mark.real_os_home
 def test_resolve_home_is_os_account_home_not_env(monkeypatch):
     """The real resolve_home() keys off the OS identity (pwd.getpwuid), never $HOME."""
     import os as _os
     import pwd as _pwd
 
+    monkeypatch.setattr(
+        agenttools_hatch_escalation,
+        "_find_tg_ctl",
+        lambda *_args, **_kwargs: pytest.fail("resolve_home test must not resolve tg-ctl"),
+    )
     monkeypatch.setenv("HOME", "/tmp/attacker-controlled-home")  # must be ignored
     assert _REAL_RESOLVE_HOME() == _pwd.getpwuid(_os.getuid()).pw_dir
 
