@@ -2667,6 +2667,7 @@ def test_audit_line_written_without_jq(tmp_path):
     assert rec["pr"] == pr_arg, rec  # round-trips through the escaping
 
 
+@pytest.mark.real_os_home
 def test_resolve_home_uses_os_identity_not_HOME_env(tmp_path, monkeypatch):
     """resolve_home() must key off the OS account identity (pwd.getpwuid), NOT the $HOME env var
     — that is the P0 fix: a shipper who exports a doctored HOME cannot move the location the hatch
@@ -2674,6 +2675,11 @@ def test_resolve_home_uses_os_identity_not_HOME_env(tmp_path, monkeypatch):
     import pwd
 
     mod = _load_hatch_module()
+    monkeypatch.setattr(
+        mod.hatch_escalation,
+        "_find_tg_ctl",
+        lambda *_args, **_kwargs: pytest.fail("resolve_home test must not resolve tg-ctl"),
+    )
     real = pwd.getpwuid(os.getuid()).pw_dir
     monkeypatch.setenv("HOME", str(tmp_path / "doctored-home"))
     assert mod.resolve_home() == real, "resolve_home must ignore $HOME and use the OS identity"

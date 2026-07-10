@@ -6,7 +6,7 @@ agent hook catches the action *mid-session* — the moment the agent tries to ru
 write a file, or finish a turn. That makes them the right place for rules that must be
 enforced *before* the side effect happens, not after.
 
-Each hook here is a self-contained directory:
+Each hook's hook-specific files live in one directory:
 
 ```
 <hook-name>/
@@ -15,10 +15,30 @@ Each hook here is a self-contained directory:
   README.md           # what it does, how to install, fail policy
 ```
 
+Hooks that need the shared `agenttools_hatch_escalation` approval helper load it from this
+catalog's repo-local `lib/` path with `importlib.util.spec_from_file_location`, not through
+ambient `sys.path`. The bootstrap is duplicated inside those hook scripts because a hook
+install must not depend on a shared helper file under `agent-hooks/`; installers must preserve
+the catalog layout that keeps `lib/agenttools_hatch_escalation` two levels above those scripts
+or rewrite the helper path deliberately. On successful load the hook keeps the repo-local helper
+in `sys.modules` so a preloaded user/site package cannot regain control later in the same hook
+process.
+
+These scripts are catalog artifacts, not Python package entrypoints: do not install hatch-using
+hooks by copying only the executable into `/usr/local/bin`, a virtualenv `bin/`, or another flat
+script directory and expecting an installed site-package dependency to satisfy the helper import.
+That fallback is intentionally absent because it would reintroduce dependency confusion through
+ambient `sys.path`. The normal host model is one hook execution per subprocess; long-lived
+in-process hosts must provide equivalent module isolation if they import hook scripts directly.
+
 ## The contract (`agents-hooks/v1`)
 
 A host (the agent harness, or a tool like a CLI) runs the hook executable and speaks a
 tiny JSON-on-stdin / exit-code protocol. No shared runtime between host and hook.
+
+Hosts must execute hook scripts as separate subprocesses. Importing hook scripts directly into
+a long-lived or multi-threaded host process is not part of the contract unless that host provides
+its own equivalent process/module isolation.
 
 - **stdin**: a JSON event — `{ hook_api, event_id, tool, point, command, cwd, args }`.
   `args` carries the action-specific payload (e.g. the Bash command string, the file path
@@ -30,7 +50,8 @@ tiny JSON-on-stdin / exit-code protocol. No shared runtime between host and hook
   - `0` → allow
   - `10` → **BLOCK** (un-corruptible: exit 10 blocks even if stdout is malformed, so a
     broken gate can never silently let an action through)
-  - any other exit → hook *error*, resolved by the descriptor's `on_error` policy.
+  - any other exit → hook *error*, resolved by the descriptor's `on_error` policy, even if
+    stdout is empty, malformed, or a Python traceback.
 
 ## Fail policy: `on_error`
 
@@ -38,6 +59,11 @@ tiny JSON-on-stdin / exit-code protocol. No shared runtime between host and hook
   Use for advisory hooks that must never break the agent's flow.
 - `on_error: "closed"` — a hook error **blocks** the action. Use for security gates where
   "I couldn't check" must mean "don't do it".
+
+If a hook cannot import its repo-local helper code (for example a missing/corrupt
+`lib/agenttools_hatch_escalation`), it fails before emitting protocol JSON. That is still a
+hook error: the host/bridge must apply the descriptor's `on_error` policy to decide whether
+the action proceeds.
 
 ## Descriptor fields
 
