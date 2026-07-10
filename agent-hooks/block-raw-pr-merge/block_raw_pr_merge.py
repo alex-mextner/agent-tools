@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""agents-hooks/v1 pre-bash hook — block a raw `gh pr merge` that bypasses ship.
+"""agents-hooks/v1 pre-bash hook — block a raw PR merge that bypasses ship.
 
-Denies a shell command that merges a PR directly with `gh pr merge` (including
-`gh pr merge --admin`), because that skips the project's ship gate: `gh ship <PR>`
-(the green-CI-gated merge + mandatory-screenshot command) is the only sanctioned path.
-A raw merge lands code without the green-CI check and the required-screenshot check —
-exactly the gates ship exists to enforce.
+Denies a shell command that merges a PR directly, because that skips the project's ship gate:
+`gh ship <PR>` (the green-CI-gated merge + mandatory-screenshot command) is the only sanctioned
+path. A raw merge lands code without the green-CI check and the required-screenshot check —
+exactly the gates ship exists to enforce. The blocked routes (all when `gh` is the ACTUALLY-invoked
+command) are `gh pr merge` (incl. `--admin` and a `gh -R o/r` global flag), the `gh api` REST merge
+(`…/pulls/<n>/merge` with a PUT/POST method), and a `gh api graphql` merge mutation
+(`mergePullRequest` / `enablePullRequestAutoMerge`). Each is also caught when hidden in a command or
+process substitution — `` `…` ``, `$( … )` (even inside double quotes), `<( … )` — whose body a real
+shell executes; the body is extracted and re-scanned (#248).
 
 This is the enforcement counterpart of the doc-only "use `gh ship`, never a raw merge"
 rule: advice in AGENTS.md cannot stop an autonomous (auto-mode) agent from running
@@ -129,7 +133,51 @@ _INLINE_ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # a benign command with an unbalanced quote (e.g. `grep won't file`) is NOT blocked just
 # because shlex can't parse it.  Only if the raw string plausibly contains a merge
 # invocation do we treat a parse error as fail-closed.
-_MERGE_HINT = re.compile(r"\bgh\b.*\bpr\b.*\bmerge\b", re.DOTALL)
+_MERGE_HINT = re.compile(
+    r"\bgh\b.*(\bpr\b.*\bmerge\b|pulls/[^/]+/merge|mergePullRequest|enablePullRequestAutoMerge)",
+    re.DOTALL,
+)
+
+# ── gh api merge-route detection (#248) ──────────────────────────────────────────────────────
+# `gh api` reaches the same PR-merge that `gh pr merge` does, via two routes that also skip ship:
+#   REST:    `gh api …/pulls/<n>/merge` with a write method (PUT/POST); a GET is a status read.
+#   GraphQL: `gh api graphql` running a `mergePullRequest` / `enablePullRequestAutoMerge` mutation.
+# `gh` global flags (`-R owner/repo`, `--hostname h`) may sit before the `pr merge` / `api`
+# subcommand and must be skipped (`gh -R o/r pr merge 5` was evaded by the argv[1]=='pr' check).
+_GH_VALUE_FLAGS = frozenset({"-R", "--repo", "--hostname"})
+# Wrapper commands that PREFIX and then EXECUTE another command (`env FOO=x gh …`, `sudo -u root gh
+# …`, `timeout 60 gh …`). Rather than model each wrapper's flag arities, scan the remaining tokens
+# for the wrapped invoked head — an `env gh pr merge` is an ACTUALLY-invoked merge, the same threat
+# class this hook covers. This is a BEST-EFFORT list of common exec-wrappers, NOT exhaustive: an
+# obscure wrapper not listed here (and deliberate circumvention generally) is a documented residual
+# — the scan must stay keyed to KNOWN executors, because treating ANY leading token as a wrapper
+# would re-block a prose mention (`see the gh pr merge docs`) that anchoring on the invoked command
+# exists to allow.
+_WRAPPERS = frozenset(
+    {"env", "command", "builtin", "exec", "sudo", "doas", "nice", "ionice", "stdbuf", "nohup",
+     "setsid", "time", "timeout", "xargs", "flock", "chronic", "firejail", "strace", "ltrace",
+     "valgrind", "taskset", "setarch", "numactl", "chrt", "unbuffer", "proxychains", "proxychains4",
+     "catchsegv", "setpriv", "rlwrap", "watch", "script", "torify", "cpulimit"}
+)
+# Interpreters that run a command from a STRING argument (not the token stream): a shell's `-c
+# <cmd>` and `eval <args…>`. A merge hidden in that quoted string can't be reached by the wrapper
+# token see-through, so the string is extracted and re-scanned as a command (`bash -c 'gh pr merge
+# 1'`, `eval "gh pr merge 1"`).
+_SHELL_INTERPRETERS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "mksh"})
+# A shell short-option group that includes `c` (`-c`, `-cx`, `-xc`) — its following token is the
+# command string. Over-block: scan the next token regardless of `c`'s position in the group.
+_SHELL_C_OPT = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")
+# gh api flags whose NEXT token is a value — skipped when locating the endpoint positional.
+_API_VALUE_FLAGS = frozenset(
+    {"-H", "--header", "-F", "--field", "-f", "--raw-field", "-q", "--jq", "-X", "--method",
+     "--input", "--hostname", "-p", "--preview", "-t", "--template", "--cache"}
+)
+_MERGE_MUTATION = re.compile(r"mergePullRequest|enablePullRequestAutoMerge")
+_REST_MERGE_PATH = re.compile(r"pulls/[^/]+/merge")
+_WRITE_METHOD_EQ = re.compile(r"^(--method|-X)=(PUT|POST)$", re.IGNORECASE)
+# A `query` field fed from a file (`@f`), stdin (`@-`) or a substitution — its text can't be read
+# at pre-exec time, so a graphql call carrying it is over-blocked (fail closed).
+_FIELDISH = frozenset({"-F", "--field", "-f", "--raw-field"})
 
 
 def emit(decision: str, message: str | None = None) -> None:
@@ -150,15 +198,21 @@ _SEGMENT_SEPS = frozenset(";&|()")
 _HEREDOC_DELIM_END = frozenset(" \t\n;&|()<>")
 
 
-def _read_heredoc_delimiter(command: str, j: int) -> tuple[str, int] | None:
-    """Read ONE shell word starting at `command[j]` and return `(dequoted_word, end_index)`, or None
-    on an unterminated quote / empty word. The word is quote-removed exactly as the shell does for a
-    heredoc delimiter: `\\EOF`, `E"OF"`, `'EOF'` and `EOF` all yield the terminator `EOF`. Quoting
-    the WHOLE word (not just a `'…'`/`"…"` prefix) matters — otherwise `<<\\EOF` / `<<E"OF"` never
-    match the unquoted `EOF` terminator, the body skips to end of input, and a real merge after the
-    heredoc is ALLOWED (Codex review)."""
+def _read_heredoc_delimiter(command: str, j: int) -> tuple[str, int, bool] | None:
+    """Read ONE shell word starting at `command[j]` and return `(dequoted_word, end_index, quoted)`,
+    or None on an unterminated quote / empty word. The word is quote-removed exactly as the shell
+    does for a heredoc delimiter: `\\EOF`, `E"OF"`, `'EOF'` and `EOF` all yield the terminator `EOF`.
+    Quoting the WHOLE word (not just a `'…'`/`"…"` prefix) matters — otherwise `<<\\EOF` / `<<E"OF"`
+    never match the unquoted `EOF` terminator, the body skips to end of input, and a real merge after
+    the heredoc is ALLOWED (Codex review).
+
+    `quoted` is True when ANY part of the delimiter was quoted/escaped (`<<'EOF'`, `<<\\EOF`,
+    `<<E"OF"`): per POSIX that makes the heredoc body LITERAL — `$( … )`/backticks are NOT expanded —
+    so the caller must not scan the body for executed substitutions (an UNQUOTED `<<EOF` body IS
+    expanded and MUST be scanned)."""
     n = len(command)
     out: list[str] = []
+    quoted = False
     k = j
     while k < n:
         ch = command[k]
@@ -166,6 +220,7 @@ def _read_heredoc_delimiter(command: str, j: int) -> tuple[str, int] | None:
             break
         if ch == "\\" and k + 1 < n:
             out.append(command[k + 1])  # backslash-escaped char → literal
+            quoted = True
             k += 2
             continue
         if ch in ("'", '"'):
@@ -173,18 +228,20 @@ def _read_heredoc_delimiter(command: str, j: int) -> tuple[str, int] | None:
             if close == -1:
                 return None  # unterminated quote in the delimiter word → decline (fail toward block)
             out.append(command[k + 1 : close])  # single quotes: verbatim; good enough for a delim
+            quoted = True
             k = close + 1
             continue
         out.append(ch)
         k += 1
     word = "".join(out)
-    return (word, k) if word else None
+    return (word, k, quoted) if word else None
 
 
-def _read_heredoc(command: str, i: int) -> tuple[str, bool, int] | None:
-    """If `command[i:]` opens a heredoc (`<<WORD` / `<<-WORD`), return `(delimiter, dash,
+def _read_heredoc(command: str, i: int) -> tuple[str, bool, bool, int] | None:
+    """If `command[i:]` opens a heredoc (`<<WORD` / `<<-WORD`), return `(delimiter, dash, quoted,
     index_after_the_operator)`; else None. `<<<` (a here-STRING, one line) is not a heredoc. The
-    delimiter is the quote-removed shell word (see `_read_heredoc_delimiter`)."""
+    delimiter is the quote-removed shell word; `quoted` marks a literal (non-expanding) body (see
+    `_read_heredoc_delimiter`)."""
     if not command.startswith("<<", i) or command.startswith("<<<", i):
         return None
     n = len(command)
@@ -199,29 +256,81 @@ def _read_heredoc(command: str, i: int) -> tuple[str, bool, int] | None:
     parsed = _read_heredoc_delimiter(command, j)
     if parsed is None:
         return None
-    delim, end = parsed
-    return delim, dash, end
+    delim, end, quoted = parsed
+    return delim, dash, quoted, end
 
 
-def _skip_heredoc_bodies(command: str, i: int, delimiters: list[tuple[str, bool]]) -> tuple[int, int]:
+def _extract_expanding_substitutions(text: str) -> list[str]:
+    r"""Extract `$( … )` and backtick bodies from UNQUOTED-heredoc-body text. In such a body quotes
+    (`'`, `"`) and `#` are LITERAL DATA and only `$( … )` / backticks (and `$var`, not detected)
+    EXPAND — unlike a normal command line. So, unlike `_extract_command_substitutions`, this does
+    NOT suppress single-quoted spans or strip comments; it only honours a backslash escape (`\$`,
+    `` \` `` prevent expansion). This closes the asymmetry where `# $(gh pr merge 1)` /
+    `'$(gh pr merge 1)'` in an unquoted heredoc body were wrongly allowed (coordinator ship review)."""
+    subs: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:  # `\$` / `` \` `` → escaped, no expansion
+            i += 2
+            continue
+        if ch == "$" and i + 1 < n and text[i + 1] == "(":
+            inner, i = _read_paren_substitution(text, i + 2)
+            subs.append(inner)
+            continue
+        if ch == "`":
+            inner, i = _read_backtick_substitution(text, i + 1)
+            subs.append(inner)
+            continue
+        i += 1
+    return subs
+
+
+def _body_line_is_merge(line: str, quoted: bool) -> bool:
+    """True iff a SKIPPED heredoc body line should be salvaged as a merge. For a QUOTED (literal)
+    delimiter only an ARGV-position merge line counts (`$( … )` in the body is literal, not
+    executed). For an UNQUOTED delimiter the body IS expanded, so an argv-position merge OR a
+    `$( … )` / backtick that runs a merge counts too. The expansion scan uses
+    `_extract_expanding_substitutions` (quotes and `#` are literal DATA in a heredoc body — only
+    `$()`/backticks expand), so `# $(gh pr merge 1)` and `'$(gh pr merge 1)'` are caught while a
+    prose/apostrophe line without a substitution is not (codex reviews 3 & 4; coordinator review)."""
+    if quoted:
+        return _line_has_executable_merge(line)
+    if _line_has_executable_merge(line):
+        return True
+    # Fail CLOSED (`is not False`, not `is True`): a merge-like but unparseable expanded body (an
+    # unbalanced quote inside `$( … )`) returns None and must still BLOCK, matching the top-level
+    # `return sub` fail-closed contract — otherwise `$(gh pr merge 1 "x)` in an unquoted heredoc
+    # would slip through (Opus ship review). A benign unparseable body returns False and passes.
+    return any(
+        _command_contains_gh_pr_merge(inner) is not False
+        for inner in _extract_expanding_substitutions(line)
+    )
+
+
+def _skip_heredoc_bodies(
+    command: str, i: int, delimiters: list[tuple[str, bool, bool]]
+) -> tuple[int, int]:
     """Advance past the bodies of the heredocs opened on the just-ended line, returning
     `(new_index, salvaged_merge_line_count)`. `i` points at the first body character (right after
-    the line's newline). For each delimiter in order, consume whole lines until a line whose content
-    equals the delimiter (leading tabs ignored when the heredoc used `<<-`).
+    the line's newline). Each delimiter is `(delim, dash, quoted)`; for each, consume whole lines
+    until a line whose content equals the delimiter (leading tabs ignored when the heredoc used
+    `<<-`).
 
     Two safety nets, both erring toward BLOCK:
     - FAIL-CLOSED: if a terminator line is NOT found ahead, skip NOTHING (return the original `i`, 0).
       A `<<` that was NOT really a heredoc opener — arithmetic left-shift, an unterminated heredoc —
       then does not swallow the rest of the input; the following lines are scanned normally.
-    - DEFENSE-IN-DEPTH: every SKIPPED body line is still scanned for an executable `gh pr merge`
-      invocation, and each hit is counted. A crafted heredoc can plant a matching terminator AFTER a
-      real merge (`(( 0 << merge ))` / `gh pr merge 1` / `merge`) to skip past it — counting the
-      merge lines lets the caller re-inject a detectable merge so the gate still blocks. A merge at a
-      body line's executable position is over-blocked (safe); a plain prose mention is not counted."""
+    - DEFENSE-IN-DEPTH: every SKIPPED body line is still scanned for a merge (see
+      `_body_line_is_merge`: argv-position for a quoted delimiter, argv-or-substitution for an
+      unquoted, expanding one), and each hit is counted. A crafted heredoc can plant a matching
+      terminator AFTER a real merge (`(( 0 << merge ))` / `gh pr merge 1` / `merge`) to skip past it —
+      counting the merge lines lets the caller re-inject a detectable merge so the gate still blocks.
+      A merge at a body line's executable position is over-blocked (safe); a prose mention is not."""
     n = len(command)
     pos = i
     salvaged = 0
-    for delim, dash in delimiters:
+    for delim, dash, quoted in delimiters:
         found = False
         local = 0
         while pos < n:
@@ -232,12 +341,7 @@ def _skip_heredoc_bodies(command: str, i: int, delimiters: list[tuple[str, bool]
             if (line.lstrip("\t") if dash else line) == delim:
                 found = True
                 break
-            # Count ONLY a line that parses to a genuine `gh pr merge` invocation (strict True). A
-            # parse failure returns None (e.g. an apostrophe in a commit-message heredoc, `don't`) —
-            # such a line is not a valid executable merge, so it must NOT be salvaged, else a normal
-            # commit-message heredoc that merely mentions a merge would be over-blocked (claude/gemini
-            # review). A real merge line always parses cleanly to True.
-            if _command_contains_gh_pr_merge(line) is True:
+            if _body_line_is_merge(line, quoted):
                 local += 1
         if not found:
             return i, 0
@@ -280,7 +384,7 @@ def _normalize_newlines(command: str) -> str:  # noqa: C901 — a small quote/es
     quote: str | None = None  # "'" or '"' when inside that quote
     boundary = True  # at an unquoted word boundary (where a `#` may start a comment)
     arith_depth = 0  # inside `((`/`$((` — a `<<` there is left-shift, not a heredoc opener
-    pending_heredocs: list[tuple[str, bool]] = []
+    pending_heredocs: list[tuple[str, bool, bool]] = []
     i, n = 0, len(command)
     while i < n:
         ch = command[i]
@@ -342,8 +446,8 @@ def _normalize_newlines(command: str) -> str:  # noqa: C901 — a small quote/es
                 pending_heredocs = []
             continue
         elif arith_depth == 0 and (heredoc := _read_heredoc(command, i)) is not None:
-            delim, dash, i = heredoc
-            pending_heredocs.append((delim, dash))
+            delim, dash, quoted, i = heredoc
+            pending_heredocs.append((delim, dash, quoted))
             boundary = False
             continue
         elif ch in " \t":
@@ -378,6 +482,16 @@ def _split_segments(command: str) -> list[list[str]]:
     command = _normalize_newlines(command)
     lex = shlex.shlex(command, posix=True, punctuation_chars=True)
     lex.whitespace_split = False
+    # Keep chars that are LITERAL inside a shell word but not already word-chars as part of the
+    # token, so a gh-api field/flag value does not fragment: without this, `punctuation_chars=True`
+    # splits `-F query=@merge.graphql` into `query=`, `@`, `merge.graphql` (→ `_gh_api_endpoint`
+    # reads `@` as the endpoint, codex review 5) and `--method=$METHOD` into `--method=`, `$`,
+    # `METHOD` (→ the glued-value regex sees an empty method and the shell-expanded `$METHOD` slips
+    # through, coordinator ship review). Adding `$` keeps `--method=$METHOD` / `query=$Q` whole so
+    # the unprovable-value checks fire. A `$( … )` command substitution is still detected by the raw
+    # `_extract_command_substitutions` scan (independent of shlex). Separators (`;&|()<>`) live in
+    # punctuation_chars and are unaffected.
+    lex.wordchars += "@:,{}%+$"
     # `_normalize_newlines` already stripped real (word-boundary, to-end-of-line) `#` comments, so
     # shlex's own commenter must be OFF — otherwise it truncates a MID-WORD `#` (literal in a real
     # shell) to end of input, e.g. `echo foo#bar && gh pr merge 1` would parse as just `['echo',
@@ -418,37 +532,416 @@ def _segment_argv(segment: list[str]) -> list[str]:
     return segment[i:]
 
 
-def _is_gh_pr_merge(segment: list[str]) -> bool:
-    """Return True iff this segment's argv is a `gh pr merge` invocation.
+def _gh_subargs(argv: list[str]) -> list[str]:
+    """`argv[0]` is `gh`; skip `gh` global flags (incl. `-R owner/repo`) to reach the subcommand.
+    So `gh -R o/r pr merge 5` resolves to `['pr', 'merge', '5']`, not `['-R', ...]`.
 
-    Uses ``os.path.basename`` on argv[0] so that path-qualified invocations
-    such as ``/opt/homebrew/bin/gh pr merge 5`` are correctly detected.
-    """
-    argv = _segment_argv(segment)
-    return (
-        len(argv) >= 3
-        and os.path.basename(argv[0]) == "gh"
-        and argv[1] == "pr"
-        and argv[2] == "merge"
+    `_GH_VALUE_FLAGS` is a whitelist of the value-taking global flags (`-R/--repo/--hostname`); any
+    other `-flag` is treated as boolean. If a future `gh` adds a value-taking global flag NOT in the
+    set, `gh --newflag val pr merge` would mis-parse (`val` seen as the subcommand) and MISS the
+    merge — keep this set in sync with `gh`'s global flags."""
+    i = 1
+    while i < len(argv):
+        t = argv[i]
+        if t in _GH_VALUE_FLAGS:
+            i += 2
+            continue
+        if t.startswith("-"):  # boolean / glued `--repo=o/r`
+            i += 1
+            continue
+        break
+    return argv[i:]
+
+
+def _gh_api_endpoint(rest: list[str]) -> str | None:
+    """The endpoint positional of `gh api <endpoint> …` — the first bare token that is neither a
+    flag nor a value-taking flag's value. Used so a `/graphql` substring inside some field VALUE
+    can't misclassify a REST call as GraphQL."""
+    i, n = 0, len(rest)
+    while i < n:
+        t = rest[i]
+        if t in _API_VALUE_FLAGS:
+            i += 2
+            continue
+        if t.startswith("-"):
+            i += 1  # boolean flag or glued `--flag=value` / `-Fk=v`
+            continue
+        return t
+    return None
+
+
+def _rest_has_write_method(rest: list[str]) -> bool:
+    """True iff a PUT/POST method flag is present: `-X PUT`, `--method PUT`, `-XPUT`, `-X=PUT`,
+    `--method=PUT`."""
+    for j, a in enumerate(rest):
+        if a in ("-X", "--method") and j + 1 < len(rest) and rest[j + 1].upper() in ("PUT", "POST"):
+            return True
+        if _WRITE_METHOD_EQ.match(a):
+            return True
+        if re.match(r"^-X(PUT|POST)$", a, re.IGNORECASE):  # glued short form
+            return True
+    return False
+
+
+def _rest_method_is_unprovable(rest: list[str]) -> bool:
+    """True iff a `-X`/`--method` flag's VALUE is a shell expansion (`$var`, `${v}`, `$( … )`,
+    backtick) the hook cannot resolve at pre-exec time. On a literal merge endpoint such a method
+    MAY be `PUT`, so it is over-blocked (fail closed) — the same posture as an unprovable graphql
+    query, and consistent with `-X $METHOD gh api …/pulls/<n>/merge` being a real merge (codex
+    review 4)."""
+
+    def value_is_expansion(v: str) -> bool:
+        return "$" in v or "`" in v
+
+    for j, a in enumerate(rest):
+        if a in ("-X", "--method") and j + 1 < len(rest) and value_is_expansion(rest[j + 1]):
+            return True
+        m = re.match(r"^(?:--method|-X)=(.*)$", a)
+        if m:
+            val = m.group(1)
+            # An EMPTY glued value (`--method=` / `-X=`) means the real value was fragmented off by
+            # a `$( … )` / backtick that the tokenizer split away (e.g. `--method=`+`` ` ``+`echo`);
+            # on a merge endpoint that method is unprovable → fail closed (codex ship review). A `$`
+            # stays glued via wordchars, so this fires for the backtick-fragmented form.
+            if val == "" or value_is_expansion(val):
+                return True
+        if a.startswith("-X") and len(a) > 2 and value_is_expansion(a[2:]):  # glued `-X$METHOD`
+            return True
+    return False
+
+
+def _graphql_query_is_unprovable(rest: list[str]) -> bool:
+    """True iff a `gh api graphql` call feeds its `query` from a source this hook cannot read at
+    pre-exec time — a file (`query=@f`), stdin (`query=@-` / `--input …`), or a substitution — so a
+    merge mutation MAY hide in it. Such a call is over-blocked (fail closed). Reading the file to
+    refine this is a tracked follow-up; blocking is the SAFE direction."""
+
+    def field_is_filebacked_query(value: str) -> bool:
+        key, _, val = value.partition("=")
+        if key != "query":
+            return False  # other fields are graphql VARIABLES; they can't execute a mutation
+        # Unreadable at pre-exec: a file (`@f`/`@-`), an empty value, or ANY shell expansion (`$var`,
+        # `${v}`, `$(…)`, backtick). shlex has already stripped the quotes, so a live `query="$Q"`
+        # and an inert `query='$Q'` are indistinguishable — the safe, consistent choice is to treat
+        # any `$`/backtick as unprovable and fail closed. This over-blocks a legitimate INLINE
+        # graphql read that uses a `$variable`; re-phrase or use `gh ship`/the hatch (Opus review).
+        return val.startswith("@") or val == "" or "$" in val or "`" in val
+
+    i, n = 0, len(rest)
+    while i < n:
+        a = rest[i]
+        if a in _FIELDISH and i + 1 < n:
+            if field_is_filebacked_query(rest[i + 1]):
+                return True
+            i += 2
+            continue
+        m = re.match(r"^(?:--field|--raw-field|-[fF])=?(.*)$", a)
+        if m and m.group(1) and field_is_filebacked_query(m.group(1)):
+            return True
+        if a == "--input" or a.startswith("--input="):  # whole request body from a file/stdin
+            return True
+        i += 1
+    return False
+
+
+def _gh_api_is_merge(rest: list[str]) -> bool:
+    """`rest` = args after `gh api`. True iff this is a PR-merge REST call (`…/pulls/<n>/merge` +
+    write method) or a graphql merge mutation (inline, or a file/stdin/substitution-backed query
+    that can't be proven safe)."""
+    endpoint = _gh_api_endpoint(rest)
+    is_graphql = endpoint == "graphql" or (endpoint or "").endswith("/graphql")
+    if is_graphql:
+        # A merge mutation token ANYWHERE in a graphql call blocks — this is a deliberate over-block:
+        # a graphql invocation carrying `mergePullRequest`/`enablePullRequestAutoMerge` in any field
+        # is almost certainly the mutation, and over-blocking is the safe direction (Opus review 2).
+        if _MERGE_MUTATION.search(" ".join(rest)):
+            return True
+        if _graphql_query_is_unprovable(rest):
+            return True
+    # Match the merge path against the ENDPOINT positional — not every arg — so a `pulls/<n>/merge`
+    # substring inside a field VALUE (`-f body='see pulls/1/merge'`) does not false-block an
+    # unrelated `gh api` call (Opus review 1). If the endpoint could not be resolved (a degraded
+    # parse, e.g. a value-flag mis-classification swallowed it), fall back to scanning all args so a
+    # real merge is not MISSED — fail-closed direction (Opus review 2).
+    rest_path_hit = (
+        bool(_REST_MERGE_PATH.search(endpoint))
+        if endpoint is not None
+        else any(_REST_MERGE_PATH.search(a) for a in rest)
     )
+    # A write method (`-X PUT`) merges; an UNPROVABLE method (`-X $METHOD`) may be PUT → fail closed.
+    return rest_path_hit and (_rest_has_write_method(rest) or _rest_method_is_unprovable(rest))
+
+
+def _is_invoked_head(base: str) -> bool:
+    """True iff a token's basename names a command whose merge we detect directly: `gh`, a shell
+    interpreter (its `-c` string is re-scanned), or `eval`."""
+    return base == "gh" or base == "eval" or base in _SHELL_INTERPRETERS
+
+
+def _resolve_invoked_argv(argv: list[str]) -> list[str] | None:
+    """Return the argv of the actually-invoked command, seeing through ONE wrapper prefix. Returns
+    the tail starting at the first token whose basename is `gh`, a shell interpreter, or `eval` —
+    so `env gh pr merge`, `env bash -c '…'` (wrapper + interpreter), and `/usr/bin/timeout 60 gh …`
+    (path-qualified) all resolve. Returns None when no such invocation is at the command position.
+    A quoted `gh pr merge` inside another program's arg (`echo "gh pr merge"`) is one token whose
+    basename is not a head, so it is not matched (Opus/codex reviews 4/6/7)."""
+    if not argv:
+        return None
+    if _is_invoked_head(os.path.basename(argv[0])):
+        return argv
+    if os.path.basename(argv[0]) in _WRAPPERS:  # basename so `/usr/bin/env …` matches too
+        # Scan for the wrapped invoked head without modelling each wrapper's flag arity. This can
+        # OVER-block a token that is merely DATA to a non-head command under a wrapper (`nice echo
+        # gh pr merge`) — the safe direction for a security gate; a merge is never let through.
+        for k in range(1, len(argv)):
+            if _is_invoked_head(os.path.basename(argv[k])):
+                return argv[k:]
+    return None
+
+
+def _wrapped_command_strings(argv: list[str]) -> list[str]:
+    """Command strings that `argv` executes from a STRING ARGUMENT rather than the token stream: a
+    shell interpreter's `-c <cmd>` (incl. combined short options `-cx` / `-xc`) and every argument
+    of `eval` (joined and re-parsed). A merge hidden in such a quoted string (`bash -c 'gh pr merge
+    1'`, `eval "gh pr merge 1"`) is not reachable by the token see-through, so the caller re-scans
+    each returned string as a command (Opus/codex reviews 6/7)."""
+    if not argv:
+        return []
+    base = os.path.basename(argv[0])
+    if base in _SHELL_INTERPRETERS:
+        out: list[str] = []
+        i = 1
+        while i < len(argv):
+            if _SHELL_C_OPT.match(argv[i]) and i + 1 < len(argv):
+                out.append(argv[i + 1])
+                i += 2
+                continue
+            i += 1
+        return out
+    if base == "eval":
+        return [" ".join(argv[1:])] if len(argv) > 1 else []
+    return []
+
+
+def _is_merge_route(segment: list[str]) -> bool:
+    """True iff this segment's argv is a direct PR-merge route that skips `gh ship`: `gh pr merge …`
+    (incl. behind a `gh -R o/r` global flag, a wrapper like `env`/`sudo`/`timeout`, or a wrapper +
+    interpreter like `env bash -c '…'`), or a `gh api` REST/GraphQL merge (see `_gh_api_is_merge`),
+    or a merge inside a shell interpreter's `-c` string / `eval` argument. Anchored on the
+    ACTUALLY-invoked command, so a prose mention in another program's args (`tg "…mergePullRequest…"`,
+    `echo mergePullRequest`) and `git merge main` all pass."""
+    argv = _resolve_invoked_argv(_segment_argv(segment))
+    if argv is None:
+        return False
+    if os.path.basename(argv[0]) == "gh":
+        sub = _gh_subargs(argv)
+        if len(sub) >= 2 and sub[0] == "pr" and sub[1] == "merge":
+            return True
+        if sub and sub[0] == "api":
+            return _gh_api_is_merge(sub[1:])
+        return False
+    # A shell interpreter / `eval`: re-scan the merge hidden in its `-c` / string arguments.
+    for cmd in _wrapped_command_strings(argv):
+        if _command_contains_gh_pr_merge(cmd) is True:
+            return True
+    return False
+
+
+def _read_paren_substitution(command: str, start: int) -> tuple[str, int]:
+    """`command[start:]` is the body right after a `$(`. Return `(inner_body, index_after_close)`,
+    finding the matching `)` while honouring nested `(`/`)`, quoted spans, and `#` COMMENTS. A `)`
+    inside a `#` comment does not close the substitution (`$(echo ok # )`+newline+`gh pr merge`+
+    newline+`)` runs the merge — the `# )` is a comment, the real `)` is after the merge line), so
+    the reader skips a comment (from an unquoted word boundary to end of line). If no close is found,
+    return the remainder and `len(command)` — over-block-safe: the tail is still re-scanned (codex
+    review 5)."""
+    depth = 1
+    i, n = start, len(command)
+    quote: str | None = None
+    boundary = True  # at an unquoted word boundary (where a `#` may start a comment)
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            boundary = False
+            continue
+        if ch == "#" and boundary:
+            nl = command.find("\n", i)
+            i = n if nl == -1 else nl  # skip the comment to end of line (the newline stays)
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            boundary = False
+        elif ch == "(":
+            depth += 1
+            boundary = True
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return command[start:i], i + 1
+            boundary = True
+        elif ch in " \t\n;&|":
+            boundary = True
+        else:
+            boundary = False
+        i += 1
+    return command[start:], n
+
+
+def _unescape_backtick_body(body: str) -> str:
+    r"""POSIX un-escaping of a backtick substitution body: `` \` `` → `` ` ``, `\\` → `\`, `\$` →
+    `$` (any other `\x` is left verbatim). A nested backtick substitution is written `` \`…\` ``
+    inside the outer backticks, so without this un-escape the re-scan of the body would treat the
+    `` \` `` as inert and MISS the nested merge — the #248 bypass one level deeper (Opus review)."""
+    out: list[str] = []
+    i, n = 0, len(body)
+    while i < n:
+        if body[i] == "\\" and i + 1 < n and body[i + 1] in ("`", "\\", "$"):
+            out.append(body[i + 1])
+            i += 2
+            continue
+        out.append(body[i])
+        i += 1
+    return "".join(out)
+
+
+def _read_backtick_substitution(command: str, start: int) -> tuple[str, int]:
+    r"""`command[start:]` is the body right after an opening backtick. Return `(inner_body,
+    index_after_close)`, ending at the next unescaped backtick. The returned body is POSIX-unescaped
+    (see `_unescape_backtick_body`) so a nested `` \`…\` `` substitution is visible when the caller
+    re-scans it. If no close is found, return the (unescaped) remainder and `len(command)`
+    (over-block-safe)."""
+    i, n = start, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "`":
+            return _unescape_backtick_body(command[start:i]), i + 1
+        i += 1
+    return _unescape_backtick_body(command[start:]), n
+
+
+def _extract_command_substitutions(command: str) -> list[str]:
+    r"""Return the bodies of every command/process substitution a real shell would EXECUTE: `$( … )`
+    and backtick `` `…` `` (both OUTSIDE quotes and INSIDE double quotes — `echo "$(gh pr merge 1)"`
+    runs the merge), plus process substitution `<( … )` / `>( … )` (unquoted only). Single-quoted
+    spans SUPPRESS substitution, so they are kept literal and skipped (`echo '$(gh pr merge 1)'` is
+    inert). Nested/inner substitutions are handled by the caller re-scanning each returned body
+    recursively.
+
+    Why this exists (#248): the argv scanner keeps a substitution body inside ONE token — a
+    double-quoted `"$( … )"` stays a single literal token, and a bare/backtick body is `$`/`` ` ``
+    prefixed — so `argv[0]` is never `gh` and the wrapped merge sails past the gate. Extracting each
+    executed body and re-scanning it with the SAME detector closes that, over-blocking in the safe
+    direction while a single-quoted (inert) body and a plain string arg still pass."""
+    subs: list[str] = []
+    i, n = 0, len(command)
+    quote: str | None = None
+    while i < n:
+        ch = command[i]
+        if quote == "'":  # single quotes: fully literal, no substitution
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:  # escape (outside single quotes): next char is inert
+            i += 2
+            continue
+        if ch == "'" and quote is None:
+            quote = "'"
+            i += 1
+            continue
+        if ch == '"':
+            quote = None if quote == '"' else '"'
+            i += 1
+            continue
+        if ch == "$" and i + 1 < n and command[i + 1] == "(":
+            inner, i = _read_paren_substitution(command, i + 2)
+            subs.append(inner)
+            continue
+        if ch in ("<", ">") and i + 1 < n and command[i + 1] == "(" and quote is None:
+            # Process substitution `<( … )` / `>( … )` also EXECUTES its body (`diff <(gh pr merge
+            # 1) x`). Unlike `$(…)`/backticks it is NOT expanded inside double quotes, so only fire
+            # when unquoted.
+            inner, i = _read_paren_substitution(command, i + 2)
+            subs.append(inner)
+            continue
+        if ch == "`":
+            inner, i = _read_backtick_substitution(command, i + 1)
+            subs.append(inner)
+            continue
+        i += 1
+    return subs
+
+
+def _line_has_executable_merge(line: str) -> bool:
+    """True iff a segment of `line` is a merge route at an executable (argv) position. Segment-only
+    — it does NOT recurse into command substitutions — so the heredoc-body salvage counts only a
+    literal executable-position merge planted before a crafted terminator, not a `$( … )` that a
+    quoted heredoc body keeps literal. A parse failure counts as no merge (fail toward allow, so a
+    prose/apostrophe body line is not over-blocked)."""
+    try:
+        segments = _split_segments(line)
+    except ValueError:
+        return False
+    return any(_is_merge_route(seg) for seg in segments)
+
+
+def _substitutions_contain_merge(command: str) -> bool | None:
+    """Scan every EXECUTED command substitution in `command` (recursively). Returns True if any
+    body is (or contains) a raw merge route; None if a merge-like body cannot be parsed (fail
+    closed); False otherwise.
+
+    Scans the NORMALIZED command (`_normalize_newlines`), not the raw text, so a `$( … )` that a
+    real shell never executes is not over-blocked: `_normalize_newlines` drops `#` comments (`echo
+    ok # $(gh pr merge 1)`) and skips heredoc bodies (`<<'EOF'` … `$(gh pr merge 1)` … `EOF`), which
+    are data, not executed substitutions (codex review round 3). An executable-position `gh pr
+    merge` LINE inside a heredoc body is still salvaged by `_skip_heredoc_bodies`."""
+    result: bool | None = False
+    for inner in _extract_command_substitutions(_normalize_newlines(command)):
+        r = _command_contains_gh_pr_merge(inner)
+        if r is True:
+            return True
+        if r is None:
+            result = None
+    return result
 
 
 def _command_contains_gh_pr_merge(command: str) -> bool | None:
-    """Return True if any parsed segment of `command` is a `gh pr merge` call.
+    """Return True if `command` is (or hides) a raw merge route: a `gh pr merge` / `gh api` merge at
+    an executable position in any segment, OR the same inside an executed command substitution
+    (`$( … )` / backticks, incl. inside double quotes — see `_extract_command_substitutions`).
 
-    Returns None (fail-closed) when the command cannot be parsed AND the raw
-    text looks like a merge invocation.  Commands whose parse fails but contain
-    no merge-like pattern (e.g. ``grep won't file`` with an unbalanced quote)
-    return False so they are not spuriously blocked.
+    Returns None (fail-closed) when the command — or a merge-like substitution body — cannot be
+    parsed.  A parse failure with no merge-like pattern (e.g. ``grep won't file``) returns False so
+    it is not spuriously blocked.
     """
     try:
-        segments = _split_segments(command)
+        segments: list[list[str]] | None = _split_segments(command)
     except ValueError:
-        # Fail-closed ONLY if the raw text plausibly contains a merge attempt.
-        if _MERGE_HINT.search(command):
+        segments = None
+    if segments is not None and any(_is_merge_route(seg) for seg in segments):
+        return True
+    sub = _substitutions_contain_merge(command)
+    if sub is True:
+        return True
+    if segments is None:
+        # Top-level parse failed: fail-closed if an inner substitution was merge-like-but-unparseable
+        # OR the raw text plausibly contains a merge attempt; otherwise it is a benign parse failure.
+        if sub is None or _MERGE_HINT.search(command):
             return None
         return False
-    return any(_is_gh_pr_merge(seg) for seg in segments)
+    return sub  # False, or None (a merge-like substitution body that could not be parsed)
 
 
 def _block(prefix: str | None = None) -> int:

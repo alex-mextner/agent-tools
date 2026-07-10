@@ -323,7 +323,7 @@ def test_empty_command_allows(monkeypatch):
 def test_line_continuation_does_not_hide_merge():
     """shlex (whitespace_split=False) emits a standalone `\\n` token for a `\\`-newline line
     continuation. After the leading `VAR=` assignment is stripped that token would become
-    argv[0], so `_is_gh_pr_merge` saw `argv[0] == '\\n'` and reported NO merge → the raw merge was
+    argv[0], so the merge detector saw `argv[0] == '\\n'` and reported NO merge → the raw merge was
     ALLOWED with no approval. Detection must survive the continuation."""
     command = 'RIG_HATCH_REQUEST_BLOCK_RAW_PR_MERGE="x" \\\n  gh pr merge 123 --admin'
     assert hook._command_contains_gh_pr_merge(command) is True
@@ -625,6 +625,477 @@ def test_prior_line_ending_in_paren_does_not_glue_the_separator(command, monkeyp
     `;` yields a `);` punctuation run that `_split_segments` does not treat as a separator, keeping
     the merge in the previous segment and ALLOWING it. Must BLOCK (Codex review on the follow-up)."""
     out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+# ── command substitution: a merge hidden in $(…) / `…` must not evade detection (#248) ───────
+#
+# A command substitution runs its body as a shell command, EVEN inside double quotes
+# (`echo "$(gh pr merge 1)"`). The argv scanner keeps such a body inside a single (quoted or
+# `$`-prefixed) token, so argv[0] is never `gh` and the merge sailed past the gate. #248 tracked
+# the backtick form; the double-quoted `$(…)` and bare `$(…)` forms were also missed. Single quotes
+# suppress substitution, so a single-quoted `$(…)` is inert and must stay ALLOWED.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "`gh pr merge 1`",  # backtick command substitution (the #248 headline)
+        "`gh pr merge 1 --admin`",
+        'echo "$(gh pr merge 1)"',  # $(…) inside double quotes — shell DOES execute it
+        'echo "$(gh pr merge 1 --admin)"',
+        "$(gh pr merge 1)",  # bare $(…) — also missed by the argv scanner
+        "echo `gh pr merge 1`",  # backtick inside another command's args
+        'result="$(gh pr merge 1 --squash)"',  # assigned from a double-quoted substitution
+        "echo $(echo $(gh pr merge 1))",  # nested substitution
+        "diff <(gh pr merge 1) other.txt",  # process substitution also executes its body
+        "cat >(gh pr merge 1)",
+    ],
+)
+def test_command_substitution_merge_is_blocked(command, monkeypatch):
+    """A `gh pr merge` inside an EXECUTED command substitution (backtick or `$(…)`, incl. inside
+    double quotes and nested) is a real raw merge and must BLOCK (#248)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "`date`",  # benign backtick substitution
+        'echo "$(git rev-parse HEAD)"',  # benign $(…) inside double quotes
+        "files=$(ls -1)",  # benign assignment from a substitution
+        "echo '$(gh pr merge 1)'",  # SINGLE-quoted → substitution suppressed, inert
+        'tg "mentions gh pr merge in a note"',  # plain double-quoted string arg, no substitution
+        "grep -r 'gh pr merge' .",  # single-quoted search pattern
+    ],
+)
+def test_benign_or_inert_substitution_is_allowed(command, monkeypatch):
+    """A substitution with no merge, and a SINGLE-quoted `$(…)` (which the shell does NOT expand —
+    inert), must be ALLOWED. Over-blocking the inert single-quoted form is avoided; a plain string
+    that merely mentions a merge (no substitution) also passes (#248 false-positive guard)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+# ── gh api merge routes: REST + graphql mutation must be caught too (#248) ───────────────────
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api repos/o/r/pulls/1/merge -X PUT",  # REST merge, PUT
+        "gh api repos/o/r/pulls/1/merge --method PUT",
+        "gh api -X PUT repos/o/r/pulls/1/merge",  # method before endpoint
+        "gh api graphql -f query='mutation { mergePullRequest(input:{}) { clientMutationId } }'",
+        "gh api graphql -f query='mutation { enablePullRequestAutoMerge(input:{}) { number } }'",
+        "gh -R o/r pr merge 5",  # gh GLOBAL flag before `pr merge` (was evaded)
+        "`gh api repos/o/r/pulls/1/merge -X PUT`",  # gh-api merge inside a substitution
+        'echo "$(gh api graphql -f query=\'mutation { mergePullRequest }\')"',
+    ],
+)
+def test_gh_api_merge_routes_are_blocked(command, monkeypatch):
+    """`gh api …/pulls/<n>/merge` with a write method, and a `gh api graphql` merge mutation
+    (mergePullRequest / enablePullRequestAutoMerge), skip the ship gate exactly like `gh pr merge`
+    and must BLOCK — including a `gh` global flag before `pr merge`, and inside a substitution
+    (#248 acceptance: cover the gh api merge routes)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api repos/o/r/pulls/1/merge",  # GET on /merge — a merge-STATUS read, no write method
+        "gh api repos/o/r/pulls",  # list PRs
+        "gh api graphql -f query='query { repository { name } }'",  # a plain graphql read
+        'tg "docs mention gh api pulls/1/merge and mergePullRequest"',  # prose in another program
+        "echo mergePullRequest",  # a bare token, not a gh invocation
+        "git merge main",  # git merge, not gh
+    ],
+)
+def test_gh_api_non_merge_and_prose_is_allowed(command, monkeypatch):
+    """A GET on `/merge` (status read), a graphql READ query, and any prose mention of the merge
+    routes inside another program's args must be ALLOWED — the block anchors on `gh` at the command
+    position (#248 false-positive guard)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_gh_api_merge_with_unbalanced_quote_fails_closed(monkeypatch):
+    """A `gh api …/pulls/<n>/merge` write with an unbalanced quote can't be parsed; the merge-hint
+    heuristic must recognise the gh-api merge shape (not just `gh pr merge`) and fail CLOSED."""
+    out, _err, code = _run("gh api repos/o/r/pulls/1/merge -X PUT --jq 'unclosed", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_graphql_file_backed_query_is_over_blocked(monkeypatch):
+    """A `gh api graphql` whose query is fed from a FILE / stdin cannot be inspected at pre-exec
+    time and MAY carry a merge mutation, so it is over-blocked (fail closed). Reading the file to
+    refine this is a tracked follow-up; the SAFE direction is to block (#248)."""
+    out, _err, code = _run("gh api graphql -F query=@mutation.graphql", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+# ── Review round 1 findings (Opus): deeper edge cases ────────────────────────────────────────
+
+
+def test_escaped_nested_backtick_merge_is_blocked(monkeypatch):
+    r"""POSIX: inside `` `…` `` an escaped `` \` `` opens a NESTED command substitution, so
+    ``echo `echo \`gh pr merge 1\``` `` really executes the merge. The backtick body must be
+    POSIX-unescaped before re-scan or the nested merge is MISSED — the #248 bypass one level deeper
+    (Opus review round 1)."""
+    out, _err, code = _run("echo `echo \\`gh pr merge 1\\``", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_graphql_query_from_shell_variable_is_over_blocked(monkeypatch):
+    """`gh api graphql -f query="$Q"` feeds the query from a shell variable the hook can't read at
+    pre-exec time — as unprovable as a `@file`, so fail closed. shlex strips the quotes, so a live
+    `"$Q"` and an inert `'$Q'` are indistinguishable → any `$` in the query value blocks (Opus
+    review round 1)."""
+    out, _err, code = _run('gh api graphql -f query="$Q"', monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_gh_api_rest_merge_substring_in_field_value_is_not_blocked(monkeypatch):
+    """A `pulls/<n>/merge` substring inside a FIELD VALUE (not the endpoint positional) must NOT
+    false-block an unrelated `gh api` write — the REST path is matched against the endpoint only
+    (Opus review round 1)."""
+    out, _err, code = _run("gh api repos/o/r/issues -X POST -f body='see pulls/1/merge'", monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api repos/o/r/pulls/1/merge -XPUT",  # glued short form
+        "gh api repos/o/r/pulls/1/merge --method=POST",  # glued long form
+        "gh api repos/o/r/pulls/1/merge -X=PUT",  # -X=PUT form
+        "gh api repos/o/r/pulls/1/merge -X put",  # lowercase, separate
+        "gh api repos/o/r/pulls/1/merge --method=post",  # lowercase, glued
+    ],
+)
+def test_gh_api_glued_write_method_forms_are_blocked(command, monkeypatch):
+    """The PUT/POST method flag in glued/lowercase forms (`-XPUT`, `--method=POST`, `-X=PUT`,
+    `-X put`) must still be recognised as a write on the REST merge endpoint (Opus review — the
+    glued/case-insensitive code paths need explicit coverage so a refactor can't silently drop
+    them)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo ok # $(gh pr merge 1)",  # substitution inside a `#` comment — never executed
+        "echo ok # `gh pr merge 1`",  # backtick substitution inside a comment
+        "cat <<'EOF'\n$(gh pr merge 1)\nEOF",  # quoted heredoc: body literal, not expanded
+        "git commit -F - <<'MSG'\nfix: `gh pr merge` example\nMSG",  # quoted heredoc, backtick prose
+    ],
+)
+def test_substitution_in_comment_or_quoted_heredoc_is_not_executed_and_allowed(command, monkeypatch):
+    """A `$(…)` / backtick inside a `#` comment (dropped) or a QUOTED-delimiter heredoc body
+    (literal, not expanded) is NOT executed by the shell, so scanning the raw text would over-block
+    it. The substitution scan runs on the normalized command (comments dropped, heredoc bodies
+    skipped) so these are ALLOWED (codex review round 3)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat <<EOF\n$(gh pr merge 1)\nEOF",  # UNQUOTED heredoc: body IS expanded → merge executes
+        "cat <<EOF\n`gh pr merge 1`\nEOF",  # unquoted, backtick substitution
+        "cat <<-EOF\n\t$(gh pr merge 1)\nEOF",  # `<<-` tab-stripped, unquoted
+    ],
+)
+def test_substitution_in_unquoted_heredoc_is_executed_and_blocked(command, monkeypatch):
+    """An UNQUOTED heredoc (`<<EOF`) EXPANDS its body, so a `$(…)`/backtick there really runs the
+    merge and must BLOCK — distinct from a quoted `<<'EOF'` (literal) body (codex review round 4)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api repos/o/r/pulls/1/merge -X $METHOD",  # method from a shell variable
+        "gh api repos/o/r/pulls/1/merge -X ${M}",
+        "gh api repos/o/r/pulls/1/merge -X $(echo PUT)",  # method from a substitution
+    ],
+)
+def test_gh_api_rest_merge_with_unprovable_method_fails_closed(command, monkeypatch):
+    """On a literal `…/pulls/<n>/merge` endpoint a shell-expanded method (`-X $METHOD`) MAY be PUT —
+    the hook can't resolve it at pre-exec time, so it fails closed and BLOCKs, consistent with the
+    unprovable-graphql-query posture (codex review round 4)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "env gh pr merge 1",  # wrapper prefix
+        "command gh pr merge 1",
+        "nohup gh pr merge 1 --admin",
+        "sudo -u ci gh pr merge 1",
+        "timeout 60 gh pr merge 1",
+        "env FOO=bar gh api repos/o/r/pulls/1/merge -X PUT",  # wrapper + gh api merge
+    ],
+)
+def test_wrapper_prefixed_merge_is_blocked(command, monkeypatch):
+    """A merge behind a wrapper command (`env`/`command`/`nohup`/`sudo`/`timeout` …) is an
+    ACTUALLY-invoked merge and must BLOCK — the detector sees through the wrapper to the wrapped
+    `gh` (Opus review round 4)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/usr/bin/env gh pr merge 1",  # path-qualified wrapper
+        "/usr/bin/timeout 60 gh pr merge 1",
+        "/usr/bin/env FOO=b gh api repos/o/r/pulls/1/merge -X PUT",
+    ],
+)
+def test_path_qualified_wrapper_merge_is_blocked(command, monkeypatch):
+    """A PATH-qualified wrapper (`/usr/bin/env gh pr merge`) must be seen through too — the wrapper
+    match uses basename, not the literal argv[0] (codex review round 6)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -c 'gh pr merge 1'",  # merge in a shell -c string
+        "sh -c \"gh pr merge 1 --admin\"",
+        "/bin/bash -c 'gh api repos/o/r/pulls/1/merge -X PUT'",  # gh api merge in -c
+        "eval gh pr merge 1",  # eval joins its args and re-parses
+        "eval \"gh pr merge 1\"",  # eval of a quoted string
+    ],
+)
+def test_interpreter_string_arg_merge_is_blocked(command, monkeypatch):
+    """A merge hidden in a shell interpreter's `-c` string or an `eval` argument is an
+    actually-invoked merge and must BLOCK — the string is re-scanned as a command (Opus review
+    round 6)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "env bash -c 'gh pr merge 1'",  # wrapper + interpreter composition
+        "timeout 60 bash -c 'gh pr merge 1 --admin'",
+        "sudo sh -c 'gh api repos/o/r/pulls/1/merge -X PUT'",
+        "/usr/bin/env bash -c 'gh pr merge 1'",  # path-qualified wrapper + interpreter
+        "env timeout 60 gh pr merge 1",  # two wrappers then gh
+        "bash -cx 'gh pr merge 1'",  # combined short option -cx
+        "sh -xc 'gh pr merge 1'",  # combined short option -xc
+    ],
+)
+def test_wrapper_interpreter_composition_merge_is_blocked(command, monkeypatch):
+    """A merge behind a wrapper + interpreter (`env bash -c '…'`) or a combined `-c` short option
+    (`bash -cx`) is still an actually-invoked merge and must BLOCK — the resolver sees through the
+    wrapper to the interpreter and re-scans its `-c` string (codex review round 7)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_interpreter_c_string_without_merge_is_allowed(monkeypatch):
+    """A shell `-c` string with no merge must still ALLOW — the re-scan anchors on an invoked `gh`."""
+    out, _err, code = _run("bash -c 'echo gh pr merge is just text'", monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_inline_graphql_query_with_variables_is_over_blocked(monkeypatch):
+    """A `$` in a graphql `query` value is over-blocked whether it is a shell expansion (`"$Q"`) or
+    a GraphQL variable (`$owner`) — once the shell strips quotes the two are indistinguishable, so
+    the safe, documented choice blocks both. Pinned so a future 'allow inline reads with variables'
+    refactor is a conscious, tested change (codex review round 6)."""
+    out, _err, code = _run(
+        "gh api graphql -f query='query($owner:String!){ repository(owner:$owner){ name } }'",
+        monkeypatch,
+    )
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_wrapper_prefixed_prose_is_not_blocked(monkeypatch):
+    """A wrapper whose argument merely MENTIONS a merge (not an invoked `gh`) must still ALLOW —
+    the wrapped-`gh` scan matches a token whose basename is `gh`, not a quoted string."""
+    out, _err, code = _run('nohup echo "gh pr merge 1"', monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("command", ["strace gh pr merge 1", "taskset -c 0 gh pr merge 1"])
+def test_additional_exec_wrappers_are_covered(command, monkeypatch):
+    """The best-effort wrapper set covers common exec-wrappers (`strace`, `taskset`, …) so
+    `strace gh pr merge 1` is still an invoked merge and BLOCKs (codex review round 8)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_command_dash_v_gh_is_not_a_merge(monkeypatch):
+    """`command -v gh` (a lookup, `command` is a wrapper + a bare `gh` tail with no subcommand) must
+    ALLOW — the resolved `gh` has no `pr merge`/`api` subargs (codex review round 8, FP guard)."""
+    out, _err, code = _run("command -v gh", monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_prose_mention_under_wrapper_scan_still_allowed(monkeypatch):
+    """SENTINEL for the wrapper-scan boundary: a NON-wrapper leading token (`see`) must NOT be
+    treated as a wrapper, so `see the gh pr merge docs` (prose) still ALLOWs. Guards against a
+    future 'treat any leading token as a wrapper' change that would re-break prose anchoring."""
+    out, _err, code = _run("cat <<EOF\nsee the gh pr merge docs for details\nEOF", monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_graphql_inline_read_query_with_merge_token_is_over_blocked(monkeypatch):
+    """A `gh api graphql` read whose text merely CONTAINS a merge-mutation token is over-blocked —
+    `_MERGE_MUTATION` scans the whole graphql call, a deliberate safe-direction over-block. Locked
+    in so a future 'scan only the query field' refactor can't silently change it (Opus review)."""
+    out, _err, code = _run(
+        "gh api graphql -f query='query { repository(name:\"mergePullRequest\") { id } }'", monkeypatch
+    )
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_unparseable_prose_mentioning_gh_api_merge_token_fails_closed(monkeypatch):
+    """The broadened `_MERGE_HINT` fails closed on an UNPARSEABLE command that mentions `gh` plus a
+    gh-api merge token — a deliberate widening of the safe-direction over-block. Locked in so the
+    accepted behaviour is pinned (Opus review round 4)."""
+    out, _err, code = _run("echo gh docs on mergePullRequest don't forget", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_unparseable_prose_without_merge_token_is_allowed(monkeypatch):
+    """The mirror of the above: an unparseable command with NO merge token must still ALLOW — the
+    fail-closed hint only fires on a merge-like shape (regression guard for the widened hint)."""
+    out, _err, code = _run("grep won't file", monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_comment_with_paren_inside_substitution_does_not_hide_merge(monkeypatch):
+    """A `)` inside a `#` comment WITHIN `$( … )` must not close the substitution early: the real
+    `)` is after the merge, which the shell executes. `echo "$(echo ok # )`+newline+`gh pr merge
+    1`+newline+`)"` must BLOCK — the paren reader is comment-aware (codex review round 5)."""
+    out, _err, code = _run('echo "$(echo ok # )\ngh pr merge 1\n)"', monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api -F query=@merge.graphql graphql",  # file-backed query, flag BEFORE endpoint
+        "gh api graphql -F query=@merge.graphql",  # flag after endpoint
+        "gh api --input @body.json graphql",  # input body, flag before endpoint
+    ],
+)
+def test_gh_api_graphql_filebacked_query_with_flags_before_endpoint_is_blocked(command, monkeypatch):
+    """A `gh api graphql` file-backed query must be detected regardless of flag/endpoint order.
+    `-F query=@merge.graphql` must NOT fragment on `@` (which would make `_gh_api_endpoint` read
+    `@` as the endpoint and miss the graphql merge) — fail closed (codex review round 5)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api repos/o/r/pulls/1/merge --method=$METHOD",  # glued long form, shell var
+        "gh api repos/o/r/pulls/1/merge -X=$METHOD",  # glued -X= form
+        "gh api repos/o/r/pulls/1/merge --method=$(echo PUT)",  # glued, substitution
+    ],
+)
+def test_gh_api_rest_merge_with_glued_unprovable_method_fails_closed(command, monkeypatch):
+    """A GLUED shell-expanded method on a literal merge endpoint (`--method=$METHOD`, `-X=$METHOD`)
+    must fail closed and BLOCK — the `$` must not fragment the token into an empty method value that
+    slips through (coordinator ship review P1)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api repos/o/r/pulls/1/merge --method=`echo PUT`",  # glued long backtick method
+        "gh api repos/o/r/pulls/1/merge -X=`echo PUT`",  # glued -X= backtick method
+    ],
+)
+def test_gh_api_rest_merge_with_glued_backtick_method_fails_closed(command, monkeypatch):
+    """A GLUED backtick method value (`--method=\\`echo PUT\\``) fragments to an EMPTY `--method=`
+    token; on a merge endpoint that empty/unprovable method must fail closed and BLOCK, not slip
+    through (codex ship review round 2)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_unquoted_heredoc_unparseable_substitution_fails_closed(monkeypatch):
+    """An unquoted heredoc body whose `$( … )` is merge-like but UNPARSEABLE (an unbalanced quote
+    inside) must fail CLOSED and BLOCK — matching the top-level contract, not fail open (Opus ship
+    review round 2)."""
+    out, _err, code = _run('cat <<EOF\n$(gh pr merge 1 "x)\nEOF', monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat <<EOF\n# $(gh pr merge 1)\nEOF",  # `#` is LITERAL data in an unquoted heredoc body
+        "cat <<EOF\n'$(gh pr merge 1)'\nEOF",  # `'` is LITERAL data; $() still expands
+    ],
+)
+def test_unquoted_heredoc_literal_hash_or_quote_still_expands_substitution(command, monkeypatch):
+    """In an UNQUOTED heredoc body a `#` and `'` are literal DATA while `$( … )` STILL EXPANDS and
+    executes — so `# $(gh pr merge 1)` / `'$(gh pr merge 1)'` run the merge and must BLOCK. The body
+    scan must not comment-strip or single-quote-inert an unquoted heredoc body (coordinator ship
+    review P1; mirrors the confirmed asymmetry where bare `$(gh pr merge 1)` already blocks)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_unparseable_substitution_body_with_parseable_top_level_fails_closed(monkeypatch):
+    """When the TOP-LEVEL command parses but a command-substitution BODY is merge-like yet
+    unparseable (an unbalanced quote), the fail-closed `return sub` (None) branch must BLOCK — the
+    only new control-flow path without direct coverage (Opus review round 2)."""
+    out, _err, code = _run("echo \"$(gh pr merge 1 --jq 'unclosed)\"", monkeypatch)
     assert code == hook.BLOCK_EXIT_CODE
     assert _decision(out) == "block"
 
