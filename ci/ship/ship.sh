@@ -12,8 +12,9 @@
 #   • A UI-touching PR has no embedded screenshot (see ci/screenshots/) — unless overridden.
 #   • The local branch has unpushed/diverged commits, or its worktree is dirty.
 #   • The review-quorum bar (Guard-B of the self-merge-authority program) is not met: the
-#     PR's task code has fewer than SHIP_REVIEW_QUORUM_MIN_ITER recorded review-cli iterations
-#     across SHIP_REVIEW_QUORUM_MIN_MODELS distinct models. There is NO self-service override —
+#     PR's task code has fewer than SHIP_REVIEW_QUORUM_MIN_ITER PASSED review-cli iterations
+#     across SHIP_REVIEW_QUORUM_MIN_MODELS distinct models among those passed iterations (a
+#     failed/degraded review does not count toward the bar). There is NO self-service override —
 #     a one-time bypass goes through a live Telegram approval to Alex (see the hatch escalation
 #     below), never a reason flag.
 #
@@ -77,8 +78,10 @@
 #                          gate refuses (fail-closed) with guidance.
 #   SHIP_REVIEW_QUORUM_ENABLED / SHIP_REVIEW_QUORUM  set either to 0 to disable the
 #                          review-quorum gate entirely (default: enabled).
-#   SHIP_REVIEW_QUORUM_MIN_ITER    quorum floor: recorded review-cli iterations (default 3).
-#   SHIP_REVIEW_QUORUM_MIN_MODELS  quorum floor: distinct models (default 3).
+#   SHIP_REVIEW_QUORUM_MIN_ITER    quorum floor: PASSED review-cli iterations (default 3). CLAMPED
+#                          to a hard minimum of 3 — raise-only, an unset/0/negative/below-3 value
+#                          resolves to 3 (fail-closed #242).
+#   SHIP_REVIEW_QUORUM_MIN_MODELS  quorum floor: distinct models (default 3). Same >=3 clamp.
 #   RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM  one-time bypass request for the review-quorum gate:
 #                          set it to a written justification to ask Alex live on Telegram (via
 #                          the shared agenttools_hatch_escalation lib); the gate proceeds ONLY on
@@ -940,10 +943,12 @@ fi
 # WHY this exists: the earlier gates verify CI is green and human/AI review THREADS are
 # resolved, but neither proves an actual multi-model review RAN. This gate is the "strictly
 # controlled" guarantee — it hard-refuses the merge unless review-cli's own record shows the
-# PR's task code has enough recorded review iterations across enough distinct models (a
-# STRUCTURAL check on runs that were dispatched, not on their verdicts — see `review task
-# --help`). Fail-CLOSED: a missing `review` CLI, an unreadable store, or no derivable task
-# code all refuse rather than merge unverified.
+# PR's task code has enough PASSED review iterations across enough distinct models among those
+# passed iterations (only clean-verdict runs count — a review that ran but failed/degraded, and
+# pre-verdict-field history, never satisfy the bar; see `review task --help`). Fail-CLOSED: a
+# missing `review` CLI, an unreadable store, no derivable task code, OR a quorum reading 0
+# iterations / 0 distinct models all refuse rather than merge unverified — ship re-derives the
+# verdict from the counts and never trusts the subprocess's `passed` boolean alone (#242).
 #
 # There is NO self-service override. When the bar is not met (or cannot be verified) and the
 # agent genuinely needs to proceed, it sets RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>";
@@ -964,6 +969,26 @@ _review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing
   if [ -n "$m" ]; then printf '%s' "$m" | tr '[:lower:]' '[:upper:]'; return 0; fi
   m=$(printf '%s\n' "$text" | grep -oE '[A-Z][A-Z]+-[0-9]+' | head -1 || true)
   printf '%s' "$m"
+  return 0
+}
+
+# Clamp a quorum floor value to the hard minimum (3). Fail-closed: an unset, non-numeric,
+# zero, negative, or below-floor value is raised to 3; only a well-formed integer >= 3 passes
+# through unchanged (an operator may RAISE the bar via SHIP_REVIEW_QUORUM_MIN_ITER/MODELS, never
+# lower it below 3). A 0 floor would let an empty record satisfy the gate via `0 >= 0` (#242).
+# $1 = raw value, $2 = label (for the warning); prints the clamped integer, ALWAYS exits 0.
+_review_quorum_clamp_floor() {
+  local raw="$1" label="$2" floor=3
+  case "$raw" in
+    ''|*[!0-9]*)  # unset, empty, negative (has '-'), or otherwise non-numeric -> hard floor
+      [ -n "$raw" ] && echo "[ship] review-quorum: ignoring invalid ${label}='${raw}' — using hard floor ${floor}." >&2
+      printf '%s' "$floor"; return 0 ;;
+  esac
+  if [ "$raw" -lt "$floor" ]; then
+    echo "[ship] review-quorum: ${label}=${raw} is below the hard floor — raising to ${floor} (the bar can be raised, never lowered)." >&2
+    printf '%s' "$floor"; return 0
+  fi
+  printf '%s' "$raw"
   return 0
 }
 
@@ -1096,8 +1121,13 @@ case "${SHIP_REVIEW_QUORUM:-1}" in 0|false|no) QUORUM_ENABLED=0 ;; esac
 if [ "$QUORUM_ENABLED" = "0" ]; then
   echo "[ship] review-quorum gate disabled (SHIP_REVIEW_QUORUM_ENABLED/SHIP_REVIEW_QUORUM=0)."
 else
-  MIN_ITER="${SHIP_REVIEW_QUORUM_MIN_ITER:-3}"
-  MIN_MODELS="${SHIP_REVIEW_QUORUM_MIN_MODELS:-3}"
+  # Hard fail-closed floor: the self-merge bar is >=3 passed iterations across >=3 distinct
+  # models. The floor must NEVER silently resolve to 0 in this subprocess — a 0 floor makes an
+  # empty quorum trivially "pass" (0 >= 0) and defeats the whole gate (#242). So clamp every
+  # unset / non-numeric / <3 value UP to the hard minimum 3; only an explicit, well-formed value
+  # of 3-or-more is honored as-is (an operator may RAISE the bar, never lower it below 3).
+  MIN_ITER=$(_review_quorum_clamp_floor "${SHIP_REVIEW_QUORUM_MIN_ITER:-}" "min-iter")
+  MIN_MODELS=$(_review_quorum_clamp_floor "${SHIP_REVIEW_QUORUM_MIN_MODELS:-}" "min-models")
   # Safe defaults so an early refusal (before the review query) still has these for the audit
   # line and the hatch context.
   QITER=0; QMODELS_N=0; QMODELS=""; QERR=""; QPASSED=false
@@ -1128,13 +1158,32 @@ else
     if [ -z "$QUORUM_JSON" ]; then
       _review_quorum_refuse_or_hatch "could not query review-cli (store unreadable / task ${TASK_CODE} unknown)"
     else
+      # review-cli's quorum_check emits `passed_iterations` / `distinct_models_passed` — the
+      # COUNT of PASSED iterations and the distinct models among them. An earlier revision read
+      # `.iterations` / `.distinct_models`, keys review-cli NEVER emits, so both parsed to 0 (the
+      # "0 iterations across 0 models" in the #242 incident log). Read ONLY the real keys — do NOT
+      # fall back to the never-emitted legacy names: a payload carrying only `.iterations` /
+      # `.distinct_models` is not review-cli's output (old build or hostile `review` on PATH), so
+      # it reads as 0/0 and fails closed below, never authorizes via a laxer key.
       QPASSED=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed // false' 2>/dev/null || echo false)
-      QITER=$(printf '%s' "$QUORUM_JSON" | jq -r '.iterations // 0' 2>/dev/null || echo 0)
-      QMODELS_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_models // 0' 2>/dev/null || echo 0)
+      QITER=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed_iterations // 0' 2>/dev/null || echo 0)
+      QMODELS_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_models_passed // 0' 2>/dev/null || echo 0)
       QMODELS=$(printf '%s' "$QUORUM_JSON" | jq -r '(.models // []) | join(", ")' 2>/dev/null || echo "")
       QERR=$(printf '%s' "$QUORUM_JSON" | jq -r '.error // empty' 2>/dev/null || echo "")
+      # Non-numeric / missing counts collapse to 0 so the arithmetic gate below fails closed
+      # (jq can hand back "null" as text if a key holds JSON null).
+      case "$QITER" in ''|*[!0-9]*) QITER=0 ;; esac
+      case "$QMODELS_N" in ''|*[!0-9]*) QMODELS_N=0 ;; esac
 
-      if [ "$QPASSED" = "true" ]; then
+      # FAIL-CLOSED authorization (#242): NEVER authorize on the subprocess's `.passed` boolean
+      # alone. ship re-derives the verdict from the numbers it read and its own hard floor, so a
+      # review-cli that returns `passed:true` with a hollow 0/0 record (an older build without the
+      # min>=1 guard, a task-code miss, or an attacker-controlled `review` on PATH) is refused.
+      # Authorize ONLY when EVERY condition holds: the subprocess agreed (passed==true), there is
+      # NO error key, and BOTH counts are strictly positive AND meet the >=3 floor independently.
+      if [ "$QPASSED" = "true" ] && [ -z "$QERR" ] \
+         && [ "$QITER" -gt 0 ] && [ "$QMODELS_N" -gt 0 ] \
+         && [ "$QITER" -ge "$MIN_ITER" ] && [ "$QMODELS_N" -ge "$MIN_MODELS" ]; then
         echo "[ship] AUTHORITY CONFIRMED — review quorum met: ${QITER} iterations across ${QMODELS_N} models for ${TASK_CODE}. Self-merge authorized by the review-quorum gate."
         _review_quorum_audit_log authorized "$TASK_CODE" "$QITER" "$QMODELS_N" ""
       else

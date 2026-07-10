@@ -2027,6 +2027,17 @@ esac
 #                                       unreadable stats store) -> ship.sh must fail closed
 #   SHIP_TEST_REVIEW_LOG                if set, append the flag actually used (check/quorum-check)
 #                                       so a test can assert which one ship.sh invoked
+#   SHIP_TEST_REVIEW_FORCE_PASSED       if set (true/false), emit `passed` VERBATIM instead of
+#                                       computing it from the counts — lets a test forge a hollow
+#                                       `passed:true` with 0/0 counts (an older/hostile review-cli)
+#                                       to prove ship's independent arithmetic gate fails closed (#242).
+#   SHIP_TEST_REVIEW_MIN_ITER_ECHO      if set, emit THIS as the JSON `min_iter`/`min_models` echo
+#                                       instead of the flag values, so a test can inspect the floor
+#                                       ship actually passed to review-cli.
+#
+# The JSON keys match review-cli's real output: `passed_iterations` / `distinct_models_passed`
+# (NOT `iterations` / `distinct_models`, which review-cli never emitted — that key mismatch was
+# half of the #242 hole; a fake using the wrong keys would validate a fiction).
 _FAKE_REVIEW = """\
 #!/usr/bin/env bash
 sub="${1:-}"; shift || true
@@ -2055,10 +2066,23 @@ if [ "${SHIP_TEST_REVIEW_BROKEN:-0}" = "1" ]; then
 fi
 iterations="${SHIP_TEST_REVIEW_ITER:-3}"
 models_n="${SHIP_TEST_REVIEW_MODELS:-3}"
-passed="false"
-if [ "$iterations" -ge "$minit" ] && [ "$models_n" -ge "$minmodels" ]; then passed="true"; fi
-printf '{"task_code":"%s","iterations":%s,"distinct_models":%s,"models":["claude","codex","gemini"],"min_iter":%s,"min_models":%s,"passed":%s}\\n' \\
-  "$code" "$iterations" "$models_n" "$minit" "$minmodels" "$passed"
+if [ -n "${SHIP_TEST_REVIEW_FORCE_PASSED:-}" ]; then
+  passed="${SHIP_TEST_REVIEW_FORCE_PASSED}"
+else
+  passed="false"
+  if [ "$iterations" -ge "$minit" ] && [ "$models_n" -ge "$minmodels" ]; then passed="true"; fi
+fi
+echo_min="${SHIP_TEST_REVIEW_MIN_ITER_ECHO:-}"
+[ -n "$echo_min" ] && { minit="$echo_min"; minmodels="$echo_min"; }
+if [ "${SHIP_TEST_REVIEW_LEGACY_KEYS:-0}" = "1" ]; then
+  # Emit ONLY the never-emitted legacy key names (`iterations` / `distinct_models`) to prove ship
+  # reads the REAL keys and treats a legacy-only payload as 0/0 -> fail-closed refuse (#242).
+  printf '{"task_code":"%s","iterations":%s,"distinct_models":%s,"models":["claude","codex","gemini"],"min_iter":%s,"min_models":%s,"passed":%s}\\n' \\
+    "$code" "$iterations" "$models_n" "$minit" "$minmodels" "$passed"
+else
+  printf '{"task_code":"%s","passed_iterations":%s,"total_iterations":%s,"distinct_models_passed":%s,"models":["claude","codex","gemini"],"min_iter":%s,"min_models":%s,"passed":%s}\\n' \\
+    "$code" "$iterations" "$iterations" "$models_n" "$minit" "$minmodels" "$passed"
+fi
 """
 
 
@@ -2373,6 +2397,130 @@ def test_review_quorum_audit_log_skipped_in_dry_run(tmp_path):
     assert "[dry-run] would append review-quorum audit" in r.stderr, r.stderr
     # ...but no persistent audit record was written.
     assert not audit.exists(), f"dry-run must not write the audit file, found: {audit.read_text()!r}"
+
+
+# --- #242: fail-closed against a hollow / forged / mis-floored quorum ----------------------
+# The #242 hole: shipping review-cli #141, the `gh ship` subprocess printed "review quorum met:
+# 0 iterations across 0 models" and STILL authorized. Two compounding bugs: (a) ship parsed the
+# JSON keys `.iterations` / `.distinct_models`, which review-cli never emits (it emits
+# `passed_iterations` / `distinct_models_passed`), so ship's counts were ALWAYS 0; (b) ship
+# authorized on the subprocess's `.passed` boolean ALONE, never re-checking the numbers against
+# its own floor. Combined, a `passed:true` with a hollow 0/0 record self-merged an empty quorum.
+# These tests pin the fail-closed fix: ship re-derives the verdict from the real-key counts and
+# a hard >=3 floor, so a forged pass, a below-floor override, or a wrong-key payload is REFUSED.
+
+
+def test_review_quorum_refuses_forged_pass_with_zero_counts(tmp_path):
+    """#242 core: review-cli returns `passed:true` but 0 passed iterations across 0 models
+    (an older build without the min>=1 guard, a task-code miss, or a hostile `review` on PATH).
+    ship must NOT trust the boolean — its independent arithmetic sees 0/3 and REFUSES."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-242",
+            "SHIP_TEST_REVIEW_ITER": "0",
+            "SHIP_TEST_REVIEW_MODELS": "0",
+            "SHIP_TEST_REVIEW_FORCE_PASSED": "true",  # forge the hollow authorization
+        },
+    )
+    assert r.returncode != 0, f"a forged 0/0 pass MUST be refused\n{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" not in r.stdout, f"must not authorize a hollow quorum\n{r.stdout}"
+    assert "bar NOT met" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout and "merged #1" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_review_quorum_reads_real_passed_iteration_keys(tmp_path):
+    """A real ≥3×3 record (review-cli's `passed_iterations` / `distinct_models_passed` keys)
+    is read correctly and AUTHORIZES — proving ship parses the keys review-cli actually emits,
+    not the never-emitted `.iterations` / `.distinct_models` that always parsed to 0 (#242)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"REVIEW_TASK_CODE": "HYP-242", "SHIP_TEST_REVIEW_ITER": "4", "SHIP_TEST_REVIEW_MODELS": "3"},
+    )
+    assert r.returncode == 0, f"a real 4×3 record should authorize\n{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
+    # The confirmed line must show the REAL counts (4 iterations across 3 models), not 0/0.
+    assert "4 iterations across 3 models" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_review_quorum_refuses_legacy_key_only_payload(tmp_path):
+    """A payload carrying ONLY the never-emitted legacy keys (`iterations` / `distinct_models`)
+    with `passed:true` and 3×3 — an old build or a hostile `review` on PATH — must read as 0/0
+    (ship reads only `passed_iterations` / `distinct_models_passed`) and fail closed (#242)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-242",
+            "SHIP_TEST_REVIEW_LEGACY_KEYS": "1",
+            "SHIP_TEST_REVIEW_ITER": "3",
+            "SHIP_TEST_REVIEW_MODELS": "3",
+            "SHIP_TEST_REVIEW_FORCE_PASSED": "true",
+        },
+    )
+    assert r.returncode != 0, f"a legacy-key-only payload must be refused\n{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" not in r.stdout, r.stdout
+    assert "bar NOT met" in r.stderr, r.stderr
+    assert "0/3 iterations" in r.stderr, f"legacy keys must read as 0 counts\n{r.stderr}"
+    assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_review_quorum_floor_clamped_when_env_sets_zero(tmp_path):
+    """An attempt to weaken the bar via SHIP_REVIEW_QUORUM_MIN_ITER/MODELS=0 must NOT resolve to
+    a 0 floor (which would let a 0/0 record pass via 0>=0). ship clamps to the hard floor 3, so a
+    genuinely hollow 0/0 record with the weakened env is STILL refused (#242)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-242",
+            "SHIP_REVIEW_QUORUM_MIN_ITER": "0",
+            "SHIP_REVIEW_QUORUM_MIN_MODELS": "0",
+            "SHIP_TEST_REVIEW_ITER": "0",
+            "SHIP_TEST_REVIEW_MODELS": "0",
+            "SHIP_TEST_REVIEW_FORCE_PASSED": "true",
+        },
+    )
+    assert r.returncode != 0, f"a 0 floor must be clamped and the hollow record refused\n{r.stdout}\n{r.stderr}"
+    assert "hard floor" in r.stderr, f"expected a floor-clamp warning\n{r.stderr}"
+    assert "bar NOT met" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_review_quorum_below_floor_positive_value_cannot_weaken_bar(tmp_path):
+    """A below-floor POSITIVE override (MIN_ITER=2, MIN_MODELS=2) with a real 2×2 record must NOT
+    authorize: the floor is clamped to 3, so ship demands 3×3 and the 2×2 record refuses with
+    '2/3'. Distinct from the 0/0 test (which the >0 guard alone would catch) — this proves the
+    clamp itself blocks a positive-but-sub-floor weakening, the case codex flagged (#242)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-242",
+            "SHIP_REVIEW_QUORUM_MIN_ITER": "2",
+            "SHIP_REVIEW_QUORUM_MIN_MODELS": "2",
+            "SHIP_TEST_REVIEW_ITER": "2",
+            "SHIP_TEST_REVIEW_MODELS": "2",
+        },
+    )
+    assert r.returncode != 0, f"a 2×2 record under a clamped-to-3 floor must refuse\n{r.stdout}\n{r.stderr}"
+    assert "hard floor" in r.stderr, f"expected a floor-clamp warning raising 2 to 3\n{r.stderr}"
+    assert "2/3 iterations" in r.stderr, f"floor must be enforced at 3, not the weakened 2\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" not in r.stdout, r.stdout
+    assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
 
 
 # --- hatch escalation: the ONLY bypass for a not-met review-quorum bar ---------------------
