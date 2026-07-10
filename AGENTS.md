@@ -171,10 +171,13 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   `--no-version-bump-ok <reason>` or `SHIP_SKIP_VERSION_BUMP=1`;
 - the **review-quorum bar is met** (Guard-B of the self-merge-authority program) — the PR's task
   code (`$REVIEW_TASK_CODE`, else a `HYP-<n>`/uppercase ticket token from the branch name or PR
-  body) has ≥ `SHIP_REVIEW_QUORUM_MIN_ITER` recorded review-cli iterations across ≥
-  `SHIP_REVIEW_QUORUM_MIN_MODELS` distinct models (`review task <code> --check`). This is the gate
-  that makes self-merge *strictly controlled*; it **fails closed** (a missing task code / `review`
-  CLI / readable store all refuse). There is **NO self-service override flag** — a one-time bypass
+  body) has ≥ `SHIP_REVIEW_QUORUM_MIN_ITER` PASSED review-cli iterations across ≥
+  `SHIP_REVIEW_QUORUM_MIN_MODELS` distinct models (`review task <code> --check`). Both floors are
+  **clamped to a hard minimum of 3** — the env knobs can only RAISE the bar, never lower it (a
+  `0`/negative/below-3 value resolves to 3). This is the gate that makes self-merge *strictly
+  controlled*; it **fails closed** (a missing task code / `review` CLI / unreadable store, OR a
+  quorum reading 0 iterations / 0 distinct models, all refuse — ship re-derives the verdict from
+  the counts, never trusts the subprocess's `passed` boolean alone, #242). There is **NO self-service override flag** — a one-time bypass
   is requested via `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>"`, which asks Alex live
   on Telegram (shared `agenttools_hatch_escalation` lib) and proceeds ONLY on his real-time
   approval. Disable the whole gate with `SHIP_REVIEW_QUORUM=0`. Every non-dry-run gated ship is
