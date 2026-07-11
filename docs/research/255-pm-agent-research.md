@@ -1,7 +1,7 @@
 # Research #255: Autonomous PM-Agent For The Task Ecosystem
 
 Date: 2026-07-11
-Worktree: `/Users/ultra/xp/.worktrees/agent-tools-255-pm-agent`
+Worktree: isolated agent-tools research worktree
 Task: agent-tools #255
 
 ## Scope And Approval
@@ -38,19 +38,19 @@ implement product code.
 ### Repositories And Files
 
 - task-cli:
-  - `/Users/ultra/xp/task-cli/AGENTS.md`
-  - `/Users/ultra/xp/task-cli/tasklib/model.py`
-  - `/Users/ultra/xp/task-cli/tasklib/transitions.py`
-  - `/Users/ultra/xp/task-cli/tasklib/session.py`
-  - `/Users/ultra/xp/task-cli/tasklib/classify.py`
-  - `/Users/ultra/xp/task-cli/tasklib/daemon.py`
+  - `task-cli/AGENTS.md`
+  - `task-cli/tasklib/model.py`
+  - `task-cli/tasklib/transitions.py`
+  - `task-cli/tasklib/session.py`
+  - `task-cli/tasklib/classify.py`
+  - `task-cli/tasklib/daemon.py`
 - rig-cli:
-  - `/Users/ultra/xp/rig-cli/docs/config-schema.md`
-  - `/Users/ultra/xp/rig-cli/docs/specs/rig-cross-harness-provisioning.md`
-  - `/Users/ultra/xp/rig-cli/riglib/stats/model.py`
-  - `/Users/ultra/xp/rig-cli/riglib/stats/aggregate.py`
-  - `/Users/ultra/xp/rig-cli/riglib/stats/command.py`
-  - `/Users/ultra/xp/rig-cli/riglib/stats/sources/codex.py`
+  - `rig-cli/docs/config-schema.md`
+  - `rig-cli/docs/specs/rig-cross-harness-provisioning.md`
+  - `rig-cli/riglib/stats/model.py`
+  - `rig-cli/riglib/stats/aggregate.py`
+  - `rig-cli/riglib/stats/command.py`
+  - `rig-cli/riglib/stats/sources/codex.py`
 - agent-tools:
   - `README.md`
   - `AGENTS.md`
@@ -61,34 +61,34 @@ implement product code.
   - `lib/agenttools_stall_watchdog/README.md`
   - `lib/contracts/models.yaml`
 - tg-cli:
-  - `/Users/ultra/xp/tg-cli/README.md`
-  - `/Users/ultra/xp/tg-cli/CHANGELOG.md`
+  - `tg-cli/README.md`
+  - `tg-cli/CHANGELOG.md`
   - task records #171 and #172
 - research-cli:
-  - `/Users/ultra/xp/research-cli/README.md`
-  - `/Users/ultra/xp/research-cli/research_cli/providers.py`
-  - `/Users/ultra/xp/research-cli/research_cli/engine.py`
-  - `/Users/ultra/xp/research-cli/research_cli/transport.py`
+  - `research-cli/README.md`
+  - `research-cli/research_cli/providers.py`
+  - `research-cli/research_cli/engine.py`
+  - `research-cli/research_cli/transport.py`
 
 ### Runtime Evidence
 
-- `rig stats show --format json --since 2026-07-01 --repo /Users/ultra/xp/agent-tools`
+- `rig stats show --format json --since 2026-07-01 --repo <agent-tools-checkout>`
   found 8,503 invocations, supported harnesses `claude-code`, `codex`, `gemini`, and
   `opencode`, and an adoption ratio of 0.1508. `task (cli)` had 246 calls, `review (cli)`
   90, `tg (cli)` 84, and `rig (cli)` 9. The large "other" bucket was dominated by harness
   control operations such as `write_stdin`, `wait_agent`, `spawn_agent`, and `close_agent`.
-- `rig status -C /Users/ultra/xp/.worktrees/agent-tools-255-pm-agent` failed before drift
+- `rig status -C <agent-tools-research-worktree>` failed before drift
   reporting because the live global config contains `harness.kinds`, while installed
   rig 0.12.0 rejects that key. This is a concrete PM-agent health-check requirement:
   configuration/schema skew can hide real drift.
-- `~/.config/agent-tools/ship-audit.jsonl` contains quorum gate audit rows with authorized
+- The user-level agent-tools ship audit JSONL contains quorum gate audit rows with authorized
   and refused decisions. PM-agent should use this as one deployment-evidence input rather
   than relying on ticket state alone; it must not become the sole authority until the
   audit path has tamper-evidence or permission hardening.
-- `~/.cache/agent-tools/overrides.log` contains explicit protect-main overrides, including
+- The user-level agent-tools override log contains explicit protect-main overrides, including
   multiple Dive Calc deploy-related overrides. PM-agent reports should surface these as
   operational exceptions.
-- `~/.local/state/task-cli/sessions/2.jsonl` shows repeated touches of the same active
+- The task-cli session journal for this work session shows repeated touches of the same active
   tickets across repos, which reinforces the need for de-duplicated session/task views.
 
 ## Current Responsibility Boundaries
@@ -426,8 +426,8 @@ interface AdapterResult {
 
 ## External Tool Notes
 
-- `research-cli` was not installed on `PATH`; it was runnable from
-  `/Users/ultra/xp/research-cli/bin/research`.
+- `research-cli` was not installed on `PATH`; it was runnable from its repo-local
+  `bin/research` entrypoint.
 - `research board` resolved three seats: Analyst `claude-opus-4-8`, Skeptic
   `claude-fable-5`, and Scout `gemini-2.5-flash`.
 - `research ask --offline --json ...` worked, but only with stub answers. The README says
@@ -440,8 +440,7 @@ interface AdapterResult {
   `Fable` is present as `claude-fable-5`. The #255 requirement for "Fable and Sol with
   effort selected per phase" therefore needs a model-manifest/config follow-up.
 - `review brainstorm` completed for task 255 with Opus/Codex/Gemini/GLM seats and an
-  Opus moderator. The raw discussion log is
-  `/Users/ultra/Library/Logs/review-cli/20260711T144730_967810Z-brainstorm.md`.
+  Opus moderator. The raw discussion log stayed in the local review-cli log directory.
   It is not kept under repo docs because the generated raw transcript includes non-English
   moderator text; the durable repo artifact is this English distillation.
 
