@@ -82,8 +82,9 @@ implement product code.
   rig 0.12.0 rejects that key. This is a concrete PM-agent health-check requirement:
   configuration/schema skew can hide real drift.
 - `~/.config/agent-tools/ship-audit.jsonl` contains quorum gate audit rows with authorized
-  and refused decisions. PM-agent should use this as deployment evidence rather than relying
-  on ticket state alone.
+  and refused decisions. PM-agent should use this as one deployment-evidence input rather
+  than relying on ticket state alone; it must not become the sole authority until the
+  audit path has tamper-evidence or permission hardening.
 - `~/.cache/agent-tools/overrides.log` contains explicit protect-main overrides, including
   multiple Dive Calc deploy-related overrides. PM-agent reports should surface these as
   operational exceptions.
@@ -315,11 +316,32 @@ type EvidenceKind =
   | "deployment" | "smoke" | "screenshot" | "limit-telemetry" | "watchdog"
   | "human-decision" | "skip-reason";
 
+type PrivacyClass = "local-only" | "remote-allowed";
+
+interface OwnerRef {
+  kind: "human" | "agent" | "service";
+  id: string;
+  label?: string;
+}
+
+interface EvidenceRef {
+  kind: EvidenceKind;
+  uri: string;
+  observedAt: string;
+  digest?: string;
+}
+
+interface TimerRef {
+  kind: "sla" | "retry" | "quota-reset" | "review-dwell" | "reminder";
+  dueAt: string;
+}
+
 interface WorkItem {
   id: string;
   title: string;
   state: string;
   projectId: string;
+  privacy: PrivacyClass;
   taskRefs: string[];
   intakeRefs: string[];
   owner?: OwnerRef;
@@ -334,6 +356,14 @@ interface DependencyEdge {
   type: "blocks" | "waits_for" | "duplicates" | "supersedes" | "relates_to";
   targetId: string;
   reason: string;
+  condition?: WaitCondition;
+}
+
+interface WaitCondition {
+  // Only meaningful for `waits_for` edges; omit for duplicate/supersession links.
+  provider: "ci" | "telegram" | "watchdog" | "time" | "quota" | "deployment";
+  subject: string;
+  expected: string;
 }
 
 interface ExecutorRef {
@@ -347,7 +377,21 @@ interface ExecutorRef {
 interface Adapter<TEvent> {
   name: string;
   poll(since?: string): Promise<TEvent[]>;
+  subscribe?(callback: (event: TEvent) => void): Promise<() => void>;
   apply?(command: AdapterCommand): Promise<AdapterResult>;
+}
+
+interface AdapterCommand {
+  idempotencyKey: string;
+  target: "task" | "telegram" | "rig" | "review" | "github" | "harness";
+  action: string;
+  payload: Record<string, unknown>;
+}
+
+interface AdapterResult {
+  ok: boolean;
+  evidence?: EvidenceRef[];
+  error?: string;
 }
 ```
 
@@ -424,8 +468,8 @@ shared by task, Gantt, ship, and session tooling.
 
 Terminal delivery states must be based on evidence the PM-agent cannot forge. `done` and
 `deployed` should require external facts such as GitHub merge/CI state, deployment probes,
-or ship-audit rows. Ship audit is useful, but autonomous dispatch needs tamper-evidence or
-path/permission hardening before using it as sole authority.
+and ship-audit rows. Ship audit is useful as one signal today, but autonomous dispatch needs
+tamper-evidence or path/permission hardening before using it as sole authority.
 
 Enforcement should prefer capability deprivation over advisory hooks. The PM harness should
 lack Edit/Write/commit/merge/ship capability; implementation happens only through delegated
