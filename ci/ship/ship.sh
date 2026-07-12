@@ -554,14 +554,49 @@ run_local_ci_gate() {
 # set CI up. Existing-but-pending checks are WATCHED (polled to completion, up to
 # SHIP_CI_WAIT) so you don't have to babysit; then the merge is gated on the final result of
 # ALL checks. (gh has `gh run watch <run-id>` for a single run; we poll the PR-aggregate.)
+#
+# STALE-RUN DEDUP (why DEDUP_FILTER exists): GitHub's statusCheckRollup keeps EVERY historical
+# run of a check name — it does NOT collapse to the latest. When a workflow is re-run (or reads
+# mutable state like `pull_request.body`, e.g. the "PR Checklist" gate that fails while an
+# acceptance box is unchecked, then passes once it is ticked), the rollup holds BOTH the old
+# FAILURE and the new SUCCESS for the same check name. Counting every entry made this gate
+# refuse a PR that GitHub itself reports mergeStateStatus=CLEAN (observed live on PR #653,
+# 2026-07-12). Fix: collapse the rollup to the LATEST run per check (grouped by
+# __typename + workflowName + name / context, keyed on completedAt/startedAt/createdAt) BEFORE
+# evaluating pass/pending/fail — matching how GitHub computes mergeStateStatus. Fail-closed is
+# preserved: if the LATEST run of a check is FAILURE/CANCELLED/pending, that latest verdict
+# still gates. __typename is in the key so a StatusContext and a CheckRun that happen to share
+# a name (a CheckRun can have a null workflowName) are NOT collapsed into one — collapsing them
+# could hide a still-failing check behind a newer passing one of the other type.
 if [ "$SKIP_CI" = "0" ]; then
   command -v jq >/dev/null 2>&1 || { echo "Refusing: jq is required for the CI gate (install jq — or --skip-ci only if CI is genuinely N/A)." >&2; exit 1; }
   SUCCESS_FILTER='((.conclusion=="SUCCESS" or .conclusion=="SKIPPED" or .conclusion=="NEUTRAL") or .state=="SUCCESS")'
   SETTLED_FILTER='(.status=="COMPLETED" or .state=="SUCCESS" or .state=="FAILURE" or .state=="ERROR")'
+  # Collapse duplicate RUNS of the same check to the newest one, WITHOUT collapsing two
+  # genuinely-distinct checks. Key = __typename + workflowName + detailsUrl-host + name /
+  # context. __typename keeps a CheckRun and a StatusContext of the same name apart. The
+  # detailsUrl/targetUrl host keeps two DIFFERENT providers that post an identically-named
+  # CheckRun with a null workflowName (third-party apps) apart, so one provider's newer
+  # SUCCESS cannot hide another provider's failing check of the same name; a re-run of ONE
+  # check shares its host, so reruns still dedup. Recency (_dts): rank by the run's own
+  # timestamp (completedAt, else startedAt, else createdAt) when it has one; a re-run always
+  # post-dates the run it replaces, so its later timestamp wins. ONLY a run with NO timestamp
+  # at all AND still queued/in-progress gets the "~" sentinel (sorts above any ISO-8601
+  # timestamp) so a timestamp-less queued re-run is WATCHED to completion instead of being
+  # dropped below the stale completed FAILURE it replaces. Fail-closed on a truly-red latest
+  # run is preserved. Tolerates a null/missing rollup by folding to [].
+  DEDUP_FILTER='
+    def _dsettled: (.status=="COMPLETED" or .state=="SUCCESS" or .state=="FAILURE" or .state=="ERROR");
+    def _dhost: ((.detailsUrl // .targetUrl // "") | split("/") | (.[2] // ""));
+    def _dkey: ((.__typename // "") + "\u001f" + (.workflowName // "") + "\u001f" + _dhost + "\u001f" + (.name // .context // ""));
+    def _dts:  ((.completedAt // .startedAt // .createdAt) as $t | if $t != null then $t elif (_dsettled|not) then "~" else "" end);
+    (. // []) | group_by(_dkey) | map(max_by(_dts))'
   CI_WAIT="${SHIP_CI_WAIT:-900}"; CI_POLL="${SHIP_CI_POLL:-20}"; CI_GRACE="${SHIP_CI_GRACE:-45}"
   START=$(date +%s); DEADLINE=$(( START + CI_WAIT )); GRACE_DEADLINE=$(( START + CI_GRACE ))
   while :; do
-    ROLLUP=$(gh pr view "$PR" --json statusCheckRollup -q '.statusCheckRollup' 2>/dev/null || echo '[]')
+    ROLLUP=$(gh pr view "$PR" --json statusCheckRollup -q '.statusCheckRollup' 2>/dev/null \
+      | jq -c "$DEDUP_FILTER" 2>/dev/null || echo '[]')
+    [ -n "$ROLLUP" ] || ROLLUP='[]'
     N=$(printf '%s' "$ROLLUP" | jq 'length' 2>/dev/null || echo 0)
     if [ "${N:-0}" = "0" ]; then
       # An empty rollup is ambiguous: either "no CI configured" OR "checks not registered yet"

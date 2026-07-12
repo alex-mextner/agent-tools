@@ -1585,6 +1585,335 @@ def test_partial_ci_failure_below_threshold_blocks_normally(repo_with_pr_worktre
 
 
 # ---------------------------------------------------------------------------------------
+# CI-gate stale-run DEDUP (the "PR Checklist stale FAILURE" papercut, sibling of the
+# review-threads-stale family). GitHub's statusCheckRollup keeps EVERY historical run of a
+# check name; it does NOT collapse to the latest. A workflow that re-runs (or reads mutable
+# state like pull_request.body — the "PR Checklist" gate fails while an acceptance box is
+# unchecked, then passes once ticked) leaves BOTH the old FAILURE and the new SUCCESS in the
+# rollup. Counting every entry made ship refuse a PR GitHub itself reports as CLEAN
+# (observed live on PR #653, 2026-07-12). ship must dedup to the LATEST run per check
+# (workflowName+name / context, keyed on completedAt) before judging pass/fail.
+# ---------------------------------------------------------------------------------------
+
+# A fake `gh` whose statusCheckRollup is injected verbatim from $SHIP_TEST_ROLLUP, so each
+# test drives the exact multi-run shape under test. review-threads -> 0, diff clean.
+_FAKE_GH_ROLLUP = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          printf '%s' "${SHIP_TEST_ROLLUP}"
+        elif printf '%s ' "$@" | grep -q body; then
+          echo ""
+        else
+          echo '[]'
+        fi ;;
+      diff)
+        if printf '%s ' "$@" | grep -q -- --name-only; then printf 'src/a.py'; else printf '+ok'; fi ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged" ;;
+      *) : ;;
+    esac ;;
+  api) echo 0 ;;
+  *) : ;;
+esac
+"""
+
+
+def _fake_gh_rollup_dir(tmp_path: Path, rollup: str) -> Path:
+    bindir = tmp_path / "binroll"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_ROLLUP, encoding="utf-8")
+    gh.chmod(0o755)
+    return bindir
+
+
+def _run_ship_rollup(main: Path, bindir: Path, rollup: str):
+    """Run ship.sh with the CI gate LIVE (no --skip-ci) and the rollup injected via env."""
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_TEST_ROLLUP"] = rollup
+    env["SHIP_REVIEW_DWELL"] = "0"  # fake PR has no review timestamps
+    return _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        cwd=main, env=env,
+    )
+
+
+# A fake `gh` for the pending-rerun case: the statusCheckRollup answer flips based on a
+# per-call counter file. On the first N polls it returns $SHIP_TEST_ROLLUP_PENDING (a check
+# whose latest run is still QUEUED); afterwards $SHIP_TEST_ROLLUP_SETTLED (the re-run
+# completed). Proves the pending re-run is WATCHED to completion, not dropped in favour of a
+# stale completed FAILURE of the same check.
+_FAKE_GH_ROLLUP_FLIP = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          n=0; [ -f "${SHIP_TEST_COUNTER}" ] && n=$(cat "${SHIP_TEST_COUNTER}")
+          n=$((n+1)); printf '%s' "$n" > "${SHIP_TEST_COUNTER}"
+          if [ "$n" -le "${SHIP_TEST_PENDING_POLLS:-1}" ]; then
+            printf '%s' "${SHIP_TEST_ROLLUP_PENDING}"
+          else
+            printf '%s' "${SHIP_TEST_ROLLUP_SETTLED}"
+          fi
+        elif printf '%s ' "$@" | grep -q body; then
+          echo ""
+        else
+          echo '[]'
+        fi ;;
+      diff)
+        if printf '%s ' "$@" | grep -q -- --name-only; then printf 'src/a.py'; else printf '+ok'; fi ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged" ;;
+      *) : ;;
+    esac ;;
+  api) echo 0 ;;
+  *) : ;;
+esac
+"""
+
+
+def test_pending_rerun_is_watched_not_blocked_by_stale_failure(repo_with_pr_worktree, tmp_path):
+    """Regression: a check with an OLD completed FAILURE plus a NEWER re-run that is still
+    QUEUED (null started/completed timestamps) must be judged by the re-run — the gate WATCHES
+    the pending re-run to completion, it does NOT immediately block on the stale FAILURE.
+    Ranking by completedAt alone would keep the timestamped stale FAILURE (the queued re-run
+    has no timestamp) and block instantly; the pending-wins sentinel prevents that."""
+    bindir = tmp_path / "binflip"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_ROLLUP_FLIP, encoding="utf-8")
+    gh.chmod(0o755)
+
+    pending = (
+        '['
+        '{"__typename":"CheckRun","name":"PR Checklist","workflowName":"PR Checklist",'
+        '"status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-07-11T23:23:12Z"},'
+        '{"__typename":"CheckRun","name":"PR Checklist","workflowName":"PR Checklist",'
+        '"status":"QUEUED","conclusion":null,"startedAt":null,"completedAt":null}'
+        ']'
+    )
+    settled = (
+        '['
+        '{"__typename":"CheckRun","name":"PR Checklist","workflowName":"PR Checklist",'
+        '"status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-07-11T23:23:12Z"},'
+        '{"__typename":"CheckRun","name":"PR Checklist","workflowName":"PR Checklist",'
+        '"status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-07-11T23:40:00Z"}'
+        ']'
+    )
+
+    main, _wt = repo_with_pr_worktree
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_REVIEW_DWELL"] = "0"
+    env["SHIP_TEST_COUNTER"] = str(tmp_path / "poll.count")
+    env["SHIP_TEST_PENDING_POLLS"] = "1"  # first poll pending, then settled
+    env["SHIP_TEST_ROLLUP_PENDING"] = pending
+    env["SHIP_TEST_ROLLUP_SETTLED"] = settled
+    env["SHIP_CI_POLL"] = "1"   # watch quickly
+    env["SHIP_CI_WAIT"] = "30"  # generous ceiling; we expect settle on poll 2
+
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
+
+    assert r.returncode == 0, (
+        "ship must watch the pending re-run then merge on its SUCCESS, not block on the stale "
+        f"FAILURE\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "merged #1" in r.stdout, r.stdout
+    # It genuinely entered the watch loop (proves the pending re-run was kept, not dropped).
+    assert "still running" in r.stdout, r.stdout
+    assert "not passing" not in r.stderr, r.stderr
+
+
+# Two distinct checks, each with an OLD run + a NEWER run of the same name. "PR Checklist"
+# went FAILURE (23:23) then SUCCESS (23:36); "Tests" went FAILURE (22:40) then SUCCESS
+# (22:53). Every check's LATEST run is green even though stale FAILUREs linger.
+_ROLLUP_STALE_FAIL_THEN_SUCCESS = (
+    '['
+    '{"__typename":"CheckRun","name":"PR Checklist","workflowName":"PR Checklist",'
+    '"status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-07-11T23:23:12Z"},'
+    '{"__typename":"CheckRun","name":"PR Checklist","workflowName":"PR Checklist",'
+    '"status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-07-11T23:36:30Z"},'
+    '{"__typename":"CheckRun","name":"Tests","workflowName":"CI",'
+    '"status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-07-11T22:40:00Z"},'
+    '{"__typename":"CheckRun","name":"Tests","workflowName":"CI",'
+    '"status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-07-11T22:53:29Z"}'
+    ']'
+)
+
+# "Tests" went SUCCESS (23:00) then FAILURE (23:30) — its LATEST run is red. "Lint" is a
+# clean single SUCCESS. Deduped: 1 failing of 2 (50%, below the CI-down threshold) → the
+# gate must still refuse via the normal CI-failure path.
+_ROLLUP_LATEST_IS_FAILURE = (
+    '['
+    '{"__typename":"CheckRun","name":"Tests","workflowName":"CI",'
+    '"status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-07-11T23:00:00Z"},'
+    '{"__typename":"CheckRun","name":"Tests","workflowName":"CI",'
+    '"status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-07-11T23:30:00Z"},'
+    '{"__typename":"CheckRun","name":"Lint","workflowName":"CI",'
+    '"status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-07-11T23:10:00Z"}'
+    ']'
+)
+
+
+def test_stale_failure_with_newer_success_does_not_block(repo_with_pr_worktree, tmp_path):
+    """Regression (PR #653): a check with an OLD FAILURE run + a NEWER SUCCESS run of the
+    same name must be judged by its LATEST run (SUCCESS) — ship merges. Two distinct checks,
+    each carrying a stale FAILURE, prove the dedup is per-check-name and covers the mixed
+    case. Without the dedup, ship counts the stale FAILUREs and wrongly refuses."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_rollup_dir(tmp_path, _ROLLUP_STALE_FAIL_THEN_SUCCESS)
+
+    r = _run_ship_rollup(main, bindir, _ROLLUP_STALE_FAIL_THEN_SUCCESS)
+
+    assert r.returncode == 0, (
+        "ship must merge when every check's LATEST run is green despite stale FAILUREs\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "merged #1" in r.stdout, r.stdout
+    # The gate must NOT have reported any failing check.
+    assert "not passing" not in r.stderr, r.stderr
+
+
+# A StatusContext and a CheckRun that share the NAME "coverage" are DISTINCT checks (the
+# CheckRun here has a null workflowName, as third-party app checks do). The CheckRun is
+# FAILURE; the same-named StatusContext is a newer SUCCESS. They must NOT collapse into one
+# group — else the newer passing status would hide the still-failing check run and weaken the
+# gate. __typename is part of the dedup key precisely to keep them separate.
+_ROLLUP_STATUSCONTEXT_VS_CHECKRUN_SAME_NAME = (
+    '['
+    '{"__typename":"CheckRun","name":"coverage","workflowName":null,'
+    '"status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-07-11T23:20:00Z"},'
+    '{"__typename":"StatusContext","context":"coverage","state":"SUCCESS",'
+    '"createdAt":"2026-07-11T23:30:00Z"},'
+    '{"__typename":"CheckRun","name":"Lint","workflowName":"CI",'
+    '"status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-07-11T23:10:00Z"}'
+    ']'
+)
+
+
+def test_same_name_statuscontext_and_checkrun_do_not_collapse(repo_with_pr_worktree, tmp_path):
+    """A failing CheckRun and a newer passing StatusContext that share a name are distinct
+    checks; the dedup must key on __typename too so the passing status does not hide the
+    failing check run. ship must still refuse (the coverage CheckRun is FAILURE)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_rollup_dir(tmp_path, _ROLLUP_STATUSCONTEXT_VS_CHECKRUN_SAME_NAME)
+
+    r = _run_ship_rollup(main, bindir, _ROLLUP_STATUSCONTEXT_VS_CHECKRUN_SAME_NAME)
+
+    assert r.returncode != 0, (
+        "ship must refuse: a same-named StatusContext must not hide a failing CheckRun\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not passing" in r.stderr, r.stderr
+    assert "coverage" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+# A single context whose status timeline holds an OLD PENDING and a NEWER SUCCESS (both carry
+# a createdAt). The newer SUCCESS must win — the pending-wins sentinel is reserved for
+# TIMESTAMP-LESS queued runs only, so a timestamped stale PENDING must NOT dominate a newer
+# settled SUCCESS (which would make ship wait out SHIP_CI_WAIT on a green PR).
+_ROLLUP_STALE_PENDING_THEN_SUCCESS = (
+    '['
+    '{"__typename":"StatusContext","context":"ci","state":"PENDING",'
+    '"targetUrl":"https://ci.example/1","createdAt":"2026-07-11T23:00:00Z"},'
+    '{"__typename":"StatusContext","context":"ci","state":"SUCCESS",'
+    '"targetUrl":"https://ci.example/2","createdAt":"2026-07-11T23:10:00Z"}'
+    ']'
+)
+
+# Two DISTINCT providers both post a CheckRun named "coverage" with a null workflowName but
+# different detailsUrl hosts. One is FAILURE, the other SUCCESS. They must NOT collapse — the
+# host is part of the key — so the failing provider's check still gates the merge.
+_ROLLUP_DISTINCT_PROVIDERS_SAME_NAME = (
+    '['
+    '{"__typename":"CheckRun","name":"coverage","workflowName":null,"status":"COMPLETED",'
+    '"conclusion":"FAILURE","completedAt":"2026-07-11T23:20:00Z",'
+    '"detailsUrl":"https://app-a.example/run/1"},'
+    '{"__typename":"CheckRun","name":"coverage","workflowName":null,"status":"COMPLETED",'
+    '"conclusion":"SUCCESS","completedAt":"2026-07-11T23:30:00Z",'
+    '"detailsUrl":"https://app-b.example/run/2"}'
+    ']'
+)
+
+
+def test_stale_pending_statuscontext_yields_to_newer_success(repo_with_pr_worktree, tmp_path):
+    """A timestamped stale PENDING status must not dominate a newer SUCCESS of the same
+    context: the sentinel is only for timestamp-less queued runs. ship must merge, not sit in
+    the watch loop until SHIP_CI_WAIT on a PR whose latest status is green."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_rollup_dir(tmp_path, _ROLLUP_STALE_PENDING_THEN_SUCCESS)
+
+    r = _run_ship_rollup(main, bindir, _ROLLUP_STALE_PENDING_THEN_SUCCESS)
+
+    assert r.returncode == 0, (
+        "ship must merge: newer SUCCESS status supersedes the older PENDING of the same "
+        f"context\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "merged #1" in r.stdout, r.stdout
+    assert "pending check" not in r.stdout, r.stdout
+
+
+def test_distinct_providers_same_name_checkrun_do_not_collapse(repo_with_pr_worktree, tmp_path):
+    """Two third-party CheckRuns sharing the name 'coverage' with a null workflowName but
+    different detailsUrl hosts are DISTINCT checks; the dedup keys on the host so the passing
+    provider does not hide the failing one. ship must refuse."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_rollup_dir(tmp_path, _ROLLUP_DISTINCT_PROVIDERS_SAME_NAME)
+
+    r = _run_ship_rollup(main, bindir, _ROLLUP_DISTINCT_PROVIDERS_SAME_NAME)
+
+    assert r.returncode != 0, (
+        "ship must refuse: a passing provider must not hide a distinct failing provider of the "
+        f"same check name\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not passing" in r.stderr, r.stderr
+    assert "coverage" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_latest_run_failure_still_blocks(repo_with_pr_worktree, tmp_path):
+    """Fail-closed: dedup keeps the LATEST run, so a check whose newest run is FAILURE (even
+    after an older SUCCESS) still blocks the merge — the dedup must not weaken the gate."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_rollup_dir(tmp_path, _ROLLUP_LATEST_IS_FAILURE)
+
+    r = _run_ship_rollup(main, bindir, _ROLLUP_LATEST_IS_FAILURE)
+
+    assert r.returncode != 0, (
+        "ship must refuse when a check's LATEST run is FAILURE\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not passing" in r.stderr, r.stderr
+    # It's the Tests check (latest FAILURE) that blocks, not Lint (clean SUCCESS).
+    assert "Tests" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+# ---------------------------------------------------------------------------------------
 # -R/--repo cross-repo support (restored; previously rejected)
 #
 # ship.sh USED to reject -R/--repo outright ("does not support -R/--repo"). That broke the
