@@ -2,7 +2,11 @@
 
 Date: 2026-07-12
 Task: agent-tools #263
+Worktree: main working tree
+Scope: point-in-time recovery report
 Source requests: Telegram recovery request around tg#7867 and report-publishing follow-up tg#7869
+
+> Snapshot as of 2026-07-12; task states, worktrees, and process rows may have moved since.
 
 ## Summary
 

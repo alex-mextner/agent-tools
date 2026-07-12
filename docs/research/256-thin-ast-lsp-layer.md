@@ -39,38 +39,38 @@ Repo docs and code:
 - `skills/universal/serena/SKILL.md`
 - `skills/universal/semantic-code-search/SKILL.md`
 - `.serena/project.yml`
-- `/Users/ultra/xp/rig-cli/riglib/evolve/symbols.py`
-- `/Users/ultra/xp/rig-cli/riglib/project_tools.py`
-- `/Users/ultra/xp/rig-cli/docs/config-schema.md`
-- `/Users/ultra/xp/rig-cli/riglib/harness_skills.py`
+- `rig-cli/riglib/evolve/symbols.py`
+- `rig-cli/riglib/project_tools.py`
+- `rig-cli/docs/config-schema.md`
+- `rig-cli/riglib/harness_skills.py`
 - `lib/cc_hook_bridge/README.md`
 - `lib/codex_hook_bridge/README.md`
 - `lib/opencode_hook_bridge/README.md`
 
 Local harness/config evidence:
 
-- `/Users/ultra/.codex/config.toml`: Codex has MCP registrations for `playwright`,
+- `~/.codex/config.toml`: Codex has MCP registrations for `playwright`,
   `haft`, `node_repl`, and `pencil`.
 - Current Codex `tool_search` for `LSP serena sverklo haft code symbol references`
   exposed no Serena, Sverklo, Haft, or LSP namespace in this session.
-- `/Users/ultra/.claude.json`: global Claude MCP registrations include `serena`,
+- `~/.claude.json`: global Claude MCP registrations include `serena`,
   `context7`, and `sverklo`.
-- `/Users/ultra/.claude/settings.json`: permission allowlist includes selected Serena
+- `~/.claude/settings.json`: permission allowlist includes selected Serena
   tools and `mcp__ide__getDiagnostics`.
-- `/Users/ultra/.config/opencode/opencode.json`: global opencode MCP config exposes
+- `~/.config/opencode/opencode.json`: global opencode MCP config exposes
   `pencil`; no Serena/Sverklo/Haft registration found there.
-- `/Users/ultra/.config/rig/config.yaml`: still contains unsupported `harness.kinds`,
+- `~/.config/rig/config.yaml`: still contains unsupported `harness.kinds`,
   matching the #257 finding that rig status can be blocked by config/schema skew.
-- `/Users/ultra/.sverklo/registry.json` and `sverklo list`: six registered repos as of
+- `~/.sverklo/registry.json` and `sverklo list`: six registered repos as of
   this pass, with most recent indexes 11-12 days old except `hyper-canvas-draft`
   at 56 days old.
-- `/Users/ultra/.sverklo/*/tool-stats.json`: Sverklo product-side calls are mostly
+- `~/.sverklo/*/tool-stats.json`: Sverklo product-side calls are mostly
   `sverklo_status`; only one recorded `sverklo_search` in the inspected stats.
 
 Historical JSONL evidence:
 
-- Parsed 11,297 files under `/Users/ultra/.claude/projects/**/*.jsonl` and
-  `/Users/ultra/.codex/sessions/**/*.jsonl` for actual `tool_use` / `function_call`
+- Parsed 11,297 files under `~/.claude/projects/**/*.jsonl` and
+  `~/.codex/sessions/**/*.jsonl` for actual `tool_use` / `function_call`
   records, not prompt mentions.
 - Counts found:
   - Haft: `haft_spec_section` 9, `haft_query` 6, `haft_note` 2,
@@ -81,10 +81,9 @@ Historical JSONL evidence:
     `write_memory`.
   - Sverklo: `sverklo_list_repos` 2, `sverklo_status` 1, `sverklo_review_diff` 1.
 - Representative files with actual code-intelligence calls:
-  - `/Users/ultra/.claude/projects/-Users-ultra-work-hyperide/81bb8c60-8548-4884-b29a-259dec215585/subagents/agent-a728973a8d2dc308a.jsonl`
-  - `/Users/ultra/.claude/projects/-Users-ultra-work-hyperide/f1dbdc0c-d36a-4c5d-a688-c0fb193e75a0/subagents/agent-af0004af8c5acce7b.jsonl`
-  - `/Users/ultra/.claude/projects/-Users-ultra-xp-hypercalendarbot/36fc440d-757b-4bbc-a33d-e2a1256a1b77/subagents/agent-a93042a0e8d163bd5.jsonl`
-  - `/Users/ultra/.claude/projects/-Users-ultra-work-hyper-canvas-draft/201e8f83-a48d-490a-a64a-1a28ef13e5ec/subagents/workflows/wf_383e7f35-483/agent-af7f691ace5f329f1.jsonl`
+  - `~/.claude/projects/-Users-*-work-hyperide/<session>/subagents/agent-*.jsonl`
+  - `~/.claude/projects/-Users-*-xp-hypercalendarbot/<session>/subagents/agent-*.jsonl`
+  - `~/.claude/projects/-Users-*-work-hyper-canvas-draft/<session>/subagents/workflows/<workflow>/agent-*.jsonl`
 
 ## Current Tools Compared
 
@@ -110,7 +109,7 @@ Sverklo has a broader and more interesting surface, especially cross-repo concep
 operations, but current evidence does not support making it the default. It is reachable in
 Claude configs, visible in local Sverklo state, and now has six registered repos, but the
 historical transcript calls are still only `list_repos`, `status`, and one `review_diff`.
-Product-side stats inspected under `/Users/ultra/.sverklo/*/tool-stats.json` are mostly
+Product-side stats inspected under `~/.sverklo/*/tool-stats.json` are mostly
 status probes, with only one `sverklo_search`.
 
 The lesson to reuse from both is the capability taxonomy and provider behavior:
@@ -310,5 +309,6 @@ Rig should provision missing capabilities by harness family:
 - Whether the codeintel layer should live in rig-cli because `rig evolve` already owns the
   symbol schema, or in agent-tools as portable content with rig-cli as the first consumer.
   The smaller first step is a rig-cli library with agent-tools docs/skill routing.
-- What freshness threshold should make Sverklo eligible for cross-repo search. A reasonable
-  starting default is seven days, configurable per repo.
+- Whether 14 days is the right default freshness threshold for Sverklo cross-repo search.
+  The local evidence would mark most current indexes stale at seven days, so seven days
+  should be a stricter project override rather than the default.

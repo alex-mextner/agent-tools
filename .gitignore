@@ -2,7 +2,8 @@
 .cache/
 *.done
 
-# Local git worktrees used by parallel agents; never commit or clean them as source.
+# Local git worktrees used by parallel agents; never committed.
+# Preserved by `git clean -fd`; only `git clean -x` would remove them.
 .worktrees/
 
 # OS / editor noise
