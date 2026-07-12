@@ -30,7 +30,7 @@ Task records:
 - `task find "Serena Sverklo Haft AST LSP evolve symbol code intelligence"` returned no
   extra task records beyond the known task path.
 
-Repo docs and code:
+agent-tools docs and code:
 
 - `docs/specs/2026-07-11-haft-research.md`
 - `docs/specs/2026-06-15-thirdparty-tool-triage.md`
@@ -39,13 +39,16 @@ Repo docs and code:
 - `skills/universal/serena/SKILL.md`
 - `skills/universal/semantic-code-search/SKILL.md`
 - `.serena/project.yml`
-- `rig-cli/riglib/evolve/symbols.py`
-- `rig-cli/riglib/project_tools.py`
-- `rig-cli/docs/config-schema.md`
-- `rig-cli/riglib/harness_skills.py`
 - `lib/cc_hook_bridge/README.md`
 - `lib/codex_hook_bridge/README.md`
 - `lib/opencode_hook_bridge/README.md`
+
+External rig-cli checkout evidence:
+
+- `riglib/evolve/symbols.py`
+- `riglib/project_tools.py`
+- `docs/config-schema.md`
+- `riglib/harness_skills.py`
 
 Local harness/config evidence:
 
@@ -160,15 +163,15 @@ codeintel references --file <file> --line <line> --col <col> --json
 codeintel diagnostics <file> --json
 codeintel search --literal <text> --json [--scope repo|workspace|registered]
 codeintel search --semantic <query> --json [--scope repo|workspace|registered]
-codeintel edit replace-symbol-body --file <file> --line <line> --col <col> --body-file <path> --provider <optional-provider>
+codeintel edit replace-symbol-body --file <file> --line <line> --col <col> --body-file <path> [--provider <name>]
 ```
 
 Suggested JSON concepts:
 
 - `capability`: `symbols`, `definition`, `references`, `diagnostics`, `search`,
-  `rename`, `replace_symbol_body`, `cross_repo_search`, `file_decisions`.
+  `replace_symbol_body`, `cross_repo_search`, `file_decisions`; `rename_symbol` is deferred.
 - `provider`: `native`, `rig-evolve`, `serena`, `sverklo`, `haft`, `rg`.
-- `confidence`: `native`, `indexed`, `syntactic`, `literal`, `stale`, `unavailable`.
+- `confidence`: `live`, `indexed`, `syntactic`, `literal`, `stale`, `unavailable`.
 - `freshness`: timestamp, index age, or `live`.
 - `reason`: why the provider was selected or skipped.
 - `result_schema`: use or extend `rig.evolve.symbol.v1` for symbol nodes.
@@ -188,6 +191,8 @@ Unsupported results should be structured, not stderr prose:
 The `--provider` flag on edit commands is an override/debug hint, not the normal contract.
 The default path should still let `codeintel` pick the safest available provider and report
 the chosen provider in JSON output.
+
+CLI subcommands use kebab-case; JSON capability values use snake_case.
 
 Provider selection order:
 

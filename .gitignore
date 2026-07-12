@@ -3,7 +3,7 @@
 *.done
 
 # Local git worktrees used by parallel agents; never committed.
-# Preserved by `git clean -fd`; only `git clean -x` would remove them.
+# Remove with `git worktree remove`, not by deleting source files.
 .worktrees/
 
 # OS / editor noise
