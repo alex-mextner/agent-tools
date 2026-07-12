@@ -2,7 +2,7 @@
 
 Date: 2026-07-12
 Task: agent-tools #256
-Worktree: main working tree, report-only artifact
+Worktree: recovery branch `agent/research-recovery-reports`
 Input: agent-tools #257 Haft research report
 Scope: read-only research, plus this draft report artifact
 
@@ -163,6 +163,11 @@ codeintel references --file <file> --line <line> --col <col> --json
 codeintel diagnostics <file> --json
 codeintel search --literal <text> --json [--scope repo|workspace|registered]
 codeintel search --semantic <query> --json [--scope repo|workspace|registered]
+```
+
+Deferred edit command after read operations and provider detection are proven:
+
+```text
 codeintel edit replace-symbol-body --file <file> --line <line> --col <col> --body-file <path> [--provider <name>]
 ```
 
@@ -193,6 +198,9 @@ The default path should still let `codeintel` pick the safest available provider
 the chosen provider in JSON output.
 
 CLI subcommands use kebab-case; JSON capability values use snake_case.
+`cross_repo_search` is `search` with `--scope registered`; `file_decisions` is decision
+context attached to returned files. Haft appears as a provider only for `file_decisions` and
+is never selected for `symbols`, `definition`, `references`, `diagnostics`, or `search`.
 
 Provider selection order:
 
@@ -314,6 +322,5 @@ Rig should provision missing capabilities by harness family:
 - Whether the codeintel layer should live in rig-cli because `rig evolve` already owns the
   symbol schema, or in agent-tools as portable content with rig-cli as the first consumer.
   The smaller first step is a rig-cli library with agent-tools docs/skill routing.
-- Whether 14 days is the right default freshness threshold for Sverklo cross-repo search.
-  The local evidence would mark most current indexes stale at seven days, so seven days
-  should be a stricter project override rather than the default.
+- Whether 14 days is the right default freshness threshold for Sverklo cross-repo search,
+  as proposed above, or whether specific projects should override it with a stricter value.

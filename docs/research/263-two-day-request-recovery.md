@@ -2,7 +2,7 @@
 
 Date: 2026-07-12
 Task: agent-tools #263
-Worktree: main working tree
+Worktree: recovery branch `agent/research-recovery-reports`
 Scope: point-in-time recovery report
 Sources: Telegram recovery request around tg#7867 and report-publishing follow-up tg#7869
 
@@ -53,11 +53,11 @@ Three research reports are now available in spec web:
 | --- | --- | --- | --- |
 | subagent sender label detection | task #159 | Done | None for this request. |
 | stdout tg# refs and dense-message warnings/help | task #167, agent-tools #215 | Done | None for this request. |
-| private topics / reply handling | Partial | PR #180 shipped the base fix; keep task #181 for ask-once fallback behavior. |
+| private topics / reply handling | PR #180 and task #181 | Partial | PR #180 shipped the base fix; keep task #181 for ask-once fallback behavior. |
 | ask once before private-topic fallback | task #181 | Todo | Implement and ship. |
 | `/tasks` mobile board | task #178 | Done | Full lifecycle remains separate #115/#117. |
 | `/tasks` lifecycle depth | tasks #115/#117 | Todo | Implement origin linkage, acceptance progress, review cycles, accepted-vs-done. |
-| Codex usage telemetry collector | Todo | Verify real state and either close the label drift or implement collector. |
+| Codex usage telemetry collector | task #176 | Todo | Verify real state and either close the label drift or implement collector. |
 | `tg-ctl ask` approval primitive | task #149 | Todo | Implement or explicitly rescope against current private-topic work. |
 
 ### review-cli / spec web
@@ -76,7 +76,7 @@ Three research reports are now available in spec web:
 | Item | Evidence | Status | Next Action |
 | --- | --- | --- | --- |
 | forgotten task warnings | task #50 | Done | None for this request. |
-| warn after priority-changing commands | task #52, dirty worktree `task-52-priority-attention` | Partial | This was forgotten; finish or park the worktree explicitly. |
+| warn after priority-changing commands | task #52, dirty worktree `.worktrees/task-52-priority-attention` | Partial | This was forgotten; finish or park the worktree explicitly. |
 
 ### research-cli
 
