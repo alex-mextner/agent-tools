@@ -2,6 +2,9 @@
 .cache/
 *.done
 
+# Local git worktrees used by parallel agents; never commit or clean them as source.
+.worktrees/
+
 # OS / editor noise
 .DS_Store
 *.swp
