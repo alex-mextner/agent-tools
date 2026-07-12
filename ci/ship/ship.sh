@@ -585,8 +585,7 @@ if [ "$SKIP_CI" = "0" ]; then
   # timestamp) so a timestamp-less queued re-run is WATCHED to completion instead of being
   # dropped below the stale completed FAILURE it replaces. Fail-closed on a truly-red latest
   # run is preserved. Tolerates a null/missing rollup by folding to [].
-  DEDUP_FILTER='
-    def _dsettled: (.status=="COMPLETED" or .state=="SUCCESS" or .state=="FAILURE" or .state=="ERROR");
+  DEDUP_FILTER="def _dsettled: $SETTLED_FILTER;"'
     def _dhost: ((.detailsUrl // .targetUrl // "") | split("/") | (.[2] // ""));
     def _dkey: ((.__typename // "") + "\u001f" + (.workflowName // "") + "\u001f" + _dhost + "\u001f" + (.name // .context // ""));
     def _dts:  ((.completedAt // .startedAt // .createdAt) as $t | if $t != null then $t elif (_dsettled|not) then "~" else "" end);

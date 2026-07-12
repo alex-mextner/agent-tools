@@ -156,11 +156,14 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
 [`ci/ship/ship.sh`](ci/ship/ship.sh)). Before it merges, `ship` refuses unless:
 
 - the PR is OPEN, not CONFLICTING, not BEHIND its base;
-- **every reported CI check is green** — it polls the PR's `statusCheckRollup` and treats any
-  check that isn't SUCCESS/SKIPPED/NEUTRAL as a failure, so *all* reported checks gate the merge,
-  not only the branch-ruleset's required ones (an optional/advisory check that goes red still
-  blocks `gh ship`). And *no CI at all is itself a failed gate*, not a free pass — it watches
-  pending checks to completion, then gates on the result;
+- **every reported CI check's LATEST run is green** — it polls the PR's `statusCheckRollup`,
+  collapses it to the latest run per logical check (keyed by check type + workflow + provider +
+  name/context, matching how GitHub computes `mergeStateStatus`, so a stale FAILURE from a
+  re-run that has since gone green does not block), and treats any check whose latest run isn't
+  SUCCESS/SKIPPED/NEUTRAL as a failure. *All* reported checks gate the merge, not only the
+  branch-ruleset's required ones (an optional/advisory check whose latest run is red still blocks
+  `gh ship`). And *no CI at all is itself a failed gate*, not a free pass — it watches pending
+  checks to completion, then gates on the result;
 - there are **no unresolved review threads**;
 - a UI-touching PR carries an embedded **screenshot** (override with `--no-screenshot-ok
   <reason>`);

@@ -1627,7 +1627,9 @@ esac
 """
 
 
-def _fake_gh_rollup_dir(tmp_path: Path, rollup: str) -> Path:
+def _fake_gh_rollup_dir(tmp_path: Path) -> Path:
+    # The rollup itself is injected via $SHIP_TEST_ROLLUP (see _run_ship_rollup); this only
+    # installs the fake `gh` that echoes it.
     bindir = tmp_path / "binroll"
     bindir.mkdir()
     gh = bindir / "gh"
@@ -1784,7 +1786,7 @@ def test_stale_failure_with_newer_success_does_not_block(repo_with_pr_worktree, 
     each carrying a stale FAILURE, prove the dedup is per-check-name and covers the mixed
     case. Without the dedup, ship counts the stale FAILUREs and wrongly refuses."""
     main, _wt = repo_with_pr_worktree
-    bindir = _fake_gh_rollup_dir(tmp_path, _ROLLUP_STALE_FAIL_THEN_SUCCESS)
+    bindir = _fake_gh_rollup_dir(tmp_path)
 
     r = _run_ship_rollup(main, bindir, _ROLLUP_STALE_FAIL_THEN_SUCCESS)
 
@@ -1819,7 +1821,7 @@ def test_same_name_statuscontext_and_checkrun_do_not_collapse(repo_with_pr_workt
     checks; the dedup must key on __typename too so the passing status does not hide the
     failing check run. ship must still refuse (the coverage CheckRun is FAILURE)."""
     main, _wt = repo_with_pr_worktree
-    bindir = _fake_gh_rollup_dir(tmp_path, _ROLLUP_STATUSCONTEXT_VS_CHECKRUN_SAME_NAME)
+    bindir = _fake_gh_rollup_dir(tmp_path)
 
     r = _run_ship_rollup(main, bindir, _ROLLUP_STATUSCONTEXT_VS_CHECKRUN_SAME_NAME)
 
@@ -1860,12 +1862,43 @@ _ROLLUP_DISTINCT_PROVIDERS_SAME_NAME = (
 )
 
 
+# Two CheckRuns share the name "build" but come from DIFFERENT workflows (workflowName
+# "CI" vs "Release"). They are distinct required checks; workflowName is in the key so they do
+# not collapse. One is FAILURE, so the merge must still be refused.
+_ROLLUP_SAME_NAME_DIFFERENT_WORKFLOW = (
+    '['
+    '{"__typename":"CheckRun","name":"build","workflowName":"CI","status":"COMPLETED",'
+    '"conclusion":"SUCCESS","completedAt":"2026-07-11T23:00:00Z"},'
+    '{"__typename":"CheckRun","name":"build","workflowName":"Release","status":"COMPLETED",'
+    '"conclusion":"FAILURE","completedAt":"2026-07-11T23:05:00Z"}'
+    ']'
+)
+
+
+def test_same_name_different_workflow_do_not_collapse(repo_with_pr_worktree, tmp_path):
+    """Two checks that share a name but belong to different workflows are distinct; the dedup
+    keys on workflowName so a passing 'build' in CI does not hide a failing 'build' in Release.
+    ship must refuse."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_rollup_dir(tmp_path)
+
+    r = _run_ship_rollup(main, bindir, _ROLLUP_SAME_NAME_DIFFERENT_WORKFLOW)
+
+    assert r.returncode != 0, (
+        "ship must refuse: a passing check must not hide a same-named check from another "
+        f"workflow\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not passing" in r.stderr, r.stderr
+    assert "build" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
 def test_stale_pending_statuscontext_yields_to_newer_success(repo_with_pr_worktree, tmp_path):
     """A timestamped stale PENDING status must not dominate a newer SUCCESS of the same
     context: the sentinel is only for timestamp-less queued runs. ship must merge, not sit in
     the watch loop until SHIP_CI_WAIT on a PR whose latest status is green."""
     main, _wt = repo_with_pr_worktree
-    bindir = _fake_gh_rollup_dir(tmp_path, _ROLLUP_STALE_PENDING_THEN_SUCCESS)
+    bindir = _fake_gh_rollup_dir(tmp_path)
 
     r = _run_ship_rollup(main, bindir, _ROLLUP_STALE_PENDING_THEN_SUCCESS)
 
@@ -1882,7 +1915,7 @@ def test_distinct_providers_same_name_checkrun_do_not_collapse(repo_with_pr_work
     different detailsUrl hosts are DISTINCT checks; the dedup keys on the host so the passing
     provider does not hide the failing one. ship must refuse."""
     main, _wt = repo_with_pr_worktree
-    bindir = _fake_gh_rollup_dir(tmp_path, _ROLLUP_DISTINCT_PROVIDERS_SAME_NAME)
+    bindir = _fake_gh_rollup_dir(tmp_path)
 
     r = _run_ship_rollup(main, bindir, _ROLLUP_DISTINCT_PROVIDERS_SAME_NAME)
 
@@ -1899,7 +1932,7 @@ def test_latest_run_failure_still_blocks(repo_with_pr_worktree, tmp_path):
     """Fail-closed: dedup keeps the LATEST run, so a check whose newest run is FAILURE (even
     after an older SUCCESS) still blocks the merge — the dedup must not weaken the gate."""
     main, _wt = repo_with_pr_worktree
-    bindir = _fake_gh_rollup_dir(tmp_path, _ROLLUP_LATEST_IS_FAILURE)
+    bindir = _fake_gh_rollup_dir(tmp_path)
 
     r = _run_ship_rollup(main, bindir, _ROLLUP_LATEST_IS_FAILURE)
 
