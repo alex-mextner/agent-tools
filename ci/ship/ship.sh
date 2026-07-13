@@ -354,8 +354,20 @@ fi
 # with a local branch here, so this is a soft limitation, not a regression. Making those paths
 # fully target-aware needs a target-checkout mapping and is tracked as a follow-up (see the PR
 # / issue) rather than folded into this minimal restoration.
+# Foreign-ness is derived from the EFFECTIVE gh target, not `REPO_FLAG` alone. `gh` honours
+# THREE ways to name a target repo — `--repo`, and the `GH_SHIP_REPO`/`GH_REPO` environment
+# vars — any of which points every gh call (view/merge) at another repo. If foreign-ness saw
+# only `REPO_FLAG`, a target named via either env var would leave `_FOREIGN_REPO_INVOKE=0` and
+# slip past every guard that keys on it (remote-branch delete, local cleanup, AND the
+# empty-rollup local-gate path), running the local gate against the AMBIENT checkout and
+# merging the wrong repo. So fold all three in (precedence matches how GH_REPO is set above:
+# --repo, else GH_SHIP_REPO, else a pre-existing ambient GH_REPO). A target equal to this
+# checkout's own origin is NOT foreign. (Residual: the compare is a raw string, so the same
+# origin written in a different form — a `.git` suffix, a URL, a case change — reads as foreign
+# and conservatively skips cleanup; that errs toward not touching the wrong repo.)
 _FOREIGN_REPO_INVOKE=0
-if [ -n "$REPO_FLAG" ] && [ "$REPO_FLAG" != "$_CWD_ORIGIN_REPO" ]; then
+_EFFECTIVE_TARGET="${REPO_FLAG:-${GH_SHIP_REPO:-${GH_REPO:-}}}"
+if [ -n "$_EFFECTIVE_TARGET" ] && [ "$_EFFECTIVE_TARGET" != "$_CWD_ORIGIN_REPO" ]; then
   _FOREIGN_REPO_INVOKE=1
 fi
 
@@ -569,6 +581,91 @@ run_local_ci_gate() {
   return 1
 }
 
+# Print ONLY the top-level `on:` block of a workflow read on stdin (from `^on:` to the next
+# top-level key), with `#` comments stripped. So a `pull_request` mention OUTSIDE the trigger
+# block — a comment, a job name, or an `if: github.event_name == 'pull_request'` expression
+# under `jobs:` — is never mistaken for a PR trigger.
+_workflow_on_block() {
+  awk '
+    /^on:([[:space:]]|$)/ { insec = 1; print; next }
+    insec && /^[^[:space:]#]/ { insec = 0 }
+    insec { print }
+  ' | sed 's/#.*//'
+}
+
+# True (exit 0) iff the `on:` block read on stdin declares a `pull_request` / `pull_request_target`
+# TRIGGER — matched STRUCTURALLY by INDENTATION, never as a free substring. A trigger is a DIRECT
+# CHILD of `on:` (a key or a bare list item at the shallowest indent inside the block) or an inline
+# value on the `on:` line itself. Every FILTER value (`branches:` / `paths:` / `tags:` lists) sits
+# one level DEEPER than the trigger key, so a push-only workflow whose filter value merely contains
+# — or is literally — `pull_request` (`branches: ['feature/pull_request-*']`, `paths:
+# [docs/pull_request.md]`, or a bare `- pull_request` branch name under `push.branches`) is NOT
+# misclassified. The inline `on:` case guards against a flow-mapping (`on: { push: { branches:
+# [pull_request] } }`) with `[^{]`; a flow-style `on:` that legitimately maps `pull_request` is the
+# one accepted residual — it fails toward REFUSE (safe direction), never toward an --admin merge.
+# So is the quoted-key form `"on":` (unmatched by the block extractor): a safe refuse.
+_on_block_declares_pr_trigger() {
+  awk '
+    BEGIN { childind = -1 }
+    # inline `on:` scalar or [list] (NOT a flow-mapping `{...}`): triggers name-checked on line 1.
+    NR == 1 && /^on:[[:space:]]*[^[:space:]{]/ {
+      if ($0 ~ /^on:[^{]*pull_request(_target)?([^0-9A-Za-z_]|$)/) { found = 1 }
+      next
+    }
+    /^[[:space:]]*$/ { next }
+    {
+      match($0, /^[[:space:]]*/); ind = RLENGTH
+      if (ind == 0) next                    # the `on:` line itself (indent 0)
+      if (childind < 0) childind = ind      # first indented line fixes the direct-child level
+      if (ind == childind) {                # a DIRECT child of on: — a trigger key or list item
+        if ($0 ~ /^[[:space:]]*pull_request(_target)?[[:space:]]*:/) found = 1
+        if ($0 ~ /^[[:space:]]*-[[:space:]]*pull_request(_target)?[[:space:]]*$/) found = 1
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+# True (exit 0) iff an EMPTY statusCheckRollup on this PR is a CI-OUTAGE (CI was EXPECTED to
+# register a check but did not — billing suspended / Actions down / runner quota exhausted),
+# rather than a repo that legitimately has no PR checks. The discriminator is a workflow whose
+# top-level `on:` block declares a `pull_request` / `pull_request_target` trigger: a check
+# SHOULD have appeared, so an empty rollup means it did not run (outage). A repo whose workflows
+# only trigger on `push` / `schedule` / `workflow_dispatch` produces an empty rollup on a PR as
+# CORRECT configured behavior — NOT an outage — so it stays a hard refuse.
+#
+# The signal is read from the REMOTE ref of the PR's OWN BASE branch (`origin/<baseRefName>`) —
+# the exact state GitHub evaluates `pull_request` workflows from — NOT the local worktree or even
+# local HEAD: an untracked, locally-modified, or committed-but-UNPUSHED `.github/workflows/*.yml`
+# cannot flip a no-PR-CI repo into the local-gate path. The fetch uses an EXPLICIT refspec so a
+# SUCCESSFUL fetch definitely advances the remote-tracking ref (a bare `fetch origin <branch>`
+# only guarantees FETCH_HEAD, and could leave `origin/<base>` stale). Best-effort: if the fetch
+# fails (offline) we fall back to the LAST-KNOWN `origin/<base>`, and if that ref does not exist
+# at all we return false (refuse — the safe direction). There is deliberately NO env force-hook:
+# tests exercise it with a real pushed `on: pull_request` workflow.
+#
+# RESIDUAL (documented): a `pull_request` trigger narrowed by `branches:` / `paths:` / `types:`
+# filters may legitimately register no check for a PR the filter excludes; this heuristic still
+# classifies that as an outage. The local gate (full test suite + leftover + checklist + threads)
+# still runs before any such merge, so the merge is never unverified — only more permissive about
+# WHEN the local gate substitutes for absent remote checks.
+_empty_rollup_is_ci_outage() {
+  local base ref f
+  # GitHub evaluates a `pull_request` workflow from the PR's OWN BASE branch, which need not be
+  # the repo default (a PR into a release/feature branch). Read the base ref and use it; fall
+  # back to $DEFAULT_BRANCH only if it can't be read or looks unsafe (leading `-`, odd chars).
+  base=$(gh pr view "$PR" --json baseRefName -q '.baseRefName' 2>/dev/null) || base=""
+  case "$base" in ''|-*|*[!A-Za-z0-9._/-]*) base="$DEFAULT_BRANCH" ;; esac
+  ref="origin/$base"
+  git -C "$ROOT" fetch -q origin "$base:refs/remotes/origin/$base" 2>/dev/null || true
+  git -C "$ROOT" rev-parse --verify --quiet "$ref" >/dev/null 2>&1 || return 1
+  while IFS= read -r f; do
+    case "$f" in *.yml|*.yaml) : ;; *) continue ;; esac
+    git -C "$ROOT" show "$ref:$f" 2>/dev/null | _workflow_on_block | _on_block_declares_pr_trigger && return 0
+  done < <(git -C "$ROOT" ls-tree -r --name-only "$ref" -- .github/workflows/ 2>/dev/null)
+  return 1
+}
+
 # --- green-CI gate: CI must EXIST + be green; pending CI is WATCHED to completion -------
 # Design (CTO): "no CI" is itself a FAILED gate, not a free pass — refuse with guidance to
 # set CI up. Existing-but-pending checks are WATCHED (polled to completion, up to
@@ -625,6 +722,28 @@ if [ "$SKIP_CI" = "0" ]; then
       if [ "$NOW" -lt "$GRACE_DEADLINE" ]; then
         echo "[ship] no checks reported yet on PR #$PR — waiting ${CI_POLL}s for CI to register (grace $(( GRACE_DEADLINE - NOW ))s left) ..."
         sleep "$CI_POLL"; continue
+      fi
+      # CI registered NO checks after the grace window. If a PULL-REQUEST-triggered workflow is
+      # configured on the pushed base branch, a check SHOULD have appeared but did not — a
+      # billing/infra outage, exactly the "no money, CI keeps failing" case — so run the SAME
+      # local fallback gate the checks-FAILED path uses and merge only if it is green, instead of
+      # hard-refusing into a blind `--skip-ci` that verifies NOTHING locally. This is the SAME
+      # posture (and the SAME plain, non-admin merge) as the checks-FAILED structural-outage path
+      # below: a green local gate just `break`s and falls through to the normal `gh pr merge`, so
+      # a branch-protection ruleset still gates the merge exactly as it would any other ship (if
+      # required checks are genuinely absent GitHub blocks the merge and the operator can
+      # `--skip-ci` deliberately — ship never silently --admin-bypasses protection here). A repo
+      # whose workflows never trigger on PRs (push/schedule only) is NOT an outage and keeps the
+      # hard refuse; a foreign --repo/GH_SHIP_REPO target also keeps the refuse — the local gate
+      # runs against THIS checkout, not the target (#166).
+      if [ "${_FOREIGN_REPO_INVOKE:-0}" != "1" ] && _empty_rollup_is_ci_outage; then
+        echo "[ship] a PR-triggered workflow is configured but registered NO checks within ${CI_GRACE}s — CI infrastructure appears unavailable (billing/outage), not a real failure. Running local fallback gates instead of refusing." >&2
+        if run_local_ci_gate; then
+          echo "[ship] CI-down local gate PASSED (no checks registered) — CI outage, not a test failure; proceeding with the normal (non-admin) merge."
+          break
+        fi
+        echo "Refusing: CI registered no checks AND local fallback gates also failed — not safe to merge." >&2
+        exit 1
       fi
       { echo "Refusing: PR #$PR has NO CI checks (none registered within ${CI_GRACE}s) — set up CI before merging (an ungated merge is not allowed; 'no CI' is a failed gate, not a pass)."
         echo "  Provision CI: enable rig's ci block — \`rig apply\` writes secret-scan / codeql / dependency-review into .github/workflows — or add your own workflows."

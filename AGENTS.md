@@ -163,7 +163,13 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   SUCCESS/SKIPPED/NEUTRAL as a failure. *All* reported checks gate the merge, not only the
   branch-ruleset's required ones (an optional/advisory check whose latest run is red still blocks
   `gh ship`). And *no CI at all is itself a failed gate*, not a free pass — it watches pending
-  checks to completion, then gates on the result;
+  checks to completion, then gates on the result. **Exception — a genuine CI outage:** if the
+  rollup is empty because a `pull_request`-triggered workflow exists on the PR's pushed base
+  branch (`origin/<baseRefName>`) but registered no check (billing suspended / Actions down),
+  ship runs the local fallback gate (tests + leftover scan + PR checklist + review threads) and,
+  only if it is fully green, falls through to the normal non-admin merge (branch protection still
+  gates it — no silent `--admin`-bypass); a repo whose workflows never trigger on PRs stays a
+  hard refuse (see `ci/ship/README.md` for the trigger-detection heuristic and its residuals);
 - there are **no unresolved review threads**;
 - a UI-touching PR carries an embedded **screenshot** (override with `--no-screenshot-ok
   <reason>`);

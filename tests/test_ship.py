@@ -1340,9 +1340,63 @@ def _fake_gh_partial_fail_dir(tmp_path: Path) -> Path:
     return bindir
 
 
+# Fake gh whose statusCheckRollup is EMPTY (`[]`) — the billing/outage shape where GitHub
+# never enqueued the workflows, so NO checks register. Otherwise answers the local-gate
+# sub-queries exactly like _FAKE_GH_CIDOWN (review threads → 0, body → empty, diff → clean).
+_FAKE_GH_EMPTY_ROLLUP = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q baseRefName; then
+          printf '%s' "${SHIP_TEST_BASE:-main}"
+        elif printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          printf '[]'
+        elif printf '%s ' "$@" | grep -q reviewThreads; then
+          echo "0"
+        elif printf '%s ' "$@" | grep -q body; then
+          echo ""
+        else
+          echo '[]'
+        fi ;;
+      diff)
+        if printf '%s ' "$@" | grep -q -- --name-only; then
+          printf 'src/a.py'
+        else
+          printf '%s\\n' "${SHIP_TEST_DIFF:-+new line without markers}"
+        fi ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged"; [ -n "${SHIP_TEST_MERGE_LOG:-}" ] && printf '%s\\n' "$*" >> "$SHIP_TEST_MERGE_LOG" || true ;;
+      *) : ;;
+    esac ;;
+  api) echo 0 ;;
+  *) : ;;
+esac
+"""
+
+
+def _fake_gh_empty_rollup_dir(tmp_path: Path) -> Path:
+    bindir = tmp_path / "biner"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_EMPTY_ROLLUP, encoding="utf-8")
+    gh.chmod(0o755)
+    return bindir
+
+
 def _run_ship_cidown(main: Path, bindir: Path, env_extra: dict | None = None):
     """Run ship.sh without --skip-ci (CI gate fires) but with --no-screenshot-ok."""
     env = dict(os.environ)
+    # Deterministic target inference: clear any ambient GH_REPO/GH_SHIP_REPO the dev/CI shell
+    # may carry, so a test only sees a foreign target when it sets one explicitly via env_extra.
+    env.pop("GH_REPO", None)
+    env.pop("GH_SHIP_REPO", None)
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
     env["SHIP_TEST_BRANCH"] = "feat"
     env["SHIP_DEFAULT_BRANCH"] = "main"
@@ -1375,6 +1429,525 @@ def test_cidown_local_gate_passes_merges(repo_with_pr_worktree, tmp_path):
     # The local gate must have reported success (success message goes to stdout).
     assert "ALL gates passed" in r.stdout, r.stdout
     assert "merged #1" in r.stdout, r.stdout
+
+
+def _add_workflow(main: Path, on_value: str, *, name: str = "ci.yml", body: str | None = None,
+                  commit: bool = True, push: bool = True) -> None:
+    """Write .github/workflows/<name>. By default a one-trigger file `on: <on_value>`; pass
+    `body` for full custom YAML. ship reads the outage signal from `origin/main`, so the file
+    must be COMMITTED and PUSHED to count — commit=False leaves it untracked, push=False leaves
+    it committed-but-unpushed (both are guard-test shapes that must NOT be treated as an outage)."""
+    wf = main / ".github" / "workflows"
+    wf.mkdir(parents=True, exist_ok=True)
+    (wf / name).write_text(body if body is not None else f"name: ci\non: {on_value}\n", encoding="utf-8")
+    if commit:
+        _git("add", f".github/workflows/{name}", cwd=main)
+        _git("commit", "-qm", f"add {name}", cwd=main)
+        if push:
+            _git("push", "-q", "origin", "main", cwd=main)
+
+
+def test_empty_rollup_ci_outage_local_gate_passes_merges(repo_with_pr_worktree, tmp_path):
+    """Billing/outage shape: a PULL-REQUEST-triggered workflow is committed (a check SHOULD
+    register) but the statusCheckRollup is EMPTY (workflows never enqueued). ship must run the
+    local fallback gate and merge when it is green — NOT hard-refuse into an ungated `--skip-ci`
+    admin bypass. Uses the REAL committed `on: pull_request` signal, no env force."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "pull_request")
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+
+    merge_log = tmp_path / "merge-args.log"
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",  # don't wait out the register-grace window in the test
+        "SHIP_LOCAL_TEST_CMD": "true",  # trivially-passing stand-in for the test suite
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_MERGE_LOG": str(merge_log),
+    })
+
+    assert r.returncode == 0, (
+        f"ship must merge when CI registered no checks but the local gate is green\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "registered NO checks" in r.stderr, r.stderr
+    assert "local gate PASSED (no checks registered)" in r.stdout, r.stdout
+    # The outage path falls through to the NORMAL merge (no --admin bypass) — same posture as the
+    # checks-failed structural path. Pin it two ways: the admin log line is absent, AND the actual
+    # `gh pr merge` argv (captured by the fake) carries no `--admin` flag — the load-bearing
+    # invariant "ship never silently --admin-bypasses branch protection on an outage".
+    assert "admin-merging" not in r.stdout, r.stdout
+    logged_merge = merge_log.read_text(encoding="utf-8") if merge_log.exists() else ""
+    assert logged_merge.strip(), f"fake gh recorded no merge call:\n{r.stdout}"
+    assert "--admin" not in logged_merge, f"outage merge must NOT pass --admin:\n{logged_merge}"
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_empty_rollup_ci_outage_local_gate_fails_refuses(repo_with_pr_worktree, tmp_path):
+    """Empty rollup classified as an outage (committed `on: pull_request` workflow), but the
+    local gate FAILS (tests red) → refuse, never merge."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "[push, pull_request]")  # PR-triggered (list form)
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "false",  # local suite fails
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must refuse when the empty-rollup local gate fails\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "local fallback gates also failed" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+_FAKE_GH_GREEN_ROLLUP = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          printf '[{"name":"pytest","conclusion":"SUCCESS","status":"COMPLETED","state":"SUCCESS"}]'
+        elif printf '%s ' "$@" | grep -q reviewThreads; then
+          echo "0"
+        elif printf '%s ' "$@" | grep -q body; then
+          echo ""
+        else
+          echo '[]'
+        fi ;;
+      diff)
+        if printf '%s ' "$@" | grep -q -- --name-only; then printf 'src/a.py'; else printf '+ok'; fi ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged" ;;
+      *) : ;;
+    esac ;;
+  api) echo 0 ;;
+  *) : ;;
+esac
+"""
+
+
+def test_nonempty_rollup_does_not_enter_outage_path(repo_with_pr_worktree, tmp_path):
+    """Regression pin (review, round 5): the empty-rollup outage branch is gated behind an EMPTY
+    rollup. A normal green (non-empty) rollup must take the ordinary green-CI path and NEVER the
+    outage branch, even when an `on: pull_request` workflow is present."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "pull_request")
+    bindir = tmp_path / "bingreen"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_GREEN_ROLLUP, encoding="utf-8")
+    gh.chmod(0o755)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "false",  # would FAIL if the outage path wrongly ran the local gate
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"a green non-empty rollup must merge via the normal path\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "registered NO checks" not in r.stderr, r.stderr
+    assert "local gate PASSED (no checks registered)" not in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_empty_rollup_no_workflows_still_refuses(repo_with_pr_worktree, tmp_path):
+    """An empty rollup with NO workflow files = genuinely no CI → keep the hard refuse. An
+    empty rollup must NEVER become a free ungated pass just because the local gate is green."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "true",  # would pass, but must not even be consulted
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse an empty rollup when the repo has no CI workflows\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "has NO CI checks" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_empty_rollup_non_pr_workflow_still_refuses(repo_with_pr_worktree, tmp_path):
+    """The false-positive guard (review #1): a workflow that does NOT trigger on pull requests
+    (`on: [push]`, schedule, workflow_dispatch) legitimately registers NO check on a PR — that
+    is correct configured behavior, NOT an outage. ship must keep the hard refuse, never
+    admin-bypass branch protection just because a `*.yml` exists."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "[push]")  # NON-PR trigger
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"a push-only workflow must NOT be classified as a CI outage\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "has NO CI checks" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_empty_rollup_untracked_pr_workflow_still_refuses(repo_with_pr_worktree, tmp_path):
+    """The mutable-state guard (review, Codex): an UNTRACKED (uncommitted) `on: pull_request`
+    workflow file in the worktree must NOT flip a no-CI repo into the admin-merge path — the
+    outage signal is read from the pushed origin/main ref only, so a stray local file is ignored."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "pull_request", commit=False)  # present on disk, NOT committed
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"an untracked local workflow must NOT bypass the no-CI refusal\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "has NO CI checks" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_empty_rollup_foreign_repo_still_refuses(repo_with_pr_worktree, tmp_path):
+    """The foreign-repo guard (review #3, relates #166): a committed `on: pull_request` workflow
+    would classify an empty rollup as an outage, but a foreign `--repo` invocation must KEEP the
+    hard refuse — the local gate runs against THIS checkout, not the target repo, so its green is
+    meaningless for the foreign PR. Uses the empty-rollup fake gh and a real --repo (origin here
+    is a local path → any owner/repo is foreign)."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "pull_request")
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env.update({"SHIP_CI_GRACE": "0", "SHIP_LOCAL_TEST_CMD": "true", "SHIP_REVIEW_DWELL": "0"})
+    env.pop("GH_REPO", None)
+    env.pop("GH_SHIP_REPO", None)
+    r = _sh(
+        "bash", str(_SHIP), "1", "--repo", "owner/repo", "--no-screenshot-ok", "test",
+        cwd=main, env=env,
+    )
+
+    assert r.returncode != 0, (
+        f"a foreign --repo empty rollup must NOT merge on a local-gate green\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "has NO CI checks" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_empty_rollup_push_only_with_stray_pull_request_text_still_refuses(repo_with_pr_worktree, tmp_path):
+    """The over-match guard (review #1, round 2): a PUSH-only workflow that merely MENTIONS
+    `pull_request` outside its `on:` block — in a comment, and in an
+    `if: github.event_name == 'pull_request'` job expression — must NOT be classified as
+    PR-triggered. Only the top-level `on:` block is parsed, so this stays a hard refuse (never
+    an admin-bypass of branch protection)."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "unused", body=(
+        "name: ci\n"
+        "# this workflow is not for pull_request events\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  build:\n"
+        "    if: github.event_name == 'pull_request'\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo hi\n"
+    ))
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"a push-only workflow mentioning pull_request must NOT be an outage\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "has NO CI checks" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_empty_rollup_committed_unpushed_workflow_still_refuses(repo_with_pr_worktree, tmp_path):
+    """The remote-state guard (review #3, Codex): a `on: pull_request` workflow COMMITTED locally
+    but NOT pushed is not what GitHub runs from — origin/main lacks it, so an empty remote rollup
+    must stay a hard refuse rather than an outage classification off stale local state."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "pull_request", commit=True, push=False)  # committed, NOT pushed
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"a committed-but-unpushed workflow must NOT be treated as a live PR CI outage\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "has NO CI checks" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_empty_rollup_block_form_pr_trigger_merges(repo_with_pr_worktree, tmp_path):
+    """The dominant real-world shape (review #3): a multi-line block-form `on:` with a
+    `pull_request:` key (and branch filters) is a genuine PR trigger — an empty rollup on it is
+    an outage, so a green local gate merges."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "unused", body=(
+        "name: ci\n"
+        "on:\n"
+        "  pull_request:\n"
+        "    branches: [main]\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo hi\n"
+    ))
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"a block-form pull_request trigger must be recognized as a CI outage\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "local gate PASSED (no checks registered)" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_empty_rollup_push_branches_filter_with_pull_request_value_still_refuses(repo_with_pr_worktree, tmp_path):
+    """The substring-in-filter-value guard (review #1, round 3): a PUSH-only workflow whose
+    `branches:` filter VALUE merely contains the text `pull_request` must NOT be classified as a
+    PR trigger — the match is structural (trigger key / list item), not a free substring, so this
+    stays a hard refuse (never an admin-bypass)."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "unused", body=(
+        "name: ci\n"
+        "on:\n"
+        "  push:\n"
+        "    branches: ['feature/pull_request-rework']\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo hi\n"
+    ))
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"a push-only workflow with pull_request in a branches filter must NOT be an outage\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "has NO CI checks" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_empty_rollup_filtered_pr_trigger_is_treated_as_outage(repo_with_pr_worktree, tmp_path):
+    """PIN the documented residual (review, round 7): a `pull_request` trigger NARROWED by a
+    `branches:` filter is still classified as an outage — the heuristic detects the trigger's
+    presence, not whether the filter matches THIS PR. This is the accepted, documented behavior
+    (the local gate still runs, so the merge is verified). This test pins it so a future refactor
+    that changes the residual is a deliberate, visible change — not a silent one."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "unused", body=(
+        "name: ci\n"
+        "on:\n"
+        "  pull_request:\n"
+        "    branches: [release]\n"   # a filter that would exclude a PR into main
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo hi\n"
+    ))
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    # Documented residual: the filtered trigger is treated as a CI outage → local gate → merge.
+    assert r.returncode == 0, (
+        f"documented residual: a filtered pull_request trigger is classified as an outage\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "local gate PASSED (no checks registered)" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_empty_rollup_push_bare_list_branch_named_pull_request_still_refuses(repo_with_pr_worktree, tmp_path):
+    """The nesting guard (review #1, round 4): a PUSH-only workflow whose `branches:` list has a
+    bare item literally named `pull_request` (a branch name, one indent level DEEPER than a
+    trigger) must NOT be classified as a PR trigger. Detection is indentation-aware — only DIRECT
+    children of `on:` are triggers — so this stays a hard refuse (never an admin-bypass)."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "unused", body=(
+        "name: ci\n"
+        "on:\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - pull_request\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo hi\n"
+    ))
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"a bare-list branch named pull_request under push must NOT be an outage\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "has NO CI checks" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_empty_rollup_pull_request_target_trigger_merges(repo_with_pr_worktree, tmp_path):
+    """The `pull_request_target` trigger (review #3, round 4) is a real PR trigger too — an empty
+    rollup on it is an outage, so a green local gate merges. Guards that both trigger spellings
+    reach the admin path, not just `pull_request`."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "unused", body=(
+        "name: ci\n"
+        "on:\n"
+        "  pull_request_target:\n"
+        "    types: [opened, synchronize]\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo hi\n"
+    ))
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"a pull_request_target trigger must be recognized as a CI outage\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_empty_rollup_foreign_via_gh_ship_repo_still_refuses(repo_with_pr_worktree, tmp_path):
+    """The env-target foreign guard (review, Codex): a foreign target named via `GH_SHIP_REPO`
+    (not `--repo`) must ALSO keep the hard refuse — the local gate runs against the ambient
+    checkout, so its green must not authorize an admin-merge of the foreign repo. Even with a
+    committed+pushed `on: pull_request` workflow here, the empty rollup stays a refuse."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "pull_request")
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "GH_SHIP_REPO": "owner/repo",  # foreign target via env, no --repo flag
+    })
+
+    assert r.returncode != 0, (
+        f"a foreign GH_SHIP_REPO empty rollup must NOT merge on a local-gate green\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "has NO CI checks" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_empty_rollup_foreign_via_gh_repo_still_refuses(repo_with_pr_worktree, tmp_path):
+    """The env-target foreign guard, raw `GH_REPO` form (review, round 6): `gh` honours a
+    pre-set `GH_REPO` as the target too, so a foreign repo named that way must ALSO keep the hard
+    refuse — the local gate runs against the ambient checkout, not the target."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "pull_request")
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "GH_REPO": "owner/repo",  # foreign target via the raw env var gh honours
+    })
+
+    assert r.returncode != 0, (
+        f"a foreign GH_REPO empty rollup must NOT merge on a local-gate green\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "has NO CI checks" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_empty_rollup_pr_base_differs_from_default_refuses(repo_with_pr_worktree, tmp_path):
+    """The base-vs-default guard (review, round 6): GitHub evaluates `pull_request` workflows from
+    the PR's OWN base branch, not the repo default. A PR whose base is a branch WITHOUT the
+    workflow (here `release`, which has no ref/workflow) must NOT be classified as an outage just
+    because the default branch has an `on: pull_request` workflow — the signal is read from the
+    base ref, which here does not resolve, so ship keeps the hard refuse."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "pull_request")  # on origin/main (default) only
+    bindir = _fake_gh_empty_rollup_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_BASE": "release",  # PR base ≠ default; no origin/release workflow exists
+    })
+
+    assert r.returncode != 0, (
+        f"a PR based on a branch without the workflow must NOT be an outage\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "has NO CI checks" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
 
 
 def test_cidown_local_gate_prefers_dev_run_test_when_rig_script_exists(repo_with_pr_worktree, tmp_path):
