@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""agents-hooks/v1 pre-bash hook — advisory self-check on a decision request.
+"""agents-hooks/v1 pre-bash hook — advisory self-check on an escalation to the human.
 
-When the agent sends a decision request to the human's out-of-band channel — a
-``tg --tag decision …`` invocation — this inspects the message body for the structural
-markers the `decision-request-discipline` skill's mandatory self-check requires (Context,
-Options, Recommendation). If any are missing, it emits an **exit-0 ADVISORY** naming what's
-absent, so the agent can rewrite before the human gets a bare "A or B?".
+When the agent escalates to the human's out-of-band channel — a ``tg --tag decision`` /
+``--tag problem`` / ``--tag question`` invocation — this inspects the message body for the
+structural markers the `decision-request-discipline` skill's mandatory self-check requires
+(Context, Options / pros-cons table, Recommendation). All three tags are the same escalation
+shape, so the self-check applies to each — an agent picking ``problem`` or ``question`` instead
+of ``decision`` no longer skips it silently (agent-tools#213/#12). If any marker is missing, it
+emits an **exit-0 ADVISORY** naming what's absent, so the agent can rewrite before the human gets
+a bare "A or B?".
 
 It is deliberately **advisory, never a block.** A malformed decision request must stay
 sendable — the human would rather receive an imperfect escalation than have the send wedged
@@ -127,6 +130,14 @@ _MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("Recommendation", re.compile(r"\brecommend|\bi suggest\b|\bi'd (?:go|pick)\b|\bproposal\b", re.I)),
 )
 
+# The escalation-shaped `tg` tags this hook inspects. All three route a message to the human's
+# out-of-band channel expecting a structured escalation (context + pros/cons + a recommendation),
+# per the decision-request-discipline skill — so the same self-check applies to each. `decision`
+# was the original tag; `problem` and `question` are the same escalation shape and were added so
+# the self-check is not silently skipped just because the agent picked a different tag word.
+# (agent-tools#213/#12.)
+_ESCALATION_TAGS = frozenset({"decision", "problem", "question"})
+
 
 def emit(decision: str, message: str | None = None) -> None:
     out = {"hook_api": HOOK_API, "decision": decision}
@@ -183,9 +194,10 @@ def _unwrap_segment(segment: str) -> list[str]:
     return tokens
 
 
-def _decision_request_body(command: str) -> str | None:
-    """If the command is a `tg` invocation carrying ``--tag decision``, return the message
-    body it would send (positional text + any ``--title``); else None.
+def _escalation_request_body(command: str) -> tuple[str, str] | None:
+    """If the command is a `tg` invocation carrying an escalation tag (``--tag decision`` /
+    ``problem`` / ``question``), return ``(tag, body)`` — the matched tag and the message body it
+    would send (positional text + any ``--title``); else None.
 
     Walks each ``&&``/``;``/``|``-separated segment so a `tg` later in a pipeline is seen.
     Uses shlex tokenization, not raw matching, so the tag and body are read exactly as `tg`
@@ -196,18 +208,19 @@ def _decision_request_body(command: str) -> str | None:
         tokens = _unwrap_segment(raw_segment)
         if not tokens or not re.fullmatch(r"(?:\S*/)?tg", tokens[0]):
             continue
-        body = _body_if_decision_tag(tokens[1:])
-        if body is not None:
-            return body
+        result = _body_if_escalation_tag(tokens[1:])
+        if result is not None:
+            return result
     return None
 
 
-def _body_if_decision_tag(args: list[str]) -> str | None:
-    """Given a `tg` invocation's args, return the message body iff ``--tag decision`` is
-    present; else None. Collects positional (non-flag) text and the ``--title`` value, which
-    together are what the human reads. Value-taking flags consume their next token so a flag
-    value is never mistaken for the positional message."""
-    has_decision_tag = False
+def _body_if_escalation_tag(args: list[str]) -> tuple[str, str] | None:
+    """Given a `tg` invocation's args, return ``(tag, body)`` iff a ``--tag`` from
+    ``_ESCALATION_TAGS`` (decision/problem/question) is present; else None. Collects positional
+    (non-flag) text and the ``--title`` value, which together are what the human reads.
+    Value-taking flags consume their next token so a flag value is never mistaken for the
+    positional message."""
+    matched_tag: str | None = None
     title = ""
     positionals: list[str] = []
     # The COMPLETE set of value-taking `tg` flags other than --tag/--title (handled above), so
@@ -221,13 +234,14 @@ def _body_if_decision_tag(args: list[str]) -> str | None:
     while i < len(args):
         tok = args[i]
         if tok == "--tag":
-            if i + 1 < len(args) and args[i + 1].lower() == "decision":
-                has_decision_tag = True
+            if i + 1 < len(args) and args[i + 1].lower() in _ESCALATION_TAGS:
+                matched_tag = args[i + 1].lower()
             i += 2
             continue
         if tok.startswith("--tag="):
-            if tok.split("=", 1)[1].lower() == "decision":
-                has_decision_tag = True
+            candidate = tok.split("=", 1)[1].lower()
+            if candidate in _ESCALATION_TAGS:
+                matched_tag = candidate
             i += 1
             continue
         if tok == "--title":
@@ -247,29 +261,30 @@ def _body_if_decision_tag(args: list[str]) -> str | None:
             continue
         positionals.append(tok)
         i += 1
-    if not has_decision_tag:
+    if matched_tag is None:
         return None
-    return "\n".join([title, *positionals]).strip()
+    return matched_tag, "\n".join([title, *positionals]).strip()
 
 
 def _missing_markers(body: str) -> list[str]:
     return [label for label, pat in _MARKERS if not pat.search(body)]
 
 
-def _advisory_message(missing: list[str]) -> str:
+def _advisory_message(tag: str, missing: list[str]) -> str:
     # `missing` is only ever a subset of the three markers this hook can detect heuristically
     # (Context / Options / Recommendation). The skill asks for two more — a glossary of terms
     # and a "where to look" code ref — that a regex can't reliably check; they're named as a
     # separate reminder, NOT folded into the `missing` list, so the list stays honest about
     # what was actually measured.
     return (
-        "Decision-request self-check (advisory — your message still sends): this "
-        f"`tg --tag decision` body appears to be missing {', '.join(missing)} (of the three "
-        "markers this hook checks). The decision-request-discipline skill also wants a glossary "
-        "of internal terms and a 'where to look' code ref, so the human can decide in 30s "
-        "without opening the repo. Consider rewriting before sending — or, for a genuine "
-        'one-time silence, request approval via RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT="<why>" '
-        "(Telegram approval, deny-by-default)."
+        "Escalation self-check (advisory — your message still sends): this "
+        f"`tg --tag {tag}` body appears to be missing {', '.join(missing)} (of the three "
+        "markers this hook checks). Read the decision-request-discipline skill and send a "
+        "structured escalation: context (a 'where to look' code ref + a glossary of internal "
+        "terms), a pros/cons table of the options, and a recommendation — so the human can "
+        "decide in 30s without opening the repo. Consider rewriting before sending — or, for a "
+        'genuine one-time silence, request approval via '
+        'RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT="<why>" (Telegram approval, deny-by-default).'
     )
 
 
@@ -281,9 +296,10 @@ def _advisory_for(command: str, cwd: str) -> str | None:
     Telegram hatch (`RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT`) silences it; an unset / invalid /
     denied request leaves the advisory in place. The hatch call never raises (it catches
     internally), so this stays fail-open."""
-    body = _decision_request_body(command)
-    if body is None:
+    matched = _escalation_request_body(command)
+    if matched is None:
         return None
+    tag, body = matched
     missing = _missing_markers(body)
     if not missing:
         return None
@@ -296,7 +312,7 @@ def _advisory_for(command: str, cwd: str) -> str | None:
     if hatch.should_stop and hatch.approved:
         warn(f"advisory silenced via hatch escalation ({hatch.reason})")
         return None
-    return _advisory_message(missing)
+    return _advisory_message(tag, missing)
 
 
 def main() -> int:

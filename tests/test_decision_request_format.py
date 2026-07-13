@@ -173,6 +173,38 @@ def test_empty_body_with_decision_tag_advises(monkeypatch):
     assert _message(out) is not None
 
 
+# ── #12: problem / question are the SAME escalation shape → same self-check ───────────────
+
+@pytest.mark.parametrize("tag", ["decision", "problem", "question"])
+def test_all_escalation_tags_trigger_advisory_on_bare_body(tag, monkeypatch):
+    """decision/problem/question all route a structured escalation to the human, so a bare body
+    (no Context/Options/Recommendation) fires the advisory for EACH — an agent can't dodge the
+    self-check by picking `problem`/`question` instead of `decision` (agent-tools#213/#12)."""
+    out, _, code = _run(f'tg --tag {tag} "{_BARE}"', monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+    msg = _message(out)
+    assert msg is not None and "self-check" in msg
+    # The advisory names the actual tag used, not a hardcoded "decision".
+    assert f"--tag {tag}" in msg
+
+
+@pytest.mark.parametrize("tag", ["decision", "problem", "question"])
+def test_all_escalation_tags_complete_body_silent(tag, monkeypatch):
+    out, _, code = _run(f'tg --tag {tag} "{_COMPLETE}"', monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+    assert _message(out) is None
+
+
+def test_advisory_points_at_pros_cons_table_and_skill(monkeypatch):
+    """#12: the advisory must steer the agent to the escalation format — read the skill, send a
+    pros/cons table + context + recommendation."""
+    out, _, _ = _run(f'tg --tag problem "{_BARE}"', monkeypatch)
+    msg = _message(out)
+    assert msg is not None
+    assert "decision-request-discipline" in msg
+    assert "pros/cons table" in msg
+
+
 # ── TRIGGER + complete body → silent allow ──────────────────────────────────────────────
 
 def test_complete_body_allows_silently(monkeypatch):
@@ -185,9 +217,9 @@ def test_complete_body_allows_silently(monkeypatch):
 # ── NON-TRIGGER → plain allow, no message ───────────────────────────────────────────────
 
 @pytest.mark.parametrize("command", [
-    'tg --tag report "build green"',                       # a different tag
-    'tg --tag problem "the deploy is down"',               # a different tag
-    'tg "just a status note"',                             # no tag at all
+    'tg --tag report "build green"',                       # a non-escalation tag
+    'tg --tag answer "yes, done"',                          # a non-escalation tag
+    'tg "just a status note"',                              # no tag at all
     'echo "use --tag decision next time"',                 # the flag inside an echo string
     'tg "remember to --tag decision later"',               # body text, no actual flag
     'git commit -m "add tg --tag decision hook"',          # the flag inside a commit message
