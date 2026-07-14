@@ -15,7 +15,7 @@ that isn't actually ready even with a one-liner.
 | Refusal | Why |
 | ------- | --- |
 | PR not OPEN / CONFLICTING / BEHIND base | Not mergeable / ruleset wants up-to-date branch. |
-| **No CI checks at all** | "No CI" is a *failed* gate, not a pass — ship refuses and tells you to set CI up first (`rig apply` provisions the gates, or add workflows). Override only with `--skip-ci`. |
+| **No CI checks at all** | "No CI" is a *failed* gate, not a pass — ship refuses and tells you to set CI up first (`rig apply` provisions the gates, or add workflows). Override only with `--skip-ci`, which is **deny-by-default** (needs a one-time live Telegram approval — see below). |
 | Any CI check's latest run failing | The green-CI gate (gates on ALL checks, by each check's LATEST run — the rollup is deduped to the newest run per logical check, so a stale FAILURE from a re-run that has since gone green does not block, matching GitHub's `mergeStateStatus`). |
 | CI still running | Ship **watches** pending checks to completion (polls every `SHIP_CI_POLL`s up to `SHIP_CI_WAIT`s) instead of refusing — you don't babysit. |
 | Unresolved review threads | Same check as [`../review-threads/`](../review-threads/). |
@@ -96,12 +96,16 @@ Nothing org-/tracker-/layout-specific is hard-coded. Configure via env:
 | `SHIP_REVIEW_QUORUM_MIN_MODELS` | `3` | Quorum floor: distinct models across those PASSED iterations. **Clamped to a hard minimum of 3** — raise-only, same as `MIN_ITER`. |
 | `REVIEW_TASK_CODE` | (auto) | The PR's task code for the quorum gate. Unset → derived from a `HYP-<n>`/uppercase ticket token in the branch name, then the PR body; none found → fail-closed refuse. |
 | `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM` | (unset) | One-time bypass request for a not-met quorum bar: set to a written justification to ask Alex live on Telegram (shared `agenttools_hatch_escalation` lib); proceeds ONLY on his real-time approval. Under `--dry-run`, the helper reports the would-be request but does not contact `tg-ctl` or write a bypass audit line. Blank/bare values denied. **No self-service reason flag exists.** The lib is imported from a fixed path relative to `ship.sh`, and tg-ctl is resolved from a rig.yaml in the OS account's **real home** (`pwd.getpwuid` — **not** the `$HOME` env var, **not** the PR's repo) then a trusted-paths allowlist. So neither an env var (including a doctored `HOME`) nor a rig.yaml the PR commits can redirect approval to a stub. |
-| `SHIP_AUDIT_FILE` | `~/.config/agent-tools/ship-audit.jsonl` | JSONL audit log; one line per non-dry-run gated ship (`authorized` / `bypass:approved` / `bypass:denied` / `refused`). |
+| `SHIP_AUDIT_FILE` | `~/.config/agent-tools/ship-audit.jsonl` | JSONL audit log; one line per non-dry-run gated ship. Review-quorum decisions: `authorized` / `bypass:approved` / `bypass:denied` / `refused` (with a `task_code`). `--skip-ci` decisions: `skipci:bypass:approved` / `skipci:bypass:denied` / `skipci:refused` (with `gate":"skip-ci"`). |
 
 ## Flags
 
-- `--skip-ci` — admin-merge bypassing the green-CI gate (use only when CI is billing-blocked
-  or stuck; the other preflights still run).
+- `--skip-ci` — admin-merge bypassing the green-CI gate (+ branch protection); the other
+  preflights still run. **Deny-by-default**: it proceeds ONLY on a one-time live Telegram approval
+  requested via `RIG_HATCH_REQUEST_SHIP_SKIP_CI="<justification>"` (same shared hatch lib as the
+  review-quorum gate; a blank/bare value is denied; no ops off-switch). This is **not** the way to
+  handle billing-blocked/stuck CI — for that, run **without** `--skip-ci`: the normal path
+  auto-detects the outage, runs the local fallback gate, and does a normal (non-admin) merge.
 - `--dry-run` — print, change nothing.
 - `--no-screenshot-ok <reason>` — override the UI screenshot requirement, logged.
 - `--no-version-bump-ok <reason>` — override the version-bump requirement for a genuine

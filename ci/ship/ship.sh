@@ -34,8 +34,12 @@
 #                          is not possible. Accepts -R / --repo=… / -R=… / -R… too. When the
 #                          target is not this checkout's own origin, remote-branch deletion is
 #                          skipped (see the cleanup guard) so the wrong remote is never touched.
-#   --skip-ci              admin-merge bypassing the green-CI gate (use only when CI is
-#                          billing-blocked / stuck — it still runs the other preflights).
+#   --skip-ci              admin-merge bypassing the green-CI gate (+ branch protection). This is
+#                          DENY-BY-DEFAULT: it proceeds ONLY on a one-time live Telegram approval
+#                          requested via RIG_HATCH_REQUEST_SHIP_SKIP_CI (see NOTE below). It is NOT
+#                          the way to handle a billing-blocked / stuck CI — for that, run ship
+#                          WITHOUT --skip-ci: the normal path auto-detects the outage, runs the
+#                          local fallback gate, and does a normal (non-admin) merge.
 #   --dry-run              print what would happen; change nothing.
 #   --no-screenshot-ok R   override the UI screenshot requirement with a logged reason R.
 #   --no-version-bump-ok R override the version-bump requirement with a logged reason R
@@ -50,6 +54,14 @@
 #   RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>"
 # which asks Alex live on Telegram (via the shared agenttools_hatch_escalation lib) and proceeds
 # ONLY on his real-time approval. SHIP_REVIEW_QUORUM=0 disables the whole gate (ops off-switch).
+#
+# NOTE: --skip-ci has NO override flag either and is deny-by-default. Request a one-time bypass by
+# setting RIG_HATCH_REQUEST_SHIP_SKIP_CI="<justification>" (same shared hatch lib, same live
+# Telegram approval). Unlike the review-quorum gate there is NO ops off-switch env var — an
+# agent-settable off-switch would defeat the whole point; the intended path is a live approval.
+# (Threat-model caveat, same as the review-quorum gate: a shipper who fully controls the ship
+# PROCESS's PATH can defeat ANY gate — fake gh/git/python3 — so this removes the fail-OPEN
+# asymmetry for a benign shipper, it is not a claim to withstand a hostile PATH.)
 #
 # Knobs (env):
 #   SHIP_MAIN_CHECKOUT     path to the primary (main) checkout for the post-merge pull.
@@ -92,10 +104,13 @@
 #                          the PR's repo), then a trusted-paths allowlist. Neither the lib dir nor
 #                          tg-ctl is env- or repo-overridable, so nothing the shipper/PR controls
 #                          can redirect approval to a stub.
-#   SHIP_AUDIT_FILE        path for the review-quorum gate's audit JSONL (default
+#   SHIP_AUDIT_FILE        path for the gate audit JSONL (default
 #                          ~/.config/agent-tools/ship-audit.jsonl). One line is appended per
-#                          non-dry-run gated ship (authorized / bypass:approved /
-#                          bypass:denied / refused); --dry-run prints the would-be audit.
+#                          non-dry-run gated ship. review-quorum gate decisions: authorized /
+#                          bypass:approved / bypass:denied / refused (has a `task_code` field).
+#                          --skip-ci gate decisions: skipci:bypass:approved / skipci:bypass:denied
+#                          / skipci:refused (has a `gate":"skip-ci"` field). --dry-run prints the
+#                          would-be audit instead of writing.
 set -euo pipefail
 
 ORIG_PWD=$(pwd -P)
@@ -114,6 +129,11 @@ USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] 
 _SHIP_SELF_SRC="${BASH_SOURCE[0]:-$0}"
 _SHIP_SELF_DIR="$(cd "$(dirname "$_SHIP_SELF_SRC")" 2>/dev/null && pwd -P || echo /nonexistent)"
 _SHIP_HATCH_PY="$_SHIP_SELF_DIR/review_quorum_hatch.py"
+# Same deal for the --skip-ci CI-bypass gate: its one-time Telegram approval routes through
+# ci/ship/skip_ci_hatch.py, which imports the SAME shared agenttools_hatch_escalation lib from a
+# fixed path and resolves tg-ctl off the account's REAL home — no self-service flag, no env-/repo-
+# overridable authority. Fails CLOSED (refuse) if ship.sh was copied out of the checkout.
+_SHIP_SKIP_CI_HATCH_PY="$_SHIP_SELF_DIR/skip_ci_hatch.py"
 
 # --- arg parse (PR number is the lone bare arg; --screenshot takes path + optional desc) --
 args=("$@"); i=0; n=${#args[@]}
@@ -608,7 +628,7 @@ if [ "$SKIP_CI" = "0" ]; then
       fi
       { echo "Refusing: PR #$PR has NO CI checks (none registered within ${CI_GRACE}s) — set up CI before merging (an ungated merge is not allowed; 'no CI' is a failed gate, not a pass)."
         echo "  Provision CI: enable rig's ci block — \`rig apply\` writes secret-scan / codeql / dependency-review into .github/workflows — or add your own workflows."
-        echo "  Override ONLY if CI is genuinely N/A for this repo: --skip-ci."; } >&2
+        echo "  Override ONLY if CI is genuinely N/A for this repo: --skip-ci (deny-by-default — needs a one-time live Telegram approval via RIG_HATCH_REQUEST_SHIP_SKIP_CI)."; } >&2
       exit 1
     fi
     PENDING=$(printf '%s' "$ROLLUP" | jq "[.[] | select($SETTLED_FILTER | not)] | length" 2>/dev/null || echo 0)
@@ -632,7 +652,7 @@ if [ "$SKIP_CI" = "0" ]; then
     else
       echo "Refusing: PR #$PR has $FAILED check(s) not passing:" >&2
       printf '%s' "$ROLLUP" | jq -r ".[] | select($SUCCESS_FILTER | not) | \"  x \(.name // .context) -> \(.conclusion // .state)\"" >&2 2>/dev/null || true
-      echo "  Fix CI, then re-run (or --skip-ci if CI is billing-blocked)." >&2
+      echo "  Fix CI, then re-run. If CI is genuinely billing-blocked/down, re-run WITHOUT --skip-ci — the normal path auto-detects a real outage and merges after its own local checks. (--skip-ci is now a deny-by-default hatch-gated admin bypass, NOT the billing path.)" >&2
       exit 1
     fi
   fi
@@ -1148,6 +1168,95 @@ _review_quorum_refuse_or_hatch() {  # $1 = refusal summary
   exit 1
 }
 
+# --- --skip-ci hatch gate (deny-by-default; one-time live Telegram approval) --------------
+# `--skip-ci` is a BLIND admin-merge: it skips the entire green-CI gate AND branch protection
+# (`gh pr merge --admin`), verifying nothing locally. The LEGITIMATE "CI is billing-blocked /
+# infrastructure is down" case never needs it — the normal (SKIP_CI=0) path auto-detects the
+# outage (_empty_rollup_is_ci_outage / ci_appears_structurally_down), runs the local fallback
+# gate, and does a NORMAL non-admin merge. So a bare --skip-ci is a pure self-service bypass and
+# is DENY-BY-DEFAULT: the ONLY way through is a one-time approval Alex grants live on Telegram,
+# requested by setting RIG_HATCH_REQUEST_SHIP_SKIP_CI="<written justification>". No env var an
+# agent can set alone unlocks it (a blank/bare "1" is rejected by the helper); authority (tg-ctl)
+# is resolved from the account's REAL home, never the repo/cwd — same hardening as the
+# review-quorum gate; see ci/ship/skip_ci_hatch.py.
+
+# One skip-ci audit line -> SHIP_AUDIT_FILE, mirroring _review_quorum_audit_log's dry-run contract
+# and jq-less JSON-safety. The Python helper owns the non-dry-run bypass:approved/denied line; this
+# shell helper records only the cases the helper does NOT (env-absent "refused", and the fail-closed
+# paths) — never double-writing.
+_skip_ci_audit_log() {  # $1=decision $2=reason(optional)
+  local decision="$1" reason="${2:-}"
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "[dry-run] would append skip-ci audit: decision=${decision}" >&2
+    return 0
+  fi
+  local file="${SHIP_AUDIT_FILE:-$HOME/.config/agent-tools/ship-audit.jsonl}"
+  mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
+  local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local esc_pr esc_branch esc_reason
+  esc_pr=$(printf '%s' "$PR" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+  esc_branch=$(printf '%s' "${BRANCH:-}" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+  esc_reason=$(printf '%s' "$reason" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+  { if [ -n "$reason" ]; then
+      printf '{"ts":"%s","pr":"%s","branch":"%s","gate":"skip-ci","decision":"%s","override_reason":"%s"}\n' \
+        "$ts" "$esc_pr" "$esc_branch" "$decision" "$esc_reason"
+    else
+      printf '{"ts":"%s","pr":"%s","branch":"%s","gate":"skip-ci","decision":"%s"}\n' \
+        "$ts" "$esc_pr" "$esc_branch" "$decision"
+    fi; } >> "$file" 2>/dev/null || true
+}
+
+# Ask Alex, live on Telegram, to approve a one-time --skip-ci bypass. `python3 -I` = isolated mode
+# (ignores PYTHONPATH/PYTHONHOME, skips user-site/sitecustomize, no cwd on sys.path) so a shipping
+# agent cannot inject a self-approving module; the helper additionally loads the shared lib by
+# explicit file path. Called ONLY when RIG_HATCH_REQUEST_SHIP_SKIP_CI is set.
+_skip_ci_hatch_check() {  # uses $PR $BRANCH $DRY_RUN
+  SHIP_HATCH_PR="$PR" \
+  SHIP_HATCH_BRANCH="${BRANCH:-}" \
+  SHIP_DRY_RUN="$DRY_RUN" \
+  python3 -I "$_SHIP_SKIP_CI_HATCH_PY"
+}
+
+# Terminal gate for --skip-ci: returns 0 to proceed with the admin merge (env unset -> refuse with
+# how-to; env set -> the helper's live Telegram verdict, authorized ONLY on exit 0 + a leading
+# APPROVED sentinel so a fake/broken python3 fails CLOSED). Otherwise exits 1.
+_skip_ci_hatch_gate() {
+  if [ -z "${RIG_HATCH_REQUEST_SHIP_SKIP_CI+x}" ]; then
+    { echo "Refusing: --skip-ci is a BLIND admin-merge that bypasses the green-CI gate AND branch protection — it is deny-by-default and needs a one-time live approval from Alex."
+      echo "  The legitimate 'CI is billing-blocked / down' case does NOT need --skip-ci: run ship WITHOUT it — the normal path auto-detects the outage, runs the local fallback gate, and does a normal (non-admin) merge."
+      echo "  There is NO self-service override. To request a ONE-TIME bypass, set:"
+      echo "    RIG_HATCH_REQUEST_SHIP_SKIP_CI=\"<justification>\""
+      echo "  which asks Alex live on Telegram and proceeds ONLY on his real-time approval."; } >&2
+    _skip_ci_audit_log "skipci:refused" ""
+    exit 1
+  fi
+  local hrc=0 hout
+  hout=$(_skip_ci_hatch_check 2>/dev/null) || hrc=$?
+  local hverdict="${hout%% *}" hreason=""
+  case "$hout" in *" "*) hreason="${hout#* }" ;; esac
+  if [ "$hrc" = "0" ] && [ "$hverdict" = "APPROVED" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+      # In --dry-run the helper sends NO Telegram round-trip: an APPROVED here means only
+      # "deny-by-default is satisfied (a real written justification is present)", NOT that Alex
+      # approved. Say so — a real run would still require his live approval before the admin merge.
+      echo "[ship] --skip-ci --dry-run: justification present — a REAL run would request live Telegram approval before the admin merge (no approval requested in dry-run). (${hreason})"
+    else
+      echo "[ship] --skip-ci: a one-time Telegram hatch escalation was APPROVED by Alex — proceeding with the admin merge. (${hreason})"
+    fi
+    return 0
+  fi
+  { echo "Refusing: --skip-ci hatch escalation was requested but NOT approved: ${hreason:-no approval}."
+    echo "  Obtain live approval, or drop --skip-ci and let the normal CI gate / billing-outage fallback run."; } >&2
+  # The helper logs its own bypass:denied only when it emitted DENIED during a REAL run. In dry-run
+  # it writes nothing (ship prints the would-be line); in every other non-DENIED case (fake/broken/
+  # absent interpreter, import-fail, unexpected verdict) it did NOT audit -> record fail-closed here.
+  case "$hverdict" in
+    DENIED) [ "$DRY_RUN" = "1" ] && _skip_ci_audit_log "skipci:bypass:denied" "$hreason" ;;
+    *) _skip_ci_audit_log "skipci:bypass:denied" "$hreason" ;;
+  esac
+  exit 1
+}
+
 QUORUM_ENABLED=1
 case "${SHIP_REVIEW_QUORUM_ENABLED:-1}" in 0|false|no) QUORUM_ENABLED=0 ;; esac
 case "${SHIP_REVIEW_QUORUM:-1}" in 0|false|no) QUORUM_ENABLED=0 ;; esac
@@ -1229,6 +1338,9 @@ fi
 
 # --- merge -----------------------------------------------------------------------------
 if [ "$SKIP_CI" = "1" ]; then
+  # Deny-by-default: the --skip-ci admin bypass proceeds ONLY on a one-time live Telegram approval
+  # (RIG_HATCH_REQUEST_SHIP_SKIP_CI). Refuses here otherwise — before any merge.
+  _skip_ci_hatch_gate
   echo "[ship] --skip-ci: admin-merging PR #${PR} (${BRANCH}) --${MERGE_METHOD} --admin ..."
   run gh pr merge "$PR" "--$MERGE_METHOD" --admin
 else
