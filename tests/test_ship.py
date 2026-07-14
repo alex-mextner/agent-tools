@@ -53,6 +53,15 @@ case "$sub" in
         # --json headRefName,state,mergeable,isCrossRepository,mergeStateStatus
         if printf '%s ' "$@" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          # One GREEN check so the CI gate passes on the normal (non-admin) merge path — this is
+          # how tests that used to pass a bare --skip-ci (a shortcut to skip CI mocking) now run
+          # after --skip-ci became a hatch-gated admin bypass. Overridable via SHIP_TEST_ROLLUP.
+          if [ -n "${SHIP_TEST_ROLLUP:-}" ]; then
+            printf '%s\\n' "$SHIP_TEST_ROLLUP"
+          else
+            printf '%s\\n' '[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI"}]'
+          fi
         else
           echo '[]'
         fi ;;
@@ -143,7 +152,9 @@ def _run_ship(main: Path, bindir: Path, cwd: Path | None = None):
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     return _sh(
-        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test",
+        # No --skip-ci: it is now a hatch-gated admin bypass. The fake gh returns a GREEN
+        # statusCheckRollup, so the normal CI gate passes and ship does a normal (non-admin) merge.
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
         cwd=cwd or main, env=env,
     )
 
@@ -336,7 +347,7 @@ def test_cleanup_guard_leaves_worktree_dirtied_after_preflight(repo_with_pr_work
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     env["SHIP_TEST_MERGE_DIRTIES"] = str(dirty_file)  # dirty the tree at merge time
     r = _sh(
-        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test",
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
         cwd=wt, env=env,
     )
 
@@ -377,6 +388,8 @@ case "$sub" in
       view)
         if printf '%s ' "$@" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          printf '%s\\n' '[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI"}]'
         else
           echo '[]'
         fi ;;
@@ -451,7 +464,7 @@ def _run_ship_vbump(main, bindir, *, name_only, patch, extra_args=(), env_extra=
     if env_extra:
         env.update(env_extra)
     return _sh(
-        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", *extra_args,
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test", *extra_args,
         cwd=main, env=env,
     )
 
@@ -740,7 +753,7 @@ def test_dry_run_self_clean_does_not_warn_or_remove(repo_with_pr_worktree, tmp_p
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     r = _sh(
-        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", "--dry-run",
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test", "--dry-run",
         cwd=wt, env=env,
     )
 
@@ -794,7 +807,7 @@ def test_self_removed_but_branch_kept_when_other_tree_dirty(repo_with_two_worktr
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     env["SHIP_TEST_MERGE_DIRTIES"] = str(dirty_file)  # dirty wt2 at merge time
     r = _sh(
-        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test",
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
         cwd=wt1, env=env,
     )
 
@@ -828,7 +841,7 @@ def test_cleanup_guard_leaves_dirty_non_self_worktree(repo_with_two_worktrees, t
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     env["SHIP_TEST_MERGE_DIRTIES"] = str(dirty_file)  # dirty wt2 at merge time
     r = _sh(
-        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test",
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
         cwd=main, env=env,
     )
 
@@ -857,7 +870,7 @@ def test_ship_from_inside_worktree_without_reroot_target_leaves_it(repo_with_pr_
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(wt)  # degenerate: re-root target IS the worktree
     r = _sh(
-        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test",
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
         cwd=wt, env=env,
     )
 
@@ -1044,7 +1057,7 @@ def test_core_bare_guard_no_false_positive_on_genuine_bare_repo_worktree(tmp_pat
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(wt)
     r = _sh(
-        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test",
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
         cwd=wt, env=env,
     )
 
@@ -1971,7 +1984,7 @@ def _run_ship_repo(main: Path, bindir: Path, repo_args, env_extra: dict | None =
     if env_extra:
         env.update(env_extra)
     return _sh(
-        "bash", str(_SHIP), "1", *repo_args, "--skip-ci", "--no-screenshot-ok", "test",
+        "bash", str(_SHIP), "1", *repo_args, "--no-screenshot-ok", "test",
         cwd=cwd or main, env=env,
     )
 
@@ -2171,7 +2184,7 @@ def test_stash_pop_conflict_exits_nonzero_with_diagnostic(repo_with_stash_confli
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     r = _sh(
-        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test",
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
         cwd=main, env=env,
     )
 
@@ -2244,7 +2257,7 @@ def _run_ship_dwell(main, bindir, *, created=None, lastcommit=None, pushed=None,
     if dwell is not None:
         env["SHIP_REVIEW_DWELL"] = str(dwell)
     return _sh(
-        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", *extra_args,
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test", *extra_args,
         cwd=main, env=env,
     )
 
@@ -2363,6 +2376,7 @@ case "$sub" in
         case "$*" in
           *headRefName*) printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}" ;;
           *"--json body"*) printf '%s' "${SHIP_TEST_PR_BODY:-}" ;;
+          *statusCheckRollup*) printf '%s\\n' '[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI"}]' ;;
           *) echo '[]' ;;
         esac ;;
       diff) echo "README.md" ;;   # docs-only: version-bump/screenshot gates pass trivially
@@ -2547,7 +2561,7 @@ def _run_ship_quorum(main, gh_bindir, review_bindir, *, branch="feat", extra_arg
     if env_extra:
         env.update(env_extra)
     return _sh(
-        "bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", *extra_args,
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test", *extra_args,
         cwd=main, env=env,
     )
 
@@ -3235,6 +3249,19 @@ def _install_fake_hatch_helper(dst_dir: Path, *, exit_code: int, message: str = 
     (dst_dir / "review_quorum_hatch.py").write_text(body, encoding="utf-8")
 
 
+def _install_fake_skip_ci_helper(dst_dir: Path) -> None:
+    """Write a fake APPROVING skip_ci_hatch.py next to a ship.sh copy so a --skip-ci run's skip-ci
+    hatch gate proceeds transparently (emits the 'APPROVED' verdict sentinel ship.sh gates on).
+    Lets the copy-ship.sh review-quorum wiring tests keep using --skip-ci without the skip-ci gate
+    interfering — a stand-in for a live-approved skip-ci hatch, no tg-ctl involved."""
+    body = (
+        "import sys\n"
+        "sys.stdout.write('APPROVED fake skip-ci approval (test)\\n')\n"
+        "sys.exit(0)\n"
+    )
+    (dst_dir / "skip_ci_hatch.py").write_text(body, encoding="utf-8")
+
+
 def _ship_copy_with_helper(tmp_path: Path, *, helper_exit, helper_msg=""):
     """A ship.sh copied into a temp ci/ship/ dir, optionally with a fake helper beside it. When
     `helper_exit` is None NO helper is written (simulating a bare `cp ship.sh` that can't reach
@@ -3246,6 +3273,12 @@ def _ship_copy_with_helper(tmp_path: Path, *, helper_exit, helper_msg=""):
     ship_copy.chmod(0o755)
     if helper_exit is not None:
         _install_fake_hatch_helper(dst, exit_code=helper_exit, message=helper_msg)
+        # These tests exercise the REVIEW-QUORUM hatch wiring, but they also pass --skip-ci (a
+        # shortcut to skip CI mocking), which is now its own hatch-gated admin bypass. Install a
+        # fake APPROVING skip_ci_hatch.py beside the copy so the skip-ci gate is transparent and
+        # never masks the quorum-hatch behaviour under test. (When helper_exit is None we install
+        # neither, so a bare `cp ship.sh` still fails closed on BOTH gates.)
+        _install_fake_skip_ci_helper(dst)
     return ship_copy
 
 
@@ -3262,6 +3295,9 @@ def _run_ship_copy_short_bar(tmp_path, main, gh, rv, ship_copy, *, request, audi
     env["SHIP_TEST_REVIEW_ITER"] = "1"
     env["SHIP_TEST_REVIEW_MODELS"] = "1"
     env["RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM"] = request
+    # --skip-ci is now hatch-gated too; request it so the fake approving skip_ci_hatch.py beside the
+    # copy is consulted (deny-by-default otherwise refuses before the merge, masking the quorum path).
+    env["RIG_HATCH_REQUEST_SHIP_SKIP_CI"] = "test skip-ci wiring"
     env.pop("SHIP_HATCH_TIMEOUT_S", None)
     if audit is not None:
         env["SHIP_AUDIT_FILE"] = str(audit)
@@ -3344,6 +3380,9 @@ def test_ship_non_dry_run_passes_falsey_marker_to_hatch_helper(tmp_path):
         "sys.exit(0)\n",
         encoding="utf-8",
     )
+    # --skip-ci is hatch-gated too; give this bare (helper_exit=None) copy an approving skip-ci
+    # helper so the quorum-wiring probe reaches merge instead of failing closed at the skip-ci gate.
+    _install_fake_skip_ci_helper(ship_copy.parent)
     r = _run_ship_copy_short_bar(
         tmp_path, main, gh, rv, ship_copy,
         request="Normal wiring probe.",
@@ -3408,6 +3447,300 @@ def test_ship_fails_closed_when_python3_exits_zero_without_sentinel(tmp_path):
     assert "[fake gh] merged" not in r.stdout
     rec = json.loads(audit.read_text().strip().splitlines()[-1])
     assert rec["decision"] == "bypass:denied", rec
+
+
+# --- --skip-ci hatch escalation (deny-by-default; the ONLY bypass is a live Telegram approval) --
+#
+# `--skip-ci` is a blind admin-merge (skips the green-CI gate + branch protection). It is
+# deny-by-default: without RIG_HATCH_REQUEST_SHIP_SKIP_CI ship refuses BEFORE any merge. With a
+# written justification it routes through ci/ship/skip_ci_hatch.py -> the shared
+# agenttools_hatch_escalation lib -> `tg-ctl ask` Alex live. As with the review-quorum hatch, the
+# live approve/deny/dry-run MECHANICS are tested IN-PROCESS against the real helper with
+# resolve_home monkeypatched to a fake home (the only way to exercise a controllable tg-ctl); the
+# deny-by-default refusal (env unset) is tested end-to-end via a real ship.sh subprocess.
+
+
+def _load_skip_ci_hatch_module():
+    """Import ci/ship/skip_ci_hatch as a module (fresh each call so a monkeypatched resolve_home
+    never leaks between tests)."""
+    import importlib
+
+    if _HATCH_MOD_DIR not in sys.path:
+        sys.path.insert(0, _HATCH_MOD_DIR)
+    mod = importlib.import_module("skip_ci_hatch")
+    return importlib.reload(mod)
+
+
+def _run_skip_ci_hatch_main(monkeypatch, *, request, resolve_home, audit,
+                            timeout="5", dry_run=None):
+    """Call skip_ci_hatch.main() with resolve_home monkeypatched to a fixed fake home (where the
+    lib looks for a rig.yaml tg_ctl_path override) and the hatch env set. Returns the exit code."""
+    mod = _load_skip_ci_hatch_module()
+    monkeypatch.setattr(mod, "resolve_home", lambda: str(resolve_home))
+    monkeypatch.setattr(mod.hatch_escalation, "resolve_home", lambda: str(resolve_home))
+    monkeypatch.setenv("RIG_HATCH_REQUEST_SHIP_SKIP_CI", request)
+    monkeypatch.setenv("SHIP_AUDIT_FILE", str(audit))
+    monkeypatch.setenv("SHIP_HATCH_PR", "1")
+    monkeypatch.setenv("SHIP_HATCH_BRANCH", "feat")
+    monkeypatch.setenv("SHIP_HATCH_TIMEOUT_S", timeout)
+    if dry_run is None:
+        monkeypatch.delenv("SHIP_DRY_RUN", raising=False)
+    else:
+        monkeypatch.setenv("SHIP_DRY_RUN", dry_run)
+    return mod.main()
+
+
+def test_skip_ci_hatch_blank_denied_without_tg_contact(tmp_path, monkeypatch):
+    """A blank RIG_HATCH_REQUEST_SHIP_SKIP_CI is invalid: denied without contacting tg-ctl,
+    exit 1, audits skipci:bypass:denied."""
+    import json
+
+    marker = tmp_path / "tg-called"
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body=f"touch {marker}\nexit 0\n")
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_skip_ci_hatch_main(monkeypatch, request="", resolve_home=home, audit=audit)
+    assert rc == 1, "a blank hatch value must be denied"
+    assert not marker.exists(), "tg-ctl must NOT be contacted for a blank hatch request"
+    rec = json.loads(audit.read_text().strip())
+    assert rec["decision"] == "skipci:bypass:denied", rec
+    assert rec["gate"] == "skip-ci", rec
+
+
+def test_skip_ci_hatch_bare_flag_denied_without_tg_contact(tmp_path, monkeypatch):
+    """A bare truthy flag ('1'/'yes'/'true') is NOT a justification: denied without tg-ctl."""
+    marker = tmp_path / "tg-called"
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body=f"touch {marker}\nexit 0\n")
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_skip_ci_hatch_main(monkeypatch, request="1", resolve_home=home, audit=audit)
+    assert rc == 1, "a bare '1' must be denied — a self-set flag is not an approval"
+    assert not marker.exists(), "tg-ctl must NOT be contacted for a bare flag"
+
+
+def test_skip_ci_hatch_reason_triggers_tg_ask_and_approval_returns_0(tmp_path, monkeypatch):
+    """A real justification runs `tg-ctl ask`; on Alex's live approval the helper returns 0, the
+    question carries the hook id + justification + PR context, and it audits skipci:bypass:approved."""
+    import json
+
+    question_file = tmp_path / "question.txt"
+    tg = _write_fake_tg_ctl(
+        tmp_path, name="tg-ctl",
+        body=f'printf "%s" "$2" > "{question_file}"\nprintf "approved by Alex\\n"\nexit 0\n',
+    )
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_skip_ci_hatch_main(
+        monkeypatch,
+        request="CI Actions billing suspended; local gates green; hotfix HYP-999 must ship now.",
+        resolve_home=home, audit=audit,
+    )
+    assert rc == 0, "a live-approved --skip-ci hatch must return 0"
+    question = question_file.read_text()
+    assert "ship-skip-ci" in question, question
+    assert "CI Actions billing suspended" in question, question
+    rec = json.loads(audit.read_text().strip())
+    assert rec["decision"] == "skipci:bypass:approved", rec
+    assert "approved by Alex" in rec.get("override_reason", ""), rec
+
+
+def test_skip_ci_hatch_denial_returns_1_and_audits(tmp_path, monkeypatch):
+    """When Alex declines (tg-ctl exits non-zero) the helper returns 1 and audits skipci:bypass:denied."""
+    import json
+
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body='printf "declined\\n"\nexit 1\n')
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_skip_ci_hatch_main(
+        monkeypatch, request="Please just let this admin-merge through, I am in a hurry.",
+        resolve_home=home, audit=audit,
+    )
+    assert rc == 1, "a declined --skip-ci hatch must return 1"
+    rec = json.loads(audit.read_text().strip())
+    assert rec["decision"] == "skipci:bypass:denied", rec
+
+
+def test_skip_ci_hatch_dry_run_reason_approves_without_tg_contact(tmp_path, monkeypatch):
+    """`--skip-ci --dry-run` is a preview that must NOT fire a live Telegram round-trip: a written
+    justification yields an APPROVED preview sentinel (exit 0) while contacting NO tg-ctl."""
+    marker = tmp_path / "tg-called"
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body=f"touch {marker}\nexit 0\n")
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_skip_ci_hatch_main(
+        monkeypatch, request="preview: would ship the billing-blocked hotfix",
+        resolve_home=home, audit=audit, dry_run="1",
+    )
+    assert rc == 0, "a dry-run preview with a real justification must return 0"
+    assert not marker.exists(), "dry-run must NOT contact tg-ctl (no live round-trip in a preview)"
+    assert not audit.exists() or audit.read_text().strip() == "", "dry-run must not write a real audit line"
+
+
+def test_skip_ci_hatch_dry_run_blank_still_denied(tmp_path, monkeypatch):
+    """Deny-by-default holds even in dry-run: a blank/bare justification is DENIED in preview too."""
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body="exit 0\n")
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_skip_ci_hatch_main(
+        monkeypatch, request="", resolve_home=home, audit=audit, dry_run="1",
+    )
+    assert rc == 1, "a blank justification must be denied even in dry-run"
+
+
+def test_skip_ci_deny_by_default_refuses_before_merge(repo_with_two_worktrees, tmp_path):
+    """End-to-end: `--skip-ci` with NO RIG_HATCH_REQUEST_SHIP_SKIP_CI refuses (deny-by-default)
+    AFTER the cheap preflights and BEFORE any merge, pointing the operator at the hatch env var."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    # Keep the audit write hermetic — never touch the developer's real ~/.config/agent-tools/.
+    env["SHIP_AUDIT_FILE"] = str(audit)
+    # Never let an ambient hatch request leak in and flip the refusal into a live tg-ctl call.
+    env.pop("RIG_HATCH_REQUEST_SHIP_SKIP_CI", None)
+    r = _sh("bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode != 0, f"deny-by-default: --skip-ci must refuse without a hatch\n{r.stdout}\n{r.stderr}"
+    assert "RIG_HATCH_REQUEST_SHIP_SKIP_CI" in r.stderr, r.stderr
+    assert "deny-by-default" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+    import json
+    rec = json.loads(audit.read_text().strip())
+    assert rec["decision"] == "skipci:refused", rec
+    assert rec["gate"] == "skip-ci", rec
+
+
+def test_skip_ci_set_but_blank_refuses_before_merge_e2e(repo_with_two_worktrees, tmp_path):
+    """End-to-end: `--skip-ci` with RIG_HATCH_REQUEST_SHIP_SKIP_CI SET BUT BLANK routes through the
+    helper, which denies a blank justification WITHOUT contacting tg-ctl, and ship refuses before
+    merge. (The env-unset case is covered separately; this covers the set-but-invalid branch.)"""
+    import json
+
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_AUDIT_FILE"] = str(audit)
+    env["RIG_HATCH_REQUEST_SHIP_SKIP_CI"] = ""  # set but blank -> helper denies, no tg-ctl
+    r = _sh("bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode != 0, f"a blank justification must refuse\n{r.stdout}\n{r.stderr}"
+    assert "NOT approved" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+    # Exactly ONE audit line: the Python helper owns the real-run denied write and the shell must
+    # NOT double-write it (a future verdict-string drift would fall into the shell `*)` case and
+    # duplicate — assert the single-write invariant, don't mask it with splitlines()[-1]).
+    lines = audit.read_text().strip().splitlines()
+    assert len(lines) == 1, f"expected exactly one audit line, got {lines}"
+    rec = json.loads(lines[0])
+    assert rec["decision"] == "skipci:bypass:denied", rec
+
+
+def test_skip_ci_fails_closed_when_python3_exits_zero_without_sentinel(repo_with_two_worktrees, tmp_path):
+    """Security fail-closed: a fake/broken `python3` that exits 0 but prints NO `APPROVED` sentinel
+    must NOT be mistaken for approval — ship refuses and audits skipci:bypass:denied. Mirrors the
+    review-quorum gate's fail-closed guard for the skip-ci gate."""
+    import json
+
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+    # A fake python3 (found first on PATH) that exits 0 without emitting the APPROVED sentinel.
+    fakepy = tmp_path / "fakepy"
+    fakepy.mkdir()
+    (fakepy / "python3").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (fakepy / "python3").chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join([str(fakepy), str(bindir), env["PATH"]])
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_AUDIT_FILE"] = str(audit)
+    env["RIG_HATCH_REQUEST_SHIP_SKIP_CI"] = "genuine reason but python3 is faked"
+    r = _sh("bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode != 0, f"a fake python3 exiting 0 must fail closed\n{r.stdout}\n{r.stderr}"
+    assert "NOT approved" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+    # Exactly ONE audit line here too: the fake python3 writes nothing, so the shell fail-closed
+    # `*)` branch is the sole writer — a duplicate would signal a control-flow regression.
+    lines = audit.read_text().strip().splitlines()
+    assert len(lines) == 1, f"expected exactly one audit line, got {lines}"
+    rec = json.loads(lines[0])
+    assert rec["decision"] == "skipci:bypass:denied", rec
+
+
+def test_skip_ci_approved_hatch_reaches_admin_merge_e2e(repo_with_two_worktrees, tmp_path):
+    """End-to-end happy path: with an APPROVED skip-ci hatch, a real ship.sh proceeds to the admin
+    merge. The hatch helper is stood in by a fake `python3` that emits the APPROVED sentinel (a
+    subprocess can't inject a fake tg-ctl — authority is the real home — so this is the e2e seam;
+    the real-helper approve path + its audit line are covered in-process)."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    # A fake python3 (first on PATH) that emits the APPROVED verdict sentinel ship.sh gates on.
+    fakepy = tmp_path / "fakepy"
+    fakepy.mkdir()
+    (fakepy / "python3").write_text("#!/bin/sh\nprintf 'APPROVED live-approved (test)\\n'\nexit 0\n", encoding="utf-8")
+    (fakepy / "python3").chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join([str(fakepy), str(bindir), env["PATH"]])
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_AUDIT_FILE"] = str(tmp_path / "audit.jsonl")
+    env["RIG_HATCH_REQUEST_SHIP_SKIP_CI"] = "CI billing suspended; hotfix must ship"
+    r = _sh("bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode == 0, f"an approved skip-ci hatch must reach the admin merge\n{r.stdout}\n{r.stderr}"
+    assert "APPROVED by Alex" in r.stdout, r.stdout
+    assert "admin-merging" in r.stdout, r.stdout
+    assert "[fake gh] merged" in r.stdout, r.stdout
+
+
+def test_skip_ci_dry_run_with_justification_does_not_claim_live_approval(repo_with_two_worktrees, tmp_path):
+    """`--skip-ci --dry-run` with a real justification previews WITHOUT firing a live Telegram
+    round-trip and WITHOUT falsely claiming Alex approved (the P1 the review flagged). The real
+    skip_ci_hatch.py dry-run path returns an APPROVED-preview sentinel but contacts NO tg-ctl, and
+    ship.sh prints a dry-run-specific message, not 'APPROVED by Alex'. Writes no real audit line."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_AUDIT_FILE"] = str(audit)
+    env["RIG_HATCH_REQUEST_SHIP_SKIP_CI"] = "billing outage preview; hotfix HYP-999"
+    r = _sh("bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", "--dry-run",
+            cwd=main, env=env)
+    assert r.returncode == 0, f"dry-run preview with a justification should proceed\n{r.stdout}\n{r.stderr}"
+    assert "APPROVED by Alex" not in r.stdout, "dry-run must NOT claim a live approval happened"
+    assert "REAL run would request live Telegram approval" in r.stdout, r.stdout
+    assert not audit.exists() or audit.read_text().strip() == "", "dry-run must write no real audit line"
+
+
+def test_skip_ci_dry_run_with_blank_justification_still_refuses(repo_with_two_worktrees, tmp_path):
+    """Deny-by-default holds in dry-run too: `--skip-ci --dry-run` with a blank justification is
+    refused before the (no-op) merge — a preview cannot manufacture an approval from nothing."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_AUDIT_FILE"] = str(tmp_path / "audit.jsonl")
+    env["RIG_HATCH_REQUEST_SHIP_SKIP_CI"] = ""
+    r = _sh("bash", str(_SHIP), "1", "--skip-ci", "--no-screenshot-ok", "test", "--dry-run",
+            cwd=main, env=env)
+    assert r.returncode != 0, f"blank justification must refuse even in dry-run\n{r.stdout}\n{r.stderr}"
+    assert "APPROVED by Alex" not in r.stdout
+    assert "[fake gh] merged" not in r.stdout
 
 
 if __name__ == "__main__":

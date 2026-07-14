@@ -192,8 +192,10 @@ you're sitting inside that worktree), and fast-forwards the main checkout. It is
 repo-agnostic: nothing about an org/tracker/path layout is hard-coded, and knobs are env-driven
 — most notably **`SHIP_MAIN_CHECKOUT`** (the primary checkout to refresh post-merge; defaults
 to the first `git worktree list` entry), plus `SHIP_DEFAULT_BRANCH`, `SHIP_MERGE_METHOD`,
-`SHIP_UI_PATH_REGEX`, `SHIP_IMAGE_UPLOAD_CMD`. `--skip-ci` admin-merges (CI billing-blocked
-only) and still runs the other preflights.
+`SHIP_UI_PATH_REGEX`, `SHIP_IMAGE_UPLOAD_CMD`. `--skip-ci` admin-merges (still runs the other
+preflights) and is **deny-by-default** — it proceeds only on a one-time live Telegram approval via
+`RIG_HATCH_REQUEST_SHIP_SKIP_CI="<justification>"`. It is NOT the billing-blocked-CI path: for that,
+run without `--skip-ci` (the normal path auto-detects the outage and does a normal non-admin merge).
 
 ---
 
