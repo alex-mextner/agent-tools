@@ -1502,6 +1502,84 @@ def test_empty_rollup_ci_outage_local_gate_fails_refuses(repo_with_pr_worktree, 
     assert "merged #1" not in r.stdout, r.stdout
 
 
+# Fake gh whose statusCheckRollup query FAILS (exits non-zero) — a gh/API/network error, NOT a
+# successfully-read empty rollup. It still answers the preflight headRefName so ship reaches the
+# CI gate, then errors on the rollup read. Guards that ship does NOT coerce an unreadable rollup
+# to `[]` and fall into the empty-rollup outage branch (which would merge on a green local gate
+# even though the remote check state was never known).
+_FAKE_GH_ROLLUP_UNREADABLE = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q baseRefName; then
+          printf '%s' "${SHIP_TEST_BASE:-main}"
+        elif printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          echo "gh: API error (simulated)" >&2; exit 7
+        elif printf '%s ' "$@" | grep -q reviewThreads; then
+          echo "0"
+        elif printf '%s ' "$@" | grep -q body; then
+          echo ""
+        else
+          echo '[]'
+        fi ;;
+      diff)
+        if printf '%s ' "$@" | grep -q -- --name-only; then printf 'src/a.py'; else printf '+ok\\n'; fi ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged"; [ -n "${SHIP_TEST_MERGE_LOG:-}" ] && printf '%s\\n' "$*" >> "$SHIP_TEST_MERGE_LOG" || true ;;
+      *) : ;;
+    esac ;;
+  api) echo 0 ;;
+  *) : ;;
+esac
+"""
+
+
+def _fake_gh_rollup_unreadable_dir(tmp_path: Path) -> Path:
+    bindir = tmp_path / "binur"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_ROLLUP_UNREADABLE, encoding="utf-8")
+    gh.chmod(0o755)
+    return bindir
+
+
+def test_unreadable_rollup_refuses_never_treats_as_empty(repo_with_pr_worktree, tmp_path):
+    """gh/API READ FAILURE (not an empty rollup): the statusCheckRollup query exits non-zero, so
+    the remote check state is UNKNOWN. Even with a committed `on: pull_request` workflow (which
+    would classify a real empty rollup as an outage) AND a green local gate, ship must REFUSE and
+    never merge — a failed rollup query must not be coerced to `[]` and slipped through the
+    empty-rollup outage path. Regression pin for codex P2 on PR #272."""
+    main, _wt = repo_with_pr_worktree
+    _add_workflow(main, "pull_request")
+    bindir = _fake_gh_rollup_unreadable_dir(tmp_path)
+
+    merge_log = tmp_path / "merge-args.log"
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_CI_WAIT": "1",  # bound the retry loop so the refuse is fast
+        "SHIP_CI_POLL": "1",
+        "SHIP_CI_GRACE": "0",
+        "SHIP_LOCAL_TEST_CMD": "true",  # a GREEN local gate — must NOT be enough on an unknown rollup
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_MERGE_LOG": str(merge_log),
+    })
+
+    assert r.returncode != 0, (
+        f"ship must refuse when the rollup query FAILS (remote state unknown)\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "remote check state is UNKNOWN" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+    logged_merge = merge_log.read_text(encoding="utf-8") if merge_log.exists() else ""
+    assert not logged_merge.strip(), f"ship must NOT merge on an unreadable rollup:\n{logged_merge}"
+
+
 _FAKE_GH_GREEN_ROLLUP = """\
 #!/usr/bin/env bash
 set -e

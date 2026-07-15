@@ -710,8 +710,29 @@ if [ "$SKIP_CI" = "0" ]; then
   CI_WAIT="${SHIP_CI_WAIT:-900}"; CI_POLL="${SHIP_CI_POLL:-20}"; CI_GRACE="${SHIP_CI_GRACE:-45}"
   START=$(date +%s); DEADLINE=$(( START + CI_WAIT )); GRACE_DEADLINE=$(( START + CI_GRACE ))
   while :; do
-    ROLLUP=$(gh pr view "$PR" --json statusCheckRollup -q '.statusCheckRollup' 2>/dev/null \
-      | jq -c "$DEDUP_FILTER" 2>/dev/null || echo '[]')
+    # Read the rollup in TWO steps so a gh/API READ FAILURE is distinguishable from a
+    # successfully-read EMPTY rollup. The old single pipeline (`gh … | jq … || echo '[]'`)
+    # coerced BOTH the failure AND an empty result to `[]`, so a transient API/network failure
+    # was silently treated as "no checks" — and could then fall into the empty-rollup outage
+    # branch and merge even though the remote check state (possibly pending/red) was never
+    # actually known. On a gh read FAILURE the remote state is UNKNOWN, not empty: retry within
+    # the wait window and, if it never becomes readable, REFUSE — never merge on an unknown
+    # rollup. A gh SUCCESS with a null/empty payload IS a genuine empty rollup and still folds
+    # to `[]` (jq's `(. // [])`), so the outage/no-CI classification below is reached only from
+    # a rollup that was successfully read.
+    RAW_ROLLUP=''; GH_ROLLUP_RC=0
+    RAW_ROLLUP=$(gh pr view "$PR" --json statusCheckRollup -q '.statusCheckRollup' 2>/dev/null) \
+      || GH_ROLLUP_RC=$?
+    if [ "$GH_ROLLUP_RC" -ne 0 ]; then
+      NOW=$(date +%s)
+      if [ "$NOW" -ge "$DEADLINE" ]; then
+        echo "Refusing: could not read CI status for PR #$PR within ${CI_WAIT}s (gh/API error, exit $GH_ROLLUP_RC) — the remote check state is UNKNOWN; refusing rather than treating an unreadable rollup as 'no CI'. Retry when the API is reachable (or --skip-ci if CI is genuinely N/A)." >&2
+        exit 1
+      fi
+      echo "[ship] could not read CI status for PR #$PR (gh/API error, exit $GH_ROLLUP_RC) — retrying (poll ${CI_POLL}s, $(( DEADLINE - NOW ))s left) ..."
+      sleep "$CI_POLL"; continue
+    fi
+    ROLLUP=$(printf '%s' "$RAW_ROLLUP" | jq -c "$DEDUP_FILTER" 2>/dev/null || echo '[]')
     [ -n "$ROLLUP" ] || ROLLUP='[]'
     N=$(printf '%s' "$ROLLUP" | jq 'length' 2>/dev/null || echo 0)
     if [ "${N:-0}" = "0" ]; then
