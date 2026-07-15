@@ -18,7 +18,7 @@ that isn't actually ready even with a one-liner.
 | **No CI checks at all** | "No CI" is a *failed* gate, not a pass — ship refuses and tells you to set CI up first (`rig apply` provisions the gates, or add workflows). Override only with `--skip-ci`, which is **deny-by-default** (needs a one-time live Telegram approval — see below). **Exception — CI outage:** if the empty rollup is a genuine outage (a `pull_request`-triggered workflow exists on the PR's **pushed base branch** — `origin/<baseRefName>` — but registered no checks, i.e. billing suspended / Actions down), ship runs the local fallback gate below instead of refusing, and — only if it is fully green — falls through to the **normal (non-admin) merge** (the same posture as the checks-failed structural-outage path; a branch-protection ruleset still gates it, and if required checks are genuinely absent GitHub blocks the merge so you `--skip-ci` deliberately — ship never silently `--admin`-bypasses here). A failed/unreadable rollup query is NOT an empty rollup — an unknown remote state hard-refuses (never merges). A repo whose workflows never trigger on PRs (push/schedule only) is NOT an outage and still hard-refuses. The signal is read from the pushed `origin/<base>` ref, not the local worktree, so an untracked/unpushed workflow cannot trigger the exception. **Trigger detection is a heuristic** over a YAML subset: it recognises an unquoted top-level `on:` naming `pull_request`/`pull_request_target` inline, as a block key, or as a list item; a `pull_request` trigger **narrowed by `branches:`/`paths:`/`types:` filters is still treated as an outage** (the local gate then runs, so the merge is verified — it is only more permissive about substituting local gates for absent remote checks), and quoted-key (`"on":`) / flow-mapping (`on: { … }`) forms conservatively hard-refuse (the safe direction). |
 | Any CI check's latest run failing | The green-CI gate (gates on ALL checks, by each check's LATEST run — the rollup is deduped to the newest run per logical check, so a stale FAILURE from a re-run that has since gone green does not block, matching GitHub's `mergeStateStatus`). |
 | CI still running | Ship **watches** pending checks to completion (polls every `SHIP_CI_POLL`s up to `SHIP_CI_WAIT`s) instead of refusing — you don't babysit. |
-| Unresolved review threads | Same check as [`../review-threads/`](../review-threads/). |
+| Unresolved review threads | Same check as [`../review-threads/`](../review-threads/). Pass `--resolve-addressed-threads` to let ship first auto-close the threads that are safe without a human — unresolved + outdated (addressed by a later commit) + authored entirely by bots; human or unaddressed threads still block (see Flags, #268). |
 | **PR younger than the review-dwell window** | Closes the premature-merge gap: the unresolved-threads check above only fails when threads *already exist*, so "0 unresolved threads" is **vacuously true** before any review has posted — a PR opened and shipped within seconds passes it without a single question forming. The dwell gate refuses until at least `SHIP_REVIEW_DWELL` seconds (default **600 / 10 min**) have elapsed since the PR's last code push, giving async review (multi-model / CI-AI / human) time to form its comments (which then become threads the check above forces resolved). Runs **independently of `--skip-ci`**. Window starts at `max(createdAt, head-commit committedDate)` so a new push restarts it. Disable with `SHIP_REVIEW_DWELL=0`; override one ship with `--no-review-dwell-ok <reason>` (logged). Fail-closed: unreadable/unparseable timestamps refuse. |
 | UI-touching PR with no screenshot | Same check as [`../screenshots/`](../screenshots/); override with `--no-screenshot-ok`. |
 | **Shippable source changed but the version is UNCHANGED** | A ship of source is a release; the declared version (`pyproject.toml` `version`/`package.json` `"version"`) must be bumped so `--version` stays a real freshness signal (skill: `bump-version-on-release`). Docs-only / pure test/CI PRs are exempt. Override a genuine no-release ship with `--no-version-bump-ok <reason>` (or `SHIP_SKIP_VERSION_BUMP=1`). |
@@ -112,6 +112,21 @@ Nothing org-/tracker-/layout-specific is hard-coded. Configure via env:
   no-release ship (docs-only, pure test/CI, a revert), logged.
 - `--no-review-dwell-ok <reason>` — fast-track past the review-dwell window for a genuine
   trivial/urgent merge, logged (the reason is printed to the ship log).
+- `--resolve-addressed-threads` (or `SHIP_RESOLVE_ADDRESSED_THREADS=1`) — before the
+  unresolved-threads gate, auto-resolve the review threads that are **safe to close without a
+  human**: unresolved **and** `isOutdated` (the code the thread anchored to has changed — a later
+  commit addressed it) **and** authored **entirely** by automated reviewers (login ends in
+  `[bot]`, or `chatgpt-codex-connector` / `codex-review-bot`). A thread with **any** human comment,
+  or one that is still current (not addressed), is **never** touched — it falls through and still
+  blocks the merge. This lets a shipping agent close its own bot nits through `gh ship` instead of
+  hand-running the `resolveReviewThread` mutation (which the `block-raw-pr-merge` agent-hook used to
+  false-block, #268). Off by default; honours `--dry-run` (reports what it would resolve, mutates
+  nothing). A bot thread with **more than 100 comments** is fail-closed (never auto-resolved, since a
+  human reply could hide on an unfetched page) and must be resolved by hand. **Caveat:** `isOutdated`
+  only means the anchored code *changed* since the comment (a heuristic that the nit was addressed) —
+  **not** a verified fix. A still-valid bot finding on rewritten/rebased code can therefore be
+  auto-closed; use the flag only when you trust the bot threads are genuinely addressed. A
+  severity-aware gate (never auto-close a P0/P1/security bot thread) is a tracked follow-up.
 - `--screenshot <path> [desc]` — upload (via `SHIP_IMAGE_UPLOAD_CMD`) and post a screenshot
   as a PR comment; repeatable.
 

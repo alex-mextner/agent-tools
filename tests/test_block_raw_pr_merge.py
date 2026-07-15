@@ -757,14 +757,189 @@ def test_escaped_nested_backtick_merge_is_blocked(monkeypatch):
     assert _decision(out) == "block"
 
 
-def test_graphql_query_from_shell_variable_is_over_blocked(monkeypatch):
-    """`gh api graphql -f query="$Q"` feeds the query from a shell variable the hook can't read at
-    pre-exec time — as unprovable as a `@file`, so fail closed. shlex strips the quotes, so a live
-    `"$Q"` and an inert `'$Q'` are indistinguishable → any `$` in the query value blocks (Opus
-    review round 1)."""
-    out, _err, code = _run('gh api graphql -f query="$Q"', monkeypatch)
+@pytest.mark.parametrize(
+    "command",
+    [
+        # A `$`/backtick the shell would EXPAND in the query value can splice in a merge field name
+        # the literal scan never sees. All of these are shell-expandable (double-quoted / unquoted /
+        # concatenated / substitution) and must fail closed (#268; opus/codex reviews).
+        'gh api graphql -f query="$Q"',  # whole query from a double-quoted shell var
+        'gh api graphql -f query="${Q}"',  # brace param expansion
+        'gh api graphql -f query="$(cat merge.graphql)"',  # command substitution
+        'gh api graphql -f query="mutation { $OP(input:{}) }"',  # $ in selection position, dbl-quoted
+        'gh api graphql -f query="mutation { a: $OP(input:{}) }"',  # after an ALIAS, dbl-quoted
+        'gh api graphql -f query="mutation { $1(input:{}) }"',  # shell positional param
+        # The concatenation breakout (codex round 4): the MIDDLE `$OP` is UNQUOTED — the shell expands
+        # it to a field name while the single-quoted parts keep the rest literal.
+        "gh api graphql -f query='mutation($OP:ID!){ '$OP'(input:{pullRequestId:$OP})"
+        "{pullRequest{merged}}}' -F OP=PR_abc",
+        # Glued flag spellings (opus/codex round 5): gh accepts `-fkey=val`, `--field=key=val`,
+        # `--raw-field=key=val` — the expandable `$Q` must be caught in every form.
+        'gh api graphql -fquery="$Q"',
+        'gh api graphql --field=query="$Q"',
+        'gh api graphql --raw-field=query="$Q"',
+        'gh api graphql -f \'query=\'"$Q"',  # `query=` assembled from a quoted prefix + expandable
+        # An expandable BACKTICK command substitution in the query value (opus round 6 test gap).
+        'gh api graphql -f query="`cat q`"',
+        # The expandable-query check must apply at EVERY recursion depth (codex round 6): inside a
+        # `$( … )` / backtick substitution and a `bash -c '…'` rescan, not only at the top level.
+        'echo $(gh api graphql -f query="$Q")',
+        'echo `gh api graphql -f query="$Q"`',
+        'bash -c \'gh api graphql -f query="$Q"\'',
+    ],
+)
+def test_graphql_query_with_expandable_dollar_is_blocked(command, monkeypatch):
+    """A shell-EXPANDABLE `$`/backtick in a `gh api graphql` `query=` value is fail-closed: the shell
+    rewrites it at runtime, so the hook cannot prove it is not a merge. Quoting is read from the raw
+    command (shlex has stripped it from the parsed tokens), which is why the concatenation form —
+    identical to a literal query once shlex de-quotes it — is still caught (#268)."""
+    out, _err, code = _run(command, monkeypatch)
     assert code == hook.BLOCK_EXIT_CODE
     assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "mutation { $OP(input:{}) { x } }",  # $OP in selection position — but SINGLE-quoted
+        "mutation X{ f(id:$Q) }",  # $Q in an argument-value position — SINGLE-quoted
+        "mutation { $1(input:{}) }",  # a literal `$1` — SINGLE-quoted, not a shell positional here
+    ],
+)
+def test_graphql_query_single_quoted_dollar_is_allowed(query, monkeypatch):
+    """A SINGLE-quoted `$` in the query value is a LITERAL, not a shell expansion — the shell passes
+    the exact text to GitHub. Such a query with an undeclared/mis-placed `$name` is INVALID GraphQL
+    that GitHub rejects (no merge happens), and it carries no literal `mergePullRequest`, so the hook
+    correctly ALLOWS it. The dangerous counterpart is the double-quoted/unquoted form above (#268)."""
+    out, _err, code = _run(f"gh api graphql -f query='{query}'", monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_expandable_query_in_non_gh_command_is_not_blocked(monkeypatch):
+    """The expandable-query check is argv-ANCHORED: a `query=$Q` in a NON-gh command (or a prose
+    mention) must NOT be blocked — only a real `gh api graphql` segment triggers it (codex round 5)."""
+    out, _err, code = _run('echo graphql query=$Q', monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_glued_single_quoted_query_with_variable_is_allowed(monkeypatch):
+    """The glued-flag counterpart of the allow-case: `-fquery='…$t…'` is single-quoted (literal), so
+    it must ALLOW even though the value carries a GraphQL `$t` (round 5 — glued forms must not
+    over-block the legitimate single-quoted mutation)."""
+    out, _err, code = _run(
+        "gh api graphql -fquery='mutation($t:ID!){resolveReviewThread(input:{threadId:$t})"
+        "{thread{isResolved}}}' -F t=x",
+        monkeypatch,
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_empty_graphql_query_is_blocked(monkeypatch):
+    """An empty `query=` value is unreadable/degenerate and stays fail-closed (pins the behaviour so a
+    refactor does not silently start allowing it — opus round 5 low)."""
+    out, _err, code = _run("gh api graphql -f query=", monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_backslash_dollar_in_double_quotes_is_over_blocked(monkeypatch):
+    """A `\\$` inside double quotes is a shell LITERAL `$` (not an expansion), but the hook over-blocks
+    it (single-quote is the only 'literal' form it recognises). This is the SAFE direction — a
+    legitimate `-f query="…\\$t…"` is denied, never a merge let through. Pinned so a future 'support
+    `\\$`' change is a conscious one (opus round 8)."""
+    out, _err, code = _run(r'gh api graphql -f query="mutation{ f(id:\$t) }"', monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_heredoc_stray_quote_does_not_mask_later_expandable_query(monkeypatch):
+    """A heredoc body containing an unmatched `'` must NOT leave the single-quote blanker stuck and
+    mask a real expandable `query="$Q"` on a LATER line — the expandable scan normalizes (removing
+    heredoc bodies) before blanking, so the later merge is still caught (codex round 7)."""
+    out, _err, code = _run(
+        'cat <<EOF\n\'\nEOF\ngh api graphql -f query="$Q"',
+        monkeypatch,
+    )
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # #1 — a wrapper `-c`/`eval` string is a NESTED context: the OUTER double quotes already
+        # expanded `$Q` before bash saw the (now-literal-looking) single quotes. The old hook blocked
+        # any `$` in a nested query; the quote-aware allowance must NOT reopen this (opus/codex).
+        'bash -c "gh api graphql -f query=\'$Q\'"',
+        'eval "gh api graphql -f query=\'$Q\'"',
+        'sh -c "gh api graphql -f query=\'$Q\'"',
+        # #3 — an UNQUOTED heredoc body EXPANDS `$`, so a `query="$Q"` / `query="$(…)"` there is a
+        # real expandable-query merge even though the body is skipped by normalization.
+        'bash <<EOF\ngh api graphql -f query="$Q"\nEOF',
+        'bash <<EOF\ngh api graphql -f query="$(cat merge.graphql)"\nEOF',
+        # #3b — a QUOTED-delimiter heredoc fed to an INTERPRETER: the outer shell keeps the body
+        # literal, but the inner `bash`/`sh` expands `$Q` when it executes the line (chatgpt-codex-
+        # connector P1 on the PR). An argv-position gh-api query with `$` in ANY heredoc body blocks.
+        "bash <<'EOF'\ngh api graphql -f query=\"$Q\"\nEOF",
+        "sh <<'EOF'\ngh api graphql -f query=\"$Q\"\nEOF",
+    ],
+)
+def test_nested_context_expandable_query_is_blocked(command, monkeypatch):
+    """A shell-expandable graphql `query=` reached through a NESTED context — a wrapper `-c`/`eval`
+    string (whose inner quoting the outer shell already processed) or an UNQUOTED heredoc body (which
+    expands `$`) — must BLOCK. These were blocked by the pre-#268 'block every `$`' rule; the
+    quote-aware single-quote allowance is sound only at the TOP LEVEL, so nested scans stay strict
+    (regression caught by the quorum re-review; opus/codex)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Alternate GraphQL landing routes must block even single-quoted / parameterized (codex): the
+        # merge queue and a direct branch merge are just as much a bypass as mergePullRequest.
+        "gh api graphql -f query='mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){x}}' -F id=x",
+        "gh api graphql -f query='mutation{enqueuePullRequest(input:{}){x}}'",
+        "gh api graphql -f query='mutation($b:ID!){mergeBranch(input:{repositoryId:$b}){x}}' -F b=x",
+        "gh api graphql -f query='mutation{mergeBranch(input:{}){x}}'",
+    ],
+)
+def test_alternate_landing_mutations_are_blocked(command, monkeypatch):
+    """`enqueuePullRequest` (merge queue) and `mergeBranch` (direct branch merge) are landing routes
+    that skip ship, so the literal scan blocks them regardless of quoting — the quote-aware
+    single-quote allowance must not open them (codex review)."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_single_quoted_query_inside_quoted_heredoc_message_is_allowed(monkeypatch):
+    """A QUOTED-delimiter heredoc body is literal (the shell never expands `$`), so a commit-message
+    heredoc that merely MENTIONS a `resolveReviewThread($t)` query must still ALLOW — the strict
+    nested rule applies only to EXPANDING (unquoted) heredoc bodies, not literal ones."""
+    out, _err, code = _run(
+        "git commit -F - <<'MSG'\nfix: resolveReviewThread($t) example in the body\nMSG",
+        monkeypatch,
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_single_quoted_backtick_in_query_is_allowed(monkeypatch):
+    """A backtick INSIDE the single-quoted query value is literal data the shell never runs, so a
+    non-merge query that contains one must ALLOW — the mirror of the expandable-backtick block that
+    exercises the single-quote-backtick blanking branch (opus round 6)."""
+    out, _err, code = _run(
+        "gh api graphql -f query='mutation{ addComment(input:{body:\"see `code`\"}){id} }'",
+        monkeypatch,
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
 
 
 def test_gh_api_rest_merge_substring_in_field_value_is_not_blocked(monkeypatch):
@@ -931,13 +1106,50 @@ def test_interpreter_c_string_without_merge_is_allowed(monkeypatch):
     assert _decision(out) == "allow"
 
 
-def test_inline_graphql_query_with_variables_is_over_blocked(monkeypatch):
-    """A `$` in a graphql `query` value is over-blocked whether it is a shell expansion (`"$Q"`) or
-    a GraphQL variable (`$owner`) — once the shell strips quotes the two are indistinguishable, so
-    the safe, documented choice blocks both. Pinned so a future 'allow inline reads with variables'
-    refactor is a conscious, tested change (codex review round 6)."""
+def test_inline_graphql_query_with_variables_is_allowed(monkeypatch):
+    """A SINGLE-quoted GraphQL variable (`$owner`) in an inline non-merge `query` value must ALLOW.
+    This is the conscious flip of the old 'block any `$`' behaviour (#268): a single-quoted `$name`
+    is a literal GraphQL variable the shell never expands, so it cannot change WHICH mutation runs.
+    The literal `_MERGE_MUTATION` scan still catches a real merge; a shell-EXPANDABLE `$` (double
+    quotes / unquoted / substitution) stays fail-closed (see the expandable-dollar tests above)."""
     out, _err, code = _run(
         "gh api graphql -f query='query($owner:String!){ repository(owner:$owner){ name } }'",
+        monkeypatch,
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_inline_resolve_review_thread_mutation_with_variables_is_allowed(monkeypatch):
+    """#268 core case: the `resolveReviewThread` mutation an agent must run to satisfy `gh ship`'s
+    unresolved-threads gate is NOT a merge and must ALLOW, even with a GraphQL `$threadId` variable."""
+    out, _err, code = _run(
+        "gh api graphql -f query='mutation($t:ID!){resolveReviewThread(input:{threadId:$t})"
+        "{thread{isResolved}}}' -F t=PRRT_abc",
+        monkeypatch,
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_inline_add_review_thread_reply_mutation_is_allowed(monkeypatch):
+    """`addPullRequestReviewThreadReply` (an agent replying to a bot nit before resolving) is not a
+    merge and must ALLOW (#268)."""
+    out, _err, code = _run(
+        "gh api graphql -f query='mutation($t:ID!,$b:String!){addPullRequestReviewThreadReply"
+        "(input:{pullRequestReviewThreadId:$t,body:$b}){comment{id}}}' -F t=PRRT_abc -F b=fixed",
+        monkeypatch,
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_inline_merge_mutation_with_variables_is_still_blocked(monkeypatch):
+    """The protection must not be neutered: a real `mergePullRequest` mutation is still BLOCKED even
+    when it carries GraphQL variables — the literal token is present, so `_MERGE_MUTATION` fires."""
+    out, _err, code = _run(
+        "gh api graphql -f query='mutation($id:ID!){mergePullRequest(input:{pullRequestId:$id})"
+        "{pullRequest{merged}}}' -F id=PR_abc",
         monkeypatch,
     )
     assert code == hook.BLOCK_EXIT_CODE

@@ -134,7 +134,8 @@ _INLINE_ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # because shlex can't parse it.  Only if the raw string plausibly contains a merge
 # invocation do we treat a parse error as fail-closed.
 _MERGE_HINT = re.compile(
-    r"\bgh\b.*(\bpr\b.*\bmerge\b|pulls/[^/]+/merge|mergePullRequest|enablePullRequestAutoMerge)",
+    r"\bgh\b.*(\bpr\b.*\bmerge\b|pulls/[^/]+/merge|mergePullRequest|enablePullRequestAutoMerge"
+    r"|enqueuePullRequest|mergeBranch)",
     re.DOTALL,
 )
 
@@ -172,7 +173,13 @@ _API_VALUE_FLAGS = frozenset(
     {"-H", "--header", "-F", "--field", "-f", "--raw-field", "-q", "--jq", "-X", "--method",
      "--input", "--hostname", "-p", "--preview", "-t", "--template", "--cache"}
 )
-_MERGE_MUTATION = re.compile(r"mergePullRequest|enablePullRequestAutoMerge")
+# The GraphQL mutations that LAND code without `gh ship`: merge a PR (`mergePullRequest`), turn on
+# auto-merge (`enablePullRequestAutoMerge`), add a PR to the merge queue (`enqueuePullRequest`), or
+# merge a branch directly (`mergeBranch`). A literal occurrence in any graphql arg blocks regardless
+# of quoting (codex review: these are alternate landing routes the quote-aware allowance must not open).
+_MERGE_MUTATION = re.compile(
+    r"mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest|mergeBranch"
+)
 _REST_MERGE_PATH = re.compile(r"pulls/[^/]+/merge")
 _WRITE_METHOD_EQ = re.compile(r"^(--method|-X)=(PUT|POST)$", re.IGNORECASE)
 # A `query` field fed from a file (`@f`), stdin (`@-`) or a substitution — its text can't be read
@@ -295,15 +302,24 @@ def _body_line_is_merge(line: str, quoted: bool) -> bool:
     `$()`/backticks expand), so `# $(gh pr merge 1)` and `'$(gh pr merge 1)'` are caught while a
     prose/apostrophe line without a substitution is not (codex reviews 3 & 4; coordinator review)."""
     if quoted:
-        return _line_has_executable_merge(line)
-    if _line_has_executable_merge(line):
+        # A QUOTED delimiter means the OUTER shell does not expand the body — but if the heredoc feeds
+        # an INTERPRETER (`bash <<'EOF' … gh api graphql -f query="$Q" … EOF`), that inner shell DOES
+        # expand `$Q` when it executes the line. We can't tell interpreter-fed from data-fed here, so
+        # scan an argv-position `gh api graphql` query STRICTLY (any `$`/backtick blocks) — the same
+        # safe over-block the salvage already applies to a bare `gh pr merge` line in a quoted body
+        # (#268 regression guard: chatgpt-codex-connector P1 on the PR). `$( … )` stays literal for a
+        # quoted delimiter (not re-scanned), matching the outer shell.
+        return _line_has_executable_merge(line, strict=True)
+    # UNQUOTED heredoc body: the shell EXPANDS `$`, so scan strictly (a `gh api graphql -f query="$Q"`
+    # here is an expandable-query merge — #268 regression guard) and also follow substitutions.
+    if _line_has_executable_merge(line, strict=True):
         return True
     # Fail CLOSED (`is not False`, not `is True`): a merge-like but unparseable expanded body (an
     # unbalanced quote inside `$( … )`) returns None and must still BLOCK, matching the top-level
     # `return sub` fail-closed contract — otherwise `$(gh pr merge 1 "x)` in an unquoted heredoc
     # would slip through (Opus ship review). A benign unparseable body returns False and passes.
     return any(
-        _command_contains_gh_pr_merge(inner) is not False
+        _command_contains_gh_pr_merge(inner, strict=True) is not False
         for inner in _extract_expanding_substitutions(line)
     )
 
@@ -610,44 +626,54 @@ def _rest_method_is_unprovable(rest: list[str]) -> bool:
     return False
 
 
-def _graphql_query_is_unprovable(rest: list[str]) -> bool:
-    """True iff a `gh api graphql` call feeds its `query` from a source this hook cannot read at
-    pre-exec time — a file (`query=@f`), stdin (`query=@-` / `--input …`), or a substitution — so a
-    merge mutation MAY hide in it. Such a call is over-blocked (fail closed). Reading the file to
-    refine this is a tracked follow-up; blocking is the SAFE direction."""
-
-    def field_is_filebacked_query(value: str) -> bool:
-        key, _, val = value.partition("=")
-        if key != "query":
-            return False  # other fields are graphql VARIABLES; they can't execute a mutation
-        # Unreadable at pre-exec: a file (`@f`/`@-`), an empty value, or ANY shell expansion (`$var`,
-        # `${v}`, `$(…)`, backtick). shlex has already stripped the quotes, so a live `query="$Q"`
-        # and an inert `query='$Q'` are indistinguishable — the safe, consistent choice is to treat
-        # any `$`/backtick as unprovable and fail closed. This over-blocks a legitimate INLINE
-        # graphql read that uses a `$variable`; re-phrase or use `gh ship`/the hatch (Opus review).
-        return val.startswith("@") or val == "" or "$" in val or "`" in val
-
+def _graphql_query_field_values(rest: list[str]) -> list[str]:
+    """The `query` field VALUES in `rest` (= args after `gh api`), across every flag spelling:
+    `-f query=<v>` / `-F query=<v>` (detached), and `-fquery=<v>` / `--field=query=<v>` /
+    `--raw-field=query=<v>` (glued). Non-`query` fields are graphql VARIABLES that cannot execute a
+    mutation, so they are ignored."""
+    values: list[str] = []
     i, n = 0, len(rest)
     while i < n:
         a = rest[i]
         if a in _FIELDISH and i + 1 < n:
-            if field_is_filebacked_query(rest[i + 1]):
-                return True
+            key, _, val = rest[i + 1].partition("=")
+            if key == "query":
+                values.append(val)
             i += 2
             continue
         m = re.match(r"^(?:--field|--raw-field|-[fF])=?(.*)$", a)
-        if m and m.group(1) and field_is_filebacked_query(m.group(1)):
-            return True
-        if a == "--input" or a.startswith("--input="):  # whole request body from a file/stdin
-            return True
+        if m and m.group(1):
+            key, _, val = m.group(1).partition("=")
+            if key == "query":
+                values.append(val)
         i += 1
-    return False
+    return values
 
 
-def _gh_api_is_merge(rest: list[str]) -> bool:
+def _graphql_query_is_unprovable(rest: list[str], strict: bool = False) -> bool:
+    """True iff a `gh api graphql` call feeds its `query` (or the whole request body) from a source
+    this hook CANNOT READ at pre-exec time — a file (`query=@f`), stdin (`query=@-` / `--input …`), or
+    an empty value — so a merge mutation could hide in it (fail closed).
+
+    `strict` (used only in NESTED contexts — a wrapper `-c`/`eval` string, a substitution body, an
+    UNQUOTED heredoc body) ALSO blocks any inline `$`/backtick in a query value, restoring the old
+    "block every `$`" rule there. In those contexts the quoting the hook sees is NOT the quoting the
+    shell applied (an outer double-quoted `bash -c "…'$Q'…"` already expanded `$Q`; an unquoted
+    heredoc body expands `$Q`), so a `$` cannot be trusted as a literal GraphQL variable. The
+    quote-aware single-quote allowance (`_graphql_query_field_is_expandable`) is only sound at the
+    TOP LEVEL, where the raw quoting is the real quoting (#268 regression guard: opus/codex)."""
+    for val in _graphql_query_field_values(rest):
+        if val.startswith("@") or val == "":  # file/stdin-backed (`@f`/`@-`) or empty: unreadable
+            return True
+        if strict and ("$" in val or "`" in val):  # nested context: any $/backtick may expand → block
+            return True
+    return any(a == "--input" or a.startswith("--input=") for a in rest)  # whole body from file/stdin
+
+
+def _gh_api_is_merge(rest: list[str], strict: bool = False) -> bool:
     """`rest` = args after `gh api`. True iff this is a PR-merge REST call (`…/pulls/<n>/merge` +
     write method) or a graphql merge mutation (inline, or a file/stdin/substitution-backed query
-    that can't be proven safe)."""
+    that can't be proven safe). `strict` — see `_graphql_query_is_unprovable`."""
     endpoint = _gh_api_endpoint(rest)
     is_graphql = endpoint == "graphql" or (endpoint or "").endswith("/graphql")
     if is_graphql:
@@ -656,7 +682,7 @@ def _gh_api_is_merge(rest: list[str]) -> bool:
         # is almost certainly the mutation, and over-blocking is the safe direction (Opus review 2).
         if _MERGE_MUTATION.search(" ".join(rest)):
             return True
-        if _graphql_query_is_unprovable(rest):
+        if _graphql_query_is_unprovable(rest, strict=strict):
             return True
     # Match the merge path against the ENDPOINT positional — not every arg — so a `pulls/<n>/merge`
     # substring inside a field VALUE (`-f body='see pulls/1/merge'`) does not false-block an
@@ -723,13 +749,13 @@ def _wrapped_command_strings(argv: list[str]) -> list[str]:
     return []
 
 
-def _is_merge_route(segment: list[str]) -> bool:
+def _is_merge_route(segment: list[str], strict: bool = False) -> bool:
     """True iff this segment's argv is a direct PR-merge route that skips `gh ship`: `gh pr merge …`
     (incl. behind a `gh -R o/r` global flag, a wrapper like `env`/`sudo`/`timeout`, or a wrapper +
     interpreter like `env bash -c '…'`), or a `gh api` REST/GraphQL merge (see `_gh_api_is_merge`),
     or a merge inside a shell interpreter's `-c` string / `eval` argument. Anchored on the
     ACTUALLY-invoked command, so a prose mention in another program's args (`tg "…mergePullRequest…"`,
-    `echo mergePullRequest`) and `git merge main` all pass."""
+    `echo mergePullRequest`) and `git merge main` all pass. `strict` — see `_graphql_query_is_unprovable`."""
     argv = _resolve_invoked_argv(_segment_argv(segment))
     if argv is None:
         return False
@@ -738,11 +764,13 @@ def _is_merge_route(segment: list[str]) -> bool:
         if len(sub) >= 2 and sub[0] == "pr" and sub[1] == "merge":
             return True
         if sub and sub[0] == "api":
-            return _gh_api_is_merge(sub[1:])
+            return _gh_api_is_merge(sub[1:], strict=strict)
         return False
-    # A shell interpreter / `eval`: re-scan the merge hidden in its `-c` / string arguments.
+    # A shell interpreter / `eval`: re-scan the merge hidden in its `-c` / string arguments. That
+    # string is a NESTED context whose inner quoting the outer shell may already have processed
+    # (`bash -c "…query='$Q'…"` expands `$Q` at the outer level), so scan it strictly.
     for cmd in _wrapped_command_strings(argv):
-        if _command_contains_gh_pr_merge(cmd) is True:
+        if _command_contains_gh_pr_merge(cmd, strict=True) is True:
             return True
     return False
 
@@ -884,17 +912,17 @@ def _extract_command_substitutions(command: str) -> list[str]:
     return subs
 
 
-def _line_has_executable_merge(line: str) -> bool:
+def _line_has_executable_merge(line: str, strict: bool = False) -> bool:
     """True iff a segment of `line` is a merge route at an executable (argv) position. Segment-only
     — it does NOT recurse into command substitutions — so the heredoc-body salvage counts only a
     literal executable-position merge planted before a crafted terminator, not a `$( … )` that a
     quoted heredoc body keeps literal. A parse failure counts as no merge (fail toward allow, so a
-    prose/apostrophe body line is not over-blocked)."""
+    prose/apostrophe body line is not over-blocked). `strict` — see `_graphql_query_is_unprovable`."""
     try:
         segments = _split_segments(line)
     except ValueError:
         return False
-    return any(_is_merge_route(seg) for seg in segments)
+    return any(_is_merge_route(seg, strict=strict) for seg in segments)
 
 
 def _substitutions_contain_merge(command: str) -> bool | None:
@@ -906,10 +934,14 @@ def _substitutions_contain_merge(command: str) -> bool | None:
     real shell never executes is not over-blocked: `_normalize_newlines` drops `#` comments (`echo
     ok # $(gh pr merge 1)`) and skips heredoc bodies (`<<'EOF'` … `$(gh pr merge 1)` … `EOF`), which
     are data, not executed substitutions (codex review round 3). An executable-position `gh pr
-    merge` LINE inside a heredoc body is still salvaged by `_skip_heredoc_bodies`."""
+    merge` LINE inside a heredoc body is still salvaged by `_skip_heredoc_bodies`.
+
+    A substitution body is a NESTED context (the outer quoting the hook read may not be what the shell
+    applied), so it is scanned strictly — any `$`/backtick in a graphql `query=` there blocks (#268
+    regression guard)."""
     result: bool | None = False
     for inner in _extract_command_substitutions(_normalize_newlines(command)):
-        r = _command_contains_gh_pr_merge(inner)
+        r = _command_contains_gh_pr_merge(inner, strict=True)
         if r is True:
             return True
         if r is None:
@@ -917,20 +949,119 @@ def _substitutions_contain_merge(command: str) -> bool | None:
     return result
 
 
-def _command_contains_gh_pr_merge(command: str) -> bool | None:
+def _blank_single_quoted_expansions(command: str) -> str:
+    r"""Replace `$` and backtick INSIDE single-quoted spans with `\0`, so that after shlex dequotes a
+    token, a surviving `$`/backtick means the shell would EXPAND it (it was double-quoted / unquoted /
+    concatenated), while a single-quoted literal (`'…$t…'`) leaves no `$`. This recovers the
+    expand-vs-literal distinction that shlex erases, WITHOUT parsing GraphQL — the sound basis for
+    allowing `-f query='…resolveReviewThread($t)…'` while blocking `-f query="$Q"` and the
+    concatenation `-f query='mutation{ '$OP'(…)}'` (#268). Behaviour-preserving for everything else:
+    `$`/backtick outside single quotes is untouched, and a `$(…)` / `` `…` `` that was single-quoted is
+    inert anyway (`_extract_command_substitutions` already skips single-quoted spans). Honours double
+    quotes (single-quote chars inside are literal) and backslash escapes."""
+    out: list[str] = []
+    i, n = 0, len(command)
+    quote: str | None = None
+    while i < n:
+        ch = command[i]
+        if quote == "'":
+            out.append("\0" if ch in ("$", "`") else ch)
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(command[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(ch)
+            out.append(command[i + 1])
+            i += 2
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _graphql_query_field_is_expandable(blanked_command: str) -> bool:
+    r"""Argv-ANCHORED: True iff a `gh api graphql` segment of the single-quote-BLANKED command carries
+    a `query=` value with a surviving `$` or backtick — one the shell would EXPAND. A single-quoted
+    literal (`'…$t…'`) was blanked to `\0` by `_blank_single_quoted_expansions`, so a `$`/backtick
+    here was double-quoted / unquoted / concatenated and gets rewritten at runtime — it can splice a
+    `mergePullRequest` field past the literal scan (`-f query="$Q"`, `-fquery="$Q"`,
+    `-f query='…'$OP'…'`), so it is a merge (fail closed).
+
+    Anchoring to a real `gh api graphql` argv keeps a prose `query=$Q` in a NON-gh command from being
+    blocked (`echo graphql query=$Q`), and parsing via shlex tokens covers every flag spelling. Kept
+    separate from `_command_contains_gh_pr_merge` (which runs on the ORIGINAL command) so the blanking
+    — which is not heredoc-aware — cannot disturb heredoc/substitution merge detection. An unparseable
+    command fails closed (block)."""
+    try:
+        segments = _split_segments(blanked_command)
+    except ValueError:
+        # Unparseable (unbalanced quotes): the shell would reject it too, so it cannot execute a
+        # merge. Return False and let `_command_contains_gh_pr_merge`'s own None/`_MERGE_HINT`
+        # fail-closed logic decide — independently blocking here over-blocks benign `grep won't file`.
+        return False
+    for seg in segments:
+        argv = _resolve_invoked_argv(_segment_argv(seg))
+        if not argv or os.path.basename(argv[0]) != "gh":
+            continue
+        sub = _gh_subargs(argv)
+        if not sub or sub[0] != "api":
+            continue
+        rest = sub[1:]
+        endpoint = _gh_api_endpoint(rest)
+        if endpoint == "graphql" or (endpoint or "").endswith("/graphql"):
+            if any("$" in val or "`" in val for val in _graphql_query_field_values(rest)):
+                return True
+    return False
+
+
+def _command_contains_gh_pr_merge(command: str, strict: bool = False) -> bool | None:
     """Return True if `command` is (or hides) a raw merge route: a `gh pr merge` / `gh api` merge at
-    an executable position in any segment, OR the same inside an executed command substitution
-    (`$( … )` / backticks, incl. inside double quotes — see `_extract_command_substitutions`).
+    an executable position in any segment (a `gh api graphql` merge is `mergePullRequest` /
+    `enablePullRequestAutoMerge` / a file/stdin-backed query — a shell-expandable inline query is
+    handled separately by `_graphql_query_field_is_expandable`), OR the same inside an executed
+    command substitution (`$( … )` / backticks, incl. inside double quotes).
+
+    `strict` is True for a NESTED scan — a substitution body, a wrapper `-c`/`eval` string, an
+    unquoted heredoc body — where the quoting the hook reads is NOT what the shell applied, so any
+    inline `$`/backtick in a graphql `query=` blocks (the old "block every `$`" rule; #268 guard).
+    The TOP-LEVEL call (from `main`) is non-strict — there the raw quoting IS the real quoting, so a
+    single-quoted GraphQL variable is allowed and only a shell-expandable `$` (caught by
+    `_graphql_query_field_is_expandable`) blocks.
 
     Returns None (fail-closed) when the command — or a merge-like substitution body — cannot be
     parsed.  A parse failure with no merge-like pattern (e.g. ``grep won't file``) returns False so
     it is not spuriously blocked.
     """
+    # A shell-expandable inline graphql `query=` is a merge route too. Run it HERE (not only at the
+    # top level) so it applies at every recursion depth — inside a `$( … )` / backtick substitution
+    # and inside a `bash -c '…'` / `eval` rescan — matching the contract that the blocked routes are
+    # caught in substitutions and wrappers (codex review). NORMALIZE first (drops `#` comments and
+    # REMOVES heredoc bodies) THEN blank single-quoted `$`/backtick on a LOCAL copy — otherwise an
+    # unmatched `'` in a heredoc body would leave the (heredoc-unaware) blanker stuck in single-quote
+    # mode and mask a real `query="$Q"` on a later line (codex review). The heredoc/substitution merge
+    # detection below still runs on the ORIGINAL `command`.
+    if _graphql_query_field_is_expandable(
+        _blank_single_quoted_expansions(_normalize_newlines(command))
+    ):
+        return True
     try:
         segments: list[list[str]] | None = _split_segments(command)
     except ValueError:
         segments = None
-    if segments is not None and any(_is_merge_route(seg) for seg in segments):
+    if segments is not None and any(_is_merge_route(seg, strict=strict) for seg in segments):
         return True
     sub = _substitutions_contain_merge(command)
     if sub is True:

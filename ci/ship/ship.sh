@@ -25,7 +25,8 @@
 #
 # Usage:
 #   ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run]
-#           [--no-screenshot-ok <reason>] [--screenshot <path> [desc]]...
+#           [--no-screenshot-ok <reason>] [--resolve-addressed-threads]
+#           [--screenshot <path> [desc]]...
 #
 # Flags:
 #   --repo <owner/repo>    ship a PR that lives in a DIFFERENT repo than the current checkout:
@@ -46,6 +47,15 @@
 #                          (genuine no-release ship: docs-only, pure test/CI, a revert).
 #   --no-review-dwell-ok R override the review-dwell window with a logged reason R (a genuine
 #                          fast-track: a trivial/urgent merge that doesn't need review latency).
+#   --resolve-addressed-threads  before the unresolved-threads gate, auto-close review threads that
+#                          are SAFE without a human: unresolved + isOutdated + authored entirely by
+#                          bots. NOTE: isOutdated only means the anchored code CHANGED since the
+#                          comment (a heuristic that the nit was addressed) — NOT a verified fix, so
+#                          a still-valid bot finding on rewritten/rebased code can be auto-closed.
+#                          Use only when you trust the bot threads are genuinely addressed. Human or
+#                          still-current threads are never touched and still block. Also
+#                          SHIP_RESOLVE_ADDRESSED_THREADS=1. A bot thread with >100 comments is
+#                          fail-closed (never auto-resolved).
 #   --screenshot P [D]     attach a local screenshot P (desc D) via SHIP_IMAGE_UPLOAD_CMD,
 #                          then post it as a PR comment. Repeatable.
 #
@@ -116,7 +126,13 @@ set -euo pipefail
 ORIG_PWD=$(pwd -P)
 PR=""; SKIP_CI=0; DRY_RUN=0; NO_SHOT_OK=""; NO_VBUMP_OK=""; NO_DWELL_OK=""; REPO_FLAG=""
 SHOT_PATHS=(); SHOT_DESCS=()
-USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--screenshot <path> [desc]]...'
+# Auto-resolve addressed bot-nit review threads before the unresolved-threads gate (opt-in, #268).
+# Enabled by --resolve-addressed-threads or SHIP_RESOLVE_ADDRESSED_THREADS=1; only ever closes a
+# thread that is unresolved, OUTDATED (its code changed = a later commit addressed it), and authored
+# ENTIRELY by bots — a human thread or an unaddressed one is never touched (see the gate below).
+RESOLVE_THREADS=0
+case "${SHIP_RESOLVE_ADDRESSED_THREADS:-}" in 1|true|yes) RESOLVE_THREADS=1 ;; esac
+USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--resolve-addressed-threads] [--screenshot <path> [desc]]...'
 
 # Path to the review-quorum gate's hatch-escalation helper (ci/ship/review_quorum_hatch.py),
 # derived ONLY from this script's own location. That helper imports the shared
@@ -142,6 +158,7 @@ while [ "$i" -lt "$n" ]; do
   case "$a" in
     --skip-ci) SKIP_CI=1 ;;
     --dry-run) DRY_RUN=1 ;;
+    --resolve-addressed-threads) RESOLVE_THREADS=1 ;;
     --no-screenshot-ok)
       i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "--no-screenshot-ok needs a <reason>." >&2; exit 1; }
       NO_SHOT_OK=${args[$i]}; [ -n "$NO_SHOT_OK" ] || { echo "--no-screenshot-ok reason empty." >&2; exit 1; } ;;
@@ -548,14 +565,18 @@ _local_pr_checklist_check() {
   return 0
 }
 
-# Check unresolved review threads via the simple (non-paginating) gh pr view query.
-# Returns 0 if none, 1 if any unresolved or query fails.
+# Check unresolved review threads via the paginating GraphQL query. `gh pr view --json reviewThreads`
+# is NOT a valid field (gh rejects it: "Unknown JSON field"), so the REST/`pr view` shape used to
+# fail the gate unconditionally; use the same `reviewThreads` GraphQL query the main gate uses.
+# Returns 0 if none, 1 if any unresolved or the query fails.
 _local_review_threads_check() {
-  local pr="$1" unresolved
+  local pr="$1" unresolved raw
+  local q='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{isResolved}}}}}'
   echo "[ship] local gate: checking review threads ..."
-  unresolved=$(gh pr view "$pr" --json reviewThreads \
-    --jq '[.reviewThreads[] | select(.isResolved == false)] | length' 2>/dev/null) || {
+  raw=$(gh api graphql --paginate -F owner='{owner}' -F name='{repo}' -F pr="$pr" -f query="$q" \
+    --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)] | length' 2>/dev/null) || {
     echo "[ship] local gate: FAILED — could not check review threads." >&2; return 1; }
+  unresolved=$(printf '%s' "$raw" | awk '{s+=$1} END{print s+0}')
   if [ "${unresolved:-0}" -gt 0 ]; then
     echo "[ship] local gate: FAILED — $unresolved unresolved review thread(s)." >&2
     return 1
@@ -665,6 +686,67 @@ _empty_rollup_is_ci_outage() {
   done < <(git -C "$ROOT" ls-tree -r --name-only "$ref" -- .github/workflows/ 2>/dev/null)
   return 1
 }
+
+# --- auto-resolve addressed bot-nit review threads (opt-in; #268) -----------------------
+# Runs BEFORE every review-thread gate — the main unresolved-threads gate below AND the CI-down local
+# fallback (`_local_review_threads_check`) — so the flag works on both paths. It closes only the
+# threads that are SAFE to resolve without a human: unresolved AND isOutdated (the code the thread
+# anchored to has changed — a later commit addressed it) AND authored ENTIRELY by automated reviewers.
+# A thread with ANY human comment, or one still current (not addressed), is NEVER touched — it falls
+# through and still blocks the merge. This lets a shipping agent close its own bot nits through
+# `gh ship` instead of hand-running the resolveReviewThread mutation the block-raw-pr-merge hook used
+# to false-block (#268). ship runs these gh calls as a child process, so the agent-hook never sees
+# them; the hook fix is for an agent resolving threads directly. It runs during preflight, so if a
+# LATER gate (CI-green, review-dwell, version-bump, quorum, clean-worktree) then refuses, some
+# eligible bot nits may already be resolved on a PR that does not merge this run — accepted, because
+# those nits are genuinely addressed and would need resolving next run anyway.
+RESOLVE_THREAD_Q='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated comments(first:100){totalCount nodes{author{login}}}}}}}}'
+# jq: emit the thread IDs eligible for auto-resolution, one per line. Fail-CLOSED on two edge cases a
+# reviewer flagged: (a) if the thread has MORE than the 100 fetched comments (totalCount > fetched),
+# a human reply could hide on an unfetched page, so a truncated thread is NOT eligible; (b) a
+# null/ghost author login coalesces to "" (never a bot), so one deleted-account comment makes the
+# thread ineligible instead of crashing jq — both keep the "never auto-close a human/uncertain
+# thread" invariant.
+RESOLVE_ELIGIBLE_JQ='[.data.repository.pullRequest.reviewThreads.nodes[]
+  | select(.isResolved == false and .isOutdated == true)
+  | select((.comments.nodes | length) > 0)
+  | select(.comments.totalCount != null and (.comments.nodes | length) >= .comments.totalCount)
+  | select([.comments.nodes[].author.login // ""] | all(. as $l | ($l | endswith("[bot]")) or ($l == "chatgpt-codex-connector") or ($l == "codex-review-bot")))
+  | .id] | .[]'
+
+_resolve_one_thread() {  # $1 = thread node id
+  # `-f` (raw-field) for the opaque node id: `-F` auto-types and would read a leading `@` as a file.
+  gh api graphql -f query='mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}' \
+    -f id="$1" >/dev/null 2>&1
+}
+
+resolve_addressed_bot_threads() {
+  # `--repo` is honoured: ship exports GH_REPO (see the "Thread --repo through EVERY gh call" block
+  # above), and gh resolves the `{owner}`/`{repo}` placeholders from it — same mechanism as the
+  # unresolved-threads gate's THREAD_Q, so this targets the shipped PR's repo, not just the CWD's.
+  local ids tid; local n=0
+  ids=$(gh api graphql --paginate -F owner='{owner}' -F name='{repo}' -F pr="$PR" \
+        -f query="$RESOLVE_THREAD_Q" --jq "$RESOLVE_ELIGIBLE_JQ" 2>/dev/null) || {
+    echo "[ship] auto-resolve: could not query review threads (gh api failed) — skipping; the gate below still applies." >&2
+    return 0; }
+  [ -n "$ids" ] || { echo "[ship] auto-resolve: no addressed bot-nit threads to resolve."; return 0; }
+  while IFS= read -r tid; do
+    [ -n "$tid" ] || continue
+    if [ "$DRY_RUN" = "1" ]; then
+      echo "[ship] auto-resolve (dry-run): would resolve addressed bot thread $tid"; n=$((n+1)); continue
+    fi
+    if _resolve_one_thread "$tid"; then
+      echo "[ship] auto-resolve: resolved addressed bot thread $tid"; n=$((n+1))
+    else
+      echo "[ship] auto-resolve: FAILED to resolve $tid — leaving it for the gate below." >&2
+    fi
+  done <<<"$ids"
+  echo "[ship] auto-resolve: ${n} addressed bot-nit thread(s) $([ "$DRY_RUN" = "1" ] && echo 'would be resolved' || echo 'resolved')."
+}
+
+if [ "${RESOLVE_THREADS:-0}" = "1" ]; then
+  resolve_addressed_bot_threads
+fi
 
 # --- green-CI gate: CI must EXIST + be green; pending CI is WATCHED to completion -------
 # Design (CTO): "no CI" is itself a FAILED gate, not a free pass — refuse with guidance to
@@ -809,7 +891,7 @@ else
   echo "Refusing: could not query review threads for PR #$PR (gh api failed) — refusing to merge rather than fail open. Fix gh access and retry." >&2
   exit 1
 fi
-[ "${UNRESOLVED:-0}" = "0" ] || { echo "Refusing: PR #$PR has $UNRESOLVED unresolved review thread(s) — resolve them, then re-run." >&2; exit 1; }
+[ "${UNRESOLVED:-0}" = "0" ] || { echo "Refusing: PR #$PR has $UNRESOLVED unresolved review thread(s) — resolve them (or re-run with --resolve-addressed-threads to auto-close outdated bot-nit threads), then re-run." >&2; exit 1; }
 
 # --- review-dwell gate: give async review time to FORM its comments before merging ---------
 # WHY this exists (the gap it closes): the unresolved-threads gate above only fails when threads

@@ -170,7 +170,10 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   only if it is fully green, falls through to the normal non-admin merge (branch protection still
   gates it — no silent `--admin`-bypass); a repo whose workflows never trigger on PRs stays a
   hard refuse (see `ci/ship/README.md` for the trigger-detection heuristic and its residuals);
-- there are **no unresolved review threads**;
+- there are **no unresolved review threads** — pass `--resolve-addressed-threads` (or
+  `SHIP_RESOLVE_ADDRESSED_THREADS=1`) to let ship first auto-close the threads that are safe without
+  a human (unresolved + outdated = addressed by a later commit + authored entirely by bots); a human
+  or still-unaddressed thread is never touched and still blocks (#268);
 - a UI-touching PR carries an embedded **screenshot** (override with `--no-screenshot-ok
   <reason>`);
 - a PR that changes **shippable source** (not docs/test/CI) has **bumped the declared
@@ -329,16 +332,34 @@ four conditions hold:
 
 The mutation is `resolveReviewThread(input: {threadId: "PRRT_..."})` via `gh api graphql`.
 
-**Current enforcement gap**: the harness auto-mode classifier treats this mutation as
-"permission laundering" when conditions are passed only in prompt text. To make autonomous
-resolution work, one of the following must be in place:
+**The `block-raw-pr-merge` false-positive is fixed (#268).** The hook used to fail-closed on
+**any** `gh api graphql` call whose query carried a `$variable` — it could not prove the mutation
+wasn't a merge, so it blocked, wedging `resolveReviewThread`/`addPullRequestReviewThreadReply`. It
+now blocks only an **actual** merge: `gh pr merge` and a literal `mergePullRequest` /
+`enablePullRequestAutoMerge` mutation token. A **single-quoted** inline mutation that carries literal
+GraphQL variables (`-f query='mutation($t:ID!){resolveReviewThread(input:{threadId:$t})…}'`) is
+**allowed** — the shell never expands a single-quoted `$t`, so the query GitHub receives is exactly
+the text the hook read and the literal scan is authoritative. A query stays fail-closed when it is
+unreadable at pre-exec time: a `@file`/stdin body, or a **shell-expandable** `$`/backtick — one that
+is unquoted, double-quoted, or concatenated (`-f query="$Q"`, `-f query="mutation{$OP}"`,
+`-f query='…'$OP'…'`) — because the shell rewrites it at runtime and could splice a merge past the
+literal scan. So an agent that meets the four conditions can run the resolve mutation directly (keep
+the query single-quoted).
 
-- A Bash permission rule in `~/.claude/settings.json` allowing `gh api graphql` mutations
-  on PR review threads matching the above conditions; OR
-- An `agent-hooks/resolve-review-thread/` gate (a `pre-bash` hook) that validates the four
-  conditions before allowing the `gh api graphql resolveReviewThread` call — verified against
-  the actual PR data, not prompt-text claims.
+**Two ways to resolve, both live:**
 
-Until one of those mechanisms exists, an agent that meets all four conditions should still
-attempt the resolution; if the harness blocks it, escalate to the CTO with the thread ID
-and evidence that all four conditions are met.
+- **Direct — the autonomous agent path.** Run `gh api graphql -f
+  query='mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{isResolved}}}' -F
+  t=PRRT_...` — no longer blocked by the hook (#268). This is the path the **four conditions above
+  govern**: the agent is responsible for verifying quorum-passed, advisory-severity, all-bot, and
+  own-PR before issuing the mutation.
+- **Through ship — an explicit operator flag, narrower and self-enforcing.** `gh ship <PR>
+  --resolve-addressed-threads` is **not** the autonomous path and does **not** rely on the agent's
+  judgement of the four conditions; it enforces its own conservative rule against live PR data: it
+  resolves a thread only when it is unresolved **and** `isOutdated` (the anchored code changed — a
+  later commit addressed it) **and** authored **entirely** by bots (with comment-truncation and
+  null-author both failing closed). A human or still-current thread is never touched and still blocks.
+  It runs during ship's preflight, so if a **later** gate (review-dwell, version-bump, quorum,
+  clean-worktree) then refuses, some eligible bot nits may already be resolved on a PR that does not
+  merge *this* run — accepted, because those nits are genuinely addressed and would need resolving on
+  the next run anyway; the flag never resolves a human or unaddressed thread regardless of outcome.
