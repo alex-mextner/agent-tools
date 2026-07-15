@@ -217,17 +217,67 @@ def _unwrap_segment(segment: str) -> list[str]:
     return tokens
 
 
+def _split_top_level_segments(command: str) -> list[str]:
+    """Split a command line on the shell separators ``&&`` / ``||`` / ``;`` / ``|`` / ``&`` /
+    newline, QUOTE-AWARELY so a separator INSIDE a quoted argument does not tear the command
+    apart. A naive ``re.split`` on ``|`` split ``tg --tag question "A | B?"`` mid-quote into an
+    unbalanced ``tg --tag question "A `` segment that failed to shlex-tokenize, so the escalation
+    went unseen and the bare-question block was bypassed for the common "A vs B" wording. The
+    char-scan tolerates an unbalanced quote gracefully (it keeps the quote open to end-of-line)
+    rather than raising, so a malformed command still fails toward the same lenient allow.
+
+    SYNC: the same quote-aware scan as no-shell-file-edit `_split_segments`, trimmed to the
+    separators this hook needs (a `tg` send has no meaningful redirect/comment semantics)."""
+    segments: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < len(command):
+            buf.append(ch)
+            buf.append(command[i + 1])
+            i += 2
+            continue
+        if command[i:i + 2] in ("&&", "||"):
+            segments.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if ch in (";", "|", "&", "\n"):
+            segments.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
+    return [s for s in segments if s.strip()]
+
+
 def _escalation_request_body(command: str) -> tuple[str, str] | None:
     """If the command is a `tg` invocation carrying an escalation tag (``--tag decision`` /
     ``problem`` / ``question``), return ``(tag, body)`` — the matched tag and the message body it
     would send (positional text + any ``--title``); else None.
 
-    Walks each ``&&``/``;``/``|``-separated segment so a `tg` later in a pipeline is seen.
-    Uses shlex tokenization, not raw matching, so the tag and body are read exactly as `tg`
-    would receive them."""
+    Walks each ``&&``/``||``/``;``/``|``/``&``-separated segment (split QUOTE-AWARELY so a
+    separator inside the quoted message body never tears it apart) so a `tg` later in a pipeline
+    is seen. Uses shlex tokenization, not raw matching, so the tag and body are read exactly as
+    `tg` would receive them."""
     if not _TG_CMD.search(command):
         return None
-    for raw_segment in re.split(r"\s*(?:&&|\|\||;|\|)\s*", command):
+    for raw_segment in _split_top_level_segments(command):
         tokens = _unwrap_segment(raw_segment)
         if not tokens or not re.fullmatch(r"(?:\S*/)?tg", tokens[0]):
             continue

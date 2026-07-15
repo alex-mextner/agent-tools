@@ -141,6 +141,25 @@ def test_bare_body_is_blocked(command, monkeypatch):
     assert "pros/cons table" in msg
 
 
+# ── a bare escalation whose body carries a shell OPERATOR inside its quotes → still BLOCK ──
+# The command splitter must be quote-aware. A raw split on `|` / `&&` / `;` tore the quoted body
+# apart (`"A | B?"` → `"A ` + ` B?"`), leaving an unbalanced segment that failed to tokenize, so
+# the escalation went unseen and the #12 bare-question block was bypassed for the common
+# "A vs B" wording. (Codex P2 on PR #281.)
+@pytest.mark.parametrize("command", [
+    'tg --tag question "should we go with A | B?"',          # single pipe inside the body
+    'tg --tag decision "keep sync || go async?"',            # `||` inside the body
+    'tg --tag problem "run migrate && deploy, or roll back?"',  # `&&` inside the body
+    'tg --tag question "do A; then B?"',                     # `;` inside the body
+    'TG_AI_MODEL=claude tg --tag decision "ship A | ship B?"',  # assignment + piped body
+    'echo x | tg --tag question "pick A | B?"',              # real pipeline AND a piped body
+])
+def test_bare_body_with_quoted_operator_is_blocked(command, monkeypatch):
+    out, _, code = _run(command, monkeypatch)
+    msg = _assert_blocked(out, code)
+    assert "decision-request-discipline" in msg
+
+
 # The advisory message names the missing markers as a `missing <A>, <B> (of the three…` list,
 # then goes on to a static reminder. A test that just asserts `missing_label in msg` is vacuous
 # — "Context"/"Options"/"Recommendation" all appear somewhere in the static text regardless of
@@ -487,22 +506,18 @@ def test_unparseable_command_allows(monkeypatch):
     assert _decision(out) == "allow"
 
 
-# ── KNOWN BOUNDARY: a pipe/semicolon char INSIDE the quoted body ─────────────────────────
-# The command is split on raw `&&`/`;`/`|` before shlex-tokenizing each segment, so a body
-# that itself contains one of those chars inside quotes (`"use A | B"`) is torn mid-quote;
-# the resulting segment has an unbalanced quote, shlex raises, and the segment is skipped —
-# so no advisory fires. This is a false NEGATIVE only (the request still SENDS; the human
-# just doesn't get the rewrite nudge), never a false positive, and matches the hook's
-# advisory/fail-open posture. Documented here so the boundary is explicit, not silent. A full
-# quote-aware splitter would close it but is over-engineering for an advisory nudge.
+# ── CLOSED BOUNDARY: a pipe/semicolon char INSIDE the quoted body ────────────────────────
+# The command is now split QUOTE-AWARELY (`_split_top_level_segments`), so a separator inside a
+# quoted body (`"use A | B?"`) no longer tears the segment mid-quote. Once the #12 hard-block
+# exists, the old miss was not merely a lost advisory — a bare escalation that used a pipe to
+# separate the options slipped past the block entirely. These bare bodies now BLOCK like any
+# other bare escalation (Codex P2 on PR #281). The general fix is pinned by
+# `test_bare_body_with_quoted_operator_is_blocked`; this keeps the historical commands explicit.
 
 @pytest.mark.parametrize("command", [
     'tg --tag decision "should we use A | B?"',     # `|` inside the quoted body
     'tg --tag decision "do X; then Y?"',            # `;` inside the quoted body
 ])
-def test_separator_inside_quoted_body_is_a_known_miss(command, monkeypatch):
+def test_separator_inside_quoted_body_is_now_seen_and_blocked(command, monkeypatch):
     out, _, code = _run(command, monkeypatch)
-    assert code == 0
-    assert _decision(out) == "allow"
-    # The send is never blocked; the only effect of the boundary is a missed advisory.
-    assert _message(out) is None
+    _assert_blocked(out, code)
