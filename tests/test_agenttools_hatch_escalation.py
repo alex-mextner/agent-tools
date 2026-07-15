@@ -340,6 +340,7 @@ _AGENT_HOOKS_DIR = Path(__file__).resolve().parents[1] / "agent-hooks"
         _AGENT_HOOKS_DIR / "require-review-before-commit"
         / "require-review-before-commit.pre-bash.json",
         _AGENT_HOOKS_DIR / "decision-request-format" / "decision-request-format.pre-bash.json",
+        _AGENT_HOOKS_DIR / "worktree-only-writes" / "worktree-only-writes.pre-write.json",
     ],
 )
 def test_descriptor_timeout_strictly_exceeds_helper_worst_case(descriptor):
