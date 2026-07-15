@@ -7,8 +7,9 @@ Denies a shell command that merges a PR directly and bypasses the ship gate:
 - `gh pr merge <PR>` (squash/merge/rebase, any flags; `gh -R o/r pr merge` too)
 - `gh pr merge --admin <PR>` (the admin bypass is the most dangerous case)
 - `gh api …/pulls/<n>/merge` with a write method (`-X PUT` / `--method POST`) — the REST merge route
-- `gh api graphql` running a `mergePullRequest` / `enablePullRequestAutoMerge` mutation (inline, or
-  a file/stdin-backed query, which is over-blocked because it can't be inspected at pre-exec time)
+- `gh api graphql` running a `mergePullRequest` / `enablePullRequestAutoMerge` mutation (inline —
+  even with `$variables` — or a file/stdin/substitution-backed query, which is over-blocked because
+  it can't be inspected at pre-exec time)
 - any of the above behind a **wrapper** command (`env gh pr merge`, `sudo … gh pr merge`,
   `timeout 60 gh pr merge`, `nohup`, `command`, …) — the wrapped `gh` is still an invoked merge
 - any of the above wrapped in a **command substitution** — `` `gh pr merge 1` ``, `$(gh pr merge 1)`,
@@ -23,20 +24,25 @@ Lets the sanctioned merge path through:
 - `pr-ship.sh` / `ship.sh` (the script the ship alias points at)
 - any non-merge `gh pr` subcommand (`view`, `list`, `checkout`, `create`, `comment`, …)
 - a non-merge `gh api` call: a GET on `…/pulls/<n>/merge` (a merge-**status read**, no write method),
-  or an **inline** `gh api graphql` **read** query with no `$` (`-f query='query { … }'`, no merge
-  mutation). A query whose value contains any `$` — a GraphQL variable (`query($owner:…){…}`) OR a
-  shell expansion (`"$Q"`) — is over-blocked (see below): the two are indistinguishable once the
-  shell strips quotes, so the safe choice is to block both
+  or an **inline, single-quoted** `gh api graphql` non-merge query/mutation — **including one that
+  carries literal GraphQL `$variables`** (`-f query='mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){…}}'`).
+  The shell never expands a single-quoted `$t`, so the query GitHub receives is exactly the text the
+  hook read; the literal merge scan is authoritative. This is what lets an agent resolve its own
+  review threads (`resolveReviewThread` / `addPullRequestReviewThreadReply`) to satisfy `gh ship`'s
+  unresolved-threads gate
 - a **prose mention** of a merge route — in an argument, a commit message, or a heredoc body — where
   `gh` is not the command word (argv[0]) of a segment (`tg "…gh pr merge…"`, `echo mergePullRequest`)
 
 **Over-block on an uninspectable graphql query:** a `gh api graphql` whose `query` value comes from a
-file (`-F query=@f`), stdin, or contains ANY `$`/backtick is blocked, because the hook cannot prove
-at pre-exec time that it carries no merge mutation. A shell expansion (`-f query="$Q"`) is genuinely
-opaque; a GraphQL variable (`-f query='query($owner:String!){ … }'`) is over-blocked too, since once
-the shell strips quotes it is indistinguishable from `"$Q"`. To run such a query, inline it with no
-`$` (spell out the values), or use `gh ship` / the Telegram hatch below. A shell-expanded REST method
-(`-X $METHOD`) on a `…/merge` endpoint is over-blocked for the same reason.
+file (`-F query=@f`), stdin (`--input`), or carries a **shell-EXPANDABLE** `$`/backtick — one that is
+unquoted, double-quoted, or concatenated so the shell rewrites it at runtime (`-f query="$Q"`,
+`-f query="${Q}"`, `-f query="$(cat q)"`, `-f query="mutation{$OP}"`, `-f query='…'$OP'…'`) — is
+blocked, because a merge mutation could be spliced in past the literal scan. Quoting is read from the
+**raw** command (shlex strips it from the parsed tokens), so the concatenation form is caught even
+though it de-quotes to the same text as a literal query. A **single-quoted** query is inert and
+allowed even when it uses GraphQL `$variables` — to run one, keep it single-quoted (`-f query='…'`).
+A shell-expanded REST method (`-X $METHOD`) on a `…/merge` endpoint is over-blocked for the same
+reason.
 
 ## Shell-faithful command parsing
 

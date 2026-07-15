@@ -16,7 +16,9 @@ Requires bash + git. Run from the repo root::
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -4392,6 +4394,269 @@ def test_skip_ci_dry_run_with_blank_justification_still_refuses(repo_with_two_wo
     assert r.returncode != 0, f"blank justification must refuse even in dry-run\n{r.stdout}\n{r.stderr}"
     assert "APPROVED by Alex" not in r.stdout
     assert "[fake gh] merged" not in r.stdout
+
+
+# --- #268: auto-resolve addressed bot-nit review threads --------------------------------
+
+# A fake `gh` that also answers the auto-resolve path: the resolve-eligible query (routed by the
+# `isOutdated` field it selects) returns the thread ids the test declares; the resolveReviewThread
+# mutation logs each resolved id; and the unresolved-COUNT query returns the initial count minus the
+# number resolved so far — simulating GitHub reflecting the resolutions before the gate re-reads.
+_FAKE_GH_RESOLVE = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          # One GREEN check so the normal (non-admin) CI gate passes — --skip-ci is now hatch-gated.
+          printf '%s\\n' '[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI"}]'
+        else echo '[]'; fi ;;
+      diff) echo "src/a.py" ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged" ;;
+      *) : ;;
+    esac ;;
+  api)
+    argstr="$(printf '%s ' "$@")"
+    if printf '%s' "$argstr" | grep -q resolveReviewThread; then
+      [ -n "${SHIP_TEST_RESOLVE_FAIL:-}" ] && exit 1   # simulate the mutation failing
+      for a in "$@"; do case "$a" in id=*) printf '%s\\n' "${a#id=}" >> "${SHIP_TEST_RESOLVE_LOG}";; esac; done
+      echo '{}'
+    elif printf '%s' "$argstr" | grep -q isOutdated; then
+      [ -n "${SHIP_TEST_ELIGIBLE_IDS:-}" ] && printf '%s\\n' ${SHIP_TEST_ELIGIBLE_IDS}
+      :
+    elif printf '%s' "$argstr" | grep -q committedDate; then
+      printf '%s\\t%s\\t%s\\n' "${SHIP_TEST_CREATED:-2020-01-01T00:00:00Z}" "" "${SHIP_TEST_LASTCOMMIT:-2020-01-01T00:00:00Z}"
+    else
+      resolved=0
+      [ -f "${SHIP_TEST_RESOLVE_LOG:-/nonexistent}" ] && resolved=$(wc -l < "${SHIP_TEST_RESOLVE_LOG}" | tr -d ' ')
+      echo $(( ${SHIP_TEST_UNRESOLVED:-0} - resolved ))
+    fi ;;
+  *) : ;;
+esac
+"""
+
+
+def _fake_gh_resolve_dir(tmp_path: Path) -> Path:
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_RESOLVE, encoding="utf-8")
+    gh.chmod(0o755)
+    return bindir
+
+
+def _run_ship_resolve(main, bindir, *, extra_args=(), env_extra=None, cwd=None):
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    if env_extra:
+        env.update(env_extra)
+    return _sh(
+        # No --skip-ci (now a hatch-gated admin bypass): the fake gh returns a GREEN
+        # statusCheckRollup so the normal CI gate passes and ship does a normal merge.
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test", *extra_args,
+        cwd=cwd or main, env=env,
+    )
+
+
+def test_ship_resolves_addressed_bot_thread_then_merges(repo_with_two_worktrees, tmp_path):
+    """With --resolve-addressed-threads, ship resolves the eligible bot-nit thread itself and then
+    the unresolved-threads gate (which now reads 0) passes → the PR merges. This is the #268 fix:
+    an agent no longer has to hand-run the resolveReviewThread mutation to close its own bot nit."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_resolve_dir(tmp_path)
+    log = tmp_path / "resolve.log"
+    r = _run_ship_resolve(
+        main, bindir, extra_args=("--resolve-addressed-threads",),
+        env_extra={"SHIP_TEST_UNRESOLVED": "1", "SHIP_TEST_ELIGIBLE_IDS": "PRRT_bot1",
+                   "SHIP_TEST_RESOLVE_LOG": str(log)},
+    )
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "merged #1" in r.stdout, r.stdout
+    assert log.exists() and "PRRT_bot1" in log.read_text(encoding="utf-8"), "mutation not called"
+    assert "resolved addressed bot thread PRRT_bot1" in r.stdout, r.stdout
+
+
+# A CI-DOWN fake gh that ALSO answers the auto-resolve path. `_local_review_threads_check` (in the
+# CI-down local fallback) reads the reviewThreads count via `gh pr view --json reviewThreads`; that
+# count is `initial - resolved`, so once auto-resolve closes the eligible bot thread the local gate
+# reads 0 and passes. Proves auto-resolve now runs BEFORE the CI-down thread check (codex round 4).
+_FAKE_GH_CIDOWN_RESOLVE = """\
+#!/usr/bin/env bash
+set -e
+resolved_count() { [ -f "${SHIP_TEST_RESOLVE_LOG:-/nonexistent}" ] && wc -l < "${SHIP_TEST_RESOLVE_LOG}" | tr -d ' ' || echo 0; }
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          printf '[{"name":"pytest","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"codeql","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"}]'
+        elif printf '%s ' "$@" | grep -q reviewThreads; then
+          echo $(( ${SHIP_TEST_UNRESOLVED:-0} - $(resolved_count) ))
+        elif printf '%s ' "$@" | grep -q body; then
+          echo ""
+        else
+          echo '[]'
+        fi ;;
+      diff)
+        if printf '%s ' "$@" | grep -q -- --name-only; then printf 'src/a.py'; else printf '+ok'; fi ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged" ;;
+      *) : ;;
+    esac ;;
+  api)
+    argstr="$(printf '%s ' "$@")"
+    if printf '%s' "$argstr" | grep -q resolveReviewThread; then
+      for a in "$@"; do case "$a" in id=*) printf '%s\\n' "${a#id=}" >> "${SHIP_TEST_RESOLVE_LOG}";; esac; done
+      echo '{}'
+    elif printf '%s' "$argstr" | grep -q isOutdated; then
+      [ -n "${SHIP_TEST_ELIGIBLE_IDS:-}" ] && printf '%s\\n' ${SHIP_TEST_ELIGIBLE_IDS}
+      :
+    elif printf '%s' "$argstr" | grep -q reviewThreads; then
+      # unresolved-count query (the local CI-down check AND the main gate, both graphql now):
+      # initial minus resolved, so once auto-resolve closes the bot thread the count reads 0.
+      resolved=0
+      [ -f "${SHIP_TEST_RESOLVE_LOG:-/nonexistent}" ] && resolved=$(wc -l < "${SHIP_TEST_RESOLVE_LOG}" | tr -d ' ')
+      echo $(( ${SHIP_TEST_UNRESOLVED:-0} - resolved ))
+    else
+      echo 0
+    fi ;;
+  *) : ;;
+esac
+"""
+
+
+def test_ship_resolve_applies_on_ci_down_fallback_path(repo_with_pr_worktree, tmp_path):
+    """The CI-down local fallback runs its OWN review-threads check; auto-resolve must run before it
+    too (codex round 4). With CI structurally down and --resolve-addressed-threads, ship resolves the
+    eligible bot thread first, the local review-threads check then reads 0, and ship merges."""
+    main, _wt = repo_with_pr_worktree
+    bindir = tmp_path / "bincdr"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_CIDOWN_RESOLVE, encoding="utf-8")
+    gh.chmod(0o755)
+    log = tmp_path / "resolve.log"
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env.update({
+        "SHIP_TEST_CI_DOWN": "1", "SHIP_LOCAL_TEST_CMD": "true", "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_UNRESOLVED": "1", "SHIP_TEST_ELIGIBLE_IDS": "PRRT_bot1",
+        "SHIP_TEST_RESOLVE_LOG": str(log),
+    })
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", "--resolve-addressed-threads",
+            cwd=main, env=env)
+    assert r.returncode == 0, f"ship must merge on CI-down after resolve\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "resolved addressed bot thread PRRT_bot1" in r.stdout, r.stdout
+    assert "CI infrastructure appears structurally unavailable" in r.stderr, r.stderr
+    assert "merged #1" in r.stdout, r.stdout
+    assert log.exists() and "PRRT_bot1" in log.read_text(encoding="utf-8")
+
+
+def test_ship_resolve_flag_dry_run_does_not_mutate(repo_with_two_worktrees, tmp_path):
+    """--dry-run with --resolve-addressed-threads REPORTS what it would resolve but issues NO
+    resolveReviewThread mutation (the log stays empty)."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_resolve_dir(tmp_path)
+    log = tmp_path / "resolve.log"
+    r = _run_ship_resolve(
+        main, bindir, extra_args=("--resolve-addressed-threads", "--dry-run"),
+        env_extra={"SHIP_TEST_UNRESOLVED": "1", "SHIP_TEST_ELIGIBLE_IDS": "PRRT_bot1",
+                   "SHIP_TEST_RESOLVE_LOG": str(log)},
+    )
+    assert "would resolve addressed bot thread PRRT_bot1" in r.stdout, r.stdout
+    assert not log.exists(), "dry-run must not issue the resolve mutation"
+
+
+def test_ship_without_resolve_flag_still_blocks_unresolved(repo_with_two_worktrees, tmp_path):
+    """Without the flag, ship never auto-resolves — an unresolved thread still BLOCKS the merge
+    (opt-in preserved; the gate is unchanged for the default path)."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_resolve_dir(tmp_path)
+    log = tmp_path / "resolve.log"
+    r = _run_ship_resolve(
+        main, bindir,
+        env_extra={"SHIP_TEST_UNRESOLVED": "1", "SHIP_TEST_ELIGIBLE_IDS": "PRRT_bot1",
+                   "SHIP_TEST_RESOLVE_LOG": str(log)},
+    )
+    assert r.returncode != 0, f"expected refusal\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "unresolved review thread" in r.stderr, r.stderr
+    assert not log.exists(), "resolve must not run without the flag"
+
+
+def test_ship_resolve_mutation_failure_leaves_thread_for_gate(repo_with_two_worktrees, tmp_path):
+    """If the resolveReviewThread mutation FAILS, ship must not swallow it: it reports the failure
+    and the unchanged unresolved count still BLOCKS the merge (fail-safe, not fail-open)."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_resolve_dir(tmp_path)
+    log = tmp_path / "resolve.log"
+    r = _run_ship_resolve(
+        main, bindir, extra_args=("--resolve-addressed-threads",),
+        env_extra={"SHIP_TEST_UNRESOLVED": "1", "SHIP_TEST_ELIGIBLE_IDS": "PRRT_bot1",
+                   "SHIP_TEST_RESOLVE_LOG": str(log), "SHIP_TEST_RESOLVE_FAIL": "1"},
+    )
+    assert r.returncode != 0, f"a failed resolve must not let the merge through\n{r.stdout}\n{r.stderr}"
+    assert "FAILED to resolve PRRT_bot1" in r.stderr, r.stderr
+    assert "unresolved review thread" in r.stderr, r.stderr
+    assert not log.exists(), "the failed mutation must not have logged a resolution"
+
+
+def _extract_resolve_eligible_jq() -> str:
+    text = _SHIP.read_text(encoding="utf-8")
+    m = re.search(r"RESOLVE_ELIGIBLE_JQ='(.*?)'", text, re.DOTALL)
+    assert m, "RESOLVE_ELIGIBLE_JQ not found in ship.sh"
+    return m.group(1)
+
+
+@pytest.mark.skipif(not shutil.which("jq"), reason="jq required for the eligibility-jq test")
+def test_resolve_eligible_jq_selects_only_addressed_bot_threads():
+    """Exercise the REAL eligibility jq (extracted from ship.sh) against crafted thread data: only an
+    unresolved + outdated + commented + all-bot thread is selected. A human comment (even mixed with
+    a bot), a still-current (not outdated) thread, an already-resolved thread, and a comment-less
+    thread are all excluded — so ship never silently closes an unaddressed or human review thread."""
+    prog = _extract_resolve_eligible_jq()
+
+    def thread(tid, *, resolved, outdated, logins, total=None):
+        nodes = [{"author": None if lg is None else {"login": lg}} for lg in logins]
+        return {"id": tid, "isResolved": resolved, "isOutdated": outdated,
+                "comments": {"totalCount": len(nodes) if total is None else total, "nodes": nodes}}
+
+    payload = {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [
+        thread("BOT_OUTDATED", resolved=False, outdated=True,
+               logins=["chatgpt-codex-connector", "some-app[bot]"]),
+        thread("BOT_CURRENT", resolved=False, outdated=False, logins=["some-app[bot]"]),
+        thread("HUMAN_OUTDATED", resolved=False, outdated=True, logins=["alex"]),
+        thread("MIXED_OUTDATED", resolved=False, outdated=True, logins=["some-app[bot]", "alex"]),
+        thread("BOT_RESOLVED", resolved=True, outdated=True, logins=["some-app[bot]"]),
+        thread("BOT_NOCOMMENTS", resolved=False, outdated=True, logins=[]),
+        # >100 comments: only the first page fetched, a human could hide beyond it → fail closed.
+        thread("BOT_TRUNCATED", resolved=False, outdated=True, logins=["some-app[bot]"], total=150),
+        # a deleted/ghost author (login null) must not crash jq and must make the thread ineligible.
+        thread("BOT_NULLAUTHOR", resolved=False, outdated=True, logins=[None]),
+        # a null totalCount (can't prove no human hides beyond the page) → fail closed.
+        {"id": "BOT_NULLTOTAL", "isResolved": False, "isOutdated": True,
+         "comments": {"totalCount": None, "nodes": [{"author": {"login": "some-app[bot]"}}]}},
+    ]}}}}}
+    r = subprocess.run(["jq", "-r", prog], input=json.dumps(payload), capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    selected = [line for line in r.stdout.splitlines() if line.strip()]
+    assert selected == ["BOT_OUTDATED"], selected
 
 
 if __name__ == "__main__":
