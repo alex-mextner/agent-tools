@@ -50,7 +50,7 @@ in the right place and it becomes a catalog item** — that is the whole registr
 
 | Carrier | Convention | What a new directory must contain |
 | --- | --- | --- |
-| Skill | `skills/universal/<name>/SKILL.md` or `skills/by-type/<group>/<name>/SKILL.md` | one `SKILL.md` with `name` + `description` frontmatter (the trigger), the portable rule, rationale, a generic example |
+| Skill | `skills/universal/<name>/SKILL.md`, `skills/by-type/<group>/<name>/SKILL.md`, or `skills/by-stack/<l1>/<lang>[/<framework>]/<name>/SKILL.md` | one `SKILL.md` with `name` + `description` frontmatter (the trigger), the portable rule, rationale, a generic example |
 | Agent-hook | `agent-hooks/<name>/` | a `<id>.<point>.json` descriptor + the executable it points at + `README.md` |
 | CI gate | `ci/<slot>/` | a `README.md` + either a `workflow.yml` (most slots) or a shell script (a client-side gate like `ci/ship/ship.sh`, which is a merge command, not a GitHub workflow) |
 | Git-hook | `git-hooks/<hook>` (`pre-commit`, `commit-msg`, `pre-push`, `no-secrets-scan`, `lefthook.yml`, `global-dispatcher/`) | the copyable hook script |
@@ -61,6 +61,17 @@ The `<group>` axis for by-type skills is fixed:
 `bot`, `backend`, `frontend`, `cli`, `library`, `infra`, `monorepo`. A skill that applies to
 *every* project goes in `universal/`; one scoped to a project shape goes under its `by-type/`
 group.
+
+The **third axis is `by-stack/`** — the stack-preset curation axis. Its path IS the stack
+path: `by-stack/<l1>/<lang>[/<framework>]/<name>/SKILL.md` (minimum depth `<l1>/<lang>`; a
+skill placed directly under `<l1>` with no `<lang>` is ignored). A repo declares a stack (e.g.
+`mobile/swift/swiftui`) and inherits every by-stack skill whose stack path is a **prefix** of
+it — so a lang-level skill at `frontend/ts/` is inherited by every `frontend/ts/*` stack, and a
+framework-level skill at `frontend/ts/react/` only by React repos. Place a skill at the *shallowest*
+prefix that honestly applies, and keep its `description` scope no broader than that prefix (a skill
+under `frontend/ts` must not claim to cover backend TS — a `backend/ts` stack never inherits it).
+`by-type/` and `by-stack/` are complementary: `by-type` selects by project *shape*, `by-stack`
+by declared tech *stack*.
 
 **Non-obvious:** because discovery is by location, the catalog grows with **no code change in
 `rig`**. You add a directory here, the consumer re-runs `rig apply` in their repo, and the new

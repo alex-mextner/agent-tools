@@ -1,6 +1,6 @@
 ---
 name: swift-concurrency
-description: Use when writing Swift async/await, actors, tasks, or dealing with data-race safety and Sendable — structuring concurrent work, isolating shared mutable state, and avoiding priority inversion / detached-task leaks. Triggers on async/await, Task, actor, @MainActor, Sendable, or a Swift concurrency data-race warning. Applies to any Swift stack (lang-level), not just SwiftUI.
+description: Use when writing Swift async/await, actors, tasks, or dealing with data-race safety and Sendable — structuring concurrent work, isolating shared mutable state, and avoiding priority inversion / detached-task leaks. Triggers on async/await, Task, actor, @MainActor, Sendable, or a Swift concurrency data-race warning. Applies to any mobile Swift stack (lang-level at `mobile/swift`), not just SwiftUI.
 ---
 
 # Swift structured concurrency

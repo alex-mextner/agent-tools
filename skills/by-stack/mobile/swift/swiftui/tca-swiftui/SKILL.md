@@ -22,7 +22,7 @@ and composition; it is heavier than plain MVVM, so use it deliberately, not by d
 
 ```swift
 @Reducer
-struct Profile {
+struct ProfileFeature {          // name the reducer distinctly from the `Profile` model
     @ObservableState
     struct State: Equatable { var profile: Profile?; var isLoading = false }
 

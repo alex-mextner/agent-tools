@@ -1,6 +1,6 @@
 ---
 name: ts-strictness
-description: Use when writing or configuring TypeScript — turning on strict compiler flags, modeling types precisely, and avoiding escape hatches (any / as / non-null !). Triggers on tsconfig strictness, a type error you're tempted to cast away, unions/discriminated unions, or "how do I type this". Applies to any TypeScript stack (lang-level), frontend or backend.
+description: Use when writing or configuring TypeScript — turning on strict compiler flags, modeling types precisely, and avoiding escape hatches (any / as / non-null !). Triggers on tsconfig strictness, a type error you're tempted to cast away, unions/discriminated unions, or "how do I type this". Applies to any TypeScript frontend stack (lang-level at `frontend/ts`), not just React.
 ---
 
 # TypeScript: keep the type checker honest
