@@ -1,6 +1,6 @@
 ---
 name: decision-request-discipline
-description: Use before escalating any product or architecture decision to a human (the project owner / CTO) — any "should we A or B", "open the PR or drop it", "which approach", or any mention of an open PR awaiting review. Brainstorm across models first and only escalate on genuine model disagreement or an irreversible high-blast-radius call; never relabel a product feature as a "risk/vuln/hazard"; and when you do escalate, send it to the human's channel in the strict question format so the decision takes 30 seconds without reading code.
+description: Use before escalating any product or architecture decision to a human (the project owner / CTO) — any "should we A or B", "open the PR or drop it", "which approach", or any mention of an open PR awaiting review. ALSO fires the moment a code review raises findings on a PR and you're deciding whether to ship, hold, or fold them in: that routing has a FIXED standing answer (fix findings on the PR's own changed scope IN the PR; for off-scope findings file a follow-up PR/ticket immediately and ship) — so it is NOT escalated. Brainstorm across models first and only escalate on genuine model disagreement or an irreversible high-blast-radius call; never relabel a product feature as a "risk/vuln/hazard"; and when you do escalate, send it to the human's channel in the strict question format so the decision takes 30 seconds without reading code.
 ---
 
 # Decide what you can; escalate only what you can't — and only in the strict format
@@ -32,6 +32,36 @@ Escalate **only** product/architecture decisions that are **not derivable from t
 - **The open-PR trigger.** Any mention of an open PR in the human's channel or the chat —
   even "waiting for review" in a status report — counts as a decision request and runs this
   protocol. A PR sitting open *is* a "merge or not" question; treat it as one.
+
+## Decisions you must NOT escalate — the fixed-approach ones
+
+Some "decisions" have a **fixed, standing answer** — the approach is already settled, so
+there is nothing to escalate. Applying the rule IS the decision; forwarding it upward is the
+violation. The canonical example is **where to fix code-review findings on a PR.**
+
+**When a code review raises findings on a PR, WHERE to fix them is always decided the same
+way — it is NEVER escalated to the human:**
+
+- **Finding on this PR's own changed scope** (a defect in the lines / files this PR actually
+  touches) → **fix it in this PR before merge.** This is the ONLY kind of finding that blocks
+  the merge, and you fix it — you do not ask.
+- **Finding NOT on this PR's scope** (a pre-existing issue, adjacent code, a different file, a
+  larger refactor the review noticed in passing) → **address it NOW by creating a follow-up
+  PR/ticket immediately**, with the finding written as that ticket's acceptance criteria and
+  linked from the shipping PR. Then **this PR ships.** "Now" means at ship time — not a vague
+  "someday", not a mental note. An off-scope finding never blocks the merge.
+- Therefore **do NOT escalate "ship now vs hold vs fold it in" to the human.** Apply the rule
+  and proceed autonomously.
+
+This **supersedes** any blanket "never ship past a P1 without human sign-off" — but only for
+findings that are **not on the PR's own scope**: an unrelated P1 → follow-up ticket + ship,
+it does not block. Only a finding **on the PR's directly-changed scope** blocks the merge —
+and that one you **fix**, you don't escalate. Severity (P1 / P2 / P3) sets the follow-up's
+priority, not whether to escalate.
+
+The general shape: **if a class of decision already has a written standing rule, the rule is
+the answer** — decide by applying it, don't hand it up. Escalate only the genuinely-open
+calls (below), never the ones already settled here.
 
 ## Self-check before ANY question — derive, don't ask
 
@@ -178,6 +208,8 @@ A PR-or-drop request must state:
 - **Citing a spec section without quoting it.** "Per §9.3, X applies" makes the human choose
   between trusting your summary or going to read the spec themselves — either way the
   escalation failed its one job. Paste the literal sentence(s) from the section, every time.
+- **Escalating "ship or hold" over review findings.** That routing is settled (fix on-scope
+  findings in the PR; off-scope → follow-up ticket + ship). Apply the fixed rule, don't ask.
 
 ## Why
 
