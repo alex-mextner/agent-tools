@@ -90,6 +90,53 @@ test("env VAR=val prefix does not hide the real argv0", () => {
 	assert.equal(decide("env FOO=1 BAR=2 git push --force"), "deny");
 });
 
+test("bare inline VAR=val assignments do not hide the real argv0", () => {
+	assert.equal(decide("FOO=1 git push --force"), "deny");
+	assert.equal(decide("FOO=1 BAR=2 git push -f"), "deny");
+	assert.equal(decide("FOO=1 env BAR=2 git push --force"), "deny");
+});
+
+test("env option flags do not hide the real argv0", () => {
+	assert.equal(decide("env -i git push --force"), "deny");
+	assert.equal(decide("env -C /tmp git push --force"), "deny");
+	assert.equal(decide("env -u NAME git push -f"), "deny");
+	assert.equal(decide("env -- git push --force"), "deny");
+	assert.equal(decide("env -i FOO=1 git push --force"), "deny");
+	// -S/--split-string's argument IS the command — it must stay visible as argv0, not be skipped
+	assert.equal(decide("env -S git push --force"), "deny");
+	// long options + short-flag clusters that take a separate argument
+	assert.equal(decide("env --unset FOO git push --force"), "deny");
+	assert.equal(decide("env --chdir /tmp git push --force"), "deny");
+	assert.equal(decide("env --unset=FOO git push --force"), "deny");
+	assert.equal(decide("env -iu NAME git push --force"), "deny");
+	// optional-arg signal options only accept an ATTACHED value — a separate token is the command,
+	// so it must NOT be swallowed (would otherwise be a deny bypass)
+	assert.equal(decide("env --block-signal git push --force"), "deny");
+	assert.equal(decide("env --ignore-signal git push --force"), "deny");
+	assert.equal(decide("env --block-signal=INT git push --force"), "deny");
+	// short-cluster getopt: an ATTACHED arg (`-uC` = `-u C`, `-uNAME`) must NOT swallow the command
+	assert.equal(decide("env -uC git push --force"), "deny");
+	assert.equal(decide("env -uNAME git push --force"), "deny");
+	assert.equal(decide("env -iS git push --force"), "deny");
+});
+
+test("a `&` inside a redirection is not a clause separator (trailing flag still seen)", () => {
+	assert.equal(decide("git push origin 2>&1 --force"), "deny");
+	assert.equal(decide("git push --force >/dev/null 2>&1"), "deny");
+	assert.equal(decide("git push origin &>log --force"), "deny");
+});
+
+test("a guarded flag glued to a redirect is still matched (redirect metachars are token boundaries)", () => {
+	assert.equal(decide("git push --force&>out"), "deny");
+	assert.equal(decide("git push --force>out"), "deny");
+	assert.equal(decide("git push --force&>>out"), "deny");
+});
+
+test("a trailing CR (CRLF input) does not defeat exact-token flag matching", () => {
+	assert.equal(decide("git push --force\r"), "deny");
+	assert.equal(decide("git push --force\r\n"), "deny");
+});
+
 test("empty / whitespace command is allowed (nothing to guard)", () => {
 	assert.equal(decide(""), "allow");
 	assert.equal(decide("   "), "allow");

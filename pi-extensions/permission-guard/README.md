@@ -75,8 +75,20 @@ The baseline mirrors the argv-level intent of the rig agent-hooks and the claude
 rules. It is kept in **SYNC** with rig's `riglib/permissions.py` (`PI_DENY_RULES` / `PI_ASK_RULES`),
 which is what rig serializes into the policy file.
 
+## Scope / limitations
+
+This is a **lightweight argv matcher for the commands an agent actually emits**, not a hardened
+sandbox against a determined adversary. It resolves argv0 through the common wrapper forms
+(`VAR=val …`, `env VAR=val …`, `env -i/-C/-u/--unset/--chdir/-iu … cmd`) and evaluates each clause
+of a `&&`/`||`/`|`/`;` chain, but by design it does **not** defeat deliberate obfuscation:
+`sh -c '…'`, command substitution `$(…)`, a quoted `env -S "git push --force"`, combined
+short-flag bundling (`git push -fq`), or a **leading** redirection before the command
+(`>/dev/null git push --force`, where the redirect target becomes the apparent argv0). Those stay
+out of scope here exactly as they do for the argv-level agent-hooks and the claude-code prefix
+rules — which remain the deep enforcement layer underneath. For a hard boundary, containerize pi.
+
 ## Test
 
 ```bash
-npm test   # tsx --test policy.test.ts — pure matcher unit tests, no pi runtime needed
+npm test   # tsx --test — pure matcher tests (policy.test.ts) + handler wiring tests (index.test.ts)
 ```

@@ -156,7 +156,10 @@ export function splitSubCommands(command: string): string[] {
 			cur += ch;
 			continue;
 		}
-		if (ch === "\n" || ch === ";" || ch === "|" || ch === "&") {
+		// a bare `&` that is part of a redirection (`2>&1`, `&>file`) is NOT a clause separator —
+		// splitting there would strand a trailing guarded flag in a clause with the wrong argv0.
+		const isRedirectAmp = ch === "&" && (cur.trimEnd().endsWith(">") || next === ">");
+		if ((ch === "\n" || ch === ";" || ch === "|" || ch === "&") && !isRedirectAmp) {
 			// consume a paired operator (&&, ||) as one separator
 			if ((ch === "&" && next === "&") || (ch === "|" && next === "|")) i++;
 			parts.push(cur);
@@ -191,7 +194,13 @@ export function tokenize(sub: string): string[] {
 			started = true;
 			continue;
 		}
-		if (ch === " " || ch === "\t") {
+		// Unquoted redirection metachars (`>`, `<`, `&`) are token boundaries, not part of a command
+		// name or flag: bash tokenizes `--force&>out` / `--force>out` into `--force` + the redirect,
+		// so a guarded flag glued to a redirect must NOT weld into one non-matching token (that would
+		// be a deny bypass). Quoted occurrences are preserved by the quote branch above.
+		// Treat CR as whitespace too: a trailing `\r` (CRLF input) glued to a token defeats
+		// exact-token flag matching (`--force\r` !== `--force`).
+		if (ch === " " || ch === "\t" || ch === "\r" || ch === ">" || ch === "<" || ch === "&") {
 			if (started) {
 				tokens.push(cur);
 				cur = "";
@@ -211,12 +220,79 @@ function basename(token: string): string {
 	return slash === -1 ? token : token.slice(slash + 1);
 }
 
-/** Skip leading `env VAR=val` prefixes so `env FOO=1 git push --force` still resolves argv0=git. */
+/**
+ * Skip leading environment-assignment prefixes so the real argv0 is resolved. Handles both the
+ * bare inline form (`FOO=1 git push --force`) and an explicit `env` runner (`env FOO=1 git …`,
+ * `FOO=1 env BAR=2 git …`) — otherwise argv0 would be `FOO=1` / `env` and a guarded command would
+ * slip past. (Full wrapper/substitution evasion — `sh -c '…'`, `$(…)` — is out of scope for a
+ * lightweight matcher, exactly as it is for the argv-level agent-hooks and the prefix rules.)
+ */
+const _ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+// GNU env long options that take a REQUIRED separate-token argument which is NOT the command (so
+// the arg must be skipped past). Only --unset/--chdir qualify: their arg is mandatory, so the
+// separate-token form is valid. Deliberately EXCLUDED:
+//   - --split-string: its argument IS the command (must stay visible as argv0);
+//   - --block-signal/--default-signal/--ignore-signal: OPTIONAL args, so getopt_long only accepts
+//     the attached `--opt=SIG` form (handled by the `--opt=value` branch) — a separate token is
+//     NEVER the value, so skipping it would swallow the real command → a deny bypass.
+const _ENV_LONG_ARG_OPTS = new Set(["--unset", "--chdir"]);
+
+/**
+ * getopt semantics for a GNU `env` short-flag cluster (the chars after the leading `-`): does the
+ * option consume the NEXT token as its argument? env's arg-taking short options are `-u` (unset)
+ * and `-C` (chdir); `-S` (split-string) is special — its value is the COMMAND, never a skippable
+ * arg. Scanning left→right for the first such letter:
+ *   -u / -iu      → arg letter is LAST in the cluster → argument is a SEPARATE token → true
+ *   -uC / -uNAME  → arg letter is NOT last → argument is ATTACHED (rest of this token) → false
+ *   -S / -iS      → split-string → arg is the command → false (leave the next token visible)
+ *   -i / -0 / -v  → no arg-taking letter → false
+ */
+function _shortClusterTakesSeparateArg(cluster: string): boolean {
+	for (let k = 0; k < cluster.length; k++) {
+		const c = cluster[k];
+		if (c === "S") return false; // split-string: its argument is the command
+		if (c === "u" || c === "C") return k === cluster.length - 1; // separate iff nothing attached
+	}
+	return false;
+}
+
 function stripEnvPrefix(tokens: string[]): string[] {
 	let i = 0;
+	while (tokens[i] && _ASSIGN_RE.test(tokens[i])) i++;
 	if (tokens[i] && basename(tokens[i]) === "env") {
 		i++;
-		while (tokens[i] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
+		// Consume env's own options + assignments so argv0 resolves to the real binary, not a flag:
+		// `env -i git …`, `env -C dir git …`, `env -u NAME git …`, `env --unset NAME git …`,
+		// `env -iu NAME git …`, `env -- git …`. This is best-effort argv0 recovery for the COMMON
+		// `env` forms an agent emits — NOT a hardened sandbox. Exotic obfuscation (`env -S "git …"`
+		// as one quoted string, `sh -c '…'`, `$(…)`) stays out of scope, exactly as it is for the
+		// argv-level agent-hooks and the claude-code prefix rules (the deep layer underneath).
+		while (tokens[i]) {
+			const t = tokens[i];
+			if (_ASSIGN_RE.test(t)) {
+				i++;
+				continue;
+			}
+			if (t === "--") {
+				i++;
+				break;
+			}
+			if (t.startsWith("--")) {
+				i++;
+				// `--opt=value` is self-contained; `--opt value` skips the separate value for the
+				// arg-taking long opts. --split-string's value IS the command → never skip it.
+				if (_ENV_LONG_ARG_OPTS.has(t) && tokens[i] !== undefined) i++;
+				continue;
+			}
+			if (t.length > 1 && t.startsWith("-")) {
+				i++;
+				// Short-flag cluster: apply getopt semantics to decide whether the NEXT token is
+				// this option's argument (and so not the command). See _shortClusterTakesSeparateArg.
+				if (_shortClusterTakesSeparateArg(t.slice(1)) && tokens[i] !== undefined) i++;
+				continue;
+			}
+			break;
+		}
 	}
 	return tokens.slice(i);
 }
