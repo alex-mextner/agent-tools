@@ -206,10 +206,23 @@ def test_cli_delegate_runs_rig(tmp_path, monkeypatch):
     assert "apply --yes" in log.read_text()
 
 
+# rig's own public exit-code contract (riglib/errors.py): 0-8 are semantic failure
+# classes (3 == EXIT_DRIFT), 127 == EXIT_MISSING_DEP. The NO_RIG sentinel MUST avoid every
+# one of them, else a shell caller cannot tell "rig absent" from a real rig exit — e.g. a
+# `rig apply` that exits 3 for config↔disk drift would be misread as "no rig" and would
+# wrongly run the direct hook writer, re-introducing the double-write this helper prevents.
+RIG_EXIT_CODES = frozenset({0, 1, 2, 3, 4, 5, 6, 7, 8, 127})
+
+
+def test_no_rig_exit_does_not_collide_with_rig_contract():
+    assert rd.NO_RIG_EXIT not in RIG_EXIT_CODES
+
+
 def test_cli_delegate_sentinel_when_absent(tmp_path, monkeypatch):
     env = _cli_env(monkeypatch, extra_path=str(tmp_path / "empty"), home=str(tmp_path / "home"))
     r = _run_cli(["delegate", "apply"], env)
-    assert r.returncode == 3  # NO_RIG_EXIT sentinel -> caller runs its own fallback
+    assert r.returncode == rd.NO_RIG_EXIT  # sentinel -> caller runs its own fallback
+    assert r.returncode not in RIG_EXIT_CODES  # never confusable with a real rig exit
 
 
 def test_cli_delegate_surfaces_rig_code(tmp_path, monkeypatch):

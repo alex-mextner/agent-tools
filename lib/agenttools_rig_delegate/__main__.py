@@ -11,20 +11,18 @@ Usage
 
     python3 -m agenttools_rig_delegate delegate [RIG_ARG ...]
         Run ``rig <RIG_ARG ...>`` and exit with rig's own exit code. If rig is absent,
-        exit with the sentinel code 3 (distinct from rig's 0/1/2) so the caller knows to
-        run its own fallback installer rather than treat it as a rig failure.
+        exit with the sentinel code ``NO_RIG_EXIT`` (97 — clear of rig's whole 0-8/127
+        exit contract) so the caller knows to run its own fallback installer rather than
+        treat it as a rig failure.
 """
 
 from __future__ import annotations
 
 import sys
 
+from . import NO_RIG_EXIT  # noqa: F401 - re-exported for callers that import the CLI mirror
 from . import delegate as _delegate
 from . import find_rig
-
-# Exit code returned by ``delegate`` when rig is absent, so a shell caller can branch to
-# its own fallback. Distinct from rig's typical 0/1/2 and from shell's 127.
-NO_RIG_EXIT = 3
 
 
 def main(argv: list[str] | None = None) -> int:
