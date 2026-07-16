@@ -177,6 +177,41 @@ mark resolved ones closed; don't re-list them as open.
 
 **More context is better than a question that can't be answered without opening the repo.**
 
+### Machine-enforced by `tg` — send it as a STRUCTURED Rich Message
+
+This is not a style suggestion any more: `tg --tag decision` and `tg --tag question` are
+**deny-by-default** — `tg` BLOCKS the send (exit 1) and lists what's missing unless the body
+carries the format above. It requires all of:
+
+- **Options as a real `<table>`** (or a `<ul>`/`<ol>` list) with **pros/cons per option** —
+  never a bare "which one?". A markdown pipe grid (`| Option | Pros | Cons |`) is
+  auto-converted by `tg` to a real Telegram `<table>`, so it renders (it used to arrive as
+  broken plain text).
+- **Recommendation**, **Context** (a `file:line` + one line on what it does), and a
+  **"where to look" `file:line`**.
+- **STRUCTURE (readability)** — the reason an 8-point message can still be rejected: it must
+  be a scannable Rich Message, **not a wall of text**. Each section under its own
+  `<h3>`/`<h4>` heading; enumerations as short one-line `<ul>`/`<li>` items (**never** an
+  inline comma-run like "плюсы: a, b, c"); `<hr>` dividers between sections; short lines.
+  Send it with `--format html`.
+
+Copy-pasteable good shape (see `tg help format` for the full GOOD-vs-BAD example):
+
+```
+tg --tag decision --format html '<h3>Context</h3><p>features/foo.ts:42 does X.</p><hr>
+<h3>Options</h3><table><tr><th>Option</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>A</td><td>fast</td><td>risky</td></tr>
+<tr><td>B</td><td>safe</td><td>slow</td></tr></table><hr>
+<h3>Recommendation</h3><ul><li>A — faster, risk contained</li></ul><hr>
+<h4>Where to look</h4><ul><li>features/foo.ts:42</li></ul>'
+```
+
+The ONE documented escape, for a genuine non-escalation / urgent edge case, is
+`ESCALATION_GATE_ENFORCE=0` (downgrades the hard block to an advisory warning). Don't reach
+for it to skip writing the format — it exists for the rare case the format genuinely doesn't
+fit. The enforcement is a `tg` code default (ships with the binary, provisioned/kept current
+by `rig`), so it cannot silently regress to unenforced.
+
 ## Showing a child-repo diff: formatted Telegram text, NEVER a raw `.patch`
 
 The hard case is a change **not in the main repo** the human reviews locally, but in a
