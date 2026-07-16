@@ -1,43 +1,47 @@
 #!/usr/bin/env python3
-"""agents-hooks/v1 pre-bash hook — advisory self-check on a decision request.
+"""agents-hooks/v1 pre-bash hook — send-time escalation-format gate.
 
-When the agent sends a decision request to the human's out-of-band channel — a
-``tg --tag decision …`` invocation — this inspects the message body for the structural
-markers the `decision-request-discipline` skill's mandatory self-check requires (Context,
-Options, Recommendation). If any are missing, it emits an **exit-0 ADVISORY** naming what's
-absent, so the agent can rewrite before the human gets a bare "A or B?".
+When the agent escalates to the human's out-of-band channel — a ``tg --tag decision`` /
+``--tag problem`` / ``--tag question`` invocation — this inspects the message body for the
+structural markers the `decision-request-discipline` skill requires (Context, Options / pros-cons
+table, Recommendation). All three tags are the same escalation shape, so the check applies to
+each — an agent picking ``problem`` or ``question`` instead of ``decision`` no longer skips it
+(agent-tools#213/#12).
 
-It is deliberately **advisory, never a block.** A malformed decision request must stay
-sendable — the human would rather receive an imperfect escalation than have the send wedged
-by a heuristic. So this NEVER returns exit 10; it reminds (allow + message) and lets the
-send proceed. The deterministic value it adds over the skill alone: it fires at *send time*,
-the exact moment the self-check is supposed to run but gets skipped under load — the one
-moment a skill can't.
+Graduated, deliberately lenient verdict (Alex: hard-block a bare question, but a false positive
+would wedge his ONLY comms channel to his agents, so err HARD toward passing):
+
+  - COMPLETE body (all three markers)                 → silent allow (exit 0)
+  - PARTIAL body (some structure, some missing)        → allow + an exit-0 advisory nudge
+  - genuinely BARE body — a bare "A or B?" with NO
+    table and NONE of the three markers               → **BLOCK (exit 10)**, the send does not
+    run; the message shows the exact skeleton to re-send. A justified
+    ``RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT`` hatch still forces it through.
+
+ONLY the bare case blocks. A message that carries a pros/cons table (markdown OR HTML) — or any
+one of Context / Options / Recommendation — is never blocked. Table detection is generous on
+purpose: over-detecting only lets a message THROUGH.
 
 Matching is by proper parsing, not raw-string search: the command is split into ``&&``/
 ``;``/``|`` segments, leading no-op wrappers (``env``, ``timeout``, ``nice``, …) are peeled,
 and each segment is shlex-tokenized so a ``tg`` substring in a path or another flag's value
-never trips it — only an actual ``tg`` command carrying ``--tag decision`` does.
+never trips it — only an actual ``tg`` command carrying an escalation ``--tag`` does.
 
-NOT subagent-exempt: the self-check binds every agent, including the subagent that (per the
-skill) drafts the request. A subagent posting a malformed decision request is exactly what
-this catches.
+NOT subagent-exempt: the check binds every agent, including the subagent that (per the skill)
+drafts the request.
 
-External silence (replaces the OLD self-service escape hatch): there is NO
-``ALLOW_RAW_DECISION_REQUEST`` env or ``# decision-request-ok:`` inline sentinel any more — an
-agent could set either on its own command, so those merely silenced the nag by self-grant. A
-one-time silence is now requested by setting
+Escape (replaces the OLD self-service hatch): there is NO ``ALLOW_RAW_DECISION_REQUEST`` env or
+``# decision-request-ok:`` inline sentinel any more — an agent could set either on its own
+command. A one-time force-through of a bare body is requested by setting
 ``RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT="<written justification>"``, which routes a single
-approval request to the human via Telegram (deny-by-default; a bare ``1`` is rejected). On an
-approved request the advisory is silenced; otherwise it is shown. This never changes the
-exit-0/allow contract — it only decides whether the advisory prints.
+approval to the human via Telegram (deny-by-default; a bare ``1`` is rejected).
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; the shell command is in args.command
-  stdout : protocol JSON only       exit 0 : allow (always)   exit 10 : BLOCK (never used)
+  stdout : protocol JSON only       exit 0 : allow   exit 10 : BLOCK (bare body only)
 
-on_error is "open": a crash here must never wedge the ability to send a message — this is a
-formatting reminder, not a boundary.
+on_error is "open": a crash here must never wedge the ability to send a message. EVERY error
+path allows; the only hard stop is the deliberate, narrow bare-body block.
 """
 
 from __future__ import annotations
@@ -93,6 +97,7 @@ def _load_hatch_escalation():
 hatch_escalation = _load_hatch_escalation()
 
 HOOK_API = "agents-hooks/v1"
+BLOCK_EXIT_CODE = 10
 
 # Cheap pre-filter: a `tg` token appears at all (word-boundary). It deliberately does NOT
 # anchor at a command start — a wrapped `timeout 30 tg …` has `tg` mid-line, and the
@@ -126,6 +131,35 @@ _MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("Options", re.compile(r"\boptions?\b|\bvariants?\b|\bpros?\b|\bcons?\b|\btrade-?offs?\b", re.I)),
     ("Recommendation", re.compile(r"\brecommend|\bi suggest\b|\bi'd (?:go|pick)\b|\bproposal\b", re.I)),
 )
+
+# The escalation-shaped `tg` tags this hook inspects. All three route a message to the human's
+# out-of-band channel expecting a structured escalation (context + pros/cons + a recommendation),
+# per the decision-request-discipline skill — so the same self-check applies to each. `decision`
+# was the original tag; `problem` and `question` are the same escalation shape and were added so
+# the self-check is not silently skipped just because the agent picked a different tag word.
+# (agent-tools#213/#12.)
+_ESCALATION_TAGS = frozenset({"decision", "problem", "question"})
+
+# A pros/cons TABLE — markdown or HTML — is the strongest signal of a real, structured escalation
+# and must ALWAYS let the message through (a false block of the human's only comms channel is far
+# worse than a false pass). Detection is deliberately GENEROUS: over-detecting a table only makes
+# the gate PASS more, which is the safe direction. Any of:
+#   - an HTML `<table…>` open tag,
+#   - a markdown delimiter row (`|---|---|`, `| :--: |`), the canonical table separator,
+#   - two or more lines that each carry >=2 unescaped `|` (a piped grid).
+_HTML_TABLE = re.compile(r"<table[\s/>]", re.I)
+_MD_TABLE_DELIM = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$", re.M)
+_MD_TABLE_ROW = re.compile(r"^[^\n|]*\|[^\n|]*\|", re.M)
+
+
+def _has_table(body: str) -> bool:
+    """Whether the body carries a pros/cons table (markdown or HTML). Generous by design: a false
+    positive here only lets a message THROUGH, never blocks one."""
+    if _HTML_TABLE.search(body):
+        return True
+    if _MD_TABLE_DELIM.search(body):
+        return True
+    return len(_MD_TABLE_ROW.findall(body)) >= 2
 
 
 def emit(decision: str, message: str | None = None) -> None:
@@ -183,31 +217,83 @@ def _unwrap_segment(segment: str) -> list[str]:
     return tokens
 
 
-def _decision_request_body(command: str) -> str | None:
-    """If the command is a `tg` invocation carrying ``--tag decision``, return the message
-    body it would send (positional text + any ``--title``); else None.
+def _split_top_level_segments(command: str) -> list[str]:
+    """Split a command line on the shell separators ``&&`` / ``||`` / ``;`` / ``|`` / ``&`` /
+    newline, QUOTE-AWARELY so a separator INSIDE a quoted argument does not tear the command
+    apart. A naive ``re.split`` on ``|`` split ``tg --tag question "A | B?"`` mid-quote into an
+    unbalanced ``tg --tag question "A `` segment that failed to shlex-tokenize, so the escalation
+    went unseen and the bare-question block was bypassed for the common "A vs B" wording. The
+    char-scan tolerates an unbalanced quote gracefully (it keeps the quote open to end-of-line)
+    rather than raising, so a malformed command still fails toward the same lenient allow.
 
-    Walks each ``&&``/``;``/``|``-separated segment so a `tg` later in a pipeline is seen.
-    Uses shlex tokenization, not raw matching, so the tag and body are read exactly as `tg`
-    would receive them."""
+    SYNC: the same quote-aware scan as no-shell-file-edit `_split_segments`, trimmed to the
+    separators this hook needs (a `tg` send has no meaningful redirect/comment semantics)."""
+    segments: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < len(command):
+            buf.append(ch)
+            buf.append(command[i + 1])
+            i += 2
+            continue
+        if command[i:i + 2] in ("&&", "||"):
+            segments.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if ch in (";", "|", "&", "\n"):
+            segments.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
+    return [s for s in segments if s.strip()]
+
+
+def _escalation_request_body(command: str) -> tuple[str, str] | None:
+    """If the command is a `tg` invocation carrying an escalation tag (``--tag decision`` /
+    ``problem`` / ``question``), return ``(tag, body)`` — the matched tag and the message body it
+    would send (positional text + any ``--title``); else None.
+
+    Walks each ``&&``/``||``/``;``/``|``/``&``-separated segment (split QUOTE-AWARELY so a
+    separator inside the quoted message body never tears it apart) so a `tg` later in a pipeline
+    is seen. Uses shlex tokenization, not raw matching, so the tag and body are read exactly as
+    `tg` would receive them."""
     if not _TG_CMD.search(command):
         return None
-    for raw_segment in re.split(r"\s*(?:&&|\|\||;|\|)\s*", command):
+    for raw_segment in _split_top_level_segments(command):
         tokens = _unwrap_segment(raw_segment)
         if not tokens or not re.fullmatch(r"(?:\S*/)?tg", tokens[0]):
             continue
-        body = _body_if_decision_tag(tokens[1:])
-        if body is not None:
-            return body
+        result = _body_if_escalation_tag(tokens[1:])
+        if result is not None:
+            return result
     return None
 
 
-def _body_if_decision_tag(args: list[str]) -> str | None:
-    """Given a `tg` invocation's args, return the message body iff ``--tag decision`` is
-    present; else None. Collects positional (non-flag) text and the ``--title`` value, which
-    together are what the human reads. Value-taking flags consume their next token so a flag
-    value is never mistaken for the positional message."""
-    has_decision_tag = False
+def _body_if_escalation_tag(args: list[str]) -> tuple[str, str] | None:
+    """Given a `tg` invocation's args, return ``(tag, body)`` iff a ``--tag`` from
+    ``_ESCALATION_TAGS`` (decision/problem/question) is present; else None. Collects positional
+    (non-flag) text and the ``--title`` value, which together are what the human reads.
+    Value-taking flags consume their next token so a flag value is never mistaken for the
+    positional message."""
+    matched_tag: str | None = None
     title = ""
     positionals: list[str] = []
     # The COMPLETE set of value-taking `tg` flags other than --tag/--title (handled above), so
@@ -221,13 +307,14 @@ def _body_if_decision_tag(args: list[str]) -> str | None:
     while i < len(args):
         tok = args[i]
         if tok == "--tag":
-            if i + 1 < len(args) and args[i + 1].lower() == "decision":
-                has_decision_tag = True
+            if i + 1 < len(args) and args[i + 1].lower() in _ESCALATION_TAGS:
+                matched_tag = args[i + 1].lower()
             i += 2
             continue
         if tok.startswith("--tag="):
-            if tok.split("=", 1)[1].lower() == "decision":
-                has_decision_tag = True
+            candidate = tok.split("=", 1)[1].lower()
+            if candidate in _ESCALATION_TAGS:
+                matched_tag = candidate
             i += 1
             continue
         if tok == "--title":
@@ -247,46 +334,100 @@ def _body_if_decision_tag(args: list[str]) -> str | None:
             continue
         positionals.append(tok)
         i += 1
-    if not has_decision_tag:
+    if matched_tag is None:
         return None
-    return "\n".join([title, *positionals]).strip()
+    return matched_tag, "\n".join([title, *positionals]).strip()
 
 
 def _missing_markers(body: str) -> list[str]:
-    return [label for label, pat in _MARKERS if not pat.search(body)]
+    """The required dimensions absent from the body. A pros/cons TABLE (markdown or HTML) counts
+    as the Options dimension — so a table-carrying body is never told to "add a pros/cons table"
+    it already has, and a Context + table + Recommendation body is COMPLETE (silent)."""
+    has_table = _has_table(body)
+    missing: list[str] = []
+    for label, pat in _MARKERS:
+        if pat.search(body):
+            continue
+        if label == "Options" and has_table:
+            continue  # a pros/cons table IS the Options dimension
+        missing.append(label)
+    return missing
 
 
-def _advisory_message(missing: list[str]) -> str:
+def _advisory_message(tag: str, missing: list[str]) -> str:
     # `missing` is only ever a subset of the three markers this hook can detect heuristically
     # (Context / Options / Recommendation). The skill asks for two more — a glossary of terms
     # and a "where to look" code ref — that a regex can't reliably check; they're named as a
     # separate reminder, NOT folded into the `missing` list, so the list stays honest about
     # what was actually measured.
     return (
-        "Decision-request self-check (advisory — your message still sends): this "
-        f"`tg --tag decision` body appears to be missing {', '.join(missing)} (of the three "
-        "markers this hook checks). The decision-request-discipline skill also wants a glossary "
-        "of internal terms and a 'where to look' code ref, so the human can decide in 30s "
-        "without opening the repo. Consider rewriting before sending — or, for a genuine "
-        'one-time silence, request approval via RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT="<why>" '
-        "(Telegram approval, deny-by-default)."
+        "Escalation self-check (advisory — your message still sends): this "
+        f"`tg --tag {tag}` body appears to be missing {', '.join(missing)} (of the three "
+        "markers this hook checks). Read the decision-request-discipline skill and send a "
+        "structured escalation: context (a 'where to look' code ref + a glossary of internal "
+        "terms), a pros/cons table of the options, and a recommendation — so the human can "
+        "decide in 30s without opening the repo. Consider rewriting before sending — or, for a "
+        'genuine one-time silence, request approval via '
+        'RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT="<why>" (Telegram approval, deny-by-default).'
     )
 
 
-def _advisory_for(command: str, cwd: str) -> str | None:
-    """The advisory message for a command, or None when nothing should be said (not a decision
-    request, externally silenced via an approved hatch, or a complete body).
+def _block_message(tag: str) -> str:
+    """The skeleton shown when a genuinely-bare escalation is BLOCKED — it must tell the agent
+    exactly how to re-send correctly so the human's channel is never left with a bare 'A or B?'."""
+    intro = (
+        f"BLOCKED: this `tg --tag {tag}` message is a bare question with none of the required "
+        "escalation structure, so it was NOT sent. The human's decision channel needs a "
+        "self-contained escalation it can act on in 30s. Re-send with all three parts:"
+    )
+    # The skeleton lines are joined with explicit "\n" (not implicit-concat leading spaces) so a
+    # re-indent can never silently corrupt the emitted layout.
+    skeleton = "\n".join([
+        "    Context: <where to look — file.ext:line — plus a glossary of any internal terms>",
+        "    Options (a pros/cons table):",
+        "        | Option | Pros | Cons |",
+        "        | --- | --- | --- |",
+        "        | A | … | … |",
+        "        | B | … | … |",
+        "    Recommendation: <which you'd pick and why>",
+    ])
+    outro = (
+        "Read the decision-request-discipline skill for the full format. A message that already "
+        "has a pros/cons table (markdown or HTML) is never blocked. If this is genuinely urgent "
+        "and cannot be formatted right now, force it through with a written justification: "
+        'RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT="<why>" (Telegram approval, deny-by-default; '
+        "a bare 1 is rejected)."
+    )
+    return f"{intro}\n{skeleton}\n{outro}"
 
-    When an advisory WOULD be shown (a decision-request body missing markers), an approved
-    Telegram hatch (`RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT`) silences it; an unset / invalid /
-    denied request leaves the advisory in place. The hatch call never raises (it catches
-    internally), so this stays fail-open."""
-    body = _decision_request_body(command)
-    if body is None:
-        return None
+
+def _is_bare(body: str, missing: list[str]) -> bool:
+    """A body is BARE — the only case that BLOCKS — when it carries none of the required
+    structure: no pros/cons table AND every one of the three markers absent. This is intentionally
+    the strictest possible block condition (err toward passing): anything with a table, or any one
+    of Context / Options / Recommendation, is NOT bare and is allowed to send."""
+    return len(missing) == len(_MARKERS) and not _has_table(body)
+
+
+def _decide(command: str, cwd: str) -> tuple[str, str | None, int]:
+    """Grade an escalation-tagged `tg` send. Returns (decision, message, exit_code):
+
+      - not an escalation send / a COMPLETE body      → allow, no message         (exit 0)
+      - a PARTIAL body (some structure, some missing)  → allow + advisory nudge    (exit 0)
+      - a genuinely BARE body (no structure at all)    → BLOCK + how-to skeleton   (exit 10),
+        unless an approved RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT hatch forces it through.
+
+    Only the BARE case blocks — the send-time hard stop the human asked for — and even then a
+    justified Telegram hatch still lets it through. Everything with any structure sends."""
+    matched = _escalation_request_body(command)
+    if matched is None:
+        return "allow", None, 0
+    tag, body = matched
     missing = _missing_markers(body)
     if not missing:
-        return None
+        return "allow", None, 0
+    if not _is_bare(body, missing):
+        return "allow", _advisory_message(tag, missing), 0  # partial → non-blocking nudge
     hatch = hatch_escalation.request_hatch_approval(
         "decision-request-format",
         {"hook": "decision-request-format", "command": command},
@@ -294,16 +435,18 @@ def _advisory_for(command: str, cwd: str) -> str | None:
         command=command,
     )
     if hatch.should_stop and hatch.approved:
-        warn(f"advisory silenced via hatch escalation ({hatch.reason})")
-        return None
-    return _advisory_message(missing)
+        # Audit breadcrumb goes to stderr; the allow stays message-free so the allow/message
+        # invariant holds (a `message` on an allow always means an advisory nudge).
+        warn(f"bare escalation forced through via hatch escalation ({hatch.reason})")
+        return "allow", None, 0
+    return "block", _block_message(tag), BLOCK_EXIT_CODE
 
 
 def main() -> int:
-    # The whole body is fail-open: ANY unexpected error (a malformed event, an input shlex
-    # can't tokenize despite the guards) returns `allow`, never a non-zero exit. This is an
-    # advisory formatting nudge, not a boundary — it must never wedge the ability to send a
-    # message. So every path through `main` returns 0/allow.
+    # Fail-OPEN: ANY unexpected error (a malformed event, an input shlex can't tokenize despite
+    # the guards) returns `allow`, never a block. This hook gates the human's ONLY comms channel
+    # to the agent, so a crash must NEVER wedge a send — the only hard stop is a deliberate,
+    # narrow BARE-body block; everything else, including every error path, allows.
     try:
         event = json.load(sys.stdin)
         args = event.get("args") or {}
@@ -311,7 +454,9 @@ def main() -> int:
         if not isinstance(command, str):
             command = str(command)
         cwd = str(event.get("cwd") or os.getcwd())
-        return _allow(_advisory_for(command, cwd))
+        decision, message, code = _decide(command, cwd)
+        emit(decision, message)
+        return code
     except Exception as exc:  # noqa: BLE001 — deliberate catch-all: fail-open is the contract
         warn(f"could not inspect command: {exc} — allowing (fail-open)")
         return _allow()

@@ -20,9 +20,13 @@ the guard enforces ONLY where the repo opts in. Opt-in signal, first match wins:
 So hyperide + the agent-ecosystem repos set `worktree_only: true` in their rig.yaml; 3d-cli
 leaves it absent and is exempt automatically.
 
-Escape hatch (the rare, deliberate main edit — mirrors block-raw-pr-merge / build guards):
-  - env  RIG_ALLOW_MAIN_EDIT=1                 — allow this action despite being on main.
-  - env  RIG_ALLOW_MAIN_EDIT_REASON='why'      — optional, logged when present.
+External approval (replaces the OLD self-service escape hatch): there is NO env-var bypass for
+this guard any more — an agent could set `RIG_ALLOW_MAIN_EDIT=1` on itself, so that merely
+self-granted the very edit the guard exists to redirect. A one-time deliberate main edit is now
+requested by exporting `RIG_HATCH_REQUEST_WORKTREE_ONLY_WRITES="<written justification>"`, which
+routes a single approval request to the human via Telegram (deny-by-default; a bare `1` is
+rejected). On the human's approval the write is allowed; otherwise it is blocked, leading with
+the denial reason. (Mirrors the converted twin pin-primary-worktree; agent-tools#213.)
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; target path in args.file_path/path/notebook_path; event.cwd is the shell dir.
@@ -36,14 +40,58 @@ never wedge the agent's ability to write. If the branch cannot be determined, we
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess  # noqa: S404 — a few read-only `git` queries are the whole job
 import sys
 from pathlib import Path
 
+# SYNC: duplicated in every hatch-using hook so each hook does not need
+# a shared helper file under agent-hooks/. Edit every copy together;
+# tests/test_hatch_import_hardening.py guards the shared behavior.
+_HATCH_MODULE = "agenttools_hatch_escalation"
+
+
+def _load_hatch_escalation():
+    hatch_init = Path(__file__).resolve().parents[2] / "lib" / _HATCH_MODULE / "__init__.py"
+    if not hatch_init.is_file():
+        raise ImportError(f"cannot load hatch escalation helper from {hatch_init}")
+    spec = importlib.util.spec_from_file_location(_HATCH_MODULE, hatch_init)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load hatch escalation helper from {hatch_init}")
+    module = importlib.util.module_from_spec(spec)
+    previous_modules = {
+        name: sys.modules[name]
+        for name in tuple(sys.modules)
+        if name == _HATCH_MODULE or name.startswith(f"{_HATCH_MODULE}.")
+    }
+    for name in previous_modules:
+        if name != _HATCH_MODULE:
+            sys.modules.pop(name, None)
+    sys.modules[_HATCH_MODULE] = module
+    # Leave the repo-local module installed on success so later imports in this
+    # hook process cannot regain a preloaded user/site package or submodule.
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        for name in tuple(sys.modules):
+            if name == _HATCH_MODULE or name.startswith(f"{_HATCH_MODULE}."):
+                sys.modules.pop(name, None)
+        sys.modules.update(previous_modules)
+        # A helper that calls sys.exit() at import must not make the hook exit 0 (allow);
+        # convert it to an import failure after cleanup. Ctrl-C still propagates.
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        raise ImportError(f"cannot execute hatch escalation helper from {hatch_init}: {exc}") from exc
+    return module
+
+
+hatch_escalation = _load_hatch_escalation()
+
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
+HOOK_ID = "worktree-only-writes"
 
 # The rig.yaml key (under agent_hooks) that opts a repo INTO worktree-only enforcement.
 CONFIG_KEY = "worktree_only"
@@ -57,8 +105,9 @@ MESSAGE = (
     "separate worktree on a feature branch first, e.g.:\n"
     "    git worktree add ../wt-<feature> -b <feature> origin/{branch}\n"
     "    cd ../wt-<feature>   # then Edit/Write there\n"
-    "(worktree-only workflow, rig-provisioned; Alex tg#5742.) Deliberate one-off main edit: "
-    "set RIG_ALLOW_MAIN_EDIT=1."
+    "(worktree-only workflow, rig-provisioned; Alex tg#5742.) There is NO self-service env-var "
+    "bypass. For a genuine one-off main edit, request a one-time Telegram approval via "
+    'RIG_HATCH_REQUEST_WORKTREE_ONLY_WRITES="<justification>" (deny-by-default; bare 1 rejected).'
 )
 
 
@@ -201,11 +250,29 @@ def worktree_only_enabled(cwd: str) -> bool:
     return _agent_hooks_bool(text, CONFIG_KEY, default=False)
 
 
-def _escape_reason() -> str | None:
-    """The escape-hatch reason if RIG_ALLOW_MAIN_EDIT=1 is set (reason optional), else None."""
-    if os.environ.get("RIG_ALLOW_MAIN_EDIT") == "1":
-        return (os.environ.get("RIG_ALLOW_MAIN_EDIT_REASON") or "").strip() or "no reason given"
-    return None
+def _decide_block(cwd: str, branch: str) -> int:
+    """The gate has decided this on-default-branch write must be redirected. Consult the Telegram
+    hatch: an unset request is the normal BLOCK; a present request allows on the human's approval
+    (tg-ctl exit 0) and blocks (leading with the denial reason) otherwise.
+
+    A pre-write hook has NO shell command string (the event is an Edit/Write), so the
+    justification is read purely from the process environment (`RIG_HATCH_REQUEST_…`); `command`
+    is not passed."""
+    message = MESSAGE.format(branch=branch)
+    hatch = hatch_escalation.request_hatch_approval(
+        HOOK_ID, {"hook": HOOK_ID, "branch": branch}, cwd=cwd,
+    )
+    if hatch.should_stop:
+        if hatch.approved:
+            note = f"main edit allowed via hatch escalation ({hatch.reason})"
+            warn(note)
+            emit("allow", note)
+            return 0
+        warn(f"main edit hatch escalation denied: {hatch.reason}")
+        emit("block", f"hatch escalation denied: {hatch.reason}\n{message}")
+        return BLOCK_EXIT_CODE
+    emit("block", message)
+    return BLOCK_EXIT_CODE
 
 
 def _target_dir(cwd: str, args: dict) -> str:
@@ -258,15 +325,8 @@ def main() -> int:
         emit("allow")  # on a feature branch → exactly where authoring belongs
         return 0
 
-    # 3. On the default branch: honor the deliberate-edit escape hatch, else BLOCK.
-    reason = _escape_reason()
-    if reason:
-        warn(f"main edit allowed via RIG_ALLOW_MAIN_EDIT ({reason})")
-        emit("allow", f"main edit allowed via escape hatch ({reason})")
-        return 0
-
-    emit("block", MESSAGE.format(branch=branch))
-    return BLOCK_EXIT_CODE
+    # 3. On the default branch: BLOCK, unless a one-time Telegram hatch request is approved.
+    return _decide_block(where, branch)
 
 
 if __name__ == "__main__":

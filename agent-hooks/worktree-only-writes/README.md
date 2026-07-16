@@ -47,15 +47,26 @@ So `hyperide` and the agent-ecosystem repos set `worktree_only: true` in their `
 `3d-cli` (which legitimately works directly on main) leaves it absent and is exempt
 automatically. See rig-cli `docs/config-schema.md` for the knob.
 
-## Escape hatch (the rare, deliberate main edit)
+## No self-service bypass — external approval only (the rare, deliberate main edit)
 
-Mirrors `block-raw-pr-merge` / the build guards:
+There is **no** env-var self-service bypass any more — the old `RIG_ALLOW_MAIN_EDIT=1` is
+**removed** (an auto-mode agent could set it on itself, so it never actually gated anything).
+The block is now **deny-by-default**. A genuine one-off main edit requests a one-time Telegram
+approval by exporting a written justification:
 
 ```bash
-RIG_ALLOW_MAIN_EDIT=1 RIG_ALLOW_MAIN_EDIT_REASON="hotfix, worktree overkill" <edit on main>
+RIG_HATCH_REQUEST_WORKTREE_ONLY_WRITES="hotfix, worktree overkill for this one edit"
 ```
 
-`RIG_ALLOW_MAIN_EDIT_REASON` is optional but logged when present.
+The request routes to the human via trusted `tg-ctl` and the write is allowed **only** on an
+approval tap; a bare `1` (no real justification) is rejected, and an unanswered/denied prompt
+blocks. This mirrors `block-raw-pr-merge` / `block-reset-hard`.
+
+Because the approval can wait up to `tg-ctl ask`'s 900s window, the descriptor's `timeout_ms`
+is **960000** (900s cap + 30s margin), not the 3s default: a slow/unanswered prompt must resolve
+to the hook's own deny **before** the bridge's descriptor-timeout kill would fire `on_error:
+open` and silently allow the edit. A Claude Code settings entry launching `cc_hook_bridge` must
+likewise set `timeout > 960s`.
 
 ## Why an agent-hook
 

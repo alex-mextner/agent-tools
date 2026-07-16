@@ -33,6 +33,7 @@ HATCH_HOOKS = (
     "agent-hooks/skills-read-gate/skills_read_gate.py",
     "agent-hooks/subagent-no-bg-longproc/subagent_no_bg_longproc.py",
     "agent-hooks/visual-proof-gate/visual_proof_gate.py",
+    "agent-hooks/worktree-only-writes/worktree_only_writes.py",
 )
 
 

@@ -40,7 +40,18 @@ assert _spec and _spec.loader
 wow = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(wow)
 
-_ENV_KEYS = ("RIG_WORKTREE_ONLY", "RIG_ALLOW_MAIN_EDIT", "RIG_ALLOW_MAIN_EDIT_REASON")
+_ENV_KEYS = (
+    "RIG_WORKTREE_ONLY",
+    "RIG_ALLOW_MAIN_EDIT",
+    "RIG_ALLOW_MAIN_EDIT_REASON",
+    "RIG_HATCH_REQUEST_WORKTREE_ONLY_WRITES",
+)
+
+
+def _fake_tg_ctl(path: Path, body: str) -> Path:
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return path
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -187,13 +198,55 @@ def test_target_path_in_feature_repo_allows_even_when_cwd_is_main(tmp_path, monk
     assert code == 0 and _decision(out) == "allow"
 
 
-# ── ESCAPE hatch ──────────────────────────────────────────────────────────────────────────
+# ── the OLD self-service escape hatch is GONE (agent-tools#213) ────────────────────────────
 
-def test_escape_hatch_allows_on_default_branch(tmp_path, monkeypatch):
+def test_old_self_service_env_hatch_no_longer_bypasses(tmp_path, monkeypatch):
+    """`RIG_ALLOW_MAIN_EDIT=1` was the self-graded bypass an agent could set on itself. It is
+    removed: setting it on the default branch of an enrolled repo no longer allows the write."""
     repo = _make_repo(tmp_path, branch="main")
     out, code = _run(repo, monkeypatch, {"RIG_WORKTREE_ONLY": "1", "RIG_ALLOW_MAIN_EDIT": "1"})
+    assert code == wow.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+# ── the RIG_HATCH_REQUEST_* Telegram escalation replaces it ────────────────────────────────
+
+def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
+    """A bare `1` (no written justification) is an invalid request → deny (block), and NO tg-ctl
+    is ever invoked. A never-callable path proves no Telegram round-trip happens."""
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 0\n")  # would ALLOW if ever called
+    monkeypatch.setattr(wow.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    repo = _make_repo(tmp_path, branch="main")
+    out, code = _run(repo, monkeypatch, {
+        "RIG_WORKTREE_ONLY": "1", "RIG_HATCH_REQUEST_WORKTREE_ONLY_WRITES": "1",
+    })
+    assert code == wow.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
+    """A written justification + tg-ctl exit 0 (the human approved) → allow."""
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", 'printf "approved by tap\\n"\nexit 0\n')
+    monkeypatch.setattr(wow.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    repo = _make_repo(tmp_path, branch="main")
+    out, code = _run(repo, monkeypatch, {
+        "RIG_WORKTREE_ONLY": "1",
+        "RIG_HATCH_REQUEST_WORKTREE_ONLY_WRITES": "Hotfix on main, worktree unavailable.",
+    })
     assert code == 0 and _decision(out) == "allow"
-    assert "escape hatch" in json.loads(out)["message"].lower()
+    assert "hatch escalation" in json.loads(out)["message"].lower()
+
+
+def test_hatch_justification_exit1_blocks_citing_denial(tmp_path, monkeypatch):
+    """A written justification + tg-ctl exit 1 (the human declined / timed out) → block, and the
+    message leads with the denial reason."""
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    monkeypatch.setattr(wow.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    repo = _make_repo(tmp_path, branch="main")
+    out, code = _run(repo, monkeypatch, {
+        "RIG_WORKTREE_ONLY": "1",
+        "RIG_HATCH_REQUEST_WORKTREE_ONLY_WRITES": "Hotfix on main, worktree unavailable.",
+    })
+    assert code == wow.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "hatch escalation denied" in json.loads(out)["message"].lower()
 
 
 # ── fail-OPEN: detached HEAD / not a git repo ─────────────────────────────────────────────
