@@ -1,0 +1,82 @@
+# permission-guard — pi coding-agent permission enforcement
+
+A [pi coding agent](https://github.com/earendil-works/pi) extension that enforces command
+permissions on the `bash` tool: it **denies** dangerous commands and **asks** before risky ones,
+giving pi the same guardrail belt the other agent harnesses (claude-code, opencode) get.
+
+## Why
+
+pi ships **no built-in permission system** — it runs bash with the invoking user's privileges. Its
+extension API, however, can intercept a tool call before it executes (`pi.on("tool_call")` →
+return `{ block: true }`), which is the sanctioned way to add a permission gate. This extension uses
+that hook to match each bash command against a policy and allow / ask / deny accordingly.
+
+## How it is provisioned
+
+`rig` installs this extension for repos whose harness is pi (`harness.kind: pi`):
+
+- copies this folder to `~/.pi/agent/extensions/permission-guard/` (pi auto-discovers
+  `~/.pi/agent/extensions/*/index.ts`; the base dir honors `PI_CODING_AGENT_DIR`);
+- writes the policy it enforces to `~/.pi/agent/rig-permission-policy.json`.
+
+Both steps are idempotent and backup-on-conflict; `rig status` reports drift.
+
+## Policy file
+
+`~/.pi/agent/rig-permission-policy.json` (rig owns it — the extension is generic):
+
+```jsonc
+{
+  "version": 1,
+  "default": "allow",
+  "rules": [
+    { "id": "git-force-push", "action": "deny", "command": "git",
+      "argvAll": ["push"], "flagsAny": ["--force", "-f"], "reason": "…" },
+    { "id": "git-reset-hard", "action": "ask", "command": "git",
+      "argvAll": ["reset"], "flagsAny": ["--hard"], "reason": "…" }
+  ]
+}
+```
+
+A rule matches a bash command when:
+
+- the command's **argv0 basename** equals `command` (so `/usr/bin/git` and `git` both match; an
+  `env FOO=1 …` prefix is skipped);
+- every token in `argvAll` appears in the argv (subcommand words); and
+- if `flagsAny` is set, at least one of those **exact** tokens appears anywhere in the argv.
+
+Exact-token, flag-**anywhere** matching is deliberate: it catches `git commit -m "x" --no-verify`
+(which prefix globs miss) yet never confuses `--force` with `--force-with-lease`. Compound commands
+(`a && b`, `a | b`, `a; b`) are split and evaluated per clause; the **strongest** decision wins
+(deny > ask > allow). Both `argvAll`/`flagsAny` (camelCase) and `argv_all`/`flags_any` (snake_case)
+keys are accepted.
+
+## Fail-closed
+
+If the policy file is **missing** the extension uses its baked-in baseline. If the file is present
+but **unparseable / invalid**, it also falls back to the baseline **and** logs a warning — the
+dangerous denies fire even with zero or corrupt config; a broken file never silently opens the gate.
+In a **non-interactive** run (`ctx.hasUI` false) an `ask` decision is **blocked** (nothing can
+prompt), while `deny` always blocks.
+
+## Baseline enforced
+
+| Command | Decision |
+|---|---|
+| `gh pr merge …` | deny (merges go through `gh ship`) |
+| `git push … --force` / `-f` | deny (`--force-with-lease` is allowed) |
+| `git … --no-verify` | deny (bypasses hooks) |
+| `sudo rm …` | deny |
+| `screencapture …` | deny (use Playwright/CDP) |
+| `pkill` / `killall` | ask |
+| `git reset --hard …` | ask |
+
+The baseline mirrors the argv-level intent of the rig agent-hooks and the claude-code deny/ask
+rules. It is kept in **SYNC** with rig's `riglib/permissions.py` (`PI_DENY_RULES` / `PI_ASK_RULES`),
+which is what rig serializes into the policy file.
+
+## Test
+
+```bash
+npm test   # tsx --test policy.test.ts — pure matcher unit tests, no pi runtime needed
+```
