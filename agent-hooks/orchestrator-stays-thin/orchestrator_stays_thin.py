@@ -623,7 +623,8 @@ def _is_git_or_python_impl(segment: str) -> bool:
 
 
 _UV_TEST_SHORT_FLAGS_WITH_VALUE = frozenset({"C", "P", "b", "c", "f", "i", "p", "w"})
-# Keep these uv option tables in sync with agenttools_dev.cli's _UV_RUN_* copies.
+# Keep these uv option tables in sync with dev-cli's dev_cli/cli.py _UV_RUN_* copies
+# (the `dev` CLI was extracted from agent-tools into the standalone alex-mextner/dev-cli repo).
 _UV_TEST_BOOLEAN_FLAGS = frozenset({
     "--active",
     "--all-extras",
