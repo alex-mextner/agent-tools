@@ -1658,5 +1658,43 @@ def test_ghgql_readonly_and_non_merge_writes_allowed(command, monkeypatch):
     assert _decision(out) == "allow"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        # #303 P1: `ghgql --allow-mutation "$Q"` where `$Q` expands to a merge mutation at RUNTIME.
+        # ghgql's own read-only guard is skipped under `--allow-mutation`, and the query is not a
+        # literal at the argv level, so only `_graphql_query_field_is_expandable`-equivalent coverage
+        # of the `ghgql` wrapper (not just a direct `gh api graphql` invocation) catches this.
+        'Q=\'mutation{ mergePullRequest(input:{pullRequestId:"x"}){ id } }\'; ghgql --allow-mutation "$Q"',
+        'Q="mutation{ enablePullRequestAutoMerge(input:{}){ id } }"; ghgql --allow-mutation "$Q"',
+        # `-q "$Q"` / `-f query="$Q"` spellings of the same expandable-query gap.
+        'Q=\'mutation{ mergePullRequest(input:{}){ id } }\'; ghgql --allow-mutation -q "$Q"',
+        'Q=\'mutation{ mergePullRequest(input:{}){ id } }\'; ghgql --allow-mutation -f query="$Q"',
+    ],
+)
+def test_ghgql_expandable_query_is_blocked(command, monkeypatch):
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_ghgql_expandable_query_without_allow_mutation_still_blocked(monkeypatch):
+    """Even without `--allow-mutation`, a `ghgql "$Q"` is fail-closed the same as a direct `gh api
+    graphql -f query="$Q"` — an expandable query can't be proven read-only at pre-exec time."""
+    command = 'Q="query{ viewer{ login } }"; ghgql "$Q"'
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_ghgql_single_quoted_query_stays_allowed(monkeypatch):
+    """The quote-aware allowance must still hold for `ghgql`: a single-quoted query is the REAL
+    quoting (not expandable), so it is scanned literally and allowed like any other read."""
+    command = "ghgql --allow-mutation 'mutation{ addComment(input:{}){ id } }'"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-v"]))

@@ -47,16 +47,58 @@ def test_dry_run_forwards_variables_and_paginate():
     assert "owner=cli" in r.stdout
 
 
-def test_dry_run_file_backed_query_passes_through():
-    r = _run(["--dry-run", "-q", "@query.graphql"])
+def test_dry_run_file_backed_query_is_read_and_inlined(tmp_path):
+    """ghgql reads a `-q @file` query itself (#303) so its own mutation-refusal can inspect the
+    actual text, and so what it execs is the inlined query, not an unread `@file` marker."""
+    qfile = tmp_path / "query.graphql"
+    qfile.write_text("query { viewer { login } }")
+    r = _run(["--dry-run", "-q", f"@{qfile}"])
     assert r.returncode == 0, r.stderr
-    assert "query=@query.graphql" in r.stdout.replace("\\", "")
+    argv = r.stdout.replace("\\", "")
+    assert "query=query { viewer { login } }" in argv
+    assert "@" not in argv.split("query=", 1)[1]
 
 
-def test_dry_run_stdin_query_builds_at_dash():
+def test_file_backed_mutation_is_refused_by_default(tmp_path):
+    qfile = tmp_path / "mutation.graphql"
+    qfile.write_text('mutation { mergePullRequest(input:{pullRequestId:"x"}){ id } }')
+    r = _run(["-q", f"@{qfile}"])
+    assert r.returncode == 2
+    assert "mutation" in r.stderr.lower()
+
+
+def test_file_backed_mutation_allowed_with_allow_mutation(tmp_path):
+    qfile = tmp_path / "mutation.graphql"
+    qfile.write_text("mutation { addComment(input:{}){ id } }")
+    r = _run(["--dry-run", "--allow-mutation", "-q", f"@{qfile}"])
+    assert r.returncode == 0, r.stderr
+    assert "addComment" in r.stdout
+
+
+def test_missing_query_file_errors():
+    r = _run(["-q", "@/no/such/file.graphql"])
+    assert r.returncode == 2
+    assert "cannot read query file" in r.stderr.lower()
+
+
+def test_dry_run_stdin_query_is_read_and_inlined():
     r = _run(["--dry-run", "-"], stdin="query { viewer { login } }")
     assert r.returncode == 0, r.stderr
-    assert "query=@-" in r.stdout.replace("\\", "")
+    argv = r.stdout.replace("\\", "")
+    assert "query=query { viewer { login } }" in argv
+    assert "@" not in argv.split("query=", 1)[1]
+
+
+def test_stdin_mutation_is_refused_by_default():
+    r = _run(["-"], stdin='mutation { mergePullRequest(input:{pullRequestId:"x"}){ id } }')
+    assert r.returncode == 2
+    assert "mutation" in r.stderr.lower()
+
+
+def test_stdin_mutation_allowed_with_allow_mutation():
+    r = _run(["--dry-run", "--allow-mutation", "-"], stdin="mutation { addComment(input:{}){ id } }")
+    assert r.returncode == 0, r.stderr
+    assert "addComment" in r.stdout
 
 
 def test_bare_mutation_is_refused_by_default():

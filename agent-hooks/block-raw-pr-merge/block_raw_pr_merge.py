@@ -1251,7 +1251,15 @@ def _graphql_query_field_is_expandable(blanked_command: str) -> bool:
     blocked (`echo graphql query=$Q`), and parsing via shlex tokens covers every flag spelling. Kept
     separate from `_command_contains_gh_pr_merge` (which runs on the ORIGINAL command) so the blanking
     — which is not heredoc-aware — cannot disturb heredoc/substitution merge detection. An unparseable
-    command fails closed (block)."""
+    command fails closed (block).
+
+    ALSO covers the `ghgql` wrapper (#303): `ghgql` execs `gh api graphql` under the hood, and its OWN
+    mutation-refusal (`ghgql`'s read-only-by-default guard) is skipped under `--allow-mutation` — a
+    `ghgql --allow-mutation "$Q"` where `$Q` expands to a merge mutation reaches `_is_merge_route` only
+    through the non-strict top-level path, where an expandable query field was previously invisible
+    (only a direct `gh api graphql` invocation was inspected here). Mapping the `ghgql` argv through
+    `_ghgql_to_graphql_rest` — the SAME mapping `_is_merge_route` uses — makes an expandable ghgql query
+    unprovable/fail-closed exactly like a direct `gh api graphql -f query="$Q"`."""
     try:
         segments = _split_segments(blanked_command)
     except ValueError:
@@ -1261,12 +1269,18 @@ def _graphql_query_field_is_expandable(blanked_command: str) -> bool:
         return False
     for seg in segments:
         argv = _resolve_invoked_argv(_segment_argv(seg))
-        if not argv or os.path.basename(argv[0]) != "gh":
+        if not argv:
             continue
-        sub = _gh_subargs(argv)
-        if not sub or sub[0] != "api":
+        base = os.path.basename(argv[0])
+        if base == "gh":
+            sub = _gh_subargs(argv)
+            if not sub or sub[0] != "api":
+                continue
+            rest = sub[1:]
+        elif base == _GHGQL_WRAPPER:
+            rest = _ghgql_to_graphql_rest(argv)
+        else:
             continue
-        rest = sub[1:]
         endpoint = _gh_api_endpoint(rest)
         if endpoint == "graphql" or (endpoint or "").endswith("/graphql"):
             if any("$" in val or "`" in val for val in _graphql_query_field_values(rest)):

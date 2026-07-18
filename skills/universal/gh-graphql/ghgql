@@ -8,12 +8,13 @@
 # accidental write never leaves this helper. It is a thin, transparent front-end: it
 # builds an argv and execs `gh`, printing the exact command with `--dry-run`.
 #
-# Hook-safety: `ghgql` is read-only by default and refuses a mutation before running. It is
-# ALSO covered by the `block-raw-pr-merge` guard: that guard maps a `ghgql …` invocation to
-# the `gh api graphql` request it execs and blocks any merge through it (even with
-# `--allow-mutation`, or a `@file`/stdin query), so `ghgql` is never a raw-merge bypass. A
-# read-only query — including one that only NAMES a merge token in a string literal — is
-# allowed by both `ghgql` and the guard.
+# Hook-safety: `ghgql` is read-only by default and refuses a mutation before running — including a
+# file-backed (`-q @file`) or stdin (`-q -`) query, which it reads and inspects itself (#303) so the
+# refusal holds even standalone, with no `block-raw-pr-merge` hook installed. It is ALSO covered by
+# that guard: the guard maps a `ghgql …` invocation to the `gh api graphql` request it execs and
+# blocks any merge through it (even with `--allow-mutation`), so `ghgql` is never a raw-merge bypass.
+# A read-only query — including one that only NAMES a merge token in a string literal — is allowed
+# by both `ghgql` and the guard.
 #
 # Usage:
 #   ghgql '<graphql query>'                 run a read-only query
@@ -69,14 +70,23 @@ done
 
 [ "$have_query" -eq 1 ] || _ghgql_die "no query given (try 'ghgql --help')"
 
+# --- inline file-backed / stdin query sources --------------------------------------
+# A `-q @file` or `-q -` (stdin) query is READ HERE so the read-only-by-default guard below can
+# inspect its actual text — otherwise the guard could not see a mutation hidden in a file/stdin
+# query and this "read-only by default" helper would perform an unrefused write whenever the
+# downstream `block-raw-pr-merge` hook is not installed or not covering this wrapper (#303). Once
+# inlined, `query` always holds literal text; the `@`/`-` special forms below are gone by the time
+# the guard and the `gh` invocation run.
+if [ "$query" = "-" ]; then
+  query="$(cat)"
+elif [ "$query" != "${query#@}" ]; then
+  _qfile="${query#@}"
+  [ -r "$_qfile" ] || _ghgql_die "cannot read query file: $_qfile"
+  query="$(cat "$_qfile")"
+fi
+
 # --- read-only-by-default guard ---------------------------------------------------
-# Only inline queries can be inspected here; a file/stdin query (`@file`, `-`) is passed
-# through unread — the downstream `block-raw-pr-merge` guard still catches a real merge.
-if [ "$allow_mutation" -eq 0 ] && [ "$query" != "${query#@}" ]; then
-  : # @file — cannot inspect; leave the mutation decision to gh + the guard
-elif [ "$allow_mutation" -eq 0 ] && [ "$query" = "-" ]; then
-  : # stdin — cannot inspect; same as above
-elif [ "$allow_mutation" -eq 0 ]; then
+if [ "$allow_mutation" -eq 0 ]; then
   # Strip GraphQL double-quoted string literals before the check, so a read-only query that merely
   # NAMES a mutation as data — `search(query: "mergePullRequest")`, which the merge guard allows —
   # is not falsely refused. This is a COARSE approximation of the hook's
@@ -91,11 +101,7 @@ elif [ "$allow_mutation" -eq 0 ]; then
 fi
 
 # --- build and run ----------------------------------------------------------------
-if [ "$query" = "-" ]; then
-  set -- api graphql -f "query=@-" ${gh_args[@]+"${gh_args[@]}"}
-else
-  set -- api graphql -f "query=$query" ${gh_args[@]+"${gh_args[@]}"}
-fi
+set -- api graphql -f "query=$query" ${gh_args[@]+"${gh_args[@]}"}
 
 if [ "$dry_run" -eq 1 ]; then
   printf 'gh'; for a in "$@"; do printf ' %q' "$a"; done; printf '\n'
