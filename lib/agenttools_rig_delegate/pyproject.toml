@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenttools-rig-delegate"
+version = "0.1.0"
+description = "Shared rig-aware install-hook delegation: when rig is present, ecosystem CLIs let rig own the hooks; otherwise they fall back to their own installer (stdlib-only)."
+readme = "README.md"
+# 3.9 to match the lowest floor in the ecosystem (review-cli is >=3.9; rig-cli >=3.10).
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alex Mextner" }]
+keywords = ["rig", "hooks", "install-hooks", "delegation", "agent-tools"]
+# Intentionally ZERO runtime dependencies — stdlib only (os + shutil + subprocess).
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/alex-mextner/agent-tools"
+
+# The package source lives one directory up (lib/agenttools_rig_delegate, this file's
+# directory is the package itself). Point discovery at the parent so setuptools finds the
+# package and never wanders into the umbrella repo's non-Python content (skills/, ci/, …).
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["agenttools_rig_delegate*"]
+
+[tool.pytest.ini_options]
+testpaths = ["../../tests"]
