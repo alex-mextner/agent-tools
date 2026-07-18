@@ -192,7 +192,7 @@ carries the format above. It requires all of:
 - **STRUCTURE (readability)** — the reason an 8-point message can still be rejected: it must
   be a scannable Rich Message, **not a wall of text**. Each section under its own
   `<h3>`/`<h4>` heading; enumerations as short one-line `<ul>`/`<li>` items (**never** an
-  inline comma-run like "плюсы: a, b, c"); `<hr>` dividers between sections; short lines.
+  inline comma-run like "pros: a, b, c"); `<hr>` dividers between sections; short lines.
   Send it with `--format html`.
 
 Copy-pasteable good shape (see `tg help format` for the full GOOD-vs-BAD example):
