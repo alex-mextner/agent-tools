@@ -6,7 +6,7 @@ WHAT THIS IS
     auto-discover it. The mechanism is identical and was copy-pasted ~4+ times:
 
       1. Write/refresh ``SKILL.md`` into ``~/.agents/skills/<tool>/`` (the Agent Skills
-         standard location, read by Claude Code, Codex, opencode, Gemini, Cursor).
+         standard location, read by Claude Code, Codex, opencode, Cursor).
       2. Symlink that skill dir into each harness discovery dir (claude-code:
          ``~/.claude/skills/<tool>``) — a skill that lives only in ``~/.agents/skills``
          is invisible to the harness, which lists/loads from its own dir.

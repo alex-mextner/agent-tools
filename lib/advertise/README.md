@@ -8,7 +8,7 @@ into one importable, well-tested library — **stdlib only**, no third-party dep
 ## What `install-skill` does (the duplicated logic)
 
 1. **Write `SKILL.md`** into `~/.agents/skills/<tool>/` — the Agent Skills standard
-   location, read by Claude Code, Codex, opencode, Gemini, Cursor. Idempotent: a
+   location, read by Claude Code, Codex, opencode, Cursor. Idempotent: a
    byte-identical file is a no-op.
 2. **Symlink** that skill dir into each **harness discovery dir** (claude-code:
    `~/.claude/skills/<tool>`). A skill that lives *only* in `~/.agents/skills` is invisible
