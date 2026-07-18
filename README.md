@@ -64,7 +64,7 @@ mechanisms are stack-agnostic (bun/node, python-uv, go).
 
 | Directory      | What it holds                                                                 |
 | -------------- | ----------------------------------------------------------------------------- |
-| `skills/`      | Advisory rules as markdown skills — `universal/` (any project) and `by-type/{bot,backend,frontend,cli,library,infra,monorepo}/`. Each is one `SKILL.md` with `name` + `description` frontmatter, the portable rule, a rationale, and a generic example. |
+| `skills/`      | Advisory rules as markdown skills — `universal/` (any project), `by-type/{bot,backend,frontend,cli,library,infra,monorepo}/` (by project shape), and `by-stack/<l1>/<lang>[/<framework>]/` (by declared tech stack; a repo inherits every skill whose stack path is a prefix of its declared stack). Each is one `SKILL.md` with `name` + `description` frontmatter, the portable rule, a rationale, and a generic example. |
 | `agent-hooks/` | Programmatic guards that fire on an agent's tool use (the `agents-hooks/v1` contract). Each is a descriptor + executable + README. They enforce, mid-session, what a skill can only advise. |
 | `git-hooks/`   | Copyable `pre-commit` / `commit-msg` / `pre-push` / `no-secrets-scan` hooks plus a `lefthook.yml`, generalized across three toolchains — and a **global dispatcher** (`global-dispatcher/`) that runs every hook in `~/.config/git/global-hooks.d/` in **every** repo, even ones whose lefthook/husky override `core.hooksPath`. |
 | `ci/`          | Drop-in CI / PR-gate building blocks a CI-building agent looks for first — one slot per concern (workflow + optional shell script + README): secret-scan (gitleaks), CodeQL (incl. a no-GHAS self-gate), semgrep SAST, dependency-review + license, AI-review, Copilot-findings, unresolved-review-thread block, unchecked-checkbox block, mandatory screenshots, conventional-commit PR-title lint, leftover-marker grep, and a green-CI-gated `ship` merge command. See [`ci/README.md`](ci/README.md). |
@@ -109,6 +109,7 @@ when-to-use trigger; the body is the rule. They have no runtime and no dependenc
 skills/universal/shell-timeouts/SKILL.md
 skills/universal/web-page-reading-agent-browser/SKILL.md
 skills/by-type/backend/atomic-db-transactions/SKILL.md
+skills/by-stack/frontend/ts/react/vercel-react-patterns/SKILL.md
 ```
 
 > **Reading a web page, API doc, or reference?** Reach for the
@@ -267,6 +268,9 @@ that nobody is required to stop at — see #543.
   and ask the user to confirm if it looks misdirected), and more.
 - **By-type skills:** 45 — bot (12), backend (13), frontend (4), cli (7), library (4),
   infra (1), monorepo (4).
+- **By-stack skills:** 5 — `frontend/ts` (ts-strictness) + `frontend/ts/react`
+  (vercel-react-patterns); `mobile/swift` (swift-concurrency) + `mobile/swift/swiftui`
+  (swiftui-mvvm, tca-swiftui). Selected by declared stack prefix, not project shape.
 - **Agent-hooks:** 8 — block-no-verify, block-raw-pr-merge, block-secrets-write,
   require-review-before-commit, enforce-timeout-on-bash, block-raw-process-env,
   stop-completion-selfcheck, **format-on-write** (runs the project's configured formatter
