@@ -167,13 +167,31 @@ would leave the same hook trivially bypassable.
   wrapped command when GNU `time`'s `-f` actually consumes `tg` as its OWN format-string operand,
   and the REAL wrapped command (`pytest`) slipped past entirely. Fixed by registering `-f`/
   `--format`/`-o`/`--output` as operand-taking, the same way `env`/`nice`/`timeout` already are.
-- **`_split_chain` had no backslash-escape awareness.** A backslash-escaped quote INSIDE a
-  double-quoted span (`\"`, which does NOT end the string in real bash) was mistaken for the real
-  closing quote, and the actual closing quote right after it was read as a fresh opener —
-  swallowing a real trailing `;`/chain operator (and whatever command follows it) as if it were
-  still-quoted text. `tg "a\""; git commit` really runs `git commit` in real bash, verified.
-  Fixed by giving `_split_chain` real escape-awareness inside double-quoted spans only (single
-  quotes have no escape mechanism in bash at all, so a backslash there stays ordinary content).
+- **`_split_chain`/`_blank_single_quoted` had no backslash-escape awareness.** A backslash-escaped
+  quote INSIDE a double-quoted span (`\"`, which does NOT end the string in real bash), an
+  UNQUOTED `\"`/`\'`, and ANSI-C `$'...'` quoting (a different mode than a plain `'...'`, where
+  `\'` does not close the string) were each mistaken for their naive/literal counterpart —
+  swallowing a real trailing `;`/chain operator, or blanking a genuinely LIVE `$(...)` as if it
+  were inert quoted text, hiding it from `_has_mutating_substitution` entirely. Both functions are
+  now escape-PARITY-aware (a `\\"` pair cancels out with no net escaping effect — only an ODD
+  backslash count escapes the following character), correctly distinguish a genuine ANSI-C opener
+  from an escaped or `$$`-consumed `$`, and strip backslash-newline LINE CONTINUATIONS from each
+  segment before any shlex-based head detection — closing a class of bypass where a command NAME
+  split across two lines (`"gi\` + newline + `t" commit -m x`) evaded `git`/`gh` detection
+  entirely, while no longer over-blocking the common `cmd \` + newline + `arg` formatting idiom.
+  Every one of these was verified against real bash execution, not just reasoned about.
+- **The blanket `HEREDOC` catch-all itself had no continuation-awareness.** This is the
+  FOUNDATIONAL check this whole carve-out is layered on top of, and it requires a literal,
+  adjacent `<<` in the raw command text. Making `_split_chain` correctly reassemble a
+  continuation-hidden operator for its own segment-counting purposes (above) had an unintended
+  side effect: the "3+ segments" fallback that used to accidentally catch a continuation-hidden
+  heredoc (via the OLD, continuation-unaware splitter producing more segments) stopped being
+  reliable once the splitter got more accurate — an empty-body, same-line-terminator heredoc could
+  drop to exactly 2 segments and the write went completely undetected (`cat <\` + newline +
+  `<EOF > /tmp/x` + newline + `EOF` really writes `/tmp/x`, verified, but was silently allowed).
+  Fixed with a single `_join_continuations` pass applied ONCE, upstream of every other check in
+  `_is_implementation_bash` — including the heredoc carve-out itself — so the blanket `HEREDOC`
+  regex (and everything else) always sees the same reassembled text real bash does.
 
 ## Per-repo opt-out (Alex tg#5743)
 

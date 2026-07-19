@@ -940,8 +940,12 @@ _DOUBLE_QUOTE_ESCAPABLE = ('"', "\\", "$", "`", "\n")
 # Outside any quote, an ANSI-C `'` opener (`$'`), and a bare quote character, can each be escaped
 # by a preceding backslash — plus `$` itself (agent-tools#307 review round 13, Codex P1): a `\$`
 # means the following `'`, even if adjacent, is a PLAIN single-quote, not an ANSI-C opener, since
-# ANSI-C mode requires a genuinely UNESCAPED `$` immediately before the `'`.
-_UNQUOTED_ESCAPABLE = ("'", '"', "$")
+# ANSI-C mode requires a genuinely UNESCAPED `$` immediately before the `'`. A literal newline is
+# ALSO included (agent-tools#307 review round 14, Opus P2): an unquoted `\`+newline is bash's own
+# LINE CONTINUATION, joining two lines into one logical command with no separator at all — a very
+# common formatting idiom (`tg exec \` + newline + `pytest`) — so it must not be treated as a bare
+# newline (a real segment-boundary character) by `_split_chain`.
+_UNQUOTED_ESCAPABLE = ("'", '"', "$", "\n")
 
 
 def _backslash_run(command: str, i: int) -> tuple[int, str, bool]:
@@ -967,6 +971,82 @@ def _backslash_run(command: str, i: int) -> tuple[int, str, bool]:
         j += 1
     escaped_char = command[j] if j < n else ""
     return j, escaped_char, (j - i) % 2 == 1
+
+
+def _join_continuations(command: str) -> str:
+    """Join backslash-newline LINE CONTINUATIONS across the WHOLE command, ONCE, upstream of every
+    other check in this file — bash's own first lexical pass (agent-tools#307 review round 17,
+    Opus/Fable — UNSAFE direction, a regression `_split_chain`'s own round-15/16 continuation
+    handling introduced for a DIFFERENT, earlier check in this file).
+
+    The blanket `HEREDOC` regex (`<<-?\\s*['\"]?\\w+`) — the FOUNDATIONAL catch-all this whole
+    carve-out is layered on top of — requires a LITERAL, adjacent `<<` in the RAW command text; it
+    has no continuation-awareness of its own and never did. Once `_split_chain` learned to
+    correctly REASSEMBLE a continuation-hidden operator for ITS OWN segment-counting purposes, the
+    "3+ segments" fallback that used to accidentally catch a continuation-hidden heredoc (via the
+    old, continuation-UNAWARE splitter producing MORE, not fewer, segments) stopped being reliable:
+    with the body kept minimal (a same-terminator-line, empty-body heredoc), segment count can
+    drop to exactly 2, and the write goes completely undetected. Verified against real bash and
+    against `main`: `cat <\\` + newline + `<EOF > /tmp/x\\nEOF` really writes `/tmp/x` (empty), but
+    `HEREDOC.search` never saw an adjacent `<<` to catch it, and (with this file's OWN
+    continuation-reassembly now more accurate than before) the segment-count fallback no longer
+    reaches 3 either — an unsafe ALLOW that does not exist on `main`, where the old, continuation-
+    unaware splitter produced 3 segments by accident.
+
+    Applying this ONCE, before ANYTHING else (including the heredoc carve-out itself) — rather
+    than teaching every individual regex/scanner in this file its own continuation-awareness — is
+    also why `_split_chain`/`_blank_single_quoted` keep their OWN, independent continuation
+    handling: by the time this function's caller hands them already-joined text, that handling is
+    redundant-but-harmless for the standard `_is_implementation_bash` entry point, while remaining
+    independently correct for anything that calls them directly (e.g. tests, or a future caller
+    that only has a raw fragment, never passed through this join)."""
+    out: list[str] = []
+    quote: str | None = None
+    ansi_c = False
+    dollar_available = False
+    i, n = 0, len(command)
+    while i < n:
+        c = command[i]
+        this_dollar_available = dollar_available
+        dollar_available = False
+        if c == "\\":
+            run_end, escaped_char, is_escaped = _backslash_run(command, i)
+            consumes = is_escaped and (
+                (quote == '"' and escaped_char in _DOUBLE_QUOTE_ESCAPABLE)
+                or (quote == "'" and ansi_c and escaped_char in ("'", "\\"))
+                or (quote is None and escaped_char in _UNQUOTED_ESCAPABLE)
+            )
+            if consumes and escaped_char == "\n":
+                if run_end - i > 1:
+                    out.append(command[i:run_end - 1])
+                else:
+                    dollar_available = this_dollar_available
+                i = run_end + 1
+            elif consumes:
+                out.append(command[i:run_end + 1])
+                i = run_end + 1
+            else:
+                out.append(command[i:run_end])
+                i = run_end
+        elif quote is None and c == "$":
+            dollar_available = not this_dollar_available
+            out.append(c)
+            i += 1
+        elif quote is not None:
+            out.append(c)
+            if c == quote:
+                quote = None
+                ansi_c = False
+            i += 1
+        elif c in ("'", '"'):
+            quote = c
+            ansi_c = c == "'" and this_dollar_available
+            out.append(c)
+            i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
 
 
 def _split_chain(command: str) -> list[str]:
@@ -1013,18 +1093,31 @@ def _split_chain(command: str) -> list[str]:
     a `$` immediately before a `'` really starts ANSI-C mode: `tg \\$'a\\'; git commit` escapes
     the `$` itself (one backslash, odd — genuinely escaped), so the `'` that follows is a PLAIN
     single-quote (no escape mechanism), not an ANSI-C opener — verified this also really runs the
-    trailing command in real bash, via the plain quote closing after two literal characters."""
+    trailing command in real bash, via the plain quote closing after two literal characters.
+
+    The ANSI-C detector tracks `$`-PAIRING via `dollar_available` rather than a positional
+    lookback (agent-tools#307 review rounds 14-15, Opus — round 14 fixed `$$` with a check on
+    `command[i-2]`, which was itself a regression: it could not tell an ESCAPED `\\$` apart from a
+    genuine `$$` pair, wrongly rejecting ANSI-C for `\\$$'...'`, where the escaped first `$` never
+    pairs with anything and the second `$` is fresh). Bash pairs consecutive, genuinely UNESCAPED
+    `$` characters left-to-right into `$$` (its PID special parameter, a complete 2-char
+    expansion): `tg $$'a\\'; git commit` really runs `git commit` (the SECOND `$` pairs with the
+    first, so the `'` after it is a PLAIN quote, not ANSI-C), but `tg \\$$'a\\''; git commit` ALSO
+    really runs it via a genuinely different mechanism (the first `$` is escaped/literal, so the
+    SECOND `$` is fresh and DOES open ANSI-C — verified both against real bash). `dollar_available`
+    toggles on each genuinely unescaped `$` (paired → False, fresh → True), correctly handling any
+    run length, not just exactly two."""
     segs: list[str] = []
     buf: list[str] = []
     quote: str | None = None
     ansi_c = False
-    dollar_escaped = False  # True only for the position right after a `\$` was just consumed
+    dollar_available = False  # True iff the PRECEDING char is a fresh, unpaired "$" (see below)
     i, n = 0, len(command)
     while i < n:
         c = command[i]
         prev = command[i - 1] if i > 0 else ""
-        this_dollar_escaped = dollar_escaped
-        dollar_escaped = False
+        this_dollar_available = dollar_available
+        dollar_available = False
         if c == "\\":
             run_end, escaped_char, is_escaped = _backslash_run(command, i)
             consumes = is_escaped and (
@@ -1032,13 +1125,45 @@ def _split_chain(command: str) -> list[str]:
                 or (quote == "'" and ansi_c and escaped_char in ("'", "\\"))
                 or (quote is None and escaped_char in _UNQUOTED_ESCAPABLE)
             )
-            if consumes:
+            if consumes and escaped_char == "\n":
+                # A LINE CONTINUATION is REMOVED — but ONLY the FINAL backslash + the newline
+                # (agent-tools#307 review round 16, Opus — a prior version deleted the WHOLE run
+                # wholesale): bash pairs backslashes left-to-right, so in a run of 3+ (always odd,
+                # since `is_escaped` already required that), everything BEFORE the last backslash
+                # pairs up into literal backslash characters that DO survive — only the trailing,
+                # unpaired backslash actually forms the continuation with the newline. Verified:
+                # `tg $\\\` + newline + `'a\'; git commit` really runs `git commit` in real bash,
+                # via `$` + a literal `\` (from the leading pair) + a PLAIN (non-ANSI-C) quoted
+                # `'a\'` — the literal backslash sitting between `$` and `'` means `$` is NOT
+                # adjacent to the quote at all, so ANSI-C never opens. `dollar_available` is only
+                # carried FORWARD when the run is EXACTLY one backslash (truly invisible removal,
+                # nothing else changes) — for a longer run, a literal backslash now sits right
+                # before the next position, so `dollar_available` must NOT survive (already False
+                # by the per-iteration default, so no explicit reset needed here).
+                if run_end - i > 1:
+                    buf.append(command[i:run_end - 1])
+                else:
+                    dollar_available = this_dollar_available
+                i = run_end + 1
+            elif consumes:
                 buf.append(command[i:run_end + 1])
-                dollar_escaped = escaped_char == "$"
                 i = run_end + 1
             else:
                 buf.append(command[i:run_end])
                 i = run_end
+        elif quote is None and c == "$":
+            # Bash pairs consecutive, genuinely UNESCAPED `$` characters into `$$` (its own PID
+            # special parameter, a complete 2-char expansion) — so whether THIS `$` is "fresh" and
+            # available to introduce `$'...'` ANSI-C quoting depends on whether the PRECEDING `$`
+            # was itself already available: if so, this one pairs with it (both consumed, neither
+            # left over); if not, this one becomes the new available `$` (agent-tools#307 review
+            # round 15, Opus — a prior positional-only check, "is the character two back a `$`",
+            # could not tell an escaped `\$` (which never pairs with anything) apart from a
+            # genuine `$$` pair, wrongly rejecting ANSI-C for `\$$'...'`, where the FIRST `$` is
+            # escaped/literal and the SECOND is fresh and does open ANSI-C mode).
+            dollar_available = not this_dollar_available
+            buf.append(c)
+            i += 1
         elif quote is not None:
             buf.append(c)
             if c == quote:
@@ -1047,7 +1172,7 @@ def _split_chain(command: str) -> list[str]:
             i += 1
         elif c in ("'", '"'):
             quote = c
-            ansi_c = c == "'" and prev == "$" and not this_dollar_escaped
+            ansi_c = c == "'" and this_dollar_available
             buf.append(c)
             i += 1
         elif command[i:i + 2] in ("&&", "||"):
@@ -1070,7 +1195,27 @@ def _split_chain(command: str) -> list[str]:
 
 
 def _norm_segments(command: str) -> list[str]:
-    """Chain-split (quote-aware) then strip wrappers from each segment (the unit of classification)."""
+    """Chain-split (quote-aware; line continuations already removed by `_split_chain` itself) then
+    strip wrappers from each segment (the unit of classification).
+
+    A prior version had a SEPARATE `_remove_line_continuations` post-processing step with its own,
+    simpler quote-tracker — no escape/ANSI-C/`$$`-pairing awareness at all (agent-tools#307 review
+    round 15, Opus/Codex): it got fooled by an unquoted escaped quote (`X=\\' gi<newline>t commit`,
+    which really invokes `git`) into thinking it was still "inside a single-quoted span," so it
+    never removed the continuation splitting the command name — and, independently, applying it as
+    a SEPARATE pass after `_split_chain` already ran meant `_split_chain`'s own `dollar_available`
+    tracking got silently reset by the untouched continuation before this fix existed. Folding
+    continuation-removal directly into `_split_chain`'s own escape-aware pass (rather than a
+    second, independently-fallible parser) closes both classes at once.
+
+    This is NOT the same as saying there is only one such state machine left in the file, though
+    (agent-tools#307 review round 16, Fable — a prior version of this docstring overclaimed
+    exactly that): `_blank_single_quoted` still carries its OWN, separately-maintained copy of the
+    identical quote/escape/`$$`-pairing/continuation logic, kept in sync by hand rather than by
+    structural sharing — the repeated rounds 13-16 bug history (fixes landing in one copy but not
+    the other, or landing asymmetrically) is the demonstrated cost of that duplication. Properly
+    unifying the two into one shared scanner is a larger refactor, tracked as a follow-up
+    (agent-tools#310) rather than folded into this already-large change."""
     return [_strip_wrappers(s) for s in _split_chain(command)]
 
 
@@ -1112,23 +1257,64 @@ def _blank_single_quoted(command: str) -> str:
     cancelling out with no net escaping effect) does NOT escape the quote the way a single `\\'`
     does — `tg \\\\'foo' $(git commit)` really runs the substitution's `git commit` in real bash
     via the quote genuinely opening then closing, not via an escape, and `\\$'a\\'` escapes the `$`
-    itself (odd count), so the `'` that follows is a plain single-quote, not an ANSI-C opener."""
+    itself (odd count), so the `'` that follows is a plain single-quote, not an ANSI-C opener.
+
+    The ANSI-C detector tracks `$`-PAIRING via `dollar_available` rather than a positional
+    lookback (agent-tools#307 review rounds 14-15, Opus — see `_split_chain`'s docstring for the
+    full rationale, including why a round-14 positional fix for `$$` was itself a regression for
+    `\\$$'...'`, an escaped-then-fresh `$` pair). `$$'a\\'; git commit` really runs `git commit`
+    (the pair consumes both `$`, so the `'` is a plain quote, not ANSI-C — the `\\'` inside it has
+    no escape meaning and the string closes at the very next `'`), but `\\$$'a\\''; git commit`
+    ALSO really runs it, via a genuinely different mechanism (the escaped first `$` never pairs,
+    leaving the second fresh and ANSI-C-opening) — both verified against real bash."""
     out: list[str] = []
     quote: str | None = None
     ansi_c = False
-    dollar_escaped = False  # True only for the position right after a `\$` was just consumed
+    dollar_available = False  # True iff the PRECEDING char is a fresh, unpaired "$" (see below)
     i, n = 0, len(command)
     while i < n:
         c = command[i]
-        prev = command[i - 1] if i > 0 else ""
-        this_dollar_escaped = dollar_escaped
-        dollar_escaped = False
+        this_dollar_available = dollar_available
+        dollar_available = False
         if c == "\\":
             run_end, escaped_char, is_escaped = _backslash_run(command, i)
-            if quote == '"' and is_escaped and escaped_char in _DOUBLE_QUOTE_ESCAPABLE:
+            consumes = is_escaped and (
+                (quote == '"' and escaped_char in _DOUBLE_QUOTE_ESCAPABLE)
+                or (quote == "'" and ansi_c and escaped_char in ("'", "\\"))
+                or (quote is None and escaped_char in _UNQUOTED_ESCAPABLE)
+            )
+            if consumes and escaped_char == "\n":
+                # Only the FINAL backslash + the newline are removed; leading backslashes in a
+                # 3+-run survive (reduced to literal chars, kept INTACT here — this branch only
+                # ever fires for `quote == '"'` or `quote is None`, never `"'"`, since ANSI-C's
+                # own escape set doesn't include a newline), and `dollar_available` carries
+                # forward only for a truly-invisible one-backslash removal — identical treatment
+                # to `_split_chain` (agent-tools#307 review round 16, Opus); see that function's
+                # docstring for the full rationale.
+                #
+                # DELIBERATE EXCEPTION to this function's usual length-preservation (every OTHER
+                # branch emits exactly as many characters as it consumes — agent-tools#307 review
+                # round 16, Opus P3 first raised this as a general invariant to protect): TRUE
+                # removal, not same-width space-blanking, is REQUIRED here (round 16, Fable —
+                # caught by testing Opus's own suggested fix against real bash before trusting it,
+                # not by reasoning alone). `_substitution_inners` scans this function's output with
+                # `_SUBST_INNER`, an ADJACENCY-sensitive regex (`\$\(...\)` requires `$` and `(`
+                # literally next to each other) — space-blanking the pair leaves `$  (git commit)`
+                # in the output, and the regex no longer matches `$(`, so a genuinely LIVE,
+                # unquoted `tg "$` + newline + `(git commit)"` substitution (verified against real
+                # bash: it really runs `git commit`) went completely undetected. No current caller
+                # of this function does position correlation against the original command (only
+                # `_substitution_inners`, which reads matched GROUPS, never offsets), so there is
+                # no length-preservation contract to actually protect at this specific branch.
+                if run_end - i > 1:
+                    out.append(command[i:run_end - 1])
+                else:
+                    dollar_available = this_dollar_available
+                i = run_end + 1
+            elif quote == '"' and consumes:
                 out.append(command[i:run_end + 1])
                 i = run_end + 1
-            elif quote == "'" and ansi_c and is_escaped and escaped_char in ("'", "\\"):
+            elif quote == "'" and consumes:
                 # Unlike the `quote == '"'` case (double-quoted content is kept INTACT since it
                 # still executes), an ANSI-C escape pair sits INSIDE a single-quoted span, whose
                 # content this function's whole job is to BLANK (agent-tools#307 review round 13,
@@ -1137,13 +1323,18 @@ def _blank_single_quoted(command: str) -> str:
                 # exactly like every other character inside a single-quoted span.
                 out.append(" " * (run_end + 1 - i))
                 i = run_end + 1
-            elif quote is None and is_escaped and escaped_char in _UNQUOTED_ESCAPABLE:
+            elif consumes:
                 out.append(command[i:run_end + 1])
-                dollar_escaped = escaped_char == "$"
                 i = run_end + 1
             else:
                 out.append(command[i:run_end] if quote != "'" else " " * (run_end - i))
                 i = run_end
+        elif quote is None and c == "$":
+            # Same `$$`-pairing/escape-aware tracking as `_split_chain` (agent-tools#307 review
+            # round 15, Opus) — see that function's docstring for the full rationale.
+            dollar_available = not this_dollar_available
+            out.append(c)
+            i += 1
         elif quote is not None:
             if c == quote:
                 quote = None
@@ -1154,7 +1345,7 @@ def _blank_single_quoted(command: str) -> str:
             i += 1
         elif c in ("'", '"'):
             quote = c
-            ansi_c = c == "'" and prev == "$" and not this_dollar_escaped
+            ansi_c = c == "'" and this_dollar_available
             out.append(c)
             i += 1
         else:
@@ -1588,6 +1779,18 @@ def _has_mutating_substitution(command: str) -> bool:
 def _is_implementation_bash(command: str) -> bool:
     if not command.strip():
         return False
+    # Join line continuations ONCE, first, before ANYTHING else — including the heredoc carve-out
+    # below (agent-tools#307 review round 17, Opus/Fable): the blanket `HEREDOC` regex a few lines
+    # down requires a LITERAL, adjacent `<<`, so a continuation hiding it (`cat <\` + newline +
+    # `<EOF > /tmp/x`) must be reassembled before that check runs, or the write goes undetected
+    # entirely. Same defensive try/except pattern as the heredoc carve-out below: any internal
+    # failure here must fail toward the SAFE direction (leave `command` untouched, still hit the
+    # ordinary blanket checks on the un-joined text) rather than propagate and crash the whole gate
+    # open under `on_error: open`.
+    try:
+        command = _join_continuations(command)
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: any failure here must not widen ALLOW
+        warn(f"continuation-joining raised {exc!r} — leaving command untouched (safe direction)")
     # agent-tools#307: collapse the ONE provably-safe heredoc shape — `$(cat <<'DELIM' ...
     # DELIM)`, ONLY when it is a plain argument of an already-`tg`-headed segment at substitution
     # depth 0 (never nested, never feeding `eval`/`bash -c`/anything else) — to the neutral

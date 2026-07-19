@@ -848,6 +848,420 @@ def test_escaped_dollar_before_quote_is_not_mistaken_for_ansi_c(tmp_path, monkey
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
 
 
+def test_dollar_dollar_before_quote_is_not_mistaken_for_ansi_c(tmp_path, monkeypatch):
+    """Live proof + regression (agent-tools#307 review round 14, Opus — a REGRESSION the round-13
+    ANSI-C tracking itself introduced): the ANSI-C detector checked only whether the character
+    right before a `'` was `$`, without checking whether that `$` was itself already consumed
+    forming `$$` (bash's own PID special parameter, a complete 2-character expansion). `$$'a\\'`
+    — the SECOND `$` is used up forming `$$`, so the `'` right after it opens a PLAIN single-quote
+    (no escape mechanism), not ANSI-C mode; the embedded `\\'` closes it after 2 literal
+    characters instead of being treated as an escape, leaving a trailing `;` genuinely live.
+    Verified against real bash that `tg_stub $$'a\\'; touch <marker>` really runs the `touch`
+    (and that the PRE-round-13 code handled this correctly BY ACCIDENT, having no ANSI-C concept
+    at all — this is a real behavior change introduced by adding that concept, now fixed)."""
+    marker = tmp_path / "dollar_dollar_marker"
+    script = "tg_stub() { :; }\n" + "tg_stub $$'a\\'; touch " + str(marker) + "\n"
+    subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert marker.exists(), "the $$-before-quote sequence did not desync real bash as expected"
+
+    command = "tg $$'a\\'; git commit"
+    assert ost._split_chain(command) == ["tg $$'a\\'", " git commit"]
+    assert ost._is_implementation_bash(command) is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_escaped_dollar_then_fresh_dollar_still_opens_ansi_c(tmp_path, monkeypatch):
+    """Live proof + regression (agent-tools#307 review round 15, Opus — a REGRESSION the round-14
+    `$$` fix itself introduced): the round-14 fix checked only whether the character TWO positions
+    back was also `$` — a purely POSITIONAL check that cannot tell an ESCAPED `\\$` (which never
+    pairs with anything, since the backslash neutralizes it into a literal, non-expansion `$`)
+    apart from a genuine `$$` pair. For `\\$$'a\\''`, the FIRST `$` is escaped/literal, so the
+    SECOND `$` is a fresh, unpaired dollar sign that DOES introduce ANSI-C `$'...'` quoting in
+    real bash (verified: `tg_stub \\$$'a\\''; touch <marker>` really runs the `touch`, proving
+    the embedded `\\'` does NOT close the string there). The purely positional check wrongly
+    rejected ANSI-C for this shape, treating the quote as plain and closing early. Fixed by
+    replacing the positional heuristic with a proper `$`-pairing state tracker (`dollar_available`)
+    that correctly follows bash's left-to-right `$$`-pairing rule, correctly telling apart an
+    escaped `$` (never pairs, always leaves the NEXT `$` fresh) from a genuine `$$` pair."""
+    marker = tmp_path / "escaped_then_fresh_dollar_marker"
+    script = "tg_stub() { :; }\n" + "tg_stub \\$$'a\\''; touch " + str(marker) + "\n"
+    subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert marker.exists(), "the escaped-then-fresh-dollar ANSI-C sequence did not run as expected"
+
+    danger = "git" + " " + "commit"
+    command = "tg \\$$'a\\''; " + danger
+    assert ost._is_implementation_bash(command) is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_triple_dollar_still_opens_ansi_c(tmp_path, monkeypatch):
+    """Regression (agent-tools#307 review round 15, Codex P1): a run of THREE consecutive `$`
+    before a quote pairs the first two into `$$` (PID), leaving the THIRD fresh and available to
+    open ANSI-C `$'...'` mode -- the `dollar_available` toggle-per-`$` design (round 15) handles
+    any run length correctly, not just exactly two, unlike the round-14 positional hack it
+    replaced. Verified against real bash that `tg_stub $$$'a\\''; touch <marker>` really runs the
+    `touch` (proving the embedded `\\'` does not close the string, i.e. ANSI-C mode really is
+    active for the third `$`)."""
+    marker = tmp_path / "triple_dollar_marker"
+    script = "tg_stub() { :; }\n" + "tg_stub $$$'a\\''; touch " + str(marker) + "\n"
+    subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert marker.exists(), "the triple-dollar ANSI-C sequence did not run as expected"
+
+    danger = "git" + " " + "commit"
+    command = "tg $$$'a\\''; " + danger
+    assert ost._is_implementation_bash(command) is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_line_continuation_does_not_reset_dollar_availability(tmp_path, monkeypatch):
+    """Live proof + regression (agent-tools#307 review round 15, Codex P1 -- UNSAFE direction): a
+    line continuation sitting BETWEEN a fresh `$` and the `'` that would open ANSI-C mode used to
+    silently reset `dollar_available` to False (the per-iteration default), because the
+    continuation-consuming branch did not carry the flag forward across its own multi-character
+    jump -- even though a continuation is logically INVISIBLE to bash (the two lines truly join
+    into one, so whatever was fresh right before it stays fresh right after). Verified against
+    real bash that `tg_stub $` + newline + `'a\\''; touch <marker>` really runs the `touch` (the
+    `$` before the continuation really does open ANSI-C mode after the lines join)."""
+    marker = tmp_path / "continuation_dollar_marker"
+    script = "tg_stub() { :; }\n" + "tg_stub $\\\n'a\\''; touch " + str(marker) + "\n"
+    subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert marker.exists(), "the $-then-continuation-then-quote sequence did not run as expected"
+
+    danger = "git" + " " + "commit"
+    command = "tg $\\\n'a\\''; " + danger
+    assert ost._split_chain(command) == ["tg $'a\\''", " " + danger]
+    assert ost._is_implementation_bash(command) is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_multi_backslash_run_before_continuation_keeps_leading_literals(tmp_path, monkeypatch):
+    """Live proof + regression (agent-tools#307 review round 16, Opus -- UNSAFE direction, a
+    regression the round-15 continuation-removal fix itself introduced): bash only ever deletes
+    the FINAL backslash + newline of a run as the continuation -- everything BEFORE it pairs up
+    left-to-right into literal backslash characters that SURVIVE. A prior version deleted the
+    WHOLE run (all N backslashes) wholesale whenever the run's length was odd (satisfying
+    `is_escaped`), which for a 3-backslash run wrongly (a) dropped a literal backslash that should
+    have remained between `$` and the following quote, defeating ANSI-C detection since the two
+    are no longer adjacent, and (b) carried `dollar_available` forward as if the removal were
+    truly invisible, when it is not once more than one backslash is involved. Verified against
+    real bash that `tg_stub $` + 3 backslashes + newline + `'a\\'; touch <marker>` really runs the
+    `touch` -- via a literal backslash landing between `$` and `'` (so ANSI-C never opens, and the
+    resulting PLAIN quoted string closes early, leaving the `;` genuinely live)."""
+    marker = tmp_path / "multi_backslash_continuation_marker"
+    script = "tg_stub() { :; }\n" + "tg_stub $\\\\\\\n'a\\'; touch " + str(marker) + "\n"
+    subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert marker.exists(), "the 3-backslash-run-before-continuation sequence did not run as expected"
+
+    danger = "git" + " " + "commit"
+    command = "tg $\\\\\\\n'a\\'; " + danger
+    assert ost._split_chain(command) == ["tg $\\\\'a\\'", " " + danger]
+    assert ost._is_implementation_bash(command) is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_odd_backslash_run_before_continuation_is_not_git_documented_bias(tmp_path, monkeypatch):
+    """Live proof + regression (agent-tools#307 review round 16, Codex P2 -- the SAFE-direction
+    counterpart of the test above): a command NAME split across two lines by `"gi\\\\\\` + newline
+    + `t" commit -m x` (THREE backslashes before the continuation) does NOT resolve to `git` in
+    real bash -- the pair of leading backslashes collapses to ONE literal backslash, and only the
+    final backslash + newline is the continuation, so the resulting word is the FOUR characters
+    `gi\\t` (g, i, backslash, t), never invoked as `git` at all. Verified against real bash with a
+    stub `git` shell function that this exact construction does NOT invoke it (bash instead fails
+    with "command not found: gi\\t"). Pins that the classifier correctly does NOT treat this as a
+    git command either -- the over-block direction is intentionally avoided here, not just the
+    under-block one."""
+    marker = tmp_path / "odd_backslash_not_git_marker"
+    command = '"gi\\\\\\\nt" commit -m x'
+    script = "git() { touch " + str(marker) + "; }\n" + command + "\n"
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert not marker.exists(), "the 3-backslash-run command name unexpectedly resolved to `git`"
+    assert result.returncode != 0, "expected real bash to fail resolving `gi\\t` as a command"
+
+
+def test_three_backslash_run_before_continuation_defeats_dollar_paren_adjacency(tmp_path, monkeypatch):
+    """Live proof + regression (agent-tools#307 review round 17, Opus -- missing-test gap for
+    `_blank_single_quoted`'s structurally identical `run_end - i > 1` branch, "precisely the
+    adjacency-sensitive interaction round 16 already got wrong once, in the run==1 case"): with
+    THREE backslashes before a continuation splitting a `$(` opener (`"$\\\\\\` + newline +
+    `(git commit)"`), the leading pair collapses to ONE literal backslash that survives BETWEEN
+    the `$` and the `(` -- so, unlike the single-backslash case (where the substitution IS live),
+    this is NOT a real substitution in bash at all (a bare `$` followed by a literal backslash has
+    no special meaning, and `\\(` inside double quotes is not a recognized escape either, so the
+    whole thing is inert text). Verified against real bash with a stub that this construction does
+    NOT run the embedded command; pins that `_blank_single_quoted` correctly does NOT report a
+    substitution here, matching bash rather than creating a false adjacency."""
+    marker = tmp_path / "run3_dollar_paren_marker"
+    script = "tg_stub() { :; }\n" + 'tg_stub "$\\\\\\\n(touch ' + str(marker) + ')"\n'
+    subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert not marker.exists(), "the 3-backslash-run before $( unexpectedly ran as a live substitution"
+
+    danger = "git" + " " + "commit"
+    command = 'tg "$\\\\\\\n(' + danger + ')"'
+    assert ost._has_mutating_substitution(command) is False
+
+    assert ost._git_subcommand(ost._norm_segments(command)[0]) is None
+    assert ost._is_implementation_bash(command) is False
+
+
+def test_continuation_inside_plain_single_quote_stays_literal(tmp_path, monkeypatch):
+    """Regression (agent-tools#307 review round 16, Opus -- missing-test gap): a plain (non-ANSI-C)
+    single-quoted span has NO escape mechanism in bash at all, so a backslash-newline INSIDE it is
+    ordinary, literal content -- NOT a continuation to be removed. `tg 'a` + newline + `b'` is one
+    legitimate, multi-line-bodied `tg` argument (verified: real bash treats the whole thing as a
+    single argument to `tg_stub`, no live trailing command); the current code only gets this right
+    because the newline-consuming branch is gated behind `consumes`, which single quotes never
+    satisfy (no escape mechanism) -- this test pins that a future refactor can't silently break it."""
+    marker = tmp_path / "continuation_in_single_quote_marker"
+    script = "tg_stub() { touch " + str(marker) + "; }\n" + "tg_stub 'a\\\nb'\n"
+    subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert marker.exists(), "the plain single-quoted multi-line argument did not run as a normal tg call"
+
+    command = "tg 'a\\\nb'"
+    assert ost._split_chain(command) == [command]  # untouched -- the continuation stays literal
+    assert ost._is_implementation_bash(command) is False
+
+
+def test_dollar_dollar_pair_then_continuation_does_not_open_ansi_c(tmp_path, monkeypatch):
+    """Live proof + regression (agent-tools#307 review round 16, Opus -- missing-test gap, "the
+    case the carry-forward logic is most likely to get wrong"): `$$` pairs into bash's PID special
+    parameter, consuming BOTH dollar signs -- so `dollar_available` must be False by the time a
+    continuation follows, and must STAY False across it (nothing to carry forward). `tg $$` +
+    newline + `'a\\'; git commit` must NOT open ANSI-C mode; the quote is plain, closes early
+    after `a\\`, and the trailing `;` is genuinely live either way. Verified against real bash that
+    `tg_stub $$` + newline + `'a\\'; touch <marker>` really runs the `touch`."""
+    marker = tmp_path / "dollar_dollar_continuation_marker"
+    script = "tg_stub() { :; }\n" + "tg_stub $$\\\n'a\\'; touch " + str(marker) + "\n"
+    subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert marker.exists(), "the $$-then-continuation-then-quote sequence did not run as expected"
+
+    danger = "git" + " " + "commit"
+    command = "tg $$\\\n'a\\'; " + danger
+    assert ost._split_chain(command) == ["tg $$'a\\'", " " + danger]
+    assert ost._is_implementation_bash(command) is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_even_backslash_run_before_newline_is_still_a_real_separator(tmp_path, monkeypatch):
+    """Regression (agent-tools#307 review round 16, Fable -- missing-test gap, "the unsafe inverse
+    of the over-block test"): an EVEN backslash count before a newline (`a\\\\` + newline, TWO
+    backslashes) pairs up into ONE literal backslash with no net escaping effect -- the newline
+    right after it is a REAL, live segment separator, not a continuation. `tg a\\\\` + newline +
+    `git commit` must still split into two segments and block on the second. Verified against
+    real bash that this really runs as two separate statements."""
+    marker = tmp_path / "even_backslash_newline_marker"
+    script = "tg_stub() { :; }\n" + "tg_stub a\\\\\ntouch " + str(marker) + "\n"
+    subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert marker.exists(), "the even-backslash-run-before-newline did not split into two real statements"
+
+    danger = "git" + " " + "commit"
+    command = "tg a\\\\\n" + danger
+    assert ost._split_chain(command) == ["tg a\\\\", danger]
+    assert ost._is_implementation_bash(command) is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_continuation_splitting_the_dollar_paren_opener_still_detected(tmp_path, monkeypatch):
+    """Live proof + regression (agent-tools#307 review round 16, Fable -- UNSAFE direction, found
+    by testing Fable's own suggested test against real bash rather than trusting the suggestion at
+    face value: the FIRST fix attempt, blanking the continuation with same-width spaces to satisfy
+    a length-preservation nicety, broke this case anew). A line continuation can split the `$(`
+    substitution opener itself: `tg "$` + newline + `(git commit)"` really runs `git commit` in
+    real bash (the two lines join, `$(` forms a genuine substitution). `_substitution_inners`
+    scans `_blank_single_quoted`'s output with an ADJACENCY-sensitive regex (`\\$\\(...\\)`
+    requires `$` and `(` literally next to each other) -- so the continuation between them must
+    be genuinely REMOVED, not replaced with same-width spaces (which would leave `$  (git commit)`
+    and never match). Verified against real bash with a stub, not just reasoned about."""
+    marker = tmp_path / "dollar_paren_continuation_marker"
+    script = "tg_stub() { :; }\n" + 'tg_stub "$\\\n(touch ' + str(marker) + ')"\n'
+    subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert marker.exists(), "the continuation-split $( opener did not run as a live substitution"
+
+    danger = "git" + " " + "commit"
+    command = 'tg "$\\\n(' + danger + ')"'
+    assert ost._has_mutating_substitution(command) is True
+    assert ost._is_implementation_bash(command) is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_bare_amp_across_continuation_still_splits_documented_bias(tmp_path, monkeypatch):
+    """Regression (agent-tools#307 review round 16, Fable): a bare, chain-splitting `&`/`|` always
+    triggers its OWN independent segment split regardless of what character follows it in the raw
+    text -- so a line continuation sitting BETWEEN two `&` characters that would join into a real
+    `&&` in bash (`tg x &` + newline + `& git commit`) does NOT hide the mutation: each `&`
+    independently splits a segment on its own, landing on the SAFE side (an accepted over-split,
+    same class as the already-documented `&&`/`||` residuals elsewhere in this file) rather than
+    ever swallowing the trailing `git commit` into an allowed segment. Verified against real bash
+    that this construction really runs the trailing command (bash DOES join the two `&` into a
+    real `&&`), and the classifier still blocks it (via independent bare-`&` splits, not by
+    correctly recognizing the joined `&&`)."""
+    marker = tmp_path / "amp_continuation_marker"
+    script = "tg_stub() { :; }\n" + "tg_stub x &\\\n& touch " + str(marker) + "\n"
+    subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert marker.exists(), "the continuation-split && did not run as a live chained command"
+
+    danger = "git" + " " + "commit"
+    command = "tg x &\\\n& " + danger
+    assert ost._is_implementation_bash(command) is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_continuation_hiding_the_blanket_heredoc_operator_still_blocks(tmp_path, monkeypatch):
+    """Live proof + regression (agent-tools#307 review round 17, Opus/Fable -- UNSAFE direction, a
+    regression this file's OWN round-15/16 continuation handling introduced for a DIFFERENT,
+    earlier check): the blanket `HEREDOC` regex -- the FOUNDATIONAL catch-all this whole carve-out
+    is layered on top of -- requires a LITERAL, adjacent `<<` in the raw command text; it has no
+    continuation-awareness of its own. `cat <\\` + newline + `<EOF > <file>` + newline + `EOF`
+    really writes `<file>` in real bash (verified), but `HEREDOC.search` never sees an adjacent
+    `<<` to catch it. Before this file's `_split_chain` gained continuation-awareness (rounds
+    15-16), the OLD, continuation-UNAWARE splitter happened to still produce 3+ segments for this
+    shape by accident (an over-split fallback), masking the gap; once `_split_chain` correctly
+    reassembles a continuation-hidden operator for ITS OWN purposes, an EMPTY-body, same-line-
+    terminator heredoc drops to exactly 2 segments and the write went completely undetected --
+    verified against `main`, where this exact construction is still (accidentally) blocked, unlike
+    the pre-round-17 version of this branch. Fixed by joining continuations ONCE, upstream of
+    every other check (`_join_continuations`), so the blanket `HEREDOC` regex sees the same
+    reassembled `<<` that real bash does."""
+    marker = tmp_path / "heredoc_continuation_write_target.txt"
+    script = "cat <\\\n<EOF > " + str(marker) + "\nEOF"
+    if marker.exists():
+        marker.unlink()
+    subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert marker.exists(), "the continuation-hidden heredoc-to-file write did not run as expected"
+    marker.unlink()
+
+    command = "cat <\\\n<EOF > " + str(marker) + "\nEOF"
+    assert ost.HEREDOC.search(ost._join_continuations(command)) is not None
+    assert ost._is_implementation_bash(command) is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_naive_continuation_removal_desync_no_longer_reachable(tmp_path, monkeypatch):
+    """Live proof + regression (agent-tools#307 review round 15, Opus/Codex -- UNSAFE direction):
+    a PRIOR design had a SEPARATE `_remove_line_continuations` post-processing function with its
+    own, simpler quote-tracker -- no escape-awareness at all. It got fooled by an UNQUOTED escaped
+    single-quote into thinking it was still "inside a single-quoted span," so it never removed the
+    continuation splitting a command NAME across two lines, and the mutation went undetected.
+    Verified against real bash with a stub `git` function that `X=\\' gi` + newline +
+    `t commit -m x` really invokes `git`. Fixed by folding continuation-removal directly into
+    `_split_chain`'s own single escape-aware pass instead of a second, independently-fallible one
+    (see `_norm_segments`'s docstring)."""
+    marker = tmp_path / "naive_continuation_marker"
+    command = "X=\\' gi\\\nt commit -m x"
+    script = "git() { touch " + str(marker) + "; }\n" + command + "\n"
+    subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert marker.exists(), "the escaped-quote-then-continuation sequence did not run as expected"
+
+    expected_segment = "git commit -m x"
+    assert ost._norm_segments(command) == [expected_segment]
+    assert ost._git_subcommand(expected_segment) == "commit"
+    assert ost._is_implementation_bash(command) is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_unquoted_line_continuation_does_not_over_block(tmp_path, monkeypatch):
+    """Regression (agent-tools#307 review round 14, Opus P2): an unquoted backslash-newline is
+    bash's own LINE CONTINUATION — a very common formatting idiom (`tg exec \\` + newline +
+    `pytest`) that joins two lines into ONE logical command with no separator at all. Before this
+    fix, `_UNQUOTED_ESCAPABLE` omitted the newline character, so it fell into the non-consuming
+    branch and was treated as a bare segment-separator — splitting into `tg exec \\` and `pytest`,
+    and the second segment (`pytest` alone) was independently classified as a test-runner
+    invocation, producing a false BLOCK on legitimate, ordinary multi-line formatting. `tg`/
+    `pytest` together are still one `tg`-headed segment and must be allowed. `_split_chain` now
+    REMOVES the continuation entirely (round 15), matching bash's own lexer, so the single
+    resulting segment reads as the joined logical line `tg exec pytest`, not the raw text with an
+    embedded backslash-newline."""
+    command = "tg exec \\\npytest"
+    assert ost._split_chain(command) == ["tg exec pytest"]  # ONE segment, continuation removed
+    assert ost._is_implementation_bash(command) is False
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    assert "message" not in json.loads(out1)
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == 0 and _decision(out2) == "allow"
+
+
+def test_line_continuation_splitting_a_command_name_still_blocks(tmp_path, monkeypatch):
+    """Live proof + regression (agent-tools#307 review round 14, Codex P1 -- UNSAFE direction): a
+    command NAME deliberately split across two lines via a line continuation inside double quotes
+    (open-quote, `gi`, backslash-newline, `t`, close-quote, ` commit -m x`, which really invokes
+    `git`) left a literal, embedded newline character in the shlex-parsed token -- `shlex.split`
+    does not collapse a backslash-newline the way bash's own lexer does, so `toks[0]` never
+    equalled `git` and the mutation went undetected entirely. Verified against real bash with a
+    stub `git` function (bypassing PATH resolution ambiguity) that the split-name form really
+    invokes it. Fixed by removing line continuations directly inside `_split_chain`'s own
+    escape-aware pass (round 15: a separate, simpler post-processing step was tried first and
+    found to reintroduce the same class of bug -- see `_norm_segments`'s docstring) BEFORE any
+    shlex-based head detection runs."""
+    marker = tmp_path / "line_continuation_marker"
+    command = '"gi\\\nt" commit -m x'
+    script = "git() { touch " + str(marker) + "; }\n" + command + "\n"
+    subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert marker.exists(), "the line-continued command name did not resolve to `git` as expected"
+
+    assert ost._git_subcommand(ost._norm_segments(command)[0]) == "commit"
+    assert ost._is_implementation_bash(command) is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+    # the SAME idiom hiding a mutation inside an unquoted, live command substitution
+    command2 = 'tg "$(git \\\ncommit -m x)"'
+    assert ost._has_mutating_substitution(command2) is True
+    assert ost._is_implementation_bash(command2) is True
+    event2 = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command2}}
+    out3, _e3, c3 = _run(event2, monkeypatch, tmp_path / "m2")
+    assert c3 == 0 and _decision(out3) == "allow"
+    out4, _e4, c4 = _run(event2, monkeypatch, tmp_path / "m2")
+    assert c4 == ost.BLOCK_EXIT_CODE and _decision(out4) == "block"
+
+
 def test_unquoted_escaped_single_quote_no_longer_hides_a_live_substitution(tmp_path, monkeypatch):
     """Live proof + regression (agent-tools#307 review round 12, Codex P1 — UNSAFE direction: a
     real LAUNDERING vector, not merely an over/under-block nuance): `_blank_single_quoted` feeds
@@ -1340,6 +1754,45 @@ def test_time_format_flag_operand_not_mistaken_for_wrapped_command(tmp_path, mon
     plain = "time tg 'hello'"
     assert ost._strip_wrappers(plain) == "tg hello"
     assert ost._is_implementation_bash(plain) is False
+
+
+def test_time_long_form_and_attached_value_flags():
+    """Test-coverage gap flagged by Opus (agent-tools#307 review round 14, P3): the round-10 fix
+    registered `--format`/`--output` (the long-option spellings) alongside `-f`/`-o`, but only the
+    short `-f` form had a regression pinning it. Covers the long, SEPARATE-token form
+    (`--format tg pytest` -- consumes `tg` as `--format`'s operand, leaving `pytest`) and the
+    attached `=`-value form real GNU time users actually write (`--format=%e tg pytest` -- the
+    value is EMBEDDED in the one token, so nothing is consumed, and `tg` is genuinely the wrapped
+    command, correctly left in place)."""
+    assert ost._strip_wrappers("time --format tg pytest") == "pytest"
+    assert ost._strip_wrappers("time --output tg pytest") == "pytest"
+    assert ost._strip_wrappers("time --format=%e tg pytest") == "tg pytest"
+    assert ost._is_implementation_bash("time --format tg pytest") is True
+    assert ost._is_implementation_bash("time --format=%e tg pytest") is False
+
+
+def test_backslash_parity_inside_double_quotes(tmp_path, monkeypatch):
+    """Test-coverage gap flagged by Opus (agent-tools#307 review round 14, P3 -- now with the live
+    bash proof round 15 also asked for): backslash parity was only ever exercised OUTSIDE quotes
+    (`\\\\"`/`\\\\'`); the analogous case INSIDE an ALREADY-open double-quoted span — where
+    `_DOUBLE_QUOTE_ESCAPABLE` membership and parity interact together — was unexercised. `tg
+    "a\\\\"; git commit` has TWO backslashes before the closing quote (even count, cancelling
+    out), so the quote genuinely closes right there (unlike the single-backslash case, where it
+    does not), and the trailing `;` is real either way."""
+    marker = tmp_path / "double_quote_parity_marker"
+    script = "tg_stub() { :; }\n" + 'tg_stub "a\\\\"; touch ' + str(marker) + "\n"
+    subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+    assert marker.exists(), "the even-backslash-count-inside-double-quotes sequence did not run as expected"
+
+    danger = "git" + " " + "commit"
+    command = 'tg "a\\\\"; ' + danger
+    assert ost._split_chain(command) == ['tg "a\\\\"', " " + danger]
+    assert ost._is_implementation_bash(command) is True
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
 
 
 def test_review_is_no_longer_a_heredoc_consumer(tmp_path, monkeypatch):
