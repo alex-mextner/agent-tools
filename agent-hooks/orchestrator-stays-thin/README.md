@@ -157,6 +157,24 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   subagent (`agent_id` present) is exempt and runs gh/ship freely — the gate governs the
   orchestrator only.
 
+**Two pre-existing, general bugs closed alongside the carve-out (found by GitHub's automated
+review on the #307 PR, PR #311):** both are verified reproducible on `main` with ZERO heredoc
+involvement — the heredoc work didn't introduce either, but both are fixed here since they share
+the same wrapper-stripping/chain-splitting machinery the carve-out reuses, and left them blocking
+would leave the same hook trivially bypassable.
+- **`time -f`/`-o` operand not recognized.** `_WRAPPER_OPT_ARGS["time"]` had no operand-taking
+  flags registered, so `time -f tg pytest` was mis-stripped to `tg pytest` — reading `tg` as the
+  wrapped command when GNU `time`'s `-f` actually consumes `tg` as its OWN format-string operand,
+  and the REAL wrapped command (`pytest`) slipped past entirely. Fixed by registering `-f`/
+  `--format`/`-o`/`--output` as operand-taking, the same way `env`/`nice`/`timeout` already are.
+- **`_split_chain` had no backslash-escape awareness.** A backslash-escaped quote INSIDE a
+  double-quoted span (`\"`, which does NOT end the string in real bash) was mistaken for the real
+  closing quote, and the actual closing quote right after it was read as a fresh opener —
+  swallowing a real trailing `;`/chain operator (and whatever command follows it) as if it were
+  still-quoted text. `tg "a\""; git commit` really runs `git commit` in real bash, verified.
+  Fixed by giving `_split_chain` real escape-awareness inside double-quoted spans only (single
+  quotes have no escape mechanism in bash at all, so a backslash there stays ordinary content).
+
 ## Per-repo opt-out (Alex tg#5743)
 
 Default **ON** (opt-OUT — this gate has always been always-on, so an un-enrolled repo keeps

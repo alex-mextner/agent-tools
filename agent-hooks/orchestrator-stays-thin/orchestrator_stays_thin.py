@@ -174,7 +174,15 @@ _WRAPPER_OPT_ARGS = {
     "gtimeout": frozenset({"-k", "--kill-after", "-s", "--signal"}),
     "stdbuf": frozenset({"-i", "-o", "-e"}),
     "ionice": frozenset({"-c", "-n"}),
-    "time": frozenset(),
+    # GNU `time`'s `-f`/`--format` and `-o`/`--output` each consume a following operand
+    # (agent-tools#307 review, GitHub bot P1 — pre-existing, reproducible on `main` with NO
+    # heredoc at all: `time -f tg pytest`, with an EMPTY operand table for "time", was already
+    # misread as the wrapped command being `tg` — because nothing told this stripper that `-f`
+    # consumes the very next token — when the REAL wrapped command is `pytest`; `tg` is merely
+    # `-f`'s format-string argument. Verified against `main`, unrelated to this PR's heredoc
+    # carve-out, but fixed here since it's the same wrapper-stripping mechanism the carve-out
+    # reuses and the bug is real regardless of whether a heredoc is involved).
+    "time": frozenset({"-f", "--format", "-o", "--output"}),
     "nohup": frozenset(),
     "setsid": frozenset(),
 }
@@ -925,6 +933,42 @@ def _strip_wrappers(segment: str) -> str:
     return " ".join(shlex.quote(t) for t in rest) if rest else segment
 
 
+# The characters a backslash actually escapes INSIDE a double-quoted bash string (POSIX): `$`,
+# backtick, `"`, `\`, and a literal newline (line continuation). A backslash before any OTHER
+# character is literal (kept, not an escape) — e.g. `"\d"` is the two characters `\d`, not `d`.
+_DOUBLE_QUOTE_ESCAPABLE = ('"', "\\", "$", "`", "\n")
+# Outside any quote, an ANSI-C `'` opener (`$'`), and a bare quote character, can each be escaped
+# by a preceding backslash — plus `$` itself (agent-tools#307 review round 13, Codex P1): a `\$`
+# means the following `'`, even if adjacent, is a PLAIN single-quote, not an ANSI-C opener, since
+# ANSI-C mode requires a genuinely UNESCAPED `$` immediately before the `'`.
+_UNQUOTED_ESCAPABLE = ("'", '"', "$")
+
+
+def _backslash_run(command: str, i: int) -> tuple[int, str, bool]:
+    """`command[i]` is a backslash. Returns `(run_end, escaped_char, is_escaped)`: `run_end` is the
+    index just past the maximal run of CONSECUTIVE backslashes starting at `i`; `escaped_char` is
+    whatever character immediately follows that run (`""` at end of string); `is_escaped` is True
+    iff the run's length is ODD.
+
+    Backslash PARITY matters (agent-tools#307 review round 13, Opus/Codex — a prior version only
+    ever peeked exactly one character back, so it treated ANY single backslash immediately before
+    a quote as escaping it, with no regard for how many backslashes actually preceded that quote):
+    in bash, each PAIR of consecutive backslashes collapses to one literal backslash with NO net
+    escaping effect on whatever follows — only a single, UNPAIRED (odd-count) backslash is left
+    over to escape the next character. So `\\"` (ONE backslash) escapes the quote (verified:
+    `tg "a\\""; git commit` really runs the trailing command because the ESCAPED quote does not
+    end the string), but `\\\\"` (TWO backslashes) does NOT — the pair cancels out, leaving the
+    quote genuinely UNESCAPED, a real opener (verified: `tg \\\\"foo"; git commit` — a DIFFERENT
+    real-bash execution than the one-backslash case — still runs `git commit` for real, but via
+    the quote actually opening-then-closing normally, not via an escape)."""
+    n = len(command)
+    j = i
+    while j < n and command[j] == "\\":
+        j += 1
+    escaped_char = command[j] if j < n else ""
+    return j, escaped_char, (j - i) % 2 == 1
+
+
 def _split_chain(command: str) -> list[str]:
     """Split a command into segments on shell operators (``&&`` ``||`` ``;`` ``|`` newline AND a
     bare control ``&``) that lie OUTSIDE quotes. Quote-aware so a ``|`` inside a quoted jq program
@@ -933,29 +977,84 @@ def _split_chain(command: str) -> list[str]:
     A bare ``&`` (backgrounding) IS a real segment separator, so `tg done & git commit` splits into
     two segments and the smuggled `git commit` is judged on its own — without this it was one
     segment with a benign `tg` head and slipped past the impl scan (codex review). A redirect ``&``
-    (`2>&1`, `&>`, `>&`) and the already-handled `&&` are NOT splits (BG_AMP semantics)."""
+    (`2>&1`, `&>`, `>&`) and the already-handled `&&` are NOT splits (BG_AMP semantics).
+
+    A backslash-escaped quote INSIDE a double-quoted span does NOT close it (agent-tools#307
+    review, GitHub bot P1 — pre-existing, reproducible on `main` with ZERO heredoc involvement:
+    `tg "a\\""; git commit` really runs `git commit` in real bash, verified, since `\\"` is a
+    literal escaped quote that does not end the string, but the REAL closing `"` right after it
+    does; a scanner with no escape awareness closes on the ESCAPED quote instead, then reopens on
+    the real one, swallowing the live `; git commit` as if it were still-quoted text). Only
+    DOUBLE-quoted spans get this treatment — single quotes have NO escape mechanism at all in
+    bash (`'a\\'` is the literal 3 characters `a\\`, verified elsewhere in this file's history),
+    so a backslash inside single quotes is ordinary content, never consulted for escaping here.
+
+    An UNQUOTED backslash-escaped quote is the SAME class of bug, one level out (agent-tools#307
+    review round 12, Opus): outside any quote at all, a bare `\\"`/`\\'` is bash's OWN way of
+    inserting a LITERAL quote character without starting a real quoted span at all (verified:
+    `tg \\"a\\"; touch /tmp/marker` really runs the `touch` — the backslash-quote pairs are two
+    literal `"` characters, never opening a span, so the `;` right after them is real, live, and
+    ends `tg`'s (unquoted) argument).
+
+    ANSI-C `$'...'` quoting is a DIFFERENT quoting mode than a plain `'...'` (agent-tools#307
+    review round 12, Codex P1 — UNSAFE direction, not a bias: `tg $'a\\''; git commit` really
+    runs `git commit`, verified). Inside `$'...'`, `\\'` is a literal escaped quote that does NOT
+    end the string, but a bare `'...'` has NO escape mechanism at all and DOES end on the very
+    next `'` — so the SAME character (`'`) means different things depending on whether the quote
+    was opened via a preceding, genuinely UNESCAPED `$`.
+
+    All THREE contexts above are escape-PARITY-aware via the shared `_backslash_run` helper
+    (agent-tools#307 review round 13, Opus/Codex — the earlier per-context fixes each only ever
+    peeked exactly one character back, so `\\\\"` — TWO backslashes, which cancel out to a
+    literal backslash with no net escaping effect — was still wrongly treated as escaping the
+    quote; `tg \\\\"foo"; git commit` really runs the trailing command in real bash via the quote
+    genuinely opening then closing, not via an escape, and the classifier must reach the same
+    conclusion by a different mechanism than the one-backslash case). Parity also governs whether
+    a `$` immediately before a `'` really starts ANSI-C mode: `tg \\$'a\\'; git commit` escapes
+    the `$` itself (one backslash, odd — genuinely escaped), so the `'` that follows is a PLAIN
+    single-quote (no escape mechanism), not an ANSI-C opener — verified this also really runs the
+    trailing command in real bash, via the plain quote closing after two literal characters."""
     segs: list[str] = []
     buf: list[str] = []
     quote: str | None = None
+    ansi_c = False
+    dollar_escaped = False  # True only for the position right after a `\$` was just consumed
     i, n = 0, len(command)
     while i < n:
         c = command[i]
         prev = command[i - 1] if i > 0 else ""
-        nxt = command[i + 1] if i + 1 < n else ""
-        if quote is not None:
+        this_dollar_escaped = dollar_escaped
+        dollar_escaped = False
+        if c == "\\":
+            run_end, escaped_char, is_escaped = _backslash_run(command, i)
+            consumes = is_escaped and (
+                (quote == '"' and escaped_char in _DOUBLE_QUOTE_ESCAPABLE)
+                or (quote == "'" and ansi_c and escaped_char in ("'", "\\"))
+                or (quote is None and escaped_char in _UNQUOTED_ESCAPABLE)
+            )
+            if consumes:
+                buf.append(command[i:run_end + 1])
+                dollar_escaped = escaped_char == "$"
+                i = run_end + 1
+            else:
+                buf.append(command[i:run_end])
+                i = run_end
+        elif quote is not None:
             buf.append(c)
             if c == quote:
                 quote = None
+                ansi_c = False
             i += 1
         elif c in ("'", '"'):
             quote = c
+            ansi_c = c == "'" and prev == "$" and not this_dollar_escaped
             buf.append(c)
             i += 1
         elif command[i:i + 2] in ("&&", "||"):
             segs.append("".join(buf))
             buf = []
             i += 2
-        elif c == "&" and prev not in ("&", ">") and nxt not in ("&", ">"):
+        elif c == "&" and prev not in ("&", ">") and command[i + 1:i + 2] not in ("&", ">"):
             segs.append("".join(buf))  # bare control `&` — a background separator, not a redirect
             buf = []
             i += 1
@@ -985,23 +1084,82 @@ def _blank_single_quoted(command: str) -> str:
     command extracted and judged, not erased. (An earlier version blanked both quote kinds, which
     erased exactly the common quoted-mutation form.) Conservative side effect: a literal `<(…)`
     inside double quotes (where process substitution does NOT execute) is still extracted and may
-    over-flag — the safe direction for a gate. Best-effort, matching `_split_chain`:
-    backslash-escapes are out of scope (discipline heuristic, not a security boundary).
-    SYNC agent-tools#159/#162."""
+    over-flag — the safe direction for a gate. SYNC agent-tools#159/#162.
+
+    Escape-aware the SAME way `_split_chain` is (agent-tools#307 review round 12, Codex P1 —
+    "backslash-escapes are out of scope" was the PRIOR claim here, but that is now a proven,
+    UNSAFE-direction bug, not just a discipline gap): without this, an unquoted `\\'` (a literal
+    escaped single-quote, opening no real span in bash) was mistaken for a real single-quote
+    OPENER, so a genuinely LIVE, unquoted `$(...)` immediately after it got BLANKED OUT as if it
+    were inert single-quoted text — hiding a real mutating substitution from `_has_mutating_
+    substitution` entirely (verified: `tg \\' $(git commit)` really runs `git commit`, but the
+    prior version of this function blanked the substitution to spaces and the classifier saw
+    nothing to flag — an actual laundering vector, not merely an over/under-block nuance). Handles
+    both an escaped quote INSIDE an open double-quoted span (which does not close it) and an
+    escaped quote OUTSIDE any quote (which does not open one), identically to `_split_chain`.
+
+    ANSI-C `$'...'` quoting (agent-tools#307 review round 12, Codex P1 — UNSAFE direction): the
+    SAME `'` character means different things depending on whether it was opened via a preceding,
+    genuinely UNESCAPED `$` — inside `$'...'`, `\\'` is a literal escaped quote that does NOT end
+    the string, but a bare `'...'` has no escape mechanism and ends on the very next `'`. Without
+    this, `tg $'a\'' $(git commit)` closed the ANSI-C string early at the escaped `\\'`, reopened a
+    spurious single-quote span at the REAL closing `'`, and blanked the genuinely LIVE
+    `$(git commit)` that followed as if it were inert quoted text — hiding it from
+    `_has_mutating_substitution` entirely (verified against real bash).
+
+    All THREE contexts are escape-PARITY-aware via the shared `_backslash_run` helper, identically
+    to `_split_chain` (agent-tools#307 review round 13, Opus/Codex): `\\\\'` (TWO backslashes,
+    cancelling out with no net escaping effect) does NOT escape the quote the way a single `\\'`
+    does — `tg \\\\'foo' $(git commit)` really runs the substitution's `git commit` in real bash
+    via the quote genuinely opening then closing, not via an escape, and `\\$'a\\'` escapes the `$`
+    itself (odd count), so the `'` that follows is a plain single-quote, not an ANSI-C opener."""
     out: list[str] = []
     quote: str | None = None
-    for c in command:
-        if quote is not None:
+    ansi_c = False
+    dollar_escaped = False  # True only for the position right after a `\$` was just consumed
+    i, n = 0, len(command)
+    while i < n:
+        c = command[i]
+        prev = command[i - 1] if i > 0 else ""
+        this_dollar_escaped = dollar_escaped
+        dollar_escaped = False
+        if c == "\\":
+            run_end, escaped_char, is_escaped = _backslash_run(command, i)
+            if quote == '"' and is_escaped and escaped_char in _DOUBLE_QUOTE_ESCAPABLE:
+                out.append(command[i:run_end + 1])
+                i = run_end + 1
+            elif quote == "'" and ansi_c and is_escaped and escaped_char in ("'", "\\"):
+                # Unlike the `quote == '"'` case (double-quoted content is kept INTACT since it
+                # still executes), an ANSI-C escape pair sits INSIDE a single-quoted span, whose
+                # content this function's whole job is to BLANK (agent-tools#307 review round 13,
+                # Opus): copying it through verbatim broke that invariant and leaked a bare `'`
+                # into the "supposed to be inert" region. Blank the WHOLE run + escaped char,
+                # exactly like every other character inside a single-quoted span.
+                out.append(" " * (run_end + 1 - i))
+                i = run_end + 1
+            elif quote is None and is_escaped and escaped_char in _UNQUOTED_ESCAPABLE:
+                out.append(command[i:run_end + 1])
+                dollar_escaped = escaped_char == "$"
+                i = run_end + 1
+            else:
+                out.append(command[i:run_end] if quote != "'" else " " * (run_end - i))
+                i = run_end
+        elif quote is not None:
             if c == quote:
                 quote = None
+                ansi_c = False
                 out.append(c)
             else:
                 out.append(" " if quote == "'" else c)
+            i += 1
         elif c in ("'", '"'):
             quote = c
+            ansi_c = c == "'" and prev == "$" and not this_dollar_escaped
             out.append(c)
+            i += 1
         else:
             out.append(c)
+            i += 1
     return "".join(out)
 
 
