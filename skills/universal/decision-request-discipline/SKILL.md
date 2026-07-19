@@ -82,7 +82,20 @@ mark resolved ones closed; don't re-list them as open.
 
 ## The question format (8 points — the human decides in 30s without reading code)
 
-1. **Context** — where the code is (`file:line`), what the function does.
+1. **Context** — where the code is (`file:line`), what the function does. **If Context or any
+   other point cites a spec/doc section (`§9.3`, "master-spec section X", a named policy
+   doc), quote the literal referenced text inline — the actual sentence(s) from that
+   section — not just the section number or name.** A section number alone forces the human
+   to go dig up and read the source document themselves, which defeats the entire point of
+   escalating in the strict format (a 30-second read, no repo access needed).
+   - **Wrong:** "Per §9.3, the router fallback applies here." — the human now has to open
+     the spec to check whether that's even true.
+   - **Right:** "§9.3 states verbatim: '*When no explicit route matches, the entry-file
+     fallback MUST activate before any error state is shown.*' — this means the fallback
+     applies here because there's no explicit route for `/preview`."
+   - If two sections conflict (the actual reason you're escalating a spec question at all),
+     quote **both** verbatim side by side — don't paraphrase either one, and don't make the
+     human reconcile them from memory of a summary.
 2. **Glossary of terms and names** — every internal name (ticket, module, function,
    acronym, flag) explained in one phrase. The human is not obliged to remember your jargon.
    When writing in a language other than English (e.g. Russian), don't invent transliterated
@@ -162,6 +175,9 @@ A PR-or-drop request must state:
   text in chunks.
 - **The orchestrator drafting its own request.** It cuts corners under load; delegate the
   drafting to a subagent that reads the spec/code.
+- **Citing a spec section without quoting it.** "Per §9.3, X applies" makes the human choose
+  between trusting your summary or going to read the spec themselves — either way the
+  escalation failed its one job. Paste the literal sentence(s) from the section, every time.
 
 ## Why
 
