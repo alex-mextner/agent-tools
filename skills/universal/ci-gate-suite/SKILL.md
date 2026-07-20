@@ -71,3 +71,27 @@ hatch.
 - `pre-commit-gate`, `ai-review-before-commit`, `secret-scanning`, `visual-proof-cycle`,
   `deferred-findings-tracking` skills — the local-habit twins of several gates here.
 - [`../../../git-hooks/`](../../../git-hooks/) — the local pre-commit/pre-push backstops.
+
+## Troubleshooting: a billing-blocked account is not a self-hosted-runner problem
+
+- **The tell is the annotation text, not `conclusion` or `steps` alone.** Exhausted GitHub
+  Actions billing/credits (or a failed payment) fails checks fast with an annotation like
+  "recent account payments have failed or your spending limit needs to be increased" —
+  that annotation, not the `conclusion` value (ordinary red CI is `failure` too) or an
+  empty `steps` array (a queued job has one too, before any step starts), is what actually
+  identifies it. A runner-capacity problem instead leaves jobs at `status: queued`
+  ("Waiting for a runner"), never producing a conclusion, hosted or self-hosted.
+- **Don't reach for self-hosted runners as the fix.** A failed payment can disable Actions
+  dispatch for the account outright (no job runs at all); an exhausted *spending limit*
+  specifically meters GitHub-hosted minutes, so self-hosted runner minutes keep working —
+  but standing up a runner fleet is still very likely the wrong move: it's rarely the
+  repo's intended architecture, and it doesn't address the billing problem the account
+  actually has. The real remediation is on the billing account (restore the payment method
+  / raise the spending limit); a same-repo `runs-on: self-hosted` workflow with an attached
+  runner is a legitimately different, unrelated setup, not a workaround improvised in
+  response to this failure.
+- **If a ready PR needs to move now:** `ci/ship/` is purpose-built to detect this class of
+  structural CI outage and substitute a local gate rather than refuse outright. Treat
+  `ci/ship/README.md` as the sole source of truth for exactly what it substitutes and when
+  `--skip-ci` is still required — this doc intentionally doesn't restate that mechanism, so
+  it can't drift out of sync with it.
