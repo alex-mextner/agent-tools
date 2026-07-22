@@ -120,6 +120,45 @@
 #                          --skip-ci gate decisions: skipci:bypass:approved / skipci:bypass:denied
 #                          / skipci:refused (has a `gate":"skip-ci"` field). --dry-run prints the
 #                          would-be audit instead of writing.
+#
+# Knobs (file):
+#   .ship-config           optional, committed at the repo root — an AUDITED, per-repo override
+#                          for the CI-down local test fallback gate (see "CI-down detection and
+#                          local fallback gate" below). Unlike SHIP_LOCAL_TEST_CMD (an env var,
+#                          test-only, never meant for production use — see that knob above),
+#                          this file is checked into the repo itself, so it is reviewed exactly
+#                          like rig.yaml/package.json already are — it does NOT introduce a new
+#                          trust boundary, it is a production-safe, auditable way to tell the
+#                          local gate where and how to run tests when auto-detection can't guess
+#                          correctly (e.g. a monorepo-of-fixtures whose real suite lives in a
+#                          subdirectory). The file is read from the last COMMITTED content at
+#                          HEAD (`git show HEAD:.ship-config`), never the working tree — an
+#                          uncommitted/staged-only .ship-config is ignored with a warning —
+#                          the "audited, committed" claim above is an enforced property, not
+#                          just documentation. Simple `KEY=value` lines, no quote-stripping
+#                          (don't wrap values in quotes — `KEY="val"` means the literal value
+#                          `"val"`, not `val`); `#`-only-prefixed lines and blank lines are
+#                          ignored. Two whitelisted keys, nothing else is read or evaluated
+#                          from the file:
+#                            SHIP_LOCAL_TEST_DIR=<path>   directory (relative to repo root) to run
+#                                                  the test command from, or to scope
+#                                                  auto-detection to when SHIP_LOCAL_TEST_CMD is
+#                                                  not also set.
+#                            SHIP_LOCAL_TEST_CMD=<cmd>    command line to eval for the local gate
+#                                                  (same eval mechanism as the env var of the same
+#                                                  name — this is just a committed, per-repo
+#                                                  source for it instead of a per-invocation one).
+#                          Precedence (highest first): SHIP_LOCAL_TEST_CMD env var (test-only) >
+#                          .ship-config file > rig.yaml + `dev` CLI (root-only) > root auto-detect
+#                          (pyproject.toml/package.json/Cargo.toml at repo root) > e2e/ subdirectory
+#                          auto-detect (same three manifests, one level deep, e2e/ ONLY — test/ and
+#                          tests/ are deliberately NOT auto-probed, see the priority-5 comment in
+#                          _local_test_runner; use .ship-config for those) > fail closed. A
+#                          present-but-empty/malformed .ship-config (neither key set, not committed
+#                          at HEAD, or an unrecognized/unsafe SHIP_LOCAL_TEST_DIR — absolute,
+#                          containing `..`, or resolving to the repo root itself — which invalidates
+#                          the WHOLE file, not just the dir) is ignored (with a logged warning) and
+#                          detection proceeds as if the file didn't exist.
 set -euo pipefail
 
 ORIG_PWD=$(pwd -P)
@@ -421,6 +460,20 @@ fi
 #   SHIP_TEST_CI_DOWN    Set to "1" to force-trigger the CI-down path (test-only shortcut,
 #                        bypasses the detection heuristics). Never set in production.
 #   SHIP_LOCAL_TEST_CMD  Override the local test command (test-only; default: auto-detect).
+#
+# Local test auto-detection order (see _local_test_runner): SHIP_LOCAL_TEST_CMD env var (if
+# set) > $root/.ship-config file (see "Knobs (file)" above) > rig.yaml + `dev` CLI (root-only)
+# > root-level pyproject.toml/package.json/Cargo.toml > the same three manifests in e2e/ ONLY,
+# one level down (bounded — no deeper recursion, no arbitrary directory scan, and deliberately
+# NOT test/tests/ — see the priority-5 comment in _local_test_runner) > fail closed with
+# "no recognized test runner found". The config file
+# outranks rig.yaml deliberately: it exists precisely to override a heuristic that guessed
+# wrong, so it must win over the OTHER heuristic (rig.yaml/dev) too, not just auto-detect.
+# Residual caveat (same trust boundary as rig.yaml/package.json, not a new one — see
+# _ship_config_load below): a PR can add/edit .ship-config in the same commit that needs
+# verifying, same as it could already add a stub `"test": "true"` script to package.json —
+# this file does not change what a malicious PR could already get away with, review still
+# has to look at test-affecting changes either way.
 
 # Query the GitHub status page for Actions component health.
 # Stdout: "degraded" if Actions is not fully operational, "ok" if fine, "unknown" on error.
@@ -483,13 +536,237 @@ ci_appears_structurally_down() {
   return 0
 }
 
+# Parse the audited per-repo config file $root/.ship-config, if present. Sets two globals
+# for the caller: SHIP_CFG_DIR and SHIP_CFG_CMD (each "" when unset/absent/rejected). Only
+# whole-line `#` comments and the two whitelisted `KEY=value` keys are recognized — the file
+# is never eval'd itself. Any non-blank, non-comment line that doesn't match one of the two
+# keys is logged and ignored (not silently dropped) so a typo doesn't silently downgrade the
+# gate to auto-detection.
+#
+# The file is read from the last COMMITTED content at HEAD (`git show HEAD:.ship-config`),
+# never the working tree — the "audited, committed" trust story in the header doc is an
+# enforced property, not just a claim. Reading the worktree copy would let a tracked-but-
+# locally-modified file (or a staged-but-never-committed one) take effect with no audit
+# trail; reading HEAD means only content that has actually landed in history — reviewed
+# like any other committed change — can ever run. A file present in the working tree but
+# absent/uncommitted at HEAD is ignored with a warning, exactly as if it didn't exist.
+#
+# SHIP_LOCAL_TEST_DIR is rejected (logged) if it is an absolute path, contains a `..`
+# component, or resolves to the repo root itself (`.`, `./`, or any all-`.`-segments path).
+# Rejection invalidates the WHOLE file (both keys cleared), not just the DIR — a rejected
+# dir alongside a still-present SHIP_LOCAL_TEST_CMD must not silently relocate that command
+# to run from the repo root instead of the (rejected) directory the author asked for; that
+# would verify a different suite than intended. Detection then proceeds exactly as if the
+# file didn't exist, per the header doc.
+#
+# Threat model: $root/.ship-config's committed content is under the SAME trust boundary as
+# rig.yaml/package.json (both already dictate what the gate runs) — a PR that edits it is
+# reviewed like any other change, this does not add a new attack surface (see the
+# header-doc caveat above). The DIR safety check is accident-prevention (a typo'd
+# absolute/traversal/root path), not a security boundary — SHIP_LOCAL_TEST_CMD is arbitrary
+# eval'd shell regardless of DIR.
+_ship_config_load() {
+  local root="$1" content line key val
+  SHIP_CFG_DIR=""
+  SHIP_CFG_CMD=""
+  if ! (cd "$root" && git show HEAD:.ship-config) >/dev/null 2>&1; then
+    [ -f "$root/.ship-config" ] && \
+      echo "[ship] local gate: .ship-config exists in the working tree but is not committed at HEAD — ignoring (uncommitted config is not audited)." >&2
+    return 0
+  fi
+  # NUL-byte guard: bash silently STRIPS NUL bytes when a command substitution's output
+  # becomes a variable's value (below), which could turn a byte sequence that never spells
+  # a whitelisted key in the actual committed bytes (e.g. `SHIP_LOCAL_TEST_C<NUL>MD=...`)
+  # into one that does once assigned to $content. Check the RAW git-show output (piped
+  # straight to grep, never touching a bash variable) for a NUL byte first and refuse to
+  # parse at all if found — a legitimate KEY=value text config never contains one. `grep -I`
+  # (without `-a`) treats a NUL-containing input as binary and reports NO match even against
+  # the empty pattern, while a plain-text input matches the (vacuously true) empty pattern —
+  # note this is NOT `grep -a $'\0'`: bash's ANSI-C quoting truncates at the first NUL, so
+  # that pattern silently becomes an EMPTY string and would match (and thus "reject") every
+  # normal file — a bug caught by this diff's own test suite before it shipped. A genuinely
+  # empty (0-byte) file ALSO fails `grep -I ''` (no lines to match at all) despite having no
+  # NUL byte, so that case is excluded via a blob-size check first. Deliberately NOT `-q`:
+  # under this script's `set -o pipefail`, `grep -q` can exit (and close its stdin pipe) as
+  # soon as it sees a match, which for a config larger than the OS pipe buffer would SIGPIPE
+  # the upstream `git show` and misreport a perfectly valid large text file as "binary" —
+  # without `-q`, grep must read every line to emit them all, so `git show` always completes.
+  local blob_size
+  blob_size=$(cd "$root" && git cat-file -s HEAD:.ship-config 2>/dev/null) || blob_size=0
+  if [ "$blob_size" -gt 0 ] && ! (cd "$root" && git show HEAD:.ship-config 2>/dev/null) | grep -I '' >/dev/null; then
+    echo "[ship] local gate: .ship-config committed content contains a NUL byte (binary/corrupt) — refusing to parse, ignoring." >&2
+    return 0
+  fi
+  content=$(cd "$root" && git show HEAD:.ship-config 2>/dev/null)
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    case "$line" in
+      ''|'#'*) continue ;;
+      SHIP_LOCAL_TEST_DIR=*|SHIP_LOCAL_TEST_CMD=*)
+        key="${line%%=*}"
+        val="${line#*=}"
+        val="$(printf '%s' "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [ "$key" = "SHIP_LOCAL_TEST_DIR" ] && SHIP_CFG_DIR="$val" || SHIP_CFG_CMD="$val"
+        ;;
+      *)
+        echo "[ship] local gate: .ship-config: ignoring unrecognized line: $line" >&2 ;;
+    esac
+  done <<< "$content"
+  if [ -n "$SHIP_CFG_DIR" ] && ! _ship_config_dir_is_safe "$SHIP_CFG_DIR"; then
+    echo "[ship] local gate: .ship-config: SHIP_LOCAL_TEST_DIR '$SHIP_CFG_DIR' is not a safe repo-relative subdirectory (absolute, a '..' path component, or '.'/repo root itself — omit the key to mean root) — ignoring the whole file." >&2
+    SHIP_CFG_DIR=""
+    SHIP_CFG_CMD=""
+  fi
+}
+
+# True (exit 0) if $1 is a safe repo-relative subdirectory reference: not absolute, no `..`
+# PATH COMPONENT (a component match, not a substring match — a dir legitimately named
+# `v1..2` or `foo..bar` must NOT be rejected), and does not resolve to "the repo root
+# itself" — every path component being `.` (or empty, from a trailing/duplicate slash),
+# e.g. `.`, `./`, `././.` — which would defeat the `mode="root"` pytest-args guarantee in
+# _local_test_try_dir if silently routed through non-root auto-detect. Omit the key
+# instead to scope to root.
+_ship_config_dir_is_safe() {
+  local p="$1" seg all_dot=1
+  case "$p" in /*) return 1 ;; esac
+  IFS='/' read -ra _ship_cfg_dir_segs <<< "$p"
+  for seg in "${_ship_cfg_dir_segs[@]}"; do
+    [ "$seg" = ".." ] && return 1
+    [ "$seg" != "." ] && [ -n "$seg" ] && all_dot=0
+  done
+  [ "$all_dot" -eq 1 ] && return 1
+  return 0
+}
+
+# True (exit 0) if $2 (a real, existing directory) is a STRICT physical descendant of $1
+# (root) — i.e. inside it, but not equal to it — resolving symlinks on BOTH sides via
+# `cd ... && pwd -P`. _ship_config_dir_is_safe only checks the CONFIGURED string lexically
+# (absolute/`..`/root-equivalent); this additionally catches a directory — or any path
+# component on the way to it — being a symlink that resolves OUTSIDE the repo, or a symlink
+# that resolves to the root itself (`SHIP_LOCAL_TEST_DIR=suite` with `suite -> .`, which
+# would otherwise bypass the lexical root-equivalence rejection). NOTE — scope: this check
+# only defends the repo-boundary case; it does NOT and cannot generally prevent a symlink
+# that redirects a candidate to a DIFFERENT directory that is still inside the repo (e.g.
+# `e2e -> tests/fixture`) — a committed symlink like that is visible in the PR diff under
+# the same review trust boundary as any other change here, not a new attack surface this
+# helper is meant to close. Call this on every directory actually about to be `cd`'d into
+# for testing (both the .ship-config-scoped dir and the priority-5 e2e/ candidate).
+_dir_is_real_descendant_of_root() {
+  local root="$1" dir="$2" real_root real_dir
+  real_root=$(cd "$root" 2>/dev/null && pwd -P) || return 1
+  real_dir=$(cd "$dir" 2>/dev/null && pwd -P) || return 1
+  case "$real_dir" in
+    "$real_root") return 1 ;;
+    "$real_root"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Try auto-detecting a test manifest in directory $1 and run its matching command from
+# there. $2 (optional) = "root" to force the classic unconditional `pytest tests/ -q`
+# invocation (byte-for-byte the pre-existing root behavior — never loosened to a bare
+# `pytest -q` repo-wide-discovery run just because this helper now also serves
+# subdirectories); any other value (or omitted) auto-detects whether `$dir/tests` exists,
+# which is only correct for a non-root $dir where the manifest's own directory IS the suite.
+#
+# Sets the global _LOCAL_TEST_MATCHED to 1 if a manifest was found (regardless of whether
+# the test command itself passed or failed), or 0 if $1 has none of the three recognized
+# manifests. Callers MUST branch on _LOCAL_TEST_MATCHED, never on this function's own return
+# code, to decide whether to keep probing other candidates: the wrapped test command's exit
+# status is returned as-is (e.g. pytest can legitimately exit 2 on a usage error/
+# interruption), so overloading "no manifest here" onto a specific exit code would collide
+# with a real test failure and risk running a DIFFERENT suite that happens to pass.
+_local_test_try_dir() {
+  local dir="$1" mode="${2:-auto}"
+  _LOCAL_TEST_MATCHED=0
+  if [ -f "$dir/pyproject.toml" ]; then
+    _LOCAL_TEST_MATCHED=1
+    echo "[ship] local gate: running pytest ($dir/pyproject.toml detected) ..."
+    local -a pytest_args=(tests/ -q)
+    if [ "$mode" != "root" ] && [ ! -d "$dir/tests" ]; then
+      pytest_args=(-q)
+    fi
+    if command -v uv >/dev/null 2>&1; then
+      (cd "$dir" && uv run --with pytest pytest "${pytest_args[@]}") 2>&1; return $?
+    else
+      (cd "$dir" && python3 -m pytest "${pytest_args[@]}") 2>&1; return $?
+    fi
+  fi
+  if [ -f "$dir/package.json" ]; then
+    _LOCAL_TEST_MATCHED=1
+    echo "[ship] local gate: running npm test ($dir/package.json detected) ..."
+    (cd "$dir" && npm test) 2>&1; return $?
+  fi
+  if [ -f "$dir/Cargo.toml" ]; then
+    _LOCAL_TEST_MATCHED=1
+    echo "[ship] local gate: running cargo test ($dir/Cargo.toml detected) ..."
+    (cd "$dir" && cargo test) 2>&1; return $?
+  fi
+  return 0
+}
+
+# Execute the audited $root/.ship-config override (see "Knobs (file)" in the header doc and
+# _ship_config_load's docstring). Sets the global _SHIP_CFG_ACTED to 1 if there was a config
+# to act on (regardless of whether the resulting command/detection passed or failed), or 0 if
+# neither key was set (no file / not committed at HEAD / rejected). Callers MUST branch on
+# _SHIP_CFG_ACTED, never on this function's own return code, for the exact same reason
+# _local_test_try_dir uses _LOCAL_TEST_MATCHED instead of its return code: the configured
+# command can legitimately exit 2 (pytest usage error, an arbitrary script's own exit 2), which
+# would collide with a return-code sentinel for "nothing configured" and risk silently falling
+# through to a DIFFERENT, passing heuristic even though the audited, explicitly-configured
+# suite actually failed — exactly the failure mode this whole file exists to avoid. The
+# SHIP_LOCAL_TEST_DIR existence check lives in exactly ONE place here (both the DIR+CMD and
+# DIR-only paths need it).
+_ship_config_run() {
+  local root="$1" status
+  _ship_config_load "$root"
+  _SHIP_CFG_ACTED=0
+  if [ -z "$SHIP_CFG_CMD" ] && [ -z "$SHIP_CFG_DIR" ]; then
+    return 0
+  fi
+  _SHIP_CFG_ACTED=1
+  if [ -n "$SHIP_CFG_DIR" ]; then
+    if [ ! -d "$root/$SHIP_CFG_DIR" ]; then
+      echo "[ship] local gate: FAILED — SHIP_LOCAL_TEST_DIR '$SHIP_CFG_DIR' does not exist under $root." >&2
+      return 1
+    fi
+    if ! _dir_is_real_descendant_of_root "$root" "$root/$SHIP_CFG_DIR"; then
+      echo "[ship] local gate: FAILED — SHIP_LOCAL_TEST_DIR '$SHIP_CFG_DIR' resolves (via a symlink) outside the repo root." >&2
+      return 1
+    fi
+  fi
+  if [ -n "$SHIP_CFG_CMD" ]; then
+    if [ -n "$SHIP_CFG_DIR" ]; then
+      echo "[ship] local gate: .ship-config: running in $SHIP_CFG_DIR: $SHIP_CFG_CMD"
+      (cd "$root/$SHIP_CFG_DIR" && eval "$SHIP_CFG_CMD") 2>&1; return $?
+    fi
+    echo "[ship] local gate: .ship-config: running: $SHIP_CFG_CMD"
+    (cd "$root" && eval "$SHIP_CFG_CMD") 2>&1; return $?
+  fi
+  echo "[ship] local gate: .ship-config: scoping auto-detect to $SHIP_CFG_DIR"
+  _local_test_try_dir "$root/$SHIP_CFG_DIR"; status=$?
+  [ "$_LOCAL_TEST_MATCHED" -eq 1 ] && return "$status"
+  echo "[ship] local gate: FAILED — no recognized test runner found in $SHIP_CFG_DIR (no pyproject.toml/package.json/Cargo.toml)." >&2
+  return 1
+}
+
 _local_test_runner() {
-  local root="$1" cmd dev_status
-  # Allow a test-only override to avoid real test execution in hermetic tests.
+  local root="$1" dev_status status
+
+  # Priority 1: test-only env override — never set in production (see header doc).
   if [ -n "${SHIP_LOCAL_TEST_CMD:-}" ]; then
     echo "[ship] local gate: running test command: $SHIP_LOCAL_TEST_CMD"
     eval "$SHIP_LOCAL_TEST_CMD" 2>&1; return $?
   fi
+
+  # Priority 2: audited per-repo $root/.ship-config (see "Knobs (file)" in the header doc).
+  # An explicit, committed override outranks every heuristic below it, INCLUDING rig.yaml —
+  # it exists precisely to correct a case where a heuristic (auto-detect OR rig.yaml) guesses
+  # wrong, so it must win over both, not just auto-detect.
+  _ship_config_run "$root"; status=$?
+  [ "$_SHIP_CFG_ACTED" -eq 1 ] && return "$status"
+
+  # Priority 3: rig.yaml + `dev` CLI probe — root-only, unchanged from prior behavior.
   if [ -f "$root/rig.yaml" ] && command -v dev >/dev/null 2>&1 && dev --agenttools-dev-probe >/dev/null 2>&1; then
     if (cd "$root" && dev has-script --repo-only test >/dev/null 2>&1); then
       dev_status=0
@@ -505,23 +782,29 @@ _local_test_runner() {
       return 1
     fi
   fi
-  if [ -f "$root/pyproject.toml" ]; then
-    echo "[ship] local gate: running pytest (pyproject.toml detected) ..."
-    if command -v uv >/dev/null 2>&1; then
-      uv run --with pytest pytest tests/ -q 2>&1; return $?
-    else
-      python3 -m pytest tests/ -q 2>&1; return $?
-    fi
+
+  # Priority 4: root-level auto-detect (existing behavior, unchanged — "root" mode keeps
+  # the classic unconditional `pytest tests/ -q`, byte-for-byte the pre-existing behavior).
+  _local_test_try_dir "$root" root; status=$?
+  [ "$_LOCAL_TEST_MATCHED" -eq 1 ] && return "$status"
+
+  # Priority 5: bounded subdirectory auto-detect, ONE candidate only (e2e/), one level deep.
+  # Handles the concrete monorepo-of-fixtures shape this feature targets (e.g. hyper-ext-e2e's
+  # e2e/package.json) where the root has no manifest but e2e/ does. Deliberately narrow: an
+  # earlier version of this also guessed test/ and tests/, but review flagged (repeatedly,
+  # across independent rounds) that those two names are exactly where repos most often keep
+  # FIXTURE manifests (a package.json/Cargo.toml with a trivially-passing test used for
+  # something else entirely) — auto-running one would silently convert a conservative
+  # fail-closed block into a false "verified" pass. e2e/ is kept because it is the concrete,
+  # unambiguous case that motivated this feature (#309); any other/ambiguous subdirectory
+  # name is exactly what .ship-config (priority 2) exists for — use it instead of growing
+  # this list, do not recurse further or scan arbitrary directories.
+  if [ -d "$root/e2e" ] && _dir_is_real_descendant_of_root "$root" "$root/e2e"; then
+    _local_test_try_dir "$root/e2e"; status=$?
+    [ "$_LOCAL_TEST_MATCHED" -eq 1 ] && return "$status"
   fi
-  if [ -f "$root/package.json" ]; then
-    echo "[ship] local gate: running npm test (package.json detected) ..."
-    npm test 2>&1; return $?
-  fi
-  if [ -f "$root/Cargo.toml" ]; then
-    echo "[ship] local gate: running cargo test (Cargo.toml detected) ..."
-    cargo test 2>&1; return $?
-  fi
-  echo "[ship] local gate: FAILED — no recognized test runner found (no pyproject.toml/package.json/Cargo.toml)." >&2
+
+  echo "[ship] local gate: FAILED — no recognized test runner found (no pyproject.toml/package.json/Cargo.toml at root or in e2e/)." >&2
   echo "[ship]   CI is down but tests cannot be verified locally — blocking conservatively." >&2
   return 1
 }
@@ -1060,6 +1343,14 @@ is_nonshippable_path() {  # $1 = path -> rc 0 if non-shippable (docs/test/CI), 1
   case "$base" in
     .gitlab-ci.yml|.gitlab-ci.yaml|.travis.yml|.travis.yaml|azure-pipelines.yml|azure-pipelines.yaml) return 0 ;;
     appveyor.yml|appveyor.yaml|.appveyor.yml|Jenkinsfile|.drone.yml|bitbucket-pipelines.yml|cloudbuild.yaml|cloudbuild.yml) return 0 ;;
+  esac
+  case "$1" in
+    # ship's own CI/merge-gate metadata, not product code — a repo adding/editing the
+    # REPO-ROOT .ship-config to fix its local-fallback test detection is not a release.
+    # Exact path match (not basename): only the root file is ever read by
+    # _ship_config_load, so a nested same-named file (e.g. src/.ship-config, which ship
+    # never consumes) must NOT be swept into this exemption.
+    .ship-config) return 0 ;;
   esac
   case "$1" in
     # tests (common conventions across languages)

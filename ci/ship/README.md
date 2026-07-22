@@ -30,15 +30,37 @@ Then it squash-merges, deletes the remote branch, removes the local branch+workt
 fast-forwards your main checkout.
 
 When ship decides CI is structurally unavailable and runs its local fallback gates, the
-test runner first prefers `dev run --repo-only test` if the repo has a committed `rig.yaml`,
-that file declares top-level `scripts.test`, and `dev` is on PATH. Probe/runtime errors from
-`dev has-script --repo-only test` block instead of silently guessing a fallback runner. If
-the repo script is absent, ship falls back to the portable pyproject/package/Cargo
-auto-detection in `ship.sh`. If `dev` is installed, install it with its runtime dependencies
-(`agenttools-config`/PyYAML); repos with `rig.yaml` fail closed on dependency or config errors
-so a declared script is not bypassed by auto-detection. A PATH `dev` must answer the hidden
-`dev --agenttools-dev-probe`; unrelated tools named `dev` are ignored and ship falls back to
-stack detection.
+test runner picks a command in this order (highest priority first):
+
+1. **`SHIP_LOCAL_TEST_CMD` env var** — test-only escape hatch, never set in production.
+2. **`.ship-config` file, committed at the repo root** — an audited, per-repo override for
+   repos where auto-detection can't guess correctly (e.g. a monorepo-of-fixtures whose real
+   suite lives in a subdirectory, like a project with no root-level manifest). Simple
+   `KEY=value` lines, two whitelisted keys: `SHIP_LOCAL_TEST_DIR=<path>` (a repo-relative
+   subdirectory to run the command from, or to scope auto-detection to) and
+   `SHIP_LOCAL_TEST_CMD=<cmd>` (a command line, eval'd the same way as the env var of the
+   same name — this is just a committed, per-repo source for it). The file is read from the
+   last **committed** content at `HEAD` (`git show HEAD:.ship-config`), never the working
+   tree, so an uncommitted/staged-only edit is not honored — the "audited" claim is an
+   enforced property. `SHIP_LOCAL_TEST_DIR` is rejected (and invalidates the whole file) if
+   it's absolute, contains a `..` path component, or resolves to the repo root itself.
+3. **`dev run --repo-only test`** if the repo has a committed `rig.yaml`, that file declares
+   top-level `scripts.test`, and `dev` is on PATH. Probe/runtime errors from
+   `dev has-script --repo-only test` block instead of silently guessing a fallback runner.
+   If `dev` is installed, install it with its runtime dependencies (`agenttools-config`/
+   PyYAML); repos with `rig.yaml` fail closed on dependency or config errors so a declared
+   script is not bypassed by auto-detection. A PATH `dev` must answer the hidden
+   `dev --agenttools-dev-probe`; unrelated tools named `dev` are ignored and ship falls back
+   to stack detection.
+4. **Root-level auto-detection** — the portable pyproject/package/Cargo detection in
+   `ship.sh`, at the repo root.
+5. **`e2e/` subdirectory auto-detection** — the same three manifests, one level down, in
+   `e2e/` ONLY. `test/` and `tests/` are deliberately never auto-probed (those directory
+   names are also where repos most often keep fixture manifests unrelated to the real
+   suite) — use `.ship-config` for any other/ambiguous subdirectory layout.
+
+If nothing above matches, ship fails closed with "no recognized test runner found" rather
+than merging unverified.
 
 ## Quick start
 
