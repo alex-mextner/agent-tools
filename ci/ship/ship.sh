@@ -839,6 +839,29 @@ _local_test_runner() {
 
 # Scan the PR diff additions for leftover markers (TODO/FIXME/HACK/XXX).
 # Returns 0 if clean, 1 if markers found or diff cannot be read.
+#
+# XXX alone gets a run-length guard — `(^|[^X])XXX($|[^X])`, a portable "no \b, no -w"
+# idiom in the same style this repo already uses in ci/leftover-grep/leftover-grep.sh's
+# focused-test check — because a plain substring match on XXX collides with bash's
+# conventional mktemp template suffix (`mktemp -d "/tmp/foo.XXXXXX"`), a common and
+# legitimate pattern (agent-tools#316). This only excludes XXX inside a longer run of X's
+# (4+), so it deliberately still catches an XXX marker embedded in an identifier, e.g.
+# `XXX_REMOVE_BEFORE_MERGE` or `fooXXX_debug()` — unlike a full \b/-w word-boundary, which
+# would also let those slip through (checked against neighboring X vs non-X only, not
+# against "is this a word character"). Residual limitation, accepted as-is: a
+# 3-character mktemp template (`foo.XXX`) is indistinguishable from a real standalone
+# marker and still blocks; this is rare/weak enough (bash's own docs recommend 6+ X's)
+# not to warrant a smarter check.
+#
+# TODO/FIXME/HACK deliberately keep plain substring matching (unlike XXX): this local
+# fallback gate must stay at least as strict as ci/leftover-grep/leftover-grep.sh's
+# untracked-TODO/FIXME check, which also substring-matches so it catches sentinel
+# identifiers like `TODO_REMOVE_BEFORE_MERGE`. Loosening these to whole-word would let
+# such genuine leftovers slip through the CI-outage fallback while the normal CI-up gate
+# still catches them — a fail-open divergence between the two gates. There's no known
+# real-world false positive for these three that would justify accepting that regression
+# (mktemp templates are XXX-specific; "HACKATHON"/"HACKING.md" substring matches are a much
+# rarer nuisance than a missed untracked TODO).
 _local_leftover_check() {
   local pr="$1" diff_out
   echo "[ship] local gate: scanning PR diff for leftover markers ..."
@@ -847,7 +870,7 @@ _local_leftover_check() {
   local hits
   hits=$(printf '%s\n' "$diff_out" \
     | grep -E '^\+' | grep -vE '^\+\+\+' \
-    | grep -E '(TODO|FIXME|HACK|XXX)' || true)
+    | grep -E '(TODO|FIXME|HACK)|(^|[^X])XXX($|[^X])' || true)
   if [ -n "$hits" ]; then
     echo "[ship] local gate: FAILED — leftover markers in PR additions:" >&2
     printf '%s\n' "$hits" >&2

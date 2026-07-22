@@ -3386,6 +3386,112 @@ def test_cidown_leftover_markers_block(repo_with_pr_worktree, tmp_path):
     assert "merged #1" not in r.stdout, r.stdout
 
 
+def test_cidown_mktemp_template_not_flagged_as_leftover(repo_with_pr_worktree, tmp_path):
+    """CI-down path: a diff addition using bash's conventional mktemp XXXXXX template
+    suffix (e.g. `mktemp -d "/tmp/foo.XXXXXX"`) must NOT be flagged as a leftover XXX
+    marker — this is standard, legitimate shell code, not a debug marker (issue #316)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",  # disable dwell gate: fake PR has no review timestamps
+        "SHIP_TEST_DIFF": '+  tmp=$(mktemp -d "/tmp/foo.XXXXXX")',
+    })
+
+    assert r.returncode == 0, (
+        f"ship must NOT block on a mktemp XXXXXX template\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" not in r.stderr, r.stderr
+
+
+def test_cidown_standalone_xxx_marker_still_blocks(repo_with_pr_worktree, tmp_path):
+    """CI-down path: a genuine standalone XXX marker (not part of a longer X run)
+    must still be caught by the leftover-marker gate after the word-boundary fix."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",  # disable dwell gate: keep the marker gate the only cause
+        "SHIP_TEST_DIFF": "+// XXX: this is broken, fix before merge",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on a standalone XXX marker\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_todo_fixme_hack_substring_still_blocks(repo_with_pr_worktree, tmp_path):
+    """CI-down path: TODO/FIXME/HACK deliberately keep plain substring matching (unlike
+    XXX) so this fallback gate stays at least as strict as the CI-side
+    ci/leftover-grep/leftover-grep.sh untracked-TODO check, which also substring-matches —
+    a sentinel identifier like `TODO_REMOVE_BEFORE_MERGE` must still be caught here too,
+    otherwise the CI-outage fallback would be weaker than the normal CI-up gate
+    (agent-tools#316 review discussion)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": "+const retryCount = 3; // TODO_REMOVE_BEFORE_MERGE",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on a TODO_-prefixed sentinel identifier\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
+def test_cidown_three_x_mktemp_template_still_blocks(repo_with_pr_worktree, tmp_path):
+    """Documented residual limitation: a 3-character mktemp template (`foo.XXX`) is
+    indistinguishable from a real standalone XXX marker under the word-boundary regex and
+    still blocks. This pins the documented trade-off in ship.sh's _local_leftover_check
+    comment so it doesn't silently change if the boundary mechanism is reworked later."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": '+  tmp=$(mktemp -d "/tmp/foo.XXX")',
+    })
+
+    assert r.returncode != 0, (
+        f"a bare 3-X mktemp template is expected to still block (documented limitation)\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
+def test_cidown_xxx_sentinel_identifier_still_blocks(repo_with_pr_worktree, tmp_path):
+    """The XXX guard only excludes XXX inside a longer run of X's (4+, the mktemp-template
+    shape) — it must still catch a genuine XXX marker embedded in an identifier, like
+    `XXX_REMOVE_BEFORE_MERGE` or `fooXXX_debug()`, which a full word-boundary (\\b/-w) fix
+    would have missed. Pins that this is deliberately narrower than a generic word-boundary
+    fix (agent-tools#316 review discussion)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": "+const x = 1; // XXX_REMOVE_BEFORE_MERGE",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on an XXX_-prefixed sentinel identifier\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
 def test_partial_ci_failure_below_threshold_blocks_normally(repo_with_pr_worktree, tmp_path):
     """One of two checks failed (50%): below the 80% threshold, so ci_appears_structurally_down
     returns false and ship blocks with the normal CI-failure message (no local fallback)."""
