@@ -1547,6 +1547,52 @@ def test_graphql_readonly_comment_naming_merge_token_is_allowed(monkeypatch):
     assert _decision(out) == "allow"
 
 
+@pytest.mark.parametrize("terminator", ["\r", "\r\n"])
+def test_graphql_cr_terminated_comment_does_not_hide_a_merge_mutation(terminator, monkeypatch):
+    """GraphQL's LineTerminator is `\\n`, `\\r`, or `\\r\\n` — a bare `\\r` also ends a `#` comment.
+    The stripper previously only scanned for `\\n`, so a comment ending in a lone `\\r` (with a real
+    call on the same "line" by `\\n`-only counting) swallowed the executing `mergePullRequest(` call
+    as commented-out text — a fail-open bypass, since GitHub's real GraphQL parser treats the `\\r` as
+    ending the comment and executes the call. Must BLOCK."""
+    command = (
+        "gh api graphql -f query='mutation{ #dummy"
+        + terminator
+        + "mergePullRequest(input:{pullRequestId:\"x\"}){ id } }'"
+    )
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize("terminator", ["\r", "\r\n"])
+def test_graphql_readonly_cr_terminated_comment_naming_merge_token_is_allowed(terminator, monkeypatch):
+    """The allow-side mirror of the `\\r`-comment fix: a `#` comment merely NAMING a merge token,
+    terminated by `\\r`/`\\r\\n` instead of `\\n`, must still be stripped (not over-strip past it and
+    swallow a real field) — the read-only query it precedes is allowed."""
+    command = (
+        "gh api graphql -f query='query{"
+        + terminator
+        + "  # remember to check mergePullRequest availability"
+        + terminator
+        + "  viewer { login }"
+        + terminator
+        + "}'"
+    )
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_graphql_comment_terminated_by_trailing_cr_at_end_of_value_fails_closed(monkeypatch):
+    """A `#` comment where a lone `\\r` is the FINAL character of the value (nothing after it) must
+    not crash the scanner and must still leave the preceding, already-visible merge call blocked —
+    exercises the `j + 1 == n` bound in the new `\\r`-terminator loop."""
+    command = "gh api graphql -f query='mutation{ mergePullRequest(input:{pullRequestId:\"x\"}){ id } } #c\r'"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
 def test_graphql_unterminated_string_in_query_fails_closed(monkeypatch):
     """An UNTERMINATED GraphQL string literal is unprovable — de-stringing must fail closed so a
     merge token after the dangling quote cannot be smuggled past the scan."""
@@ -1631,11 +1677,49 @@ def test_gh_graphql_helper_readonly_recipe_is_allowed(monkeypatch):
         "ghgql 'query{ viewer{ login } }' -f query='mutation{ mergePullRequest(input:{}){ id } }'",
         "env ghgql --allow-mutation 'mutation{ enqueuePullRequest(input:{}){ id } }'",
         "ghgql -F query='mutation{ enablePullRequestAutoMerge(input:{}){ id } }' 'query{ x }'",
+        # Glued `-q`/`--query=` spellings: real ghgql doesn't recognize them as a query source (only
+        # detached `-q <v>`/`--query <v>`), so the mapper must NOT read a merge token out of them and
+        # allow through — it must treat the glued token as unprovable and fail closed (#303 review).
+        "ghgql --query=@merge.graphql",
+        "ghgql -qmutation{mergePullRequest(input:{}){id}}",
+        # Sticky-ordering regression: a glued query flag must stay unprovable even when a LATER
+        # provable-looking query source is present (the naive first draft cleared the "unprovable"
+        # marker whenever ANY later query source was seen — a real fail-open bypass).
+        "ghgql --query=@merge.graphql 'query{ viewer{ login } }'",
+        "ghgql -q 'query{ viewer{ login } }' --query=@merge.graphql",
+        # A `query=` value smuggled behind a NON-`-f`/`-F` value flag: real ghgql's `case` statement
+        # captures `query=…` on EVERY one of -F/--field/-f/--raw-field/-H/--header/--jq/--hostname/
+        # -p/--preview/-t/--template/--cache, not only -f/-F. The mapper previously forwarded these
+        # as opaque header/jq/template/cache fields, hiding the actual query from the scan entirely —
+        # a real bypass, since `--allow-mutation` disables ghgql's OWN guard and this is the only
+        # remaining gate (#303 review, Codex).
+        "ghgql --allow-mutation -H query=mutation{mergePullRequest(input:{}){id}}",
+        "ghgql --allow-mutation --jq query=@merge.graphql",
+        "ghgql --allow-mutation --cache query=@merge.graphql",
+        # Isolated detached `-q <mutation>` — direct coverage of the ONE query source real ghgql's
+        # `case` statement (and the mapper's first branch) recognizes, without a second/glued query
+        # source in the same command masking whether this branch alone actually works.
+        "ghgql --allow-mutation -q 'mutation{ mergePullRequest(input:{}){ id } }'",
+        # Stdin marker (`-`) smuggled as a `query=` value behind a non-`-f`/`-F` flag: real ghgql
+        # resolves ANY captured `query="-"` to stdin uniformly (its check runs after parsing, on
+        # the one shared `query` variable), so this reads a piped mutation exactly like `-q -`
+        # does — the mapper must canonicalize it to the unprovable `@-` marker here too, not scan
+        # it as a harmless one-character literal (Fable review).
+        "ghgql --allow-mutation -H query=-",
+        # `--input` supplies gh's ENTIRE request body from a file/stdin, uninspected by any
+        # `query=` scan — `_graphql_query_is_unprovable`'s existing `--input` check already covers
+        # this once the flag reaches `rest` (Codex review: confirms it does for the ghgql route).
+        "ghgql --allow-mutation 'query{ viewer{ login } }' --input body.json",
+        # Glued native-gh field spelling (`-fquery=…`, no space) — already recognized by
+        # `_graphql_query_field_values`'s regex independent of the ghgql-specific mapper branches;
+        # locks that this stays true as the mapper evolves (Fable review).
+        "ghgql --allow-mutation -fquery=mutation{mergePullRequest(input:{}){id}}",
     ],
 )
 def test_ghgql_merge_route_is_blocked(command, monkeypatch):
     """Every merge path THROUGH `ghgql` — a forced mutation, a positional mutation, an unreadable
-    `@file`/stdin query, a smuggled second `query=` field, behind an `env` wrapper — must block."""
+    `@file`/stdin query, a smuggled second `query=` field, behind an `env` wrapper, a glued
+    `-q`/`--query=` spelling (even ordered around a provable-looking query) — must block."""
     out, _err, code = _run(command, monkeypatch)
     assert code == hook.BLOCK_EXIT_CODE
     assert _decision(out) == "block"

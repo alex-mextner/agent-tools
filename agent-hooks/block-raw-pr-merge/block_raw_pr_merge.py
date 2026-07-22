@@ -722,10 +722,15 @@ def _strip_graphql_string_literals(value: str) -> str:
     i, n = 0, len(value)
     while i < n:
         if value[i] == "#":  # GraphQL line comment: skip to EOL so a comment `"` opens no span
-            nl = value.find("\n", i)
-            if nl == -1:
+            # GraphQL's LineTerminator is `\n`, `\r`, or `\r\n` — a bare `\r` also ends a comment.
+            # Scanning only for `\n` treats a `\r`-terminated comment as running past the real
+            # LineTerminator, swallowing an executable call that follows the `\r` (a fail-open bypass).
+            j = i + 1
+            while j < n and value[j] not in "\r\n":
+                j += 1
+            if j >= n:
                 break  # comment runs to end of value — nothing executable remains
-            i = nl + 1
+            i = j + 2 if value[j] == "\r" and j + 1 < n and value[j + 1] == "\n" else j + 1
             continue
         if value.startswith('"""', i):
             j = i + 3
@@ -875,10 +880,27 @@ def _ghgql_to_graphql_rest(argv: list[str]) -> list[str]:
     positional / `@file` / `-` stdin) becomes a `-f query=<v>` field, with `-` mapped to stdin
     (`@-`) so it reads as UNPROVABLE and blocks; forwarded `-f`/`-F` fields (incl. a smuggled second
     `query=`) are carried through verbatim so a merge in any of them is caught. `--allow-mutation`
-    is ghgql's OWN opt-in and is irrelevant here — the guard rules on the resulting request."""
+    is ghgql's OWN opt-in and is irrelevant here — the guard rules on the resulting request. This
+    output is SCAN-ONLY: it feeds `_gh_api_is_merge`/`_graphql_query_field_values` to decide
+    allow/block and is never itself executed — this hook is a PreToolUse decision point, not an
+    invoker — so a non-`-f`/`-F` value flag rewritten into a canonical `-f query=<v>` field (see the
+    `_GHGQL_VALUE_FLAGS` branch below) only affects what the SCAN sees, never the real command
+    `ghgql`/`gh` actually runs."""
     rest: list[str] = ["graphql"]
     args = argv[1:]
     query: str | None = None
+    # STICKY once set — unlike `query`, a later query source must NOT clear this. Real `ghgql`
+    # (its own `case` statement) only accepts `-q`/`--query` DETACHED as a QUERY source; a glued
+    # spelling (`--query=X`, `-qX`) is never treated as one there and instead falls to ghgql's `-*`
+    # catch-all, forwarded to `gh` verbatim. `--query=X` has no meaning to `gh` and errors; but a
+    # glued `-q<jq-filter>` IS a legitimate spelling of `gh`'s `--jq` shorthand (e.g. `-q.data.x`) —
+    # a real, benign read. Since this mapper cannot tell a jq-filter spelling from an attempted
+    # (non-functional) query override, ANY glued `-q`/`--query=` token makes the whole call
+    # unprovable and forces a block — a deliberate false-positive on the jq-shorthand case in
+    # exchange for never trusting a glued spelling's meaning — regardless of where it appears among
+    # other (possibly provable-looking) query sources; a later or earlier detached `-q`/positional
+    # query must not silently clear this back to "provable".
+    saw_unrecognized_glued_query_flag = False
     i, n = 0, len(args)
     while i < n:
         a = args[i]
@@ -886,12 +908,42 @@ def _ghgql_to_graphql_rest(argv: list[str]) -> list[str]:
             query = args[i + 1]
             i += 2
             continue
+        if a.startswith("--query=") or (a.startswith("-q") and len(a) > 2):
+            saw_unrecognized_glued_query_flag = True
+            rest.append(a)  # keep it visible to the raw-token scan too, as a safety net
+            i += 1
+            continue
         if a == "--":  # everything after is forwarded to gh verbatim
             rest.extend(args[i + 1:])
             break
         if a in _GHGQL_VALUE_FLAGS and i + 1 < n:
-            rest.append(a)
-            rest.append(args[i + 1])
+            # Real ghgql's `case "$2" in query=*)` applies to EVERY one of these value flags, not
+            # only `-f`/`-F` — `ghgql -H query=@/dev/stdin` (or `--jq`/`--cache`/`-t`/etc. with a
+            # `query=` value) is captured by ghgql as THE query (unconditionally OVERWRITING any
+            # earlier query, per its `case` statement — last one wins at runtime), same as
+            # `-f query=…`. Forwarding it here as an opaque header/jq/template/cache field (the old
+            # behavior) hid the query entirely from `_graphql_query_field_values`, so a merge or
+            # unreadable-file/stdin query smuggled behind a non-`-f`/`-F` flag was never seen — a
+            # real bypass (#303 review, Codex). Mirror ghgql's own capture by emitting it in the
+            # SAME canonical `-f query=<v>` form `_graphql_query_field_values` already recognizes for
+            # `-f`/`-F` — for EVERY such flag, not just the first — so every candidate "the query
+            # ghgql might actually use" is visible to the scan and a merge/unprovable value in ANY of
+            # them blocks (conservative: we don't need to reproduce ghgql's last-wins precisely, only
+            # to never miss a query source it could resolve to).
+            val = args[i + 1]
+            if val.startswith("query="):
+                # Real ghgql resolves `query="-"` to STDIN uniformly, regardless of which flag
+                # captured it (its `[ "$query" = "-" ]` check runs AFTER parsing, on the one shared
+                # `query` variable) — so `-H query=-` reads a piped mutation exactly like `-q -`
+                # does. Apply the SAME `-` → `@-` canonicalization the primary query-capture path
+                # uses below, or a bare `-` here scans as a harmless 1-char literal instead of the
+                # unprovable stdin marker it actually is (a real gap: Fable review).
+                qv = val[len("query="):]
+                rest.append("-f")
+                rest.append(f"query={'@-' if qv == '-' else qv}")
+            else:
+                rest.append(a)
+                rest.append(val)
             i += 2
             continue
         if a != "-" and a.startswith("-"):  # boolean/unknown flag (--allow-mutation, --paginate): forward
@@ -907,6 +959,14 @@ def _ghgql_to_graphql_rest(argv: list[str]) -> list[str]:
     if query is not None:
         rest.append("-f")
         rest.append(f"query={'@-' if query == '-' else query}")
+    if saw_unrecognized_glued_query_flag:
+        # A glued `-q`/`--query=` token was present ANYWHERE in argv, regardless of whether a
+        # separate (possibly provable-looking) query source was also found. `_graphql_query_field_values`
+        # collects every `query=` field's value and `_graphql_query_is_unprovable` blocks if ANY of
+        # them is unreadable — appending a second, empty `query=` field forces that outcome without
+        # disturbing a real query value already recorded above (order-independent, non-clobbering).
+        rest.append("-f")
+        rest.append("query=")
     return rest
 
 

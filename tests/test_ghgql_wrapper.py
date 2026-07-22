@@ -140,6 +140,20 @@ def test_no_query_errors():
     assert "no query" in r.stderr.lower()
 
 
+def test_readonly_comment_naming_merge_token_is_over_refused_not_bypassed():
+    """The wrapper's own standalone guard is a COARSE, string-only approximation (it does not
+    strip `#` comments at all — see the comment above the `sed` pipeline in `ghgql`): a read-only
+    query whose `#` comment merely NAMES a merge token is (over-)refused, not allowed. This is a
+    deliberate, documented trade-off (over-refuse is the SAFE direction; the Python hook is the
+    authoritative gate and correctly allows this exact case via its comment-aware stripper — see
+    `test_graphql_readonly_comment_naming_merge_token_is_allowed` in test_block_raw_pr_merge.py).
+    Locks that the wrapper never silently starts ALLOWING a comment-hidden case instead."""
+    query = "query {\n  # remember to check mergePullRequest availability\n  viewer { login }\n}"
+    r = _run(["--dry-run", query])
+    assert r.returncode == 2
+    assert "mutation" in r.stderr.lower()
+
+
 def test_native_f_query_field_is_treated_as_the_query():
     """`ghgql -f query='…'` (the native gh spelling) is the query, not a forwarded variable — it must
     build a single query field and not die with 'no query given' or duplicate the field."""

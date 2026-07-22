@@ -90,9 +90,17 @@ if [ "$allow_mutation" -eq 0 ]; then
   # Strip GraphQL double-quoted string literals before the check, so a read-only query that merely
   # NAMES a mutation as data — `search(query: "mergePullRequest")`, which the merge guard allows —
   # is not falsely refused. This is a COARSE approximation of the hook's
-  # `_strip_graphql_string_literals` (it does not understand `\"` escapes or `"""` block strings),
-  # so it can OVER-refuse an exotic read — safe direction; the hook stays the authoritative merge
-  # gate. Only the `query` operation can execute, so a token surviving outside a string is a write.
+  # `_strip_graphql_string_literals` (it does not understand `\"` escapes, `"""` block strings, or
+  # `#` line comments), so it can OVER-refuse an exotic read — safe direction; the hook stays the
+  # AUTHORITATIVE merge gate when installed (#303 review, Codex). An earlier revision of this line
+  # also stripped `#` comments to fix a narrower `\r`-comment edge case in this wrapper's OWN
+  # standalone guard — but stripping comments BEFORE strings deletes real code whenever a string
+  # literal itself contains `#` (`x(q:"#") mutation M{...}` loses the trailing mutation entirely,
+  # a WORSE fail-open than the edge case it fixed), and stripping strings first re-opens the
+  # original comment-quote-pairing bug. Neither pass ordering is sound without a real interleaved
+  # lexer, so this deliberately stays string-only: it can still OVER-refuse (never a bypass) but
+  # never deletes real code out from under the scan. Only the `query` operation can execute, so a
+  # token surviving outside a string is a write.
   q_scan=$(printf '%s' "$query" | sed 's/"[^"]*"//g')
   case "$q_scan" in
     *mutation*|*mergePullRequest*|*enablePullRequestAutoMerge*|*enqueuePullRequest*|*mergeBranch*)
