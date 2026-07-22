@@ -695,6 +695,121 @@ def _graphql_argument_role_is_unprovable(rest: list[str]) -> bool:
     return False
 
 
+def _strip_graphql_string_literals(value: str) -> str:
+    """Return `value` with every GraphQL STRING LITERAL removed — a `"…"` string (honouring `\\"`
+    escapes) and a `\"\"\"…\"\"\"` block string. GraphQL has no single-quoted strings, so only double
+    quotes delimit a literal.
+
+    Used so a merge-mutation TOKEN that appears ONLY as data inside a read-only query — e.g.
+    `search(query: "mergePullRequest")` — is not mistaken for a mutation CALL. An UNTERMINATED
+    literal is unprovable (a merge call could hide after the dangling quote), so the ORIGINAL value
+    is returned unchanged — the token stays visible and the caller fails closed.
+
+    The stripper MIRRORS GraphQL's own string/comment lexing so a token that survives stripping is a
+    real field reference, never data hiding in a literal or comment:
+
+    - A `#` line COMMENT is skipped to end-of-line BEFORE quote handling, so a `"` in a comment
+      cannot open a phantom span that swallows a real call between two comment quotes.
+    - A block string honours GraphQL's ONLY block-string escape, `\\\"\"\"` (an escaped triple-quote
+      does NOT terminate the block string). Without this, two escaped delimiters re-pair across a
+      real `mergePullRequest(` and strip it — a bypass, not a false-positive.
+    - A regular string honours `\\<char>` escapes (so `\\\"` does not close it).
+
+    An UNTERMINATED string/block string is unprovable (a merge call could hide after the dangling
+    delimiter), so the ORIGINAL value is returned unchanged — the token stays visible and the caller
+    fails closed."""
+    out: list[str] = []
+    i, n = 0, len(value)
+    while i < n:
+        if value[i] == "#":  # GraphQL line comment: skip to EOL so a comment `"` opens no span
+            # GraphQL's LineTerminator is `\n`, `\r`, or `\r\n` — a bare `\r` also ends a comment.
+            # Scanning only for `\n` treats a `\r`-terminated comment as running past the real
+            # LineTerminator, swallowing an executable call that follows the `\r` (a fail-open bypass).
+            j = i + 1
+            while j < n and value[j] not in "\r\n":
+                j += 1
+            if j >= n:
+                break  # comment runs to end of value — nothing executable remains
+            i = j + 2 if value[j] == "\r" and j + 1 < n and value[j + 1] == "\n" else j + 1
+            continue
+        if value.startswith('"""', i):
+            j = i + 3
+            closed = False
+            while j < n:
+                if value[j] == "\\" and value.startswith('"""', j + 1):
+                    j += 4  # `\"""` — GraphQL's block-string escape, NOT a terminator
+                    continue
+                if value.startswith('"""', j):
+                    j += 3
+                    closed = True
+                    break
+                j += 1
+            if not closed:
+                return value  # unterminated block string → fail closed (do not strip)
+            i = j
+            continue
+        if value[i] == '"':
+            j = i + 1
+            closed = False
+            while j < n:
+                if value[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if value[j] == '"':
+                    closed = True
+                    j += 1
+                    break
+                j += 1
+            if not closed:
+                return value  # unterminated string → fail closed (do not strip)
+            i = j
+            continue
+        out.append(value[i])
+        i += 1
+    return "".join(out)
+
+
+def _graphql_carries_merge_mutation(rest: list[str]) -> bool:
+    """True iff a `gh api graphql` call actually PERFORMS a merge mutation.
+
+    Only the `query` field can carry a GraphQL operation; every other `-f`/`-F` field is a variable
+    (data). A merge-mutation token is a real merge only when it is a FIELD in a readable `query`
+    value — NOT when it appears solely as a STRING LITERAL there (a read-only `search`/code query
+    that merely NAMES the mutation).  So each readable `query` value is scanned with its string
+    literals stripped.
+
+    A merge token OUTSIDE a readable `query` value — in a non-`query` field, or a bare positional —
+    keeps the blunt over-block (fail closed): the guard cannot prove such a stray token is inert, so
+    it stays blocked. Unreadable / expandable query bodies are handled by
+    `_graphql_query_is_unprovable`; this function only rules on what it CAN read.
+
+    Scanning is TOKEN-PRECISE: each `query` field value is scanned with its string literals
+    stripped, and every other token is scanned raw. This avoids a positional string-`replace` that
+    could excise the wrong occurrence and either miss a token or splice a spurious one."""
+    i, n = 0, len(rest)
+    while i < n:
+        a = rest[i]
+        if a in _FIELDISH and i + 1 < n:  # detached field: `-f query=<v>` / `-F note=<v>`
+            key, _, val = rest[i + 1].partition("=")
+            probe = _strip_graphql_string_literals(val) if key == "query" else rest[i + 1]
+            if _MERGE_MUTATION.search(probe):
+                return True
+            i += 2
+            continue
+        m = re.match(r"^(?:--field|--raw-field|-[fF])=?(.*)$", a)  # glued: `-fquery=<v>` / `--field=note=<v>`
+        if m and m.group(1):
+            key, _, val = m.group(1).partition("=")
+            probe = _strip_graphql_string_literals(val) if key == "query" else a
+            if _MERGE_MUTATION.search(probe):
+                return True
+            i += 1
+            continue
+        if _MERGE_MUTATION.search(a):  # endpoint, flags, bare args: scan raw (fail closed)
+            return True
+        i += 1
+    return False
+
+
 def _graphql_query_is_unprovable(rest: list[str], strict: bool = False) -> bool:
     """True iff a `gh api graphql` call feeds its `query` (or the whole request body) from a source
     this hook CANNOT READ at pre-exec time — a file (`query=@f`), stdin (`query=@-` / `--input …`), or
@@ -725,10 +840,11 @@ def _gh_api_is_merge(rest: list[str], strict: bool = False) -> bool:
     endpoint = _gh_api_endpoint(rest)
     is_graphql = endpoint == "graphql" or (endpoint or "").endswith("/graphql")
     if is_graphql:
-        # A merge mutation token ANYWHERE in a graphql call blocks — this is a deliberate over-block:
-        # a graphql invocation carrying `mergePullRequest`/`enablePullRequestAutoMerge` in any field
-        # is almost certainly the mutation, and over-blocking is the safe direction (Opus review 2).
-        if _MERGE_MUTATION.search(" ".join(rest)):
+        # A merge mutation FIELD in the request blocks. A merge token that appears ONLY as a STRING
+        # LITERAL inside a read-only `query` (e.g. `search(query:"mergePullRequest")`) executes
+        # nothing and is allowed; a token OUTSIDE a readable query value keeps the blunt over-block
+        # (fail closed). See `_graphql_carries_merge_mutation`.
+        if _graphql_carries_merge_mutation(rest):
             return True
         if _graphql_query_is_unprovable(rest, strict=strict):
             return True
@@ -746,10 +862,118 @@ def _gh_api_is_merge(rest: list[str], strict: bool = False) -> bool:
     return rest_path_hit and (_rest_has_write_method(rest) or _rest_method_is_unprovable(rest))
 
 
+# `ghgql` (skills/universal/gh-graphql/ghgql) is a wrapper that EXECS `gh api graphql`. A command-string
+# PreToolUse hook sees only the top-level `ghgql …` word, never the wrapped `gh` call, so the guard
+# must inspect `ghgql` itself or it becomes a raw-merge bypass. `ghgql`'s query grammar is mapped to the
+# equivalent `gh api graphql` request and run through the SAME graphql merge check.
+_GHGQL_WRAPPER = "ghgql"
+# ghgql flags whose NEXT token is a value (mirrors ghgql's own forwarding set) — consumed when mapping.
+_GHGQL_VALUE_FLAGS = frozenset(
+    {"-F", "--field", "-f", "--raw-field", "-H", "--header", "--jq", "--hostname",
+     "-p", "--preview", "-t", "--template", "--cache"}
+)
+
+
+def _ghgql_to_graphql_rest(argv: list[str]) -> list[str]:
+    """Map a `ghgql …` argv (argv[0] basename == `ghgql`) to the `gh api graphql` `rest` it execs, so
+    `_gh_api_is_merge` governs it. Conservative by construction: ghgql's query (`-q <v>` / a bare
+    positional / `@file` / `-` stdin) becomes a `-f query=<v>` field, with `-` mapped to stdin
+    (`@-`) so it reads as UNPROVABLE and blocks; forwarded `-f`/`-F` fields (incl. a smuggled second
+    `query=`) are carried through verbatim so a merge in any of them is caught. `--allow-mutation`
+    is ghgql's OWN opt-in and is irrelevant here — the guard rules on the resulting request. This
+    output is SCAN-ONLY: it feeds `_gh_api_is_merge`/`_graphql_query_field_values` to decide
+    allow/block and is never itself executed — this hook is a PreToolUse decision point, not an
+    invoker — so a non-`-f`/`-F` value flag rewritten into a canonical `-f query=<v>` field (see the
+    `_GHGQL_VALUE_FLAGS` branch below) only affects what the SCAN sees, never the real command
+    `ghgql`/`gh` actually runs."""
+    rest: list[str] = ["graphql"]
+    args = argv[1:]
+    query: str | None = None
+    # STICKY once set — unlike `query`, a later query source must NOT clear this. Real `ghgql`
+    # (its own `case` statement) only accepts `-q`/`--query` DETACHED as a QUERY source; a glued
+    # spelling (`--query=X`, `-qX`) is never treated as one there and instead falls to ghgql's `-*`
+    # catch-all, forwarded to `gh` verbatim. `--query=X` has no meaning to `gh` and errors; but a
+    # glued `-q<jq-filter>` IS a legitimate spelling of `gh`'s `--jq` shorthand (e.g. `-q.data.x`) —
+    # a real, benign read. Since this mapper cannot tell a jq-filter spelling from an attempted
+    # (non-functional) query override, ANY glued `-q`/`--query=` token makes the whole call
+    # unprovable and forces a block — a deliberate false-positive on the jq-shorthand case in
+    # exchange for never trusting a glued spelling's meaning — regardless of where it appears among
+    # other (possibly provable-looking) query sources; a later or earlier detached `-q`/positional
+    # query must not silently clear this back to "provable".
+    saw_unrecognized_glued_query_flag = False
+    i, n = 0, len(args)
+    while i < n:
+        a = args[i]
+        if a in ("-q", "--query") and i + 1 < n:
+            query = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--query=") or (a.startswith("-q") and len(a) > 2):
+            saw_unrecognized_glued_query_flag = True
+            rest.append(a)  # keep it visible to the raw-token scan too, as a safety net
+            i += 1
+            continue
+        if a == "--":  # everything after is forwarded to gh verbatim
+            rest.extend(args[i + 1:])
+            break
+        if a in _GHGQL_VALUE_FLAGS and i + 1 < n:
+            # Real ghgql's `case "$2" in query=*)` applies to EVERY one of these value flags, not
+            # only `-f`/`-F` — `ghgql -H query=@/dev/stdin` (or `--jq`/`--cache`/`-t`/etc. with a
+            # `query=` value) is captured by ghgql as THE query (unconditionally OVERWRITING any
+            # earlier query, per its `case` statement — last one wins at runtime), same as
+            # `-f query=…`. Forwarding it here as an opaque header/jq/template/cache field (the old
+            # behavior) hid the query entirely from `_graphql_query_field_values`, so a merge or
+            # unreadable-file/stdin query smuggled behind a non-`-f`/`-F` flag was never seen — a
+            # real bypass (#303 review, Codex). Mirror ghgql's own capture by emitting it in the
+            # SAME canonical `-f query=<v>` form `_graphql_query_field_values` already recognizes for
+            # `-f`/`-F` — for EVERY such flag, not just the first — so every candidate "the query
+            # ghgql might actually use" is visible to the scan and a merge/unprovable value in ANY of
+            # them blocks (conservative: we don't need to reproduce ghgql's last-wins precisely, only
+            # to never miss a query source it could resolve to).
+            val = args[i + 1]
+            if val.startswith("query="):
+                # Real ghgql resolves `query="-"` to STDIN uniformly, regardless of which flag
+                # captured it (its `[ "$query" = "-" ]` check runs AFTER parsing, on the one shared
+                # `query` variable) — so `-H query=-` reads a piped mutation exactly like `-q -`
+                # does. Apply the SAME `-` → `@-` canonicalization the primary query-capture path
+                # uses below, or a bare `-` here scans as a harmless 1-char literal instead of the
+                # unprovable stdin marker it actually is (a real gap: Fable review).
+                qv = val[len("query="):]
+                rest.append("-f")
+                rest.append(f"query={'@-' if qv == '-' else qv}")
+            else:
+                rest.append(a)
+                rest.append(val)
+            i += 2
+            continue
+        if a != "-" and a.startswith("-"):  # boolean/unknown flag (--allow-mutation, --paginate): forward
+            rest.append(a)
+            i += 1
+            continue
+        # a bare `-` (like a bare positional) is ghgql's stdin query — fall through as the query token
+        if query is None:  # first bare positional (or `-`) is the query
+            query = a
+        else:
+            rest.append(a)
+        i += 1
+    if query is not None:
+        rest.append("-f")
+        rest.append(f"query={'@-' if query == '-' else query}")
+    if saw_unrecognized_glued_query_flag:
+        # A glued `-q`/`--query=` token was present ANYWHERE in argv, regardless of whether a
+        # separate (possibly provable-looking) query source was also found. `_graphql_query_field_values`
+        # collects every `query=` field's value and `_graphql_query_is_unprovable` blocks if ANY of
+        # them is unreadable — appending a second, empty `query=` field forces that outcome without
+        # disturbing a real query value already recorded above (order-independent, non-clobbering).
+        rest.append("-f")
+        rest.append("query=")
+    return rest
+
+
 def _is_invoked_head(base: str) -> bool:
-    """True iff a token's basename names a command whose merge we detect directly: `gh`, a shell
-    interpreter (its `-c` string is re-scanned), or `eval`."""
-    return base == "gh" or base == "eval" or base in _SHELL_INTERPRETERS
+    """True iff a token's basename names a command whose merge we detect directly: `gh`, the `ghgql`
+    wrapper over `gh api graphql`, a shell interpreter (its `-c` string is re-scanned), or `eval`."""
+    return base == "gh" or base == _GHGQL_WRAPPER or base == "eval" or base in _SHELL_INTERPRETERS
 
 
 def _resolve_invoked_argv(argv: list[str]) -> list[str] | None:
@@ -845,6 +1069,10 @@ def _is_merge_route(segment: list[str], strict: bool = False) -> bool:
         if sub and sub[0] == "api":
             return _gh_api_is_merge(sub[1:], strict=strict)
         return False
+    if os.path.basename(argv[0]) == _GHGQL_WRAPPER:
+        # `ghgql` execs `gh api graphql`; inspect the request it would build (see `_ghgql_to_graphql_rest`)
+        # so a merge through the wrapper is blocked exactly like a direct `gh api graphql`.
+        return _gh_api_is_merge(_ghgql_to_graphql_rest(argv), strict=strict)
     # A shell interpreter / `eval`: re-scan the merge hidden in its `-c` / string arguments. That
     # string is a NESTED context whose inner quoting the outer shell may already have processed
     # (`bash -c "…query='$Q'…"` expands `$Q` at the outer level), so scan it strictly.
@@ -1083,7 +1311,15 @@ def _graphql_query_field_is_expandable(blanked_command: str) -> bool:
     blocked (`echo graphql query=$Q`), and parsing via shlex tokens covers every flag spelling. Kept
     separate from `_command_contains_gh_pr_merge` (which runs on the ORIGINAL command) so the blanking
     — which is not heredoc-aware — cannot disturb heredoc/substitution merge detection. An unparseable
-    command fails closed (block)."""
+    command fails closed (block).
+
+    ALSO covers the `ghgql` wrapper (#303): `ghgql` execs `gh api graphql` under the hood, and its OWN
+    mutation-refusal (`ghgql`'s read-only-by-default guard) is skipped under `--allow-mutation` — a
+    `ghgql --allow-mutation "$Q"` where `$Q` expands to a merge mutation reaches `_is_merge_route` only
+    through the non-strict top-level path, where an expandable query field was previously invisible
+    (only a direct `gh api graphql` invocation was inspected here). Mapping the `ghgql` argv through
+    `_ghgql_to_graphql_rest` — the SAME mapping `_is_merge_route` uses — makes an expandable ghgql query
+    unprovable/fail-closed exactly like a direct `gh api graphql -f query="$Q"`."""
     try:
         segments = _split_segments(blanked_command)
     except ValueError:
@@ -1093,12 +1329,18 @@ def _graphql_query_field_is_expandable(blanked_command: str) -> bool:
         return False
     for seg in segments:
         argv = _resolve_invoked_argv(_segment_argv(seg))
-        if not argv or os.path.basename(argv[0]) != "gh":
+        if not argv:
             continue
-        sub = _gh_subargs(argv)
-        if not sub or sub[0] != "api":
+        base = os.path.basename(argv[0])
+        if base == "gh":
+            sub = _gh_subargs(argv)
+            if not sub or sub[0] != "api":
+                continue
+            rest = sub[1:]
+        elif base == _GHGQL_WRAPPER:
+            rest = _ghgql_to_graphql_rest(argv)
+        else:
             continue
-        rest = sub[1:]
         endpoint = _gh_api_endpoint(rest)
         if endpoint == "graphql" or (endpoint or "").endswith("/graphql"):
             if any("$" in val or "`" in val for val in _graphql_query_field_values(rest)):

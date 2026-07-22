@@ -1276,15 +1276,21 @@ def test_prose_mention_under_wrapper_scan_still_allowed(monkeypatch):
     assert _decision(out) == "allow"
 
 
-def test_graphql_inline_read_query_with_merge_token_is_over_blocked(monkeypatch):
-    """A `gh api graphql` read whose text merely CONTAINS a merge-mutation token is over-blocked —
-    `_MERGE_MUTATION` scans the whole graphql call, a deliberate safe-direction over-block. Locked
-    in so a future 'scan only the query field' refactor can't silently change it (Opus review)."""
+def test_graphql_inline_read_query_with_merge_token_string_literal_is_allowed(monkeypatch):
+    """A `gh api graphql` read whose merge-mutation token is only a STRING LITERAL inside the query
+    (`repository(name:"mergePullRequest")`) executes nothing and is now ALLOWED.
+
+    This REPLACES the former deliberate whole-call over-block: per the CTO 2026-07-18 order to
+    block merges more precisely, `_graphql_carries_merge_mutation` strips GraphQL string literals
+    from the readable `query` value before scanning, so a read-only query that merely NAMES the
+    mutation is no longer false-blocked. The safe-direction guarantees are preserved by the sibling
+    tests: a real `mergePullRequest(` CALL, a token OUTSIDE a readable query value, and an
+    unprovable/expandable query all still BLOCK."""
     out, _err, code = _run(
         "gh api graphql -f query='query { repository(name:\"mergePullRequest\") { id } }'", monkeypatch
     )
-    assert code == hook.BLOCK_EXIT_CODE
-    assert _decision(out) == "block"
+    assert code == 0
+    assert _decision(out) == "allow"
 
 
 def test_unparseable_non_gh_prose_mentioning_gh_api_merge_token_is_allowed(monkeypatch):
@@ -1394,6 +1400,384 @@ def test_unparseable_substitution_body_with_parseable_top_level_fails_closed(mon
     out, _err, code = _run("echo \"$(gh pr merge 1 --jq 'unclosed)\"", monkeypatch)
     assert code == hook.BLOCK_EXIT_CODE
     assert _decision(out) == "block"
+
+
+# ── Precise merge-mutation detection: a merge TOKEN inside a read-only GraphQL query's STRING
+#    LITERAL is data, not a mutation. The blunt `mergePullRequest`-anywhere over-block wrongly
+#    denied read-only queries that merely NAME the mutation (e.g. a code/PR search). Block only an
+#    actual merge mutation FIELD; keep every real merge and every unprovable form blocked. ──
+
+
+def test_readonly_graphql_search_for_merge_token_string_literal_allowed(monkeypatch):
+    """A read-only `search(query: "mergePullRequest")` names the mutation as a STRING LITERAL — it
+    executes nothing. The guard must ALLOW it (the exact class the blunt token scan false-blocked)."""
+    command = (
+        "gh api graphql -f query='query{ search(query:\"mergePullRequest\" type:ISSUE "
+        "first:5){ nodes{ ... on PullRequest{ title } } } }'"
+    )
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_readonly_graphql_block_string_mentioning_merge_token_allowed(monkeypatch):
+    """A merge token inside a GraphQL block string (`\"\"\"…\"\"\"`) is documentation, not a call."""
+    command = (
+        'gh api graphql -f query=\'query{ """runs enablePullRequestAutoMerge later""" '
+        "viewer{ login } }'"
+    )
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_readonly_graphql_field_named_like_merge_allowed(monkeypatch):
+    """Reading merge-adjacent SCHEMA fields (`mergeable`, `autoMergeAllowed`) is read-only."""
+    command = (
+        "gh api graphql -f query='query{ repository(owner:\"o\" name:\"r\"){ "
+        "autoMergeAllowed pullRequest(number:1){ mergeable mergeStateStatus } } }'"
+    )
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_graphql_real_merge_mutation_still_blocked(monkeypatch):
+    """A real `mergePullRequest(` CALL in the query value must still BLOCK (regression guard)."""
+    command = (
+        "gh api graphql -f query='mutation{ mergePullRequest(input:{pullRequestId:\"x\"})"
+        "{ clientMutationId } }'"
+    )
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "mutation_field",
+    [
+        "enablePullRequestAutoMerge(input:{pullRequestId:\"x\"}){ clientMutationId }",
+        "enqueuePullRequest(input:{pullRequestId:\"x\"}){ clientMutationId }",
+        "mergeBranch(input:{repositoryId:\"x\" base:\"main\" head:\"f\"}){ clientMutationId }",
+    ],
+)
+def test_graphql_non_merge_pull_request_landing_mutations_still_blocked(mutation_field, monkeypatch):
+    """The precise scan must still block EVERY landing route, not just `mergePullRequest`: an
+    auto-merge enable, a merge-queue enqueue, and a direct branch merge are all real merges. This
+    locks in that the swap from the blunt whole-call scan to `_graphql_carries_merge_mutation` kept
+    the full `_MERGE_MUTATION` token set (findings: review round for this change)."""
+    command = f"gh api graphql -f query='mutation{{ {mutation_field} }}'"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_graphql_escaped_block_string_delimiter_honored_readonly_allowed(monkeypatch):
+    """A merge token inside a well-formed block string that uses GraphQL's `\\\"\"\"` escape is data
+    in a read-only query — the stripper honours the escape (the `\\\"\"\"` does not terminate the
+    span), so the whole literal is removed and the call is ALLOWED."""
+    command = 'gh api graphql -f query=\'query{ note(x:"""a \\""" mergePullRequest \\""" b""") viewer{ login } }\''
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+@pytest.mark.parametrize(
+    "landing_field",
+    ["mergePullRequest", "enablePullRequestAutoMerge", "enqueuePullRequest", "mergeBranch"],
+)
+def test_graphql_two_escaped_block_strings_cannot_straddle_a_merge_call(landing_field, monkeypatch):
+    """Two `\\\"\"\"` escaped block-string delimiters must NOT re-pair across a real merge call and
+    strip it. Correctly honouring the escape keeps each block string self-contained, so the
+    executing `<merge>(input:…)` between them stays visible and BLOCKS (this was a real bypass: naive
+    `find` re-pairing swallowed the call)."""
+    command = (
+        f"gh api graphql -f query='mutation{{ setX(a:\"\"\"p\\\"\"\"q\"\"\") "
+        f"{landing_field}(input:{{pullRequestId:\"1\"}}){{ id }} setY(b:\"\"\"r\\\"\"\"s\"\"\") }}'"
+    )
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_graphql_merge_call_hidden_after_string_literal_still_blocked(monkeypatch):
+    """De-stringing must not let a REAL call hide behind a string literal: a query that both quotes
+    the token AND performs the mutation still BLOCKS."""
+    command = (
+        "gh api graphql -f query='mutation{ x: search(query:\"mergePullRequest\"){ n } "
+        "mergePullRequest(input:{pullRequestId:\"x\"}){ id } }'"
+    )
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "comment_delim",
+    ['"', '"""'],
+)
+def test_graphql_comment_quote_cannot_hide_a_merge_mutation(comment_delim, monkeypatch):
+    """A GraphQL `#` line comment containing a quote must NOT open a phantom string span that
+    swallows a real `mergePullRequest(` call on a LATER line. The stripper skips comments to
+    end-of-line, so the executing call between two comment quotes stays visible and BLOCKS (this
+    was a real bypass: a cross-line phantom string deleted the call → allow)."""
+    command = (
+        "gh api graphql -f query='mutation {\n"
+        f"  # {comment_delim}\n"
+        "  mergePullRequest(input:{pullRequestId:\"x\"}){ id }\n"
+        f"  # {comment_delim}\n"
+        "}'"
+    )
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_graphql_readonly_comment_naming_merge_token_is_allowed(monkeypatch):
+    """A read-only query whose `#` comment merely mentions a merge token is allowed — the comment is
+    skipped and no executing call remains."""
+    command = (
+        "gh api graphql -f query='query {\n"
+        "  # remember to check mergePullRequest availability\n"
+        "  viewer { login }\n"
+        "}'"
+    )
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("terminator", ["\r", "\r\n"])
+def test_graphql_cr_terminated_comment_does_not_hide_a_merge_mutation(terminator, monkeypatch):
+    """GraphQL's LineTerminator is `\\n`, `\\r`, or `\\r\\n` — a bare `\\r` also ends a `#` comment.
+    The stripper previously only scanned for `\\n`, so a comment ending in a lone `\\r` (with a real
+    call on the same "line" by `\\n`-only counting) swallowed the executing `mergePullRequest(` call
+    as commented-out text — a fail-open bypass, since GitHub's real GraphQL parser treats the `\\r` as
+    ending the comment and executes the call. Must BLOCK."""
+    command = (
+        "gh api graphql -f query='mutation{ #dummy"
+        + terminator
+        + "mergePullRequest(input:{pullRequestId:\"x\"}){ id } }'"
+    )
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize("terminator", ["\r", "\r\n"])
+def test_graphql_readonly_cr_terminated_comment_naming_merge_token_is_allowed(terminator, monkeypatch):
+    """The allow-side mirror of the `\\r`-comment fix: a `#` comment merely NAMING a merge token,
+    terminated by `\\r`/`\\r\\n` instead of `\\n`, must still be stripped (not over-strip past it and
+    swallow a real field) — the read-only query it precedes is allowed."""
+    command = (
+        "gh api graphql -f query='query{"
+        + terminator
+        + "  # remember to check mergePullRequest availability"
+        + terminator
+        + "  viewer { login }"
+        + terminator
+        + "}'"
+    )
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_graphql_comment_terminated_by_trailing_cr_at_end_of_value_fails_closed(monkeypatch):
+    """A `#` comment where a lone `\\r` is the FINAL character of the value (nothing after it) must
+    not crash the scanner and must still leave the preceding, already-visible merge call blocked —
+    exercises the `j + 1 == n` bound in the new `\\r`-terminator loop."""
+    command = "gh api graphql -f query='mutation{ mergePullRequest(input:{pullRequestId:\"x\"}){ id } } #c\r'"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_graphql_unterminated_string_in_query_fails_closed(monkeypatch):
+    """An UNTERMINATED GraphQL string literal is unprovable — de-stringing must fail closed so a
+    merge token after the dangling quote cannot be smuggled past the scan."""
+    command = "gh api graphql -f query='query{ x(q:\"open mergePullRequest(input:{}){id} }'"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_graphql_unterminated_block_string_in_query_fails_closed(monkeypatch):
+    """An UNTERMINATED block string is a distinct code path from a regular one — it too must fail
+    closed so a merge token after the dangling `\"\"\"` stays visible and blocks."""
+    command = "gh api graphql -f query='query{ x(q:\"\"\"open enablePullRequestAutoMerge(input:{}){id} }'"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_graphql_merge_token_in_non_query_field_still_blocked(monkeypatch):
+    """A merge token outside a readable `query` value keeps the conservative over-block (fail
+    closed): the guard cannot prove a stray `mergePullRequest` token is inert data."""
+    command = "gh api graphql -F note=mergePullRequest -f query='query{ viewer{ login } }'"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_graphql_glued_query_field_real_mutation_blocked(monkeypatch):
+    """The GLUED field spelling (`-fquery=…`, no space) must be scanned like the detached form: a
+    real mutation in it blocks."""
+    command = "gh api graphql -fquery='mutation{ mergePullRequest(input:{}){ id } }'"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_graphql_glued_query_field_string_literal_allowed(monkeypatch):
+    """The glued field spelling with a read-only query that only NAMES the token is allowed."""
+    command = "gh api graphql --field=query='query{ search(query:\"mergePullRequest\"){ nodes{ __typename } } }'"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_graphql_glued_non_query_field_with_merge_token_over_blocked(monkeypatch):
+    """A merge token in a GLUED non-`query` field keeps the conservative over-block (fail closed)."""
+    command = "gh api graphql -Fnote=mergePullRequest -f query='query{ viewer{ login } }'"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+# ── Coupling guard: the provisioned `gh api graphql` helper's read-only recipe is NOT blocked. ──
+
+
+def test_gh_graphql_helper_readonly_recipe_is_allowed(monkeypatch):
+    """The `gh-graphql` skill's canonical read-only invocation (single-quoted inline query, `-F`
+    variables) must pass the guard — the alias is read-only by design and must never be blocked."""
+    command = (
+        "gh api graphql -F owner=cli -F name=cli -f query='query($owner:String! $name:String!)"
+        "{ repository(owner:$owner name:$name){ pullRequests(first:20 states:OPEN){ "
+        "nodes{ number title } } } }'"
+    )
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+# ── `ghgql` wrapper coverage: `ghgql` execs `gh api graphql`, invisible to a command-string hook, so
+#    the guard maps a `ghgql …` call to that request and blocks a merge through it — no bypass. ──
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ghgql --allow-mutation 'mutation{ mergePullRequest(input:{pullRequestId:\"x\"}){ id } }'",
+        "ghgql 'mutation{ mergePullRequest(input:{}){ id } }'",
+        "ghgql -q @merge.graphql",            # file-backed: unreadable → unprovable → block
+        "ghgql -F query=@merge.graphql",      # file-backed query FIELD: unprovable → block
+        "ghgql -q -",                          # stdin: unprovable → block
+        "ghgql -",                             # bare-dash stdin: unprovable → block
+        "ghgql 'query{ viewer{ login } }' -f query='mutation{ mergePullRequest(input:{}){ id } }'",
+        "env ghgql --allow-mutation 'mutation{ enqueuePullRequest(input:{}){ id } }'",
+        "ghgql -F query='mutation{ enablePullRequestAutoMerge(input:{}){ id } }' 'query{ x }'",
+        # Glued `-q`/`--query=` spellings: real ghgql doesn't recognize them as a query source (only
+        # detached `-q <v>`/`--query <v>`), so the mapper must NOT read a merge token out of them and
+        # allow through — it must treat the glued token as unprovable and fail closed (#303 review).
+        "ghgql --query=@merge.graphql",
+        "ghgql -qmutation{mergePullRequest(input:{}){id}}",
+        # Sticky-ordering regression: a glued query flag must stay unprovable even when a LATER
+        # provable-looking query source is present (the naive first draft cleared the "unprovable"
+        # marker whenever ANY later query source was seen — a real fail-open bypass).
+        "ghgql --query=@merge.graphql 'query{ viewer{ login } }'",
+        "ghgql -q 'query{ viewer{ login } }' --query=@merge.graphql",
+        # A `query=` value smuggled behind a NON-`-f`/`-F` value flag: real ghgql's `case` statement
+        # captures `query=…` on EVERY one of -F/--field/-f/--raw-field/-H/--header/--jq/--hostname/
+        # -p/--preview/-t/--template/--cache, not only -f/-F. The mapper previously forwarded these
+        # as opaque header/jq/template/cache fields, hiding the actual query from the scan entirely —
+        # a real bypass, since `--allow-mutation` disables ghgql's OWN guard and this is the only
+        # remaining gate (#303 review, Codex).
+        "ghgql --allow-mutation -H query=mutation{mergePullRequest(input:{}){id}}",
+        "ghgql --allow-mutation --jq query=@merge.graphql",
+        "ghgql --allow-mutation --cache query=@merge.graphql",
+        # Isolated detached `-q <mutation>` — direct coverage of the ONE query source real ghgql's
+        # `case` statement (and the mapper's first branch) recognizes, without a second/glued query
+        # source in the same command masking whether this branch alone actually works.
+        "ghgql --allow-mutation -q 'mutation{ mergePullRequest(input:{}){ id } }'",
+        # Stdin marker (`-`) smuggled as a `query=` value behind a non-`-f`/`-F` flag: real ghgql
+        # resolves ANY captured `query="-"` to stdin uniformly (its check runs after parsing, on
+        # the one shared `query` variable), so this reads a piped mutation exactly like `-q -`
+        # does — the mapper must canonicalize it to the unprovable `@-` marker here too, not scan
+        # it as a harmless one-character literal (Fable review).
+        "ghgql --allow-mutation -H query=-",
+        # `--input` supplies gh's ENTIRE request body from a file/stdin, uninspected by any
+        # `query=` scan — `_graphql_query_is_unprovable`'s existing `--input` check already covers
+        # this once the flag reaches `rest` (Codex review: confirms it does for the ghgql route).
+        "ghgql --allow-mutation 'query{ viewer{ login } }' --input body.json",
+        # Glued native-gh field spelling (`-fquery=…`, no space) — already recognized by
+        # `_graphql_query_field_values`'s regex independent of the ghgql-specific mapper branches;
+        # locks that this stays true as the mapper evolves (Fable review).
+        "ghgql --allow-mutation -fquery=mutation{mergePullRequest(input:{}){id}}",
+    ],
+)
+def test_ghgql_merge_route_is_blocked(command, monkeypatch):
+    """Every merge path THROUGH `ghgql` — a forced mutation, a positional mutation, an unreadable
+    `@file`/stdin query, a smuggled second `query=` field, behind an `env` wrapper, a glued
+    `-q`/`--query=` spelling (even ordered around a provable-looking query) — must block."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ghgql 'query{ viewer{ login } }'",
+        "ghgql -F owner=cli 'query($owner:String!){ repositoryOwner(login:$owner){ id } }'",
+        "ghgql 'query{ search(query:\"mergePullRequest\" type:ISSUE){ nodes{ __typename } } }'",
+        "ghgql --allow-mutation 'mutation{ addComment(input:{}){ clientMutationId } }'",  # non-merge write
+    ],
+)
+def test_ghgql_readonly_and_non_merge_writes_allowed(command, monkeypatch):
+    """A read-only `ghgql` query (incl. one naming a merge token only as a string literal) and a
+    NON-merge mutation must pass the guard — `ghgql` is not blanket-blocked, only merges are."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # #303 P1: `ghgql --allow-mutation "$Q"` where `$Q` expands to a merge mutation at RUNTIME.
+        # ghgql's own read-only guard is skipped under `--allow-mutation`, and the query is not a
+        # literal at the argv level, so only `_graphql_query_field_is_expandable`-equivalent coverage
+        # of the `ghgql` wrapper (not just a direct `gh api graphql` invocation) catches this.
+        'Q=\'mutation{ mergePullRequest(input:{pullRequestId:"x"}){ id } }\'; ghgql --allow-mutation "$Q"',
+        'Q="mutation{ enablePullRequestAutoMerge(input:{}){ id } }"; ghgql --allow-mutation "$Q"',
+        # `-q "$Q"` / `-f query="$Q"` spellings of the same expandable-query gap.
+        'Q=\'mutation{ mergePullRequest(input:{}){ id } }\'; ghgql --allow-mutation -q "$Q"',
+        'Q=\'mutation{ mergePullRequest(input:{}){ id } }\'; ghgql --allow-mutation -f query="$Q"',
+    ],
+)
+def test_ghgql_expandable_query_is_blocked(command, monkeypatch):
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_ghgql_expandable_query_without_allow_mutation_still_blocked(monkeypatch):
+    """Even without `--allow-mutation`, a `ghgql "$Q"` is fail-closed the same as a direct `gh api
+    graphql -f query="$Q"` — an expandable query can't be proven read-only at pre-exec time."""
+    command = 'Q="query{ viewer{ login } }"; ghgql "$Q"'
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_ghgql_single_quoted_query_stays_allowed(monkeypatch):
+    """The quote-aware allowance must still hold for `ghgql`: a single-quoted query is the REAL
+    quoting (not expandable), so it is scanned literally and allowed like any other read."""
+    command = "ghgql --allow-mutation 'mutation{ addComment(input:{}){ id } }'"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
 
 
 if __name__ == "__main__":  # pragma: no cover
