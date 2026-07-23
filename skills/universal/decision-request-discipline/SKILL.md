@@ -177,6 +177,54 @@ mark resolved ones closed; don't re-list them as open.
 
 **More context is better than a question that can't be answered without opening the repo.**
 
+### Machine-enforced by `tg` — send it as a STRUCTURED Rich Message
+
+This is not a style suggestion any more: `tg --tag decision` and `tg --tag question` are
+**deny-by-default** — `tg` BLOCKS the send (exit 1) and lists what's missing unless the body
+carries the format above. It requires all of:
+
+- **Options as a table, or a list of >=2 items** — the gate DOES enforce this structural
+  shape, never a bare "which one?". Alongside it, **write pros/cons per option** — but the
+  gate's pros/cons check is weaker than the structure check: it only confirms pros/cons
+  *language appears somewhere* in the body, not that every option individually has one, so
+  passing the gate is not proof you wrote a real per-option comparison. Telegram's HTML
+  mode has no native `<table>` tag: an HTML `<table>` you write, or a markdown pipe grid
+  (`| Option | Pros | Cons |`), is rendered by `tg` as a column-aligned monospace block inside
+  `<pre>` — not a literal Telegram table widget, but it displays aligned and readable (it used
+  to arrive as broken plain text).
+- **Recommendation**, **Context** (a `file:line` + one line on what it does), and a
+  **"where to look" `file:line`**.
+- **STRUCTURE (readability)** — the reason an 8-point message can still be rejected: it must
+  be a scannable Rich Message, **not a wall of text**. Each section under its own
+  `<h3>`/`<h4>` heading; enumerations as short one-line `<ul>`/`<li>` items (**never** an
+  inline comma-run like "pros: a, b, c"); `<hr>` dividers between sections; short lines.
+  Send it with `--format html`.
+
+Copy-pasteable good shape (see `tg help format` for the full GOOD-vs-BAD example):
+
+```
+tg --tag decision --format html '<h3>Context</h3><p>features/foo.ts:42 does X.</p><hr>
+<h3>Options</h3><table><tr><th>Option</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>A</td><td>fast</td><td>risky</td></tr>
+<tr><td>B</td><td>safe</td><td>slow</td></tr></table><hr>
+<h3>Recommendation</h3><ul><li>A — faster, risk contained</li></ul><hr>
+<h4>Where to look</h4><ul><li>features/foo.ts:42</li></ul>'
+```
+
+The ONE documented escape, for a genuine non-escalation / urgent edge case, is
+`ESCALATION_GATE_ENFORCE=0` (downgrades the hard block to an advisory warning — it is a real,
+named env var, so setting it in a shell profile or CI config does disable the gate for every
+call in that environment; there is no other DOCUMENTED way to bypass it). Don't reach for
+it to skip writing the format — it exists for the rare case the format genuinely doesn't fit.
+The **shipped default** (in the `tg` binary itself, provisioned/kept current by `rig`) is ON —
+a repo or agent has to actively set this named variable to turn it off, it never ships or
+regresses to unenforced on its own.
+
+This check is a heuristic floor (keyword/structure matching on free-form, often-Russian
+text), not a semantic reviewer: it can be satisfied by a message that technically has all the
+sections but is still a weak escalation. Meeting the gate is necessary, not sufficient — write
+an actually good comparison, don't just clear the regex.
+
 ## Showing a child-repo diff: formatted Telegram text, NEVER a raw `.patch`
 
 The hard case is a change **not in the main repo** the human reviews locally, but in a
