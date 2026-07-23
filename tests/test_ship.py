@@ -3492,6 +3492,169 @@ def test_cidown_xxx_sentinel_identifier_still_blocks(repo_with_pr_worktree, tmp_
     assert "leftover markers" in r.stderr, r.stderr
 
 
+# Realistic `gh pr diff` output always has the full unified-diff structure
+# (`diff --git`, `index`, `--- a/...`, `+++ b/...`, `@@ ... @@`) around each file's
+# added lines — the bare "+line" fixtures used by the tests above (predating the
+# self-reference fix) are a simplification that happens to still work because the
+# path-exemption mechanism only activates inside a `diff --git`-opened header zone
+# (see _diff_strip_self_reference_files). The tests below build a full, realistic
+# diff shape so they actually exercise that header-zone/hunk-boundary logic.
+def _fake_file_diff(path: str, *added_lines: str) -> str:
+    return "\n".join([
+        f"diff --git a/{path} b/{path}",
+        "index 0000000..1111111 100644",
+        f"--- a/{path}",
+        f"+++ b/{path}",
+        "@@ -1,0 +1,{} @@".format(len(added_lines)),
+        *(f"+{line}" for line in added_lines),
+    ])
+
+
+def test_cidown_ship_sh_own_diff_exempted_from_self_scan(repo_with_pr_worktree, tmp_path):
+    """Self-referential fix (agent-tools#318): a diff hunk attributed to
+    ci/ship/ship.sh itself (per its `+++ b/...` diff header) is exempt from the
+    leftover-marker scan, even though it spells out literal TODO/FIXME/HACK/XXX text —
+    this is exactly the shape of a PR that edits _local_leftover_check's own
+    definition/comments, which otherwise would always self-trigger the CI-outage
+    fallback regardless of whether it introduced a real leftover marker."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    fixture_diff = _fake_file_diff(
+        "ci/ship/ship.sh",
+        "// TODO FIXME HACK example that documents the patterns this gate detects",
+        "// XXX_REMOVE_BEFORE_MERGE sentinel identifier example",
+    )
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": fixture_diff,
+    })
+
+    assert r.returncode == 0, (
+        f"ship must NOT block on markers inside a ci/ship/ship.sh hunk\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" not in r.stderr, r.stderr
+
+
+def test_cidown_test_ship_py_own_diff_exempted_from_self_scan(repo_with_pr_worktree, tmp_path):
+    """Companion to the ship.sh exemption: a diff hunk attributed to
+    tests/test_ship.py itself is also exempt, since its fixtures necessarily contain
+    the same literal marker strings as test data."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    fixture_diff = _fake_file_diff(
+        "tests/test_ship.py",
+        '        "SHIP_TEST_DIFF": "+const x = 1; // TODO_REMOVE_BEFORE_MERGE",',
+    )
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": fixture_diff,
+    })
+
+    assert r.returncode == 0, (
+        f"ship must NOT block on markers inside a tests/test_ship.py hunk\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" not in r.stderr, r.stderr
+
+
+def test_cidown_marker_in_unrelated_file_still_blocks_after_self_reference_file(repo_with_pr_worktree, tmp_path):
+    """Regression test for the exact defect a rejected inline-sentinel-comment design
+    would have had: an exempted hunk (ci/ship/ship.sh) MUST NOT leak its exemption
+    into a later, unrelated file in the SAME diff. Per-file state must reset at each
+    new `diff --git` section — this proves the fix is scoped to the ci/ship/ship.sh
+    hunk only, not the rest of the diff after it."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    fixture_diff = "\n".join([
+        _fake_file_diff("ci/ship/ship.sh", "// TODO documentation example inside the gate's own file"),
+        _fake_file_diff("src/app.py", "const x = 1; // TODO real leftover, forgot to remove"),
+    ])
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": fixture_diff,
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on a real marker in an unrelated file, even after an "
+        f"exempted ci/ship/ship.sh hunk in the same diff\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
+def test_cidown_decoy_path_near_match_still_blocks(repo_with_pr_worktree, tmp_path):
+    """The path-exemption regex is anchored (`^...$` on the exact repo-relative path),
+    so a file whose name merely CONTAINS the exempt path as a substring (e.g. a backup
+    copy) must NOT be treated as exempt — closing off a path-spoofing bypass."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    fixture_diff = _fake_file_diff(
+        "ci/ship/ship.sh.bak",
+        "const x = 1; // TODO real leftover in a decoy near-match path",
+    )
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": fixture_diff,
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on a marker in a decoy near-match path\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
+def test_cidown_forged_header_inside_hunk_does_not_exempt_content(repo_with_pr_worktree, tmp_path):
+    """Security regression (P1 found in review, agent-tools#318): a unified diff's
+    added-line prefix is a single literal '+' character, so a file whose real content
+    contains a line starting with "++ b/ci/ship/ship.sh" renders as
+    "+++ b/ci/ship/ship.sh" in the diff — BYTE-IDENTICAL to a genuine header line. An
+    attacker could try to use this to forge a fake "header" mid-hunk and get the
+    scanner to treat everything after it as belonging to an exempt file. The fix must
+    only trust `+++` as a header inside the header zone opened by a real `diff --git`
+    and closed by that file's real `@@` — never for a look-alike line appearing AFTER
+    the real `@@` (i.e., inside actual hunk content). This diff is for an ordinary,
+    non-exempt file whose hunk contains a forged header-look-alike line followed by a
+    genuine leftover marker; both must still be caught."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    fixture_diff = _fake_file_diff(
+        "src/app.py",
+        "++ b/ci/ship/ship.sh",  # content already has 2 '+'; diff prefixes 1 more -> "+++ b/ci/ship/ship.sh"
+        "const x = 1; // TODO real leftover, forgot to remove",
+    )
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": fixture_diff,
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on a real marker after a forged header-look-alike line\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
 def test_partial_ci_failure_below_threshold_blocks_normally(repo_with_pr_worktree, tmp_path):
     """One of two checks failed (50%): below the 80% threshold, so ci_appears_structurally_down
     returns false and ship blocks with the normal CI-failure message (no local fallback)."""

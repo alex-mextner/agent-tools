@@ -837,6 +837,68 @@ _local_test_runner() {
   return 1
 }
 
+# Strip diff hunks belonging to this gate's own implementation/test files before the
+# marker regex runs. The regex definition, its explanatory comments, and its test
+# fixtures necessarily spell out literal TODO/FIXME/HACK/XXX text as example data —
+# without an exemption, any PR editing this gate would always self-trigger the
+# CI-outage fallback regardless of whether it added a REAL leftover marker
+# (agent-tools#318, found reviewing #317).
+#
+# Exclusion is by FILE PATH, read from the diff's own `+++ b/<path>` headers —
+# structural metadata git generates, not text inside the PR's added lines. An
+# inline-sentinel-comment design (e.g. a `# scan:ignore-start` marker inside the diff
+# content) was tried and rejected in review: since the diff being scanned IS the
+# untrusted PR content, a single unclosed or duplicated sentinel written by the PR
+# author anywhere would blind the scanner to every file after it in the whole diff —
+# a self-inflicted false-negative hole, worse than the false positive being fixed.
+# Path exclusion has no such injection surface IF header parsing is hunk-aware (see
+# below) — it only fires when the diff's own `+++` header says a hunk belongs to one
+# of these two fixed, known paths, which requires actually touching this gate's real
+# implementation or test file (itself a change worth extra scrutiny, not something a
+# hunk in an unrelated file can spoof).
+#
+# Hunk-aware parsing is load-bearing, not cosmetic: a unified diff's ADDED-line prefix
+# is a single literal '+' character prepended to the original line text. If a file's
+# real content contains a line that itself starts with "++ b/ci/ship/ship.sh" (e.g. as
+# a comment or string), the diff renders it as "+++ b/ci/ship/ship.sh" — BYTE-IDENTICAL
+# to a genuine header line. A naive `/^\+\+\+ /` match anywhere in the stream (an
+# earlier version of this function, caught in review) would treat that forged content
+# as a real header and wrongly exempt everything after it. The only reliable
+# disambiguator is POSITION: a real `+++` header always appears between a `diff --git`
+# line and the file's first `@@` hunk marker, never inside a hunk — and a hunk can only
+# be entered via a genuine (unprefixed) `@@` line, which a content line can never forge
+# for the same single-'+'-prefix reason. So `+++` is trusted as a header ONLY inside
+# the "header zone" opened by a real `diff --git` line and closed by that file's first
+# real `@@`; once `@@` is seen, every subsequent `+++`-looking line is just hunk
+# content, and no new header zone can open until the next genuine `diff --git`. Input
+# that never contains a `diff --git` line at all (bare added-line fixtures with no
+# surrounding diff structure) never opens a header zone either, so it passes through
+# unfiltered — matching plain `gh pr diff` output, which always has full structure.
+#
+# This is a narrow allowlist (2 fixed paths), not a wildcard, and applies ONLY to the
+# CI-outage local fallback — the CI-up ci/leftover-grep/leftover-grep.sh gate still
+# scans both files with no exemption. A real leftover marker added anywhere else,
+# including any OTHER file in the same PR, is still caught (state resets per file).
+_LEFTOVER_SELF_EXEMPT_PATH_RE='^(ci/ship/ship\.sh|tests/test_ship\.py)$'
+
+_diff_strip_self_reference_files() {
+  awk -v re="$_LEFTOVER_SELF_EXEMPT_PATH_RE" '
+    /^diff --git / { header_zone = 1; in_hunk = 0; next }
+    header_zone && /^@@ / { in_hunk = 1; header_zone = 0; next }
+    header_zone && /^\+\+\+ / {
+      f = $0
+      sub(/^\+\+\+ /, "", f)
+      sub(/^b\//, "", f)
+      sub(/\t.*$/, "", f)
+      skip = (f ~ re) ? 1 : 0
+      next
+    }
+    header_zone { next }
+    skip { next }
+    { print }
+  '
+}
+
 # Scan the PR diff additions for leftover markers (TODO/FIXME/HACK/XXX).
 # Returns 0 if clean, 1 if markers found or diff cannot be read.
 #
@@ -867,8 +929,18 @@ _local_leftover_check() {
   echo "[ship] local gate: scanning PR diff for leftover markers ..."
   diff_out=$(gh pr diff "$pr" 2>/dev/null) || {
     echo "[ship] local gate: FAILED — could not read PR diff for leftover scan." >&2; return 1; }
+  # The self-reference filter's exit status is checked ON ITS OWN, separate from the
+  # `|| true` below — that `|| true` exists only to tolerate the FINAL grep's exit 1
+  # on "no markers found" (the clean/expected case), not to swallow a real tool
+  # failure. If awk itself errors (bad script, missing binary), fail closed rather
+  # than silently reporting a clean scan.
+  local stripped
+  stripped=$(printf '%s\n' "$diff_out" | _diff_strip_self_reference_files) || {
+    echo "[ship] local gate: FAILED — could not filter self-reference files from PR diff." >&2
+    return 1
+  }
   local hits
-  hits=$(printf '%s\n' "$diff_out" \
+  hits=$(printf '%s\n' "$stripped" \
     | grep -E '^\+' | grep -vE '^\+\+\+' \
     | grep -E '(TODO|FIXME|HACK)|(^|[^X])XXX($|[^X])' || true)
   if [ -n "$hits" ]; then
