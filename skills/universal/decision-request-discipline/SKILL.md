@@ -183,10 +183,15 @@ This is not a style suggestion any more: `tg --tag decision` and `tg --tag quest
 **deny-by-default** — `tg` BLOCKS the send (exit 1) and lists what's missing unless the body
 carries the format above. It requires all of:
 
-- **Options as a real `<table>`** (or a `<ul>`/`<ol>` list) with **pros/cons per option** —
-  never a bare "which one?". A markdown pipe grid (`| Option | Pros | Cons |`) is
-  auto-converted by `tg` to a real Telegram `<table>`, so it renders (it used to arrive as
-  broken plain text).
+- **Options as a table, or a list of >=2 items** — the gate DOES enforce this structural
+  shape, never a bare "which one?". Alongside it, **write pros/cons per option** — but the
+  gate's pros/cons check is weaker than the structure check: it only confirms pros/cons
+  *language appears somewhere* in the body, not that every option individually has one, so
+  passing the gate is not proof you wrote a real per-option comparison. Telegram's HTML
+  mode has no native `<table>` tag: an HTML `<table>` you write, or a markdown pipe grid
+  (`| Option | Pros | Cons |`), is rendered by `tg` as a column-aligned monospace block inside
+  `<pre>` — not a literal Telegram table widget, but it displays aligned and readable (it used
+  to arrive as broken plain text).
 - **Recommendation**, **Context** (a `file:line` + one line on what it does), and a
   **"where to look" `file:line`**.
 - **STRUCTURE (readability)** — the reason an 8-point message can still be rejected: it must
@@ -207,10 +212,18 @@ tg --tag decision --format html '<h3>Context</h3><p>features/foo.ts:42 does X.</
 ```
 
 The ONE documented escape, for a genuine non-escalation / urgent edge case, is
-`ESCALATION_GATE_ENFORCE=0` (downgrades the hard block to an advisory warning). Don't reach
-for it to skip writing the format — it exists for the rare case the format genuinely doesn't
-fit. The enforcement is a `tg` code default (ships with the binary, provisioned/kept current
-by `rig`), so it cannot silently regress to unenforced.
+`ESCALATION_GATE_ENFORCE=0` (downgrades the hard block to an advisory warning — it is a real,
+named env var, so setting it in a shell profile or CI config does disable the gate for every
+call in that environment; there is no other DOCUMENTED way to bypass it). Don't reach for
+it to skip writing the format — it exists for the rare case the format genuinely doesn't fit.
+The **shipped default** (in the `tg` binary itself, provisioned/kept current by `rig`) is ON —
+a repo or agent has to actively set this named variable to turn it off, it never ships or
+regresses to unenforced on its own.
+
+This check is a heuristic floor (keyword/structure matching on free-form, often-Russian
+text), not a semantic reviewer: it can be satisfied by a message that technically has all the
+sections but is still a weak escalation. Meeting the gate is necessary, not sufficient — write
+an actually good comparison, don't just clear the regex.
 
 ## Showing a child-repo diff: formatted Telegram text, NEVER a raw `.patch`
 
