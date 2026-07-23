@@ -837,112 +837,87 @@ _local_test_runner() {
   return 1
 }
 
-# Strip diff hunks belonging to this gate's own implementation/test files before the
-# marker regex runs. The regex definition, its explanatory comments, and its test
-# fixtures necessarily spell out literal TODO/FIXME/HACK/XXX text as example data —
-# without an exemption, any PR editing this gate would always self-trigger the
-# CI-outage fallback regardless of whether it added a REAL leftover marker
-# (agent-tools#318, found reviewing #317).
-#
-# Exclusion is by FILE PATH, read from the diff's own `+++ b/<path>` headers —
-# structural metadata git generates, not text inside the PR's added lines. An
-# inline-sentinel-comment design (e.g. a `# scan:ignore-start` marker inside the diff
-# content) was tried and rejected in review: since the diff being scanned IS the
-# untrusted PR content, a single unclosed or duplicated sentinel written by the PR
-# author anywhere would blind the scanner to every file after it in the whole diff —
-# a self-inflicted false-negative hole, worse than the false positive being fixed.
-# Path exclusion has no such injection surface IF header parsing is hunk-aware (see
-# below) — it only fires when the diff's own `+++` header says a hunk belongs to one
-# of these two fixed, known paths, which requires actually touching this gate's real
-# implementation or test file (itself a change worth extra scrutiny, not something a
-# hunk in an unrelated file can spoof).
-#
-# Hunk-aware parsing is load-bearing, not cosmetic: a unified diff's ADDED-line prefix
-# is a single literal '+' character prepended to the original line text. If a file's
-# real content contains a line that itself starts with "++ b/ci/ship/ship.sh" (e.g. as
-# a comment or string), the diff renders it as "+++ b/ci/ship/ship.sh" — BYTE-IDENTICAL
-# to a genuine header line. A naive `/^\+\+\+ /` match anywhere in the stream (an
-# earlier version of this function, caught in review) would treat that forged content
-# as a real header and wrongly exempt everything after it. The only reliable
-# disambiguator is POSITION: a real `+++` header always appears between a `diff --git`
-# line and the file's first `@@` hunk marker, never inside a hunk — and a hunk can only
-# be entered via a genuine (unprefixed) `@@` line, which a content line can never forge
-# for the same single-'+'-prefix reason. So `+++` is trusted as a header ONLY inside
-# the "header zone" opened by a real `diff --git` line and closed by that file's first
-# real `@@`; once `@@` is seen, every subsequent `+++`-looking line is just hunk
-# content, and no new header zone can open until the next genuine `diff --git`. Input
-# that never contains a `diff --git` line at all (bare added-line fixtures with no
-# surrounding diff structure) never opens a header zone either, so it passes through
-# unfiltered — matching plain `gh pr diff` output, which always has full structure.
-#
-# This is a narrow allowlist (2 fixed paths), not a wildcard, and applies ONLY to the
-# CI-outage local fallback — the CI-up ci/leftover-grep/leftover-grep.sh gate still
-# scans both files with no exemption. A real leftover marker added anywhere else,
-# including any OTHER file in the same PR, is still caught (state resets per file).
-_LEFTOVER_SELF_EXEMPT_PATH_RE='^(ci/ship/ship\.sh|tests/test_ship\.py)$'
-
-_diff_strip_self_reference_files() {
-  awk -v re="$_LEFTOVER_SELF_EXEMPT_PATH_RE" '
-    /^diff --git / { header_zone = 1; in_hunk = 0; next }
-    header_zone && /^@@ / { in_hunk = 1; header_zone = 0; next }
-    header_zone && /^\+\+\+ / {
-      f = $0
-      sub(/^\+\+\+ /, "", f)
-      sub(/^b\//, "", f)
-      sub(/\t.*$/, "", f)
-      skip = (f ~ re) ? 1 : 0
-      next
-    }
-    header_zone { next }
-    skip { next }
-    { print }
-  '
-}
-
-# Scan the PR diff additions for leftover markers (TODO/FIXME/HACK/XXX).
+# Scan the PR diff additions for leftover markers: an unfinished-work marker
+# ("[T]ODO"/"[F]IXME"/"[H]ACK") or a standalone "[X]XX" marker.
 # Returns 0 if clean, 1 if markers found or diff cannot be read.
 #
-# XXX alone gets a run-length guard — `(^|[^X])XXX($|[^X])`, a portable "no \b, no -w"
-# idiom in the same style this repo already uses in ci/leftover-grep/leftover-grep.sh's
-# focused-test check — because a plain substring match on XXX collides with bash's
-# conventional mktemp template suffix (`mktemp -d "/tmp/foo.XXXXXX"`), a common and
-# legitimate pattern (agent-tools#316). This only excludes XXX inside a longer run of X's
-# (4+), so it deliberately still catches an XXX marker embedded in an identifier, e.g.
-# `XXX_REMOVE_BEFORE_MERGE` or `fooXXX_debug()` — unlike a full \b/-w word-boundary, which
-# would also let those slip through (checked against neighboring X vs non-X only, not
-# against "is this a word character"). Residual limitation, accepted as-is: a
-# 3-character mktemp template (`foo.XXX`) is indistinguishable from a real standalone
-# marker and still blocks; this is rare/weak enough (bash's own docs recommend 6+ X's)
-# not to warrant a smarter check.
+# Bracket-expression trick on the FIRST letter of each marker (`[T]ODO` instead of
+# spelling it bare): functionally IDENTICAL to the plain literal in an ERE — a
+# single-character bracket class matches exactly that one character, same as writing
+# it bare — but it means this file's own source (this line, and every comment/fixture
+# that needs to spell an example) never contains any marker as ONE contiguous token.
+# This is the standard "grep must not match its own pattern" idiom (the same trick as
+# `ps aux | grep '[f]oo'` to exclude the grep process itself from its own output).
 #
-# TODO/FIXME/HACK deliberately keep plain substring matching (unlike XXX): this local
-# fallback gate must stay at least as strict as ci/leftover-grep/leftover-grep.sh's
-# untracked-TODO/FIXME check, which also substring-matches so it catches sentinel
-# identifiers like `TODO_REMOVE_BEFORE_MERGE`. Loosening these to whole-word would let
-# such genuine leftovers slip through the CI-outage fallback while the normal CI-up gate
-# still catches them — a fail-open divergence between the two gates. There's no known
-# real-world false positive for these three that would justify accepting that regression
-# (mktemp templates are XXX-specific; "HACKATHON"/"HACKING.md" substring matches are a much
-# rarer nuisance than a missed untracked TODO).
+# Why this matters here specifically: this exact regex line, its own explanatory
+# comments, and the fixtures in tests/test_ship.py that exercise it ALL legitimately
+# need to spell these marker strings as literal example/test data. Without the
+# bracket-expression split, ANY PR editing this gate's own implementation or tests
+# would self-trigger the CI-outage fallback, regardless of whether it added a REAL
+# leftover marker (agent-tools#318, found reviewing #317).
+#
+# Two designs were tried and rejected before this one (both add an exemption
+# mechanism instead of removing the self-match at the source):
+#   - An inline sentinel comment marking "ignore from here to here" inside the diff
+#     content itself — rejected: the diff being scanned IS the untrusted PR content,
+#     so an unclosed or duplicated sentinel written by the PR author would silently
+#     blind the scanner to every file after it in the whole diff.
+#   - A file-path exemption (skip any hunk whose diff header names this file or its
+#     test file) — works and has no injection surface if hunk-boundary-aware, but
+#     blanket-exempts ALL additions to those 2 files from this LOCAL FALLBACK gate,
+#     opening a blind window exactly where a motivated author would most want it
+#     closed: CI down + editing the gate itself + a genuine forgotten marker.
+# The bracket-expression split has neither downside: no new mechanism, no exemption,
+# no blind window — this file's own source simply never contains a literal match, so
+# there's nothing to exempt. Unlike the file-path-exemption design, it needs no
+# coordination with the CI-up ci/leftover-grep/leftover-grep.sh gate to stay
+# consistent: this scanner just doesn't have a self-reference problem to solve.
+# (leftover-grep.sh's OWN detector line has the identical literal-marker self-match
+# exposure for a PR that edits leftover-grep.sh itself — not fixed here, since it's a
+# separate file/gate outside agent-tools#318's scope; tracked as agent-tools#330. A
+# related pre-existing diff-header-parsing false negative in both gates — a real
+# added line that itself starts with "++" collides with the diff's own "+++ b/path"
+# header prefix — is tracked as agent-tools#329.)
+#
+# The [X]XX marker alone gets an additional run-length guard —
+# `(^|[^X])[X]XX($|[^X])`, a portable "no word-boundary regex, no grep -w" idiom in
+# the same style this repo already uses in ci/leftover-grep/leftover-grep.sh's
+# focused-test check — because a plain substring match collides with bash's
+# conventional mktemp template suffix (`mktemp -d "/tmp/foo.XXXXXX"`), a common and
+# legitimate pattern (agent-tools#316). This only excludes a marker inside a longer
+# run of X's (4+), so it deliberately still catches one embedded in an identifier,
+# e.g. an [X]XX-prefixed sentinel like `[X]XX_REMOVE_BEFORE_MERGE` or
+# `foo[X]XX_debug()` — unlike a full word-boundary fix, which would also let those
+# slip through (checked against neighboring X vs non-X only, not against "is this a
+# word character"). Residual limitation, accepted as-is: a 3-character mktemp
+# template (`foo.[X]XX`) is indistinguishable from a real standalone marker and still
+# blocks; this is rare/weak enough (bash's own docs recommend 6+ X's) not to warrant
+# a smarter check.
+#
+# The other three markers deliberately keep plain substring matching (unlike [X]XX).
+# For [T]ODO/[F]IXME this local fallback gate must stay at least as strict as
+# ci/leftover-grep/leftover-grep.sh's untracked-marker check (that gate greps for
+# `[T]ODO|[F]IXME`, also substring, so it catches sentinel identifiers like
+# `[T]ODO_REMOVE_BEFORE_MERGE`): loosening these two to whole-word would let such
+# genuine leftovers slip through the CI-outage fallback while the normal CI-up gate
+# still catches them — a fail-open divergence between the two gates. [H]ACK has no
+# such parity requirement — ci/leftover-grep/leftover-grep.sh does NOT check for it at
+# all, so this fallback gate is deliberately STRICTER than the CI-up gate on [H]ACK,
+# not matched to it (a PR-time [H]ACK passes normal CI but blocks under this
+# CI-outage-only fallback; accepted, since a stricter fallback is a safe direction to
+# diverge in). There's no known real-world false positive for these three that would
+# justify loosening any of them (mktemp templates are an [X]XX-specific nuisance; a
+# project name or filename that happens to contain one of these four
+# letter-sequences as a substring is a much rarer nuisance than a missed marker).
 _local_leftover_check() {
   local pr="$1" diff_out
   echo "[ship] local gate: scanning PR diff for leftover markers ..."
   diff_out=$(gh pr diff "$pr" 2>/dev/null) || {
     echo "[ship] local gate: FAILED — could not read PR diff for leftover scan." >&2; return 1; }
-  # The self-reference filter's exit status is checked ON ITS OWN, separate from the
-  # `|| true` below — that `|| true` exists only to tolerate the FINAL grep's exit 1
-  # on "no markers found" (the clean/expected case), not to swallow a real tool
-  # failure. If awk itself errors (bad script, missing binary), fail closed rather
-  # than silently reporting a clean scan.
-  local stripped
-  stripped=$(printf '%s\n' "$diff_out" | _diff_strip_self_reference_files) || {
-    echo "[ship] local gate: FAILED — could not filter self-reference files from PR diff." >&2
-    return 1
-  }
   local hits
-  hits=$(printf '%s\n' "$stripped" \
+  hits=$(printf '%s\n' "$diff_out" \
     | grep -E '^\+' | grep -vE '^\+\+\+' \
-    | grep -E '(TODO|FIXME|HACK)|(^|[^X])XXX($|[^X])' || true)
+    | grep -E '([T]ODO|[F]IXME|[H]ACK)|(^|[^X])[X]XX($|[^X])' || true)
   if [ -n "$hits" ]; then
     echo "[ship] local gate: FAILED — leftover markers in PR additions:" >&2
     printf '%s\n' "$hits" >&2
