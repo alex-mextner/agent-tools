@@ -10,7 +10,7 @@
  * Kept separate from policy.ts (pure, fs-free) so the matcher stays unit-testable without fs/env.
  */
 
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { coercePolicy, DEFAULT_POLICY, type Policy } from "./policy.ts";
@@ -39,8 +39,24 @@ export function loadPolicy(env: NodeJS.ProcessEnv = process.env): LoadResult {
 		text = readFileSync(path, "utf8");
 	} catch (err) {
 		if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
-			// genuinely missing — clean machine or not yet provisioned. Silent baked baseline.
-			return { policy: DEFAULT_POLICY, warning: null };
+			// `readFileSync` also raises ENOENT for a DANGLING symlink (the link itself exists, its
+			// target does not) — that is "present but broken", not "genuinely missing", so check the
+			// link entry itself with lstat (which does NOT follow the symlink) before deciding.
+			let linkEntryExists = false;
+			try {
+				lstatSync(path);
+				linkEntryExists = true;
+			} catch {
+				// lstat also failing means there truly is no entry at all — genuinely missing.
+			}
+			if (!linkEntryExists) {
+				// genuinely missing — clean machine or not yet provisioned. Silent baked baseline.
+				return { policy: DEFAULT_POLICY, warning: null };
+			}
+			return {
+				policy: DEFAULT_POLICY,
+				warning: `permission-guard: policy at ${path} is a dangling symlink; using baked baseline (fail-closed)`,
+			};
 		}
 		// present but unreadable (permission/ownership drift, a directory in its place, …): this is
 		// NOT the clean-machine case — a rig-installed stricter policy could be silently disabled,

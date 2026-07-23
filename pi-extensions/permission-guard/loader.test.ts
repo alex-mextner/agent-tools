@@ -4,7 +4,7 @@
  */
 
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -77,4 +77,20 @@ test("a directory in place of the policy file is also treated as unreadable, not
 	const { policy, warning } = loadPolicy({ PI_CODING_AGENT_DIR: dir });
 	assert.deepEqual(policy, DEFAULT_POLICY);
 	assert.match(warning ?? "", /unreadable/);
+});
+
+test("a dangling symlink in place of the policy file is treated as present-but-broken, not silently missing", () => {
+	const dir = tmpAgentDir();
+	const path = join(dir, POLICY_FILENAME);
+	try {
+		symlinkSync(join(dir, "does-not-exist.json"), path);
+	} catch (err) {
+		// Creating a symlink can require elevated privilege on Windows (no dev-mode / admin) — skip
+		// rather than fail an environment limitation unrelated to the loader logic under test.
+		if ((err as NodeJS.ErrnoException)?.code === "EPERM") return;
+		throw err;
+	}
+	const { policy, warning } = loadPolicy({ PI_CODING_AGENT_DIR: dir });
+	assert.deepEqual(policy, DEFAULT_POLICY);
+	assert.match(warning ?? "", /dangling symlink/);
 });

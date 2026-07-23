@@ -1,6 +1,6 @@
 /**
- * policy.test.ts — unit tests for the permission-guard matcher.
- * Run: `npm test` (in this dir) → `tsx --test policy.test.ts` (no pi runtime needed).
+ * policy.test.ts — unit tests for the permission-guard matcher (no pi runtime needed).
+ * Run: `npm test` (in this dir) → `tsx --test policy.test.ts index.test.ts loader.test.ts`.
  */
 
 import assert from "node:assert/strict";
@@ -196,6 +196,54 @@ test("unquoted backslash-escaped flags still match (bash strips the backslash be
 	assert.equal(decide("git commit -m x --no\\-verify"), "deny");
 });
 
+test("an escaped quote inside a double-quoted string does not prematurely close it, so a real `;` after it still splits into a separate clause", () => {
+	// Without escape-awareness, the escaped `"` looks like it closes the string; the real `;`
+	// then reads as "still inside a string" by the (wrong) quote-state bookkeeping, merging the
+	// whole thing into one clause with argv0 `echo` and hiding `git push --force` from evaluation.
+	const cmd = 'echo "x\\"y" ; git push --force';
+	assert.deepEqual(splitSubCommands(cmd), ['echo "x\\"y"', "git push --force"]);
+	assert.equal(decide(cmd), "deny");
+});
+
+test("an escaped (literal) redirect character does not fool the redirect-amp heuristic into swallowing a real clause separator", () => {
+	// `\>` outside quotes is bash for a LITERAL `>` character, not a redirect target. Without
+	// tracking that it was escaped, the `isRedirectAmp` check (which exists so a real `2>&1` /
+	// `&>file` doesn't spuriously split) also suppresses the split here, merging `git push
+	// --force` into the same clause as `echo` and hiding it from evaluation.
+	const cmd = "echo marker\\> & git push --force";
+	assert.deepEqual(splitSubCommands(cmd), ["echo marker\\>", "git push --force"]);
+	assert.equal(decide(cmd), "deny");
+	// genuine redirect-amp forms are unaffected (still one clause, not split)
+	assert.equal(decide("git push --force 2>&1"), "deny");
+	assert.equal(decide("ls &>out.txt"), "allow");
+});
+
+test("a backslash-newline line continuation is collapsed before clause-splitting (bash joins the lines first)", () => {
+	// Splitting on the raw newline BEFORE resolving the continuation would strand `--for\` and
+	// `ce` in two separate clauses, evading the exact-token --force match entirely.
+	assert.deepEqual(splitSubCommands("git push --for\\\nce"), ["git push --force"]);
+	assert.equal(decide("git push --for\\\nce"), "deny");
+	assert.equal(decide("git commit -m x --no\\\n-verify"), "deny");
+	// a CRLF-style continuation (`\` + CR + LF) collapses the same way
+	assert.equal(decide("git push --for\\\r\nce"), "deny");
+});
+
+test("an EVEN run of backslashes before a newline is a literal escaped backslash + a REAL separator, NOT a continuation", () => {
+	// `\\<newline>` is bash for a literal `\` followed by an unescaped newline that ends the
+	// command — collapsing it (as if it were a continuation) would merge two separate commands
+	// into one clause and hide the second (here, a denied force-push) from evaluation entirely.
+	const cmd = "echo x \\\\\ngit push --force";
+	assert.deepEqual(splitSubCommands(cmd), ["echo x \\\\", "git push --force"]);
+	assert.equal(decide(cmd), "deny");
+	// three backslashes (odd) IS still a continuation (the third escapes the newline, joining the
+	// lines) — but the remaining PAIR resolves to one literal backslash (verified against real
+	// bash: `bash -x -c 'echo x --for\\\<newline>force'` prints the joined word as `--for\force`,
+	// backslash preserved), so the result is the literal word `--for\force`, not `--force` — this
+	// does NOT match the exact-token flag rule, which is correct (a different word), not a bypass.
+	assert.deepEqual(splitSubCommands("git push --for\\\\\\\nce"), ["git push --for\\\\ce"]);
+	assert.equal(decide("git push --for\\\\\\\nce"), "allow");
+});
+
 test("an escaped space stays inside one token, it is not a token boundary", () => {
 	// `--for\ ce` is bash for the single argv token `--for ce` (one word, literal space) — it must
 	// NOT weld/split into something that spuriously matches (or evades) an exact-token flag rule.
@@ -226,10 +274,14 @@ test("coercePolicy rejects an unknown/typo'd default instead of silently coercin
 	assert.equal(coercePolicy({ version: 1, default: 1, rules: [] }), null);
 	assert.equal(coercePolicy({ version: 1, default: true, rules: [] }), null);
 	assert.equal(coercePolicy({ version: 1, default: {}, rules: [] }), null);
-	// every valid default value, and an absent default, are all still accepted
-	assert.deepEqual(coercePolicy({ version: 1, default: "deny", rules: [] }), {
+	// an explicit JSON `null` is exactly as ambiguous as a typo (could be "never set" or "a
+	// stricter deny/ask got nulled by a bug") and there is no way to tell those apart, so it is
+	// ALSO rejected — not silently treated the same as a genuinely absent key.
+	assert.equal(coercePolicy({ version: 1, default: null, rules: [] }), null);
+	// every valid default value round-trips, and a genuinely absent key defaults to "allow"
+	assert.deepEqual(coercePolicy({ version: 1, default: "allow", rules: [] }), {
 		version: 1,
-		default: "deny",
+		default: "allow",
 		rules: [],
 	});
 	assert.deepEqual(coercePolicy({ version: 1, default: "ask", rules: [] }), {
@@ -237,14 +289,12 @@ test("coercePolicy rejects an unknown/typo'd default instead of silently coercin
 		default: "ask",
 		rules: [],
 	});
-	assert.deepEqual(coercePolicy({ version: 1, rules: [] }), { version: 1, default: "allow", rules: [] });
-	// a JSON `null` default (e.g. a generator emitting null for an unset field) is treated the same
-	// as absent, NOT as an invalid value that discards the whole document
-	assert.deepEqual(coercePolicy({ version: 1, default: null, rules: [] }), {
+	assert.deepEqual(coercePolicy({ version: 1, default: "deny", rules: [] }), {
 		version: 1,
-		default: "allow",
+		default: "deny",
 		rules: [],
 	});
+	assert.deepEqual(coercePolicy({ version: 1, rules: [] }), { version: 1, default: "allow", rules: [] });
 });
 
 test("a custom policy default of deny blocks unmatched commands", () => {

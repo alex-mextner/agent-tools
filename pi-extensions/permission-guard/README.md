@@ -42,14 +42,21 @@ A rule matches a bash command when:
 
 - the command's **argv0 basename** equals `command` (so `/usr/bin/git` and `git` both match; an
   `env FOO=1 …` prefix is skipped);
-- every token in `argvAll` appears in the argv (subcommand words); and
-- if `flagsAny` is set, at least one of those **exact** tokens appears anywhere in the argv.
+- every entry in `argvAll` matches some argv token **by basename** (so a subcommand naming a
+  binary — e.g. sudo's `"rm"` — still matches `sudo /bin/rm`/`sudo ./rm`, not only a bare `rm`
+  token; this applies to EVERY remaining argv token, not just the one actually executed, so an
+  unrelated path argument that happens to share a basename with a guarded entry — e.g.
+  `sudo cp /bin/rm /tmp/rm.bak` against an `argvAll: ["rm"]` rule — also matches); and
+- if `flagsAny` is set, at least one of those **exact** tokens appears anywhere in the argv (this
+  one stays literal-token, unlike `argvAll`).
 
 Exact-token, flag-**anywhere** matching is deliberate: it catches `git commit -m "x" --no-verify`
 (which prefix globs miss) yet never confuses `--force` with `--force-with-lease`. Compound commands
 (`a && b`, `a | b`, `a; b`) are split and evaluated per clause; the **strongest** decision wins
 (deny > ask > allow). Both `argvAll`/`flagsAny` (camelCase) and `argv_all`/`flags_any` (snake_case)
-keys are accepted.
+keys are accepted. `argvAll`'s basename-broadening is the safe over-match direction only because
+every `PolicyRule.action` is `"ask"` or `"deny"` — there is no per-rule `"allow"` action (allow
+comes only from `Policy.default`), so this broadening can never widen what gets allowed.
 
 ## Fail-closed
 

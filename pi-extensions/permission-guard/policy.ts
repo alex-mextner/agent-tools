@@ -43,7 +43,12 @@ export interface PolicyRule {
 	action: "ask" | "deny";
 	/** argv0 basename the rule applies to (e.g. "git", "gh", "sudo", "screencapture"). */
 	command: string;
-	/** All of these tokens must appear in argv[1:] (subcommand words like ["pr","merge"]). */
+	/**
+	 * Every entry must match some argv[1:] token BY BASENAME (subcommand words like ["pr","merge"],
+	 * or a binary name like sudo's "rm" — which then also matches `sudo /bin/rm`/`sudo ./rm`, and
+	 * any other argv token whose basename happens to collide, e.g. a path argument named "rm").
+	 * Safe over-matching because `action` is `"ask" | "deny"` only — never `"allow"`.
+	 */
 	argvAll?: string[];
 	/** At least one of these exact tokens must appear anywhere in argv (flags like ["--force","-f"]). */
 	flagsAny?: string[];
@@ -138,15 +143,49 @@ const _SEVERITY: Record<Decision, number> = { allow: 0, ask: 1, deny: 2 };
  * Operators inside single/double quotes are ignored so a quoted literal (e.g. a commit message
  * that contains `;`) does not spuriously split. This is intentionally a lightweight splitter, not a
  * full shell parser — it mirrors what the rig agent-hooks do (evaluate each clause independently).
+ *
+ * Backslash-newline line continuations (an ODD run of `\` immediately followed by a newline) are
+ * collapsed FIRST, before the newline-splitting below ever runs: bash treats `--for\<newline>ce`
+ * as the single word `--force` on one logical line, but splitting on the raw newline first would
+ * strand `--for\` and `ce` in two different clauses, evading an exact-token flag match. The run
+ * length matters: `\\<newline>` (an EVEN run — an escaped, literal backslash) is bash for a
+ * literal `\` followed by a REAL, unescaped newline separator, NOT a continuation — collapsing it
+ * anyway would merge two genuinely separate commands into one clause and hide the second one
+ * (e.g. a denied `git push --force` on the second line) from evaluation entirely. Only the last
+ * backslash of an odd run is consumed; this is applied unconditionally (not quote-aware),
+ * mirroring the technique in the rig agent-hooks (block-reset-hard / block-no-verify's
+ * `joined.replace("\\\n", "")`, which does not need the odd/even distinction since it only ever
+ * sees single-backslash continuations in practice) — the one remaining place this could differ
+ * from bash is a single-quoted literal containing a backslash-newline sequence, which is rare and
+ * lands in the safe (over-match) direction if it ever fires.
  */
+function collapseLineContinuations(command: string): string {
+	return command.replace(/(\\+)\r?\n/g, (match, backslashes: string) =>
+		backslashes.length % 2 === 1 ? backslashes.slice(0, -1) : match,
+	);
+}
 export function splitSubCommands(command: string): string[] {
+	const withoutContinuations = collapseLineContinuations(command);
 	const parts: string[] = [];
 	let cur = "";
 	let quote: '"' | "'" | null = null;
-	for (let i = 0; i < command.length; i++) {
-		const ch = command[i];
-		const next = command[i + 1];
+	for (let i = 0; i < withoutContinuations.length; i++) {
+		const ch = withoutContinuations[i];
+		const next = withoutContinuations[i + 1];
 		if (quote) {
+			// Inside DOUBLE quotes an unquoted-for-this-purpose backslash still escapes the very
+			// next character (bash: `\"` inside `"..."` is a literal quote, it does NOT close the
+			// string) — without this, `echo "x\"y" ; git push --force` mis-detects the escaped `"`
+			// as closing the string, which then makes the real `;` look like it's still "inside a
+			// string" by the wrong quote-state bookkeeping, and the whole thing collapses into one
+			// clause with argv0 `echo` — silently hiding `git push --force` from evaluation
+			// entirely. Single quotes have NO backslash-escaping in bash, so this only applies to
+			// `"`.
+			if (quote === '"' && ch === "\\" && next !== undefined) {
+				cur += ch + next;
+				i++;
+				continue;
+			}
 			cur += ch;
 			if (ch === quote) quote = null;
 			continue;
@@ -156,9 +195,26 @@ export function splitSubCommands(command: string): string[] {
 			cur += ch;
 			continue;
 		}
+		// An unquoted backslash escapes the very next character, stripping ANY special meaning it
+		// would otherwise have — including as a redirect/operator character. Without this,
+		// `echo marker\> & git push --force` reads the escaped (literal) `>` as a real redirect
+		// target, so the `isRedirectAmp` heuristic below wrongly treats the following `&` as part
+		// of that redirect instead of a clause separator, again merging `git push --force` into the
+		// same clause as `echo` and hiding it from evaluation. splitSubCommands doesn't need to
+		// resolve the escape (tokenize does that per-clause later) — it only needs to keep the
+		// escaped character out of the operator-detection logic below.
+		if (ch === "\\" && next !== undefined) {
+			cur += ch + next;
+			i++;
+			continue;
+		}
 		// a bare `&` that is part of a redirection (`2>&1`, `&>file`) is NOT a clause separator —
 		// splitting there would strand a trailing guarded flag in a clause with the wrong argv0.
-		const isRedirectAmp = ch === "&" && (cur.trimEnd().endsWith(">") || next === ">");
+		// The trailing `>` must be a REAL (unescaped) redirect character: the escape-preserving
+		// branch above keeps an escaped `>` as the literal two characters `\>` in `cur`, so checking
+		// for that exact suffix tells an escaped `>` (not a redirect) apart from a real one.
+		const trimmedCur = cur.trimEnd();
+		const isRedirectAmp = ch === "&" && !trimmedCur.endsWith("\\>") && (trimmedCur.endsWith(">") || next === ">");
 		if ((ch === "\n" || ch === ";" || ch === "|" || ch === "&") && !isRedirectAmp) {
 			// consume a paired operator (&&, ||) as one separator
 			if ((ch === "&" && next === "&") || (ch === "|" && next === "|")) i++;
@@ -188,6 +244,17 @@ export function tokenize(sub: string): string[] {
 	for (let i = 0; i < sub.length; i++) {
 		const ch = sub[i];
 		if (quote) {
+			// Inside DOUBLE quotes a backslash still escapes the very next character (bash: `\"`
+			// inside `"..."` is a literal quote, it does NOT close the string — same reasoning as
+			// splitSubCommands' identical guard). Single quotes have no backslash-escaping at all,
+			// so this only applies to `"`. Kept literal (backslash retained) except before the
+			// handful of characters bash actually treats as escapable inside double quotes.
+			if (quote === '"' && ch === "\\" && i + 1 < sub.length) {
+				const nc = sub[i + 1];
+				cur += nc === '"' || nc === "\\" || nc === "$" || nc === "`" ? nc : ch + nc;
+				i++;
+				continue;
+			}
 			if (ch === quote) {
 				quote = null;
 				continue;
@@ -383,12 +450,13 @@ export function coercePolicy(value: unknown): Policy | null {
 			reason: typeof r.reason === "string" ? r.reason : "",
 		});
 	}
-	// An absent default (or JSON `null`, e.g. from a generator that emits null for an unset field)
-	// is fine (implicit "allow"), but a PRESENT-and-invalid one (a typo like "dney") must fail the
-	// whole document closed rather than silently coerce to "allow" — a typo in a stricter policy's
-	// default must not quietly reopen the gate for unmatched commands.
+	// An absent key is fine (implicit "allow" — the field was genuinely never set). Anything
+	// PRESENT-and-invalid — a typo ("dney"), the wrong type, or an explicit JSON `null` — must fail
+	// the whole document closed instead of silently coercing to "allow": a `default: null` is
+	// exactly as ambiguous as a typo (it could mean "never set" or "a stricter deny/ask got nulled
+	// by a bug"), and this loader has no way to tell those apart, so it must not guess "allow".
 	let def: Decision;
-	if (v.default === undefined || v.default === null) {
+	if (v.default === undefined) {
 		def = "allow";
 	} else if (v.default === "allow" || v.default === "ask" || v.default === "deny") {
 		def = v.default;
