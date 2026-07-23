@@ -1,6 +1,6 @@
 # Agent CLI Ecosystem — Roadmap
 
-Status snapshot: **2026-06-28** (newest session block first, right below the north-star). This is
+Status snapshot: **2026-07-23** (newest session block first, right below the north-star). This is
 the handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, `rig-cli`,
 `draw-cli`, `3d-cli`, `task-cli`) + the `agent-tools` umbrella.
 
@@ -9,7 +9,7 @@ the handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, 
 > merged) · ⏭️ = skipped (with reason). A merged PR is 🔬, never ✅, until the CTO signs off.
 
 > **Reading order:** the AUTHORITATIVE current state is the **newest dated session block at the very
-> top** (currently **2026-06-27 → 06-28**), then **§Remaining work (prioritized)** and the **§Open-ticket
+> top** (currently **2026-07-18 → 07-23**), then **§Remaining work (prioritized)** and the **§Open-ticket
 > ledger** below. ⚠️ The dated session blocks lead; the lower §Remaining-work / §Open-ticket ledger lag
 > behind the newest block and may still list items the top block has since shipped — when they disagree,
 > the newest dated block wins. The two collapsed `📜 …` blocks are older dated transcript (2026-06-15 →
@@ -21,6 +21,72 @@ the handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, 
 > New tools are built in Python on that lib so a new tool spins up fast on one architecture.
 > `rig` is the front door (`rig init` onboarding, `rig apply` reconcile — two distinct commands,
 > interactivity orthogonal). `agent-tools` = WHAT (the catalog), `rig` = HOW (installs it).
+
+---
+
+## 2026-07-18 → 07-23 — multi-day autonomous backlog marathon (🔬 under CTO review)
+
+*A long multi-day autonomous shipping run across the whole ecosystem, tracked live via `gh` throughout.
+Headline: **38 PRs merged 2026-07-18 → 07-22** (each verified MERGED on its repo's `origin/main`, not a
+self-report) across five repos — agent-tools 7, review-cli 4, rig-cli 13, tg-cli 12, task-cli 2 — plus
+several notable items that landed just after that tally (below, also all verified MERGED). Separately, one
+real unpatched security finding is held back deliberately (see below, no exploit details in this public
+file), and a systemic CI-gate problem still needs a CTO decision. Within the "Held / deferred" section
+below, each bullet's own marker says its actual state (⛔ = genuinely blocked/held, not merged; ⏳ =
+deliberately not merged, pending review; 📋 = informational, not a merge claim; 🔬 = a real correction or
+completed piece of work that itself IS merged/verified — e.g. the task-cli #56 correction, the `dev-cli`
+extraction, the cc-restore investigation). As with every block above, 🔬 is "shipped, awaiting CTO sign-off,"
+never ✅.*
+
+### Additional notable items (shipped after the 38-PR tally, each with a real finding behind it)
+
+- 🔬 **rig-cli #179** — tmux **pane-titles** feature, merged. Also surfaced a real machine-side bug: a
+  stale tmux-boot LaunchAgent carrying a wrong `PATH`. Root-caused, but the fix needs a one-time **manual
+  restart of the tmux boot service on the real machine** — not something an agent should do to a live
+  session unattended. **Alex: this restart is still owed on your side.**
+- 🔬 **agent-tools #303** — `gh-graphql` alias (`ghgql`) + precision fix to `block-raw-pr-merge`. Several
+  real security-adjacent bugs were found and fixed during review, not just the headline feature.
+- 🔬 **tg-cli #232** — fixes the hook-disconnected UX: a message to a pane whose hook bridge is down now
+  gets proper pane identification and **queued delivery**, instead of a silent drop.
+- 🔬 **tg-cli #234** — a direct follow-up to #232: removes a **10-minute hard expiry** on queued messages
+  that had crept in, which violated Alex's standing rule ("queue until resolved, never a timer"). Found and
+  fixed a real per-invocation identity bug along the way (queued messages could be mis-attributed across
+  invocations); fixed with nonce-based scoping.
+
+### Held / deferred — deliberately, with real reasons (do not "just do it" without re-reading these)
+
+- ⛔ **A real, unpatched security bypass exists on `block-raw-pr-merge`.** **Held privately, on purpose —
+  NOT filed as a public GitHub issue**, because this repo is public and an issue would be premature exploit
+  disclosure. The mechanics are intentionally NOT described here or in any public tracker. **Talk to the
+  CTO directly** for the dedicated private fix. This is the top security item outstanding.
+- ⏳ **agent-tools #294** — a salvaged WIP pi permission-guard extension with **5 unresolved P1/P2
+  security findings**. Deliberately held, not merged, pending a dedicated security review pass — do not
+  pick this back up casually.
+- ⛔ **The review-threads CI gate is blocking merges on live unresolved codex-bot findings** on
+  **review-cli #157** and **agent-tools #290 / #295**. There ARE two sanctioned resolution paths
+  (see `AGENTS.md` §gh-graphql: a direct single-quoted `resolveReviewThread` mutation for a
+  quorum-passed/advisory-only/bot-only finding on the agent's own PR, and `gh ship
+  --resolve-addressed-threads` for an outdated bot-only thread) — during the marathon neither applied
+  cleanly to these three PRs' actual thread state, but that per-PR eligibility was not re-verified before
+  writing this entry. **Before escalating this as a systemic gate-design problem, re-check each PR against
+  the two live paths above** — it may be a per-PR eligibility gap, not a gate redesign. If it still doesn't
+  resolve after that check, that's the **CTO decision** needed: how to handle this class of gate long-term.
+- 🔬 **Correction to a prior assumption:** **task-cli #56**'s earlier finding ("the classifier denies
+  merging non-authored PRs") turned out to be about one specific bad-faith retry attempt, **not** a
+  permanent structural block. It was later legitimately merged by a different agent, who found and fixed a
+  real credential-leak bug in it along the way. If any earlier part of this roadmap reads as "task-cli PRs
+  can never be agent-merged," that was wrong — correct it on sight.
+- 📋 **~35+ follow-up tickets** were filed across the ecosystem during the marathon for findings noticed
+  but not fixed inline (real bugs, design gaps, doc inaccuracies). Not enumerated here — the exact list
+  drifts as they get triaged; run `gh issue list` per repo for the current state rather than trusting a
+  number written down at one point in time.
+- 🔬 **`dev-cli` extraction complete** — successfully split out of `agent-tools` into its own standalone
+  public repo, [`alex-mextner/dev-cli`](https://github.com/alex-mextner/dev-cli), earlier in this effort.
+  Cutover verified.
+- 🔬 **cc-restore mechanism (rig-cli, `riglib/tmux.py`) — investigated, CONFIRMED WORKING, no bug found.**
+  It resumes the actual prior Claude Code conversation across a tmux server restart (`claude --resume
+  <session-id>`), not just a fresh relaunch reusing the same window. Verified via isolated e2e tests plus
+  live config inspection. No follow-up needed here.
 
 ---
 
