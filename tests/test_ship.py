@@ -2933,10 +2933,43 @@ def test_cidown_local_gate_ship_config_tree_is_rejected(repo_with_pr_worktree, t
         f"ship must fall through to root auto-detect, ignoring the tree at .ship-config\n"
         f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
     )
-    assert "is not a regular file (blob)" in r.stderr, r.stderr
+    assert "is not a regular file" in r.stderr, r.stderr
     lines = npm_log.read_text(encoding="utf-8").splitlines()
     assert lines == ["test", str(main.resolve())], (
         "the tree's entry name must never reach the eval'd command path\n"
+        f"npm.log: {lines}"
+    )
+
+
+def test_cidown_local_gate_ship_config_symlink_is_rejected(repo_with_pr_worktree, tmp_path):
+    """If .ship-config is committed as a SYMLINK (git tree mode 120000), ship must reject it
+    instead of parsing its blob content -- a symlink's blob content is the link TARGET
+    STRING, not test-runner config, and `git cat-file -t` reports `blob` for a symlink just
+    like it does for a regular file, so a type-only check can't tell them apart. Craft the
+    symlink target so it would parse as a valid KEY=value line if it reached the parser."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").symlink_to("SHIP_LOCAL_TEST_CMD=echo evil")
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "commit .ship-config as a symlink", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect, ignoring the symlinked .ship-config\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "is not a regular file" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], (
+        "the symlink target string must never reach the eval'd command path\n"
         f"npm.log: {lines}"
     )
 

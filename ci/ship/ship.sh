@@ -574,16 +574,29 @@ _ship_config_load() {
       echo "[ship] local gate: .ship-config exists in the working tree but is not committed at HEAD — ignoring (uncommitted config is not audited)." >&2
     return 0
   fi
-  # HEAD:.ship-config must be a blob. If it's a TREE (someone committed a `.ship-config/`
-  # directory), `git show`/`git cat-file -s` both succeed on it and print a tree listing —
-  # tree entry names are plain filenames that can legally contain `=` and spaces, so an
-  # entry literally named `SHIP_LOCAL_TEST_CMD=<cmd>` would otherwise flow into the KEY=value
-  # parser below as if it were committed file CONTENT. Reject anything that isn't a blob
-  # before parsing.
-  if [ "$(cd "$root" && git cat-file -t HEAD:.ship-config 2>/dev/null)" != "blob" ]; then
-    echo "[ship] local gate: .ship-config at HEAD is not a regular file (blob) — ignoring." >&2
-    return 0
-  fi
+  # HEAD:.ship-config must be a REGULAR FILE — mode 100644/100755, checked via `git ls-tree`,
+  # not merely `git cat-file -t` == blob. Two non-regular tree entries are ALSO type `blob`
+  # and would slip past a bare type check:
+  #   - A TREE (someone committed a `.ship-config/` directory): `git show`/`git cat-file -s`
+  #     both succeed on it and print a tree listing — tree entry names are plain filenames
+  #     that can legally contain `=` and spaces, so an entry literally named
+  #     `SHIP_LOCAL_TEST_CMD=<cmd>` would otherwise flow into the KEY=value parser below as
+  #     if it were committed file CONTENT.
+  #   - A SYMLINK (git mode 120000, e.g. `.ship-config -> /some/attacker/path`): its blob
+  #     content is the link TARGET STRING, not test-runner config — `git cat-file -t` reports
+  #     `blob` for symlinks too, so a type-only check would parse a target path as if it were
+  #     a committed KEY=value line.
+  # `git ls-tree` reports the tree ENTRY's mode (unlike `cat-file -t`, which resolves to the
+  # blob's own type and can't distinguish a symlink's blob from a regular file's blob).
+  local head_mode
+  head_mode=$(cd "$root" && git ls-tree HEAD -- .ship-config 2>/dev/null | awk '{print $1}')
+  case "$head_mode" in
+    100644|100755) ;;
+    *)
+      echo "[ship] local gate: .ship-config at HEAD is not a regular file (mode ${head_mode:-unknown}, not 100644/100755) — ignoring." >&2
+      return 0
+      ;;
+  esac
   # NUL-byte guard: bash silently STRIPS NUL bytes when a command substitution's output
   # becomes a variable's value (below), which could turn a byte sequence that never spells
   # a whitelisted key in the actual committed bytes (e.g. `SHIP_LOCAL_TEST_C<NUL>MD=...`)
@@ -638,6 +651,7 @@ _ship_config_load() {
 # instead to scope to root.
 _ship_config_dir_is_safe() {
   local p="$1" seg all_dot=1
+  local -a _ship_cfg_dir_segs
   case "$p" in /*) return 1 ;; esac
   IFS='/' read -ra _ship_cfg_dir_segs <<< "$p"
   for seg in "${_ship_cfg_dir_segs[@]}"; do
