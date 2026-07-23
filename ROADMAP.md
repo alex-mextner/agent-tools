@@ -31,9 +31,12 @@ Headline: **38 PRs merged 2026-07-18 → 07-22** (each verified MERGED on its re
 self-report) across five repos — agent-tools 7, review-cli 4, rig-cli 13, tg-cli 12, task-cli 2 — plus
 several notable items that landed just after that tally (below, also all verified MERGED). Separately, one
 real unpatched security finding is held back deliberately (see below, no exploit details in this public
-file), and a systemic CI-gate problem still needs a CTO decision — the items below that are held, deferred,
-or blocked are called out explicitly as NOT merged; only the 38-PR tally and the "Additional notable items"
-subsection assert MERGED. As with every block above, 🔬 not ✅ — the CTO signs off.*
+file), and a systemic CI-gate problem still needs a CTO decision. Within the "Held / deferred" section
+below, each bullet's own marker says its actual state (⛔ = genuinely blocked/held, not merged; ⏳ =
+deliberately not merged, pending review; 📋 = informational, not a merge claim; 🔬 = a real correction or
+completed piece of work that itself IS merged/verified — e.g. the task-cli #56 correction, the `dev-cli`
+extraction, the cc-restore investigation). As with every block above, 🔬 is "shipped, awaiting CTO sign-off,"
+never ✅.*
 
 ### Additional notable items (shipped after the 38-PR tally, each with a real finding behind it)
 
