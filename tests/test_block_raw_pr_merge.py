@@ -1780,5 +1780,255 @@ def test_ghgql_single_quoted_query_stays_allowed(monkeypatch):
     assert _decision(out) == "allow"
 
 
+# ── Clustered short-flag bypass (a real `gh` short-flag group, e.g. `-iF`/`-iX`) ────────────
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # A `query` fed from a FILE (`@f`) can't be read at pre-exec time and must fail closed
+        # exactly like the detached/glued `-F`/`-f` spelling already does — but only if the
+        # clustered flag is recognised as carrying a `query` field at all. Glued value:
+        "gh api -iFquery=@merge_payload.graphql graphql",
+        "gh api -ifquery=@merge_payload.graphql graphql",
+        # Clustered ahead of a DETACHED value flag (`-iF query=...` == `-i -F query=...`).
+        "gh api -iF query=@merge_payload.graphql graphql",
+        # A `query` fed from a shell VARIABLE is equally unreadable at pre-exec time.
+        "gh api -iFquery=$Q graphql",
+    ],
+)
+def test_gh_api_graphql_clustered_short_flag_unprovable_query_is_blocked(command, monkeypatch):
+    """An unreadable (file-backed / shell-variable) `query` value must fail closed exactly like
+    the detached/glued `-F`/`-f` spelling already does — but a clustered spelling (`-iFquery=...`)
+    previously hid the field from `_graphql_query_field_values` entirely (it only recognised a
+    token starting with `-f`/`-F`), so the fail-closed check never fired and the call was
+    ALLOWED. A merge mutation is a valid body for such a query, so an unrecognised clustered field
+    is a real, exploitable bypass of the `gh ship`-only gate — not merely a theoretical gap."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # An INLINE merge mutation (not file/variable-backed) carried by a clustered `query`
+        # field — the primary `_graphql_carries_merge_mutation` path over expanded tokens, and
+        # the most direct real exploit shape.
+        "gh api -iFquery='mutation{ mergePullRequest(input:{pullRequestId:\"x\"}){ clientMutationId } }' graphql",
+        "gh api -iF query='mutation{ mergePullRequest(input:{pullRequestId:\"x\"}){ clientMutationId } }' graphql",
+    ],
+)
+def test_gh_api_graphql_clustered_short_flag_inline_mutation_is_blocked(command, monkeypatch):
+    """A real, INLINE (not file/variable-backed) merge mutation carried by a clustered `-iFquery=`
+    spelling must be blocked by `_graphql_carries_merge_mutation` over the expanded tokens — the
+    most direct shape of this bypass, distinct from the unprovable-query cases above."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api -iXPUT repos/o/r/pulls/1/merge",  # `-i` clustered ahead of a glued write method
+        "gh api -iX PUT repos/o/r/pulls/1/merge",  # `-i` clustered ahead of a detached write method
+        "gh api -iXPOST repos/o/r/pulls/1/merge",  # glued POST (not just PUT)
+        "gh api -iX POST repos/o/r/pulls/1/merge",  # detached POST
+    ],
+)
+def test_gh_api_rest_merge_clustered_write_method_is_blocked(command, monkeypatch):
+    """The same clustering must not hide a write method (`-X PUT`) on the REST merge endpoint."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # A legitimate READ-ONLY clustered query (no merge mutation) must still be allowed.
+        "gh api -iFquery='query{ viewer{ login } }' graphql",
+        "gh api -iF query='query{ viewer{ login } }' graphql",
+        # `-i` clustered with a non-merge REST GET stays allowed too.
+        "gh api -iX GET repos/o/r/issues",
+    ],
+)
+def test_gh_api_clustered_short_flag_readonly_is_allowed(command, monkeypatch):
+    """A clustered short-flag spelling must not become an over-block for ordinary read-only
+    `gh api` usage — only an actual merge-carrying value blocks."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("leading_flag", ["-t", "-q", "-H", "-p", "-X"])
+def test_gh_api_value_flag_operand_shaped_like_a_cluster_still_catches_real_merge(
+    leading_flag, monkeypatch
+):
+    """A detached value-taking flag's OPERAND that merely happens to LOOK like a short-flag
+    cluster (`-t -iX ...` — `-iX` is `-t`'s template-string value, not `-i`+`-X`) must not be
+    expanded as if it were a flag itself: doing so shifts every later token by one position and
+    can hide the real endpoint/query from the scanner entirely (a review caught this as a
+    fail-open regression in an earlier version of the fix). Parametrized across every detached
+    short value flag `gh api` defines (`_API_VALUE_SHORT_CHARS`), since the operand-protection
+    guarantee depends on ALL of them being recognized, not just the one case first tested."""
+    command = f"gh api {leading_flag} -iX graphql -f query=@merge.graphql"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize("leading_flag", ["-t", "-q", "-H", "-p", "-X"])
+def test_gh_api_value_flag_operand_shaped_like_a_cluster_stays_allowed_when_benign(
+    leading_flag, monkeypatch
+):
+    """The symmetric allow-case: a benign detached operand that merely looks like a cluster must
+    not become an over-block once it is correctly left untouched as the preceding flag's value."""
+    command = f"gh api {leading_flag} -iX .foo repos/o/r/issues"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("leading_flag", ["--jq", "--template", "--header", "--method"])
+def test_gh_api_long_form_value_flag_operand_shaped_like_a_cluster_still_catches_real_merge(
+    leading_flag, monkeypatch
+):
+    """Same guarantee as the short-flag operand-protection tests above, but for the LONG spelling
+    of a detached value flag (`--jq`/`--template`/`--header`/`--method` are all in
+    `_API_VALUE_FLAGS` alongside their short forms). A review raised this as a possible fail-open
+    regression if a long form were ever missing from that set; it is not missing, but the
+    guarantee was previously unproven for long spellings — this closes that coverage gap."""
+    command = f"gh api {leading_flag} -iX graphql -f query=@merge.graphql"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize("leading_flag", ["--jq", "--template", "--header", "--method"])
+def test_gh_api_long_form_value_flag_operand_shaped_like_a_cluster_stays_allowed_when_benign(
+    leading_flag, monkeypatch
+):
+    """The symmetric allow-case for the long-flag operand-protection guarantee."""
+    command = f"gh api {leading_flag} -iX .foo repos/o/r/issues"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_gh_api_graphql_multi_boolean_cluster_unprovable_query_is_blocked(monkeypatch):
+    """A cluster may carry more than one leading boolean short flag (`gh api` only defines `-i`
+    today, but the expansion loop supports repeats of it, e.g. a doubled/typo'd `-ii`); the loop
+    that strips leading booleans must still find the trailing value flag regardless of how many
+    booleans precede it."""
+    command = "gh api -iiFquery=@merge_payload.graphql graphql"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api -iX=PUT repos/o/r/pulls/1/merge",
+        "gh api -iX=POST repos/o/r/pulls/1/merge",
+    ],
+)
+def test_gh_api_rest_merge_clustered_write_method_equals_glued_is_blocked(command, monkeypatch):
+    """A write method glued to the cluster with `=` (`-iX=PUT`, mirroring the long-flag
+    `--method=PUT` spelling `_WRITE_METHOD_EQ` already recognizes) must expand to `-i`, `-X=PUT`
+    and still be caught by `_WRITE_METHOD_EQ` over the expanded token."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Equals-glued fieldish spelling (`-F=query=<v>` sets the raw field `query` to `<v>`,
+        # same as the bare-`=` `_graphql_query_field_values` regex already recognizes for an
+        # UNCLUSTERED `-F`/`--field`) behind a leading `-i`. A review raised this as a possible
+        # bypass distinct from the plain-glued (`-Fquery=<v>`) spelling already covered above.
+        "gh api -iF=query=@merge.graphql graphql",
+        "gh api -if=query=@merge.graphql graphql",
+    ],
+)
+def test_gh_api_graphql_clustered_equals_glued_field_unprovable_query_is_blocked(
+    command, monkeypatch
+):
+    """An unreadable (file-backed) `query` value carried by a clustered, equals-glued field
+    spelling (`-iF=query=@x`) must fail closed exactly like every other glued spelling."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_gh_api_graphql_clustered_equals_glued_field_readonly_is_allowed(monkeypatch):
+    """The symmetric allow-case: a clustered, equals-glued, read-only query must not be
+    over-blocked."""
+    command = "gh api -iF=query='query{ viewer{ login } }' graphql"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+# Every detached value flag `_expand_clustered_gh_api_flags` must protect, DERIVED from the same
+# source set the implementation reads (`hook._API_VALUE_FLAGS`, minus the fieldish flags — those
+# have their own dedicated `-f`/`-F` coverage above and don't take a bare operand the same way) —
+# so the completeness of this guarantee is proven against the actual set the code uses, not a
+# hand-copied list that could silently drift from it as `gh api` grows more flags (review).
+_NON_FIELDISH_VALUE_FLAGS = sorted(hook._API_VALUE_FLAGS - hook._FIELDISH)
+
+
+@pytest.mark.parametrize("leading_flag", _NON_FIELDISH_VALUE_FLAGS)
+def test_gh_api_every_value_flag_operand_shaped_like_a_cluster_still_catches_real_merge(
+    leading_flag, monkeypatch
+):
+    """Exhaustive version of the short/long-form operand-protection tests above: EVERY detached
+    value flag `gh api` defines (per `_API_VALUE_FLAGS`) must treat its own operand as a value, not
+    a flag to expand — including `--input`/`--hostname`/`--cache`, which have no short form and
+    were not covered by the earlier hand-picked lists. `--input` is the sharp case: a real
+    `gh api --input -iF graphql -f query=@merge.graphql` must still be blocked."""
+    command = f"gh api {leading_flag} -iX graphql -f query=@merge.graphql"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize("leading_flag", _NON_FIELDISH_VALUE_FLAGS)
+def test_gh_api_every_value_flag_operand_shaped_like_a_cluster_stays_allowed_when_benign(
+    leading_flag, monkeypatch
+):
+    """The symmetric allow-case for the exhaustive operand-protection guarantee above."""
+    command = f"gh api {leading_flag} -iX .foo repos/o/r/issues"
+    out, _err, code = _run(command, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_api_bool_and_value_short_chars_stay_disjoint_and_in_sync():
+    """`_API_BOOL_SHORT_CHARS` and `_API_VALUE_SHORT_CHARS` each mirror `gh api`'s flag grammar by
+    hand (review flagged this as a drift risk: if a future `gh` adds a second boolean short flag
+    without updating `_API_BOOL_SHORT_CHARS`, or a value short char is dropped from
+    `_API_VALUE_SHORT_CHARS`, the cluster-expansion safety guarantee silently regresses). This pins
+    the two invariants that must hold for `_expand_clustered_short_flag` to stay correct: the two
+    sets never overlap (a char can't be both a boolean and a value flag), and every non-fieldish
+    short char backing `_API_VALUE_FLAGS` (`-H/-q/-X/-p/-t`, i.e. the short spelling of a long-form
+    entry) is present in `_API_VALUE_SHORT_CHARS`. A future `gh` change that breaks either
+    invariant fails this test loudly instead of silently reopening the bypass."""
+    assert hook._API_BOOL_SHORT_CHARS.isdisjoint(hook._API_VALUE_SHORT_CHARS)
+    short_value_flags = {
+        f.lstrip("-") for f in hook._API_VALUE_FLAGS if f.startswith("-") and not f.startswith("--")
+    }
+    # Both directions matter: missing a real short flag fails CLOSED (an unrecognized value flag
+    # is simply never expanded as a cluster, so it's scanned as before this fix — no regression);
+    # an EXTRA, non-real char in `_API_VALUE_SHORT_CHARS` is the fail-OPEN direction a review
+    # flagged — it would make `_expand_clustered_short_flag` treat a bogus char as a real trailing
+    # value flag and swallow the next token as its operand, hiding the real endpoint/query.
+    assert short_value_flags <= hook._API_VALUE_SHORT_CHARS
+    assert hook._API_VALUE_SHORT_CHARS - {"f", "F"} <= short_value_flags
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-v"]))

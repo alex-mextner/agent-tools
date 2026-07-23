@@ -191,6 +191,80 @@ _WRITE_METHOD_EQ = re.compile(r"^(--method|-X)=(PUT|POST)$", re.IGNORECASE)
 # at pre-exec time, so a graphql call carrying it is over-blocked (fail closed).
 _FIELDISH = frozenset({"-F", "--field", "-f", "--raw-field"})
 
+# ── pflag/cobra short-flag clustering (`gh api`'s own flag grammar) ──────────────────────────
+# `gh api`'s ONLY boolean short flag (`-i/--include`) can be clustered ahead of a value-taking
+# short flag in one token — `-iF query=x` == `-i -F query=x`, and the value may be glued on too
+# (`-iFquery=x` == `-i -F query=x`). Every detector below (`_gh_api_endpoint`,
+# `_graphql_carries_merge_mutation`, `_graphql_query_field_values`,
+# `_graphql_argument_role_is_unprovable`, `_rest_has_write_method`, `_rest_method_is_unprovable`)
+# only recognises a value flag at the START of a token (`-f`/`-F`/`-X`/...), so a merge query or a
+# write method smuggled behind a leading `-i` was invisible to all of them. Keep this set in sync
+# with `gh api --help`'s FLAGS section if a future `gh` adds another short boolean flag.
+_API_BOOL_SHORT_CHARS = frozenset({"i"})
+# Every value-taking short flag letter `gh api` defines (the short forms of `_API_VALUE_FLAGS`
+# plus `-f`/`-F`, which are tracked separately in `_FIELDISH`). Verified against `gh api --help`:
+# `-p`/`--preview` takes a `strings` argument (it is NOT the boolean `--paginate`, which has no
+# short form) — a review raised this as a possible misclassification; it is not one.
+_API_VALUE_SHORT_CHARS = frozenset({"f", "F", "H", "q", "X", "p", "t"})
+
+
+def _expand_clustered_short_flag(token: str) -> list[str] | None:
+    """If `token` is a pflag-style clustered short-flag group — one or more boolean short flags
+    (`_API_BOOL_SHORT_CHARS`) followed by exactly one value-taking short flag
+    (`_API_VALUE_SHORT_CHARS`), with the value either glued on (`-iFquery=x`) or left for the next
+    token (`-iF`) — return the equivalent unclustered tokens (e.g. `['-i', '-Fquery=x']` /
+    `['-i', '-F']`), so a query/method smuggled behind a leading boolean short flag becomes visible
+    to every detector that already understands the plain `-F`/`-f`/`-X`/... spelling.
+
+    Returns None when `token` is not such a cluster: a bare value flag (`-Fquery=x`, no leading
+    boolean) is left for the existing `-[fF]`-anchored handling; a long flag, `--`, a lone short
+    flag, or an all-boolean cluster (nothing to split off) is not a value carrier either."""
+    if not token.startswith("-") or token.startswith("--") or len(token) < 3:
+        return None
+    body = token[1:]
+    i = 0
+    while i < len(body) and body[i] in _API_BOOL_SHORT_CHARS:
+        i += 1
+    if i == 0 or i >= len(body):
+        return None  # no leading boolean short, or the whole cluster is booleans (nothing to split)
+    if body[i] not in _API_VALUE_SHORT_CHARS:
+        return None  # next char is not a recognized value flag in this position
+    return [f"-{c}" for c in body[:i]] + [f"-{body[i:]}"]
+
+
+def _expand_clustered_gh_api_flags(rest: list[str]) -> list[str]:
+    """Return `rest` (args after `gh api`) with every pflag-style clustered short-flag token in
+    FLAG POSITION expanded to its unclustered equivalent (see `_expand_clustered_short_flag`), so
+    downstream endpoint/field/method scanning sees the same tokens it would for the unclustered
+    spelling.
+
+    Tracks value-flag position exactly like `_gh_api_endpoint` does: the token right after a
+    DETACHED value-taking flag (`_API_VALUE_FLAGS` / `_FIELDISH`) is that flag's VALUE, not a flag
+    itself, and must pass through untouched even if it happens to look like a cluster (`-t -iX
+    graphql` — `-iX` is `-t`'s template-string value, not `-i`+`-X`; expanding it would shift
+    `_gh_api_endpoint` onto the wrong token and let a real merge slip past — a real regression a
+    review caught). A cluster's own trailing value flag with no glued value (`-iF` alone) likewise
+    puts the FOLLOWING token in value position."""
+    out: list[str] = []
+    expect_value = False
+    for tok in rest:
+        if expect_value:
+            out.append(tok)  # the operand of a preceding detached value flag — never a flag itself
+            expect_value = False
+            continue
+        if tok in _API_VALUE_FLAGS or tok in _FIELDISH:
+            out.append(tok)
+            expect_value = True
+            continue
+        expanded = _expand_clustered_short_flag(tok)
+        if expanded is None:
+            out.append(tok)
+            continue
+        out.extend(expanded)
+        if len(expanded[-1]) == 2:  # trailing value flag with nothing glued on (`-F`/`-f`/...)
+            expect_value = True
+    return out
+
 
 def emit(decision: str, message: str | None = None) -> None:
     out: dict[str, str] = {"hook_api": HOOK_API, "decision": decision}
@@ -836,7 +910,11 @@ def _graphql_query_is_unprovable(rest: list[str], strict: bool = False) -> bool:
 def _gh_api_is_merge(rest: list[str], strict: bool = False) -> bool:
     """`rest` = args after `gh api`. True iff this is a PR-merge REST call (`…/pulls/<n>/merge` +
     write method) or a graphql merge mutation (inline, or a file/stdin/substitution-backed query
-    that can't be proven safe). `strict` — see `_graphql_query_is_unprovable`."""
+    that can't be proven safe). `strict` — see `_graphql_query_is_unprovable`.
+
+    `rest` is expanded first (`_expand_clustered_gh_api_flags`) so a clustered short-flag spelling
+    (`-iFquery=...`, `-iXPUT`) is scanned exactly like its unclustered equivalent."""
+    rest = _expand_clustered_gh_api_flags(rest)
     endpoint = _gh_api_endpoint(rest)
     is_graphql = endpoint == "graphql" or (endpoint or "").endswith("/graphql")
     if is_graphql:
@@ -1341,6 +1419,7 @@ def _graphql_query_field_is_expandable(blanked_command: str) -> bool:
             rest = _ghgql_to_graphql_rest(argv)
         else:
             continue
+        rest = _expand_clustered_gh_api_flags(rest)
         endpoint = _gh_api_endpoint(rest)
         if endpoint == "graphql" or (endpoint or "").endswith("/graphql"):
             if any("$" in val or "`" in val for val in _graphql_query_field_values(rest)):
