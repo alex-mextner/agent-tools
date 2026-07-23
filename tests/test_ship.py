@@ -2809,6 +2809,11 @@ def test_cidown_local_gate_e2e_symlink_escape_is_rejected(repo_with_pr_worktree,
         f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
     )
     assert not npm_log.exists(), "npm must never have run in the symlink target"
+    assert "e2e/ resolves (via a symlink) outside the repo root" in r.stderr, (
+        "the e2e/ symlink-escape skip must log a specific diagnostic (matching the "
+        f".ship-config SHIP_LOCAL_TEST_DIR path), not silently fall through to the generic "
+        f"'no recognized test runner found' message\nSTDERR:\n{r.stderr}"
+    )
 
 
 def test_cidown_local_gate_ship_config_dir_symlink_escape_is_rejected(
@@ -2899,6 +2904,41 @@ def test_cidown_local_gate_ship_config_nul_byte_is_rejected(repo_with_pr_worktre
     assert "contains a NUL byte" in r.stderr, r.stderr
     lines = npm_log.read_text(encoding="utf-8").splitlines()
     assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_tree_is_rejected(repo_with_pr_worktree, tmp_path):
+    """If HEAD:.ship-config is a TREE (someone committed a `.ship-config/` directory) rather
+    than a blob, ship must reject it outright instead of feeding `git show`'s tree listing to
+    the KEY=value parser -- a tree entry's NAME is a plain filename that can legally contain
+    '=' and spaces, so a file literally named `SHIP_LOCAL_TEST_CMD=echo evil` inside that
+    directory must never be parsed as committed file CONTENT."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    cfg_dir = main / ".ship-config"
+    cfg_dir.mkdir()
+    (cfg_dir / "SHIP_LOCAL_TEST_CMD=echo evil").write_text("", encoding="utf-8")
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "commit .ship-config as a directory (tree), not a file", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect, ignoring the tree at .ship-config\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "is not a regular file (blob)" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], (
+        "the tree's entry name must never reach the eval'd command path\n"
+        f"npm.log: {lines}"
+    )
 
 
 def test_cidown_local_gate_ship_config_empty_file_is_treated_as_absent(

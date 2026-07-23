@@ -574,6 +574,16 @@ _ship_config_load() {
       echo "[ship] local gate: .ship-config exists in the working tree but is not committed at HEAD — ignoring (uncommitted config is not audited)." >&2
     return 0
   fi
+  # HEAD:.ship-config must be a blob. If it's a TREE (someone committed a `.ship-config/`
+  # directory), `git show`/`git cat-file -s` both succeed on it and print a tree listing —
+  # tree entry names are plain filenames that can legally contain `=` and spaces, so an
+  # entry literally named `SHIP_LOCAL_TEST_CMD=<cmd>` would otherwise flow into the KEY=value
+  # parser below as if it were committed file CONTENT. Reject anything that isn't a blob
+  # before parsing.
+  if [ "$(cd "$root" && git cat-file -t HEAD:.ship-config 2>/dev/null)" != "blob" ]; then
+    echo "[ship] local gate: .ship-config at HEAD is not a regular file (blob) — ignoring." >&2
+    return 0
+  fi
   # NUL-byte guard: bash silently STRIPS NUL bytes when a command substitution's output
   # becomes a variable's value (below), which could turn a byte sequence that never spells
   # a whitelisted key in the actual committed bytes (e.g. `SHIP_LOCAL_TEST_C<NUL>MD=...`)
@@ -799,9 +809,13 @@ _local_test_runner() {
   # unambiguous case that motivated this feature (#309); any other/ambiguous subdirectory
   # name is exactly what .ship-config (priority 2) exists for — use it instead of growing
   # this list, do not recurse further or scan arbitrary directories.
-  if [ -d "$root/e2e" ] && _dir_is_real_descendant_of_root "$root" "$root/e2e"; then
-    _local_test_try_dir "$root/e2e"; status=$?
-    [ "$_LOCAL_TEST_MATCHED" -eq 1 ] && return "$status"
+  if [ -d "$root/e2e" ]; then
+    if _dir_is_real_descendant_of_root "$root" "$root/e2e"; then
+      _local_test_try_dir "$root/e2e"; status=$?
+      [ "$_LOCAL_TEST_MATCHED" -eq 1 ] && return "$status"
+    else
+      echo "[ship] local gate: e2e/ resolves (via a symlink) outside the repo root — skipping the priority-5 candidate (same guard as SHIP_LOCAL_TEST_DIR; use .ship-config for an intentional alias)." >&2
+    fi
   fi
 
   echo "[ship] local gate: FAILED — no recognized test runner found (no pyproject.toml/package.json/Cargo.toml at root or in e2e/)." >&2
