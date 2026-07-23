@@ -26,12 +26,14 @@ the handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, 
 
 ## 2026-07-18 → 07-23 — multi-day autonomous backlog marathon (🔬 under CTO review)
 
-*A long multi-day autonomous shipping run across the whole ecosystem, tracked live via `gh` throughout
-(not a self-report — every PR below was verified MERGED on its repo's `origin/main`). Headline: **38 PRs
-merged 2026-07-18 → 07-22** across five repos — agent-tools 7, review-cli 4, rig-cli 13, tg-cli 12,
-task-cli 2 — plus several notable items that landed just after that tally, one real unpatched security
-finding held back deliberately (see below, no exploit details in this public file), and a systemic CI-gate
-problem that still needs a CTO decision. As with every block above, 🔬 not ✅ — the CTO signs off.*
+*A long multi-day autonomous shipping run across the whole ecosystem, tracked live via `gh` throughout.
+Headline: **38 PRs merged 2026-07-18 → 07-22** (each verified MERGED on its repo's `origin/main`, not a
+self-report) across five repos — agent-tools 7, review-cli 4, rig-cli 13, tg-cli 12, task-cli 2 — plus
+several notable items that landed just after that tally (below, also all verified MERGED). Separately, one
+real unpatched security finding is held back deliberately (see below, no exploit details in this public
+file), and a systemic CI-gate problem still needs a CTO decision — the items below that are held, deferred,
+or blocked are called out explicitly as NOT merged; only the 38-PR tally and the "Additional notable items"
+subsection assert MERGED. As with every block above, 🔬 not ✅ — the CTO signs off.*
 
 ### Additional notable items (shipped after the 38-PR tally, each with a real finding behind it)
 
@@ -57,12 +59,15 @@ problem that still needs a CTO decision. As with every block above, 🔬 not ✅
 - ⏳ **agent-tools #294** — a salvaged WIP pi permission-guard extension with **5 unresolved P1/P2
   security findings**. Deliberately held, not merged, pending a dedicated security review pass — do not
   pick this back up casually.
-- ⛔ **The review-threads CI gate is systemically blocking merges** it probably shouldn't in this form: it
-  blocks any PR carrying a live unresolved codex-bot finding, and both of the sanctioned bypass paths are
-  themselves classifier/guard-denied for an agent to use. Currently blocking **review-cli #157** and
-  **agent-tools #290 / #295**. This needs the **CTO's decision on how to handle this class of gate
-  long-term** (escalate-and-fix vs. a narrower bypass vs. redesigning the gate) — not resolved this
-  marathon, and not something to route around ad hoc per-PR.
+- ⛔ **The review-threads CI gate is blocking merges on live unresolved codex-bot findings** on
+  **review-cli #157** and **agent-tools #290 / #295**. There ARE two sanctioned resolution paths
+  (see `AGENTS.md` §gh-graphql: a direct single-quoted `resolveReviewThread` mutation for a
+  quorum-passed/advisory-only/bot-only finding on the agent's own PR, and `gh ship
+  --resolve-addressed-threads` for an outdated bot-only thread) — during the marathon neither applied
+  cleanly to these three PRs' actual thread state, but that per-PR eligibility was not re-verified before
+  writing this entry. **Before escalating this as a systemic gate-design problem, re-check each PR against
+  the two live paths above** — it may be a per-PR eligibility gap, not a gate redesign. If it still doesn't
+  resolve after that check, that's the **CTO decision** needed: how to handle this class of gate long-term.
 - 🔬 **Correction to a prior assumption:** **task-cli #56**'s earlier finding ("the classifier denies
   merging non-authored PRs") turned out to be about one specific bad-faith retry attempt, **not** a
   permanent structural block. It was later legitimately merged by a different agent, who found and fixed a
@@ -80,7 +85,9 @@ problem that still needs a CTO decision. As with every block above, 🔬 not ✅
   <session-id>`), not just a fresh relaunch reusing the same window. Verified via isolated e2e tests plus
   live config inspection. No follow-up needed here.
 
+---
 
+## 2026-06-27 → 06-28 — shipped this session (🔬 under CTO review)
 
 *Every **PR** below is **MERGED on each repo's `origin/main`** and is marked 🔬 (awaiting CTO review),
 NOT ✅ — the CTO signs off to ✅ (the "Not a PR" subsection is non-PR machine/config changes, not merges).
