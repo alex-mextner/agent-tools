@@ -706,6 +706,44 @@ def test_ci_only_pr_is_not_required_to_bump(repo_with_pyproject, tmp_path):
     assert "no shippable source" in r.stdout, r.stdout
 
 
+def test_root_ship_config_only_pr_is_not_required_to_bump(repo_with_pyproject, tmp_path):
+    """A PR that only adds/edits the REPO-ROOT .ship-config is exempt -- it's ship's own
+    CI/merge-gate metadata, not product code."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    patch = (
+        "diff --git a/.ship-config b/.ship-config\n"
+        "--- a/.ship-config\n+++ b/.ship-config\n"
+        "@@ -0,0 +1 @@\n+SHIP_LOCAL_TEST_CMD=npm test\n"
+    )
+    r = _run_ship_vbump(main, bindir, name_only=".ship-config", patch=patch)
+
+    assert r.returncode == 0, f"root .ship-config-only PR must not be blocked\n{r.stdout}\n{r.stderr}"
+    assert "no shippable source" in r.stdout, r.stdout
+
+
+def test_nested_ship_config_named_file_still_requires_bump(repo_with_pyproject, tmp_path):
+    """Regression: a NESTED file that merely shares the basename `.ship-config` (e.g.
+    `src/.ship-config`) is NOT the file _ship_config_load ever reads (only the repo-root one
+    is), so it must NOT get the version-bump exemption -- the exemption is an exact-path
+    match, not a basename match."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    patch = (
+        "diff --git a/src/.ship-config b/src/.ship-config\n"
+        "--- a/src/.ship-config\n+++ b/src/.ship-config\n"
+        "@@ -0,0 +1 @@\n+SHIP_LOCAL_TEST_CMD=npm test\n"
+    )
+    r = _run_ship_vbump(main, bindir, name_only="src/.ship-config", patch=patch)
+
+    assert r.returncode != 0, (
+        f"a nested src/.ship-config must still require a version bump\n{r.stdout}\n{r.stderr}"
+    )
+    assert "version in pyproject.toml is UNCHANGED" in r.stderr, r.stderr
+
+
 def test_ship_version_files_override_locates_nested_manifest(tmp_path):
     """SHIP_VERSION_FILES pins a non-standard version file; the gate checks THAT file. Here a
     nested package's pyproject is the version source and a source change without bumping it is
@@ -2212,6 +2250,1121 @@ def test_cidown_local_tests_fail_blocks(repo_with_pr_worktree, tmp_path):
     )
     assert "Local CI fallback: FAILED" in r.stderr, r.stderr
     assert "merged #1" not in r.stdout, r.stdout
+
+
+def _fake_npm_logging_cwd(bindir: Path, log_path: Path) -> None:
+    """Write a fake `npm` on bindir's PATH that appends "<args>\\n<cwd>" to log_path,
+    so a test can assert both WHAT ran and WHERE it ran from."""
+    npm = bindir / "npm"
+    npm.write_text(
+        "#!/usr/bin/env bash\n"
+        f"{{ printf '%s\\n' \"$*\"; pwd; }} >> \"{log_path}\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    npm.chmod(0o755)
+
+
+def test_cidown_local_gate_autodetects_e2e_subdir_when_root_has_no_manifest(
+    repo_with_pr_worktree, tmp_path
+):
+    """Root has no pyproject.toml/package.json/Cargo.toml, but e2e/package.json does (the
+    hyper-ext-e2e shape, #309): the local gate must auto-detect it and run there instead of
+    failing closed with 'no recognized test runner found'."""
+    main, _wt = repo_with_pr_worktree
+    (main / "e2e").mkdir()
+    (main / "e2e" / "package.json").write_text('{"scripts":{"test":"e2e-suite"}}\n', encoding="utf-8")
+    _git("add", "e2e/package.json", cwd=main)
+    _git("commit", "-qm", "add e2e package.json", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must auto-detect the e2e/ subdir test runner\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    # Exactly one invocation (args, cwd) -- npm must not have ALSO run a second time
+    # anywhere else (e.g. a future root+subdir double-run bug).
+    assert lines == ["test", str((main / "e2e").resolve())], lines
+    assert "no recognized test runner found" not in r.stderr
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_dir_and_cmd_wins_over_autodetect(
+    repo_with_pr_worktree, tmp_path
+):
+    """.ship-config declaring both SHIP_LOCAL_TEST_DIR and SHIP_LOCAL_TEST_CMD must run
+    exactly that command from that directory, even when e2e/ also has a package.json that
+    auto-detection would otherwise guess (proves the config file outranks auto-detect)."""
+    main, _wt = repo_with_pr_worktree
+    (main / "e2e").mkdir()
+    (main / "e2e" / "package.json").write_text('{"scripts":{"test":"e2e-suite"}}\n', encoding="utf-8")
+    marker = tmp_path / "custom-cmd.log"
+    (main / ".ship-config").write_text(
+        "# audited local-test override for hyper-ext-e2e-shaped repos\n"
+        "SHIP_LOCAL_TEST_DIR=e2e\n"
+        f"SHIP_LOCAL_TEST_CMD=echo custom-ran >> {marker}\n",
+        encoding="utf-8",
+    )
+    _git("add", "e2e/package.json", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add e2e package.json and .ship-config", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must run the .ship-config command\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert marker.read_text(encoding="utf-8").strip() == "custom-ran"
+    assert ".ship-config: running in e2e" in r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_cmd_only_runs_from_root(repo_with_pr_worktree, tmp_path):
+    """.ship-config with only SHIP_LOCAL_TEST_CMD (no dir) runs from the repo root."""
+    main, _wt = repo_with_pr_worktree
+    marker = tmp_path / "root-cmd.log"
+    (main / ".ship-config").write_text(
+        f"SHIP_LOCAL_TEST_CMD=pwd >> {marker}\n",
+        encoding="utf-8",
+    )
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add root-only .ship-config", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must run the root-scoped .ship-config command\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert marker.read_text(encoding="utf-8").strip() == str(main.resolve())
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_env_override_still_wins_over_ship_config(
+    repo_with_pr_worktree, tmp_path
+):
+    """Regression guard: the pre-existing SHIP_LOCAL_TEST_CMD env var (test-only escape
+    hatch) must still take priority over a committed .ship-config file."""
+    main, _wt = repo_with_pr_worktree
+    marker = tmp_path / "should-not-run.log"
+    (main / ".ship-config").write_text(
+        f"SHIP_LOCAL_TEST_CMD=echo from-config >> {marker}\n",
+        encoding="utf-8",
+    )
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add .ship-config that must be overridden", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must succeed via the env override\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert not marker.exists(), "the .ship-config command must NOT have run"
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_malformed_ship_config_falls_through_to_autodetect(
+    repo_with_pr_worktree, tmp_path
+):
+    """A present .ship-config with neither recognized key set (just a comment) is ignored;
+    the gate falls through to normal auto-detection instead of erroring or blocking."""
+    main, _wt = repo_with_pr_worktree
+    (main / ".ship-config").write_text(
+        "# no recognized keys here, just a comment\n",
+        encoding="utf-8",
+    )
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "add malformed .ship-config plus root package.json", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "test"
+    assert lines[1] == str(main.resolve())
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_root_exit_code_2_blocks_not_falls_through(
+    repo_with_pr_worktree, tmp_path
+):
+    """Regression for the exit-code-2 sentinel collision: a root suite that legitimately
+    exits 2 (e.g. a pytest usage error) must NOT be misread as 'no manifest at root' and
+    silently fall through to a DIFFERENT, passing suite in e2e/ -- that would merge a PR
+    whose real root suite failed."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / "e2e").mkdir()
+    (main / "e2e" / "package.json").write_text('{"scripts":{"test":"e2e-suite"}}\n', encoding="utf-8")
+    _git("add", "package.json", "e2e/package.json", cwd=main)
+    _git("commit", "-qm", "add root and e2e package.json", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    root_resolved = str(main.resolve())
+    npm = bindir / "npm"
+    npm.write_text(
+        "#!/usr/bin/env bash\n"
+        f"{{ printf '%s\\n' \"$*\"; pwd; }} >> \"{npm_log}\"\n"
+        f"if [ \"$(pwd)\" = \"{root_resolved}\" ]; then exit 2; else exit 0; fi\n",
+        encoding="utf-8",
+    )
+    npm.chmod(0o755)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        "ship must block on the root suite's real exit-2 failure, not fall through to e2e/\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", root_resolved], lines  # npm ran exactly once, at root
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_root_manifest_wins_over_subdir_manifest(
+    repo_with_pr_worktree, tmp_path
+):
+    """When both root AND e2e/ have a manifest, the root one wins (priority 4 before 5) --
+    the subdir probe never even runs."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / "e2e").mkdir()
+    (main / "e2e" / "package.json").write_text('{"scripts":{"test":"e2e-suite"}}\n', encoding="utf-8")
+    _git("add", "package.json", "e2e/package.json", cwd=main)
+    _git("commit", "-qm", "add root and e2e package.json", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must succeed via the root manifest\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_subdir_only_e2e_used_when_test_and_tests_also_present(
+    repo_with_pr_worktree, tmp_path
+):
+    """When e2e/, test/, and tests/ ALL have a manifest, only e2e/ is ever used -- test/ and
+    tests/ are not fallback candidates at all (narrowed scope, see the priority-5 comment in
+    _local_test_runner), they simply happen to be irrelevant here since e2e/ already matches."""
+    main, _wt = repo_with_pr_worktree
+    for sub in ("e2e", "test", "tests"):
+        (main / sub).mkdir()
+        (main / sub / "package.json").write_text(
+            f'{{"scripts":{{"test":"{sub}-suite"}}}}\n', encoding="utf-8"
+        )
+    _git("add", "e2e/package.json", "test/package.json", "tests/package.json", cwd=main)
+    _git("commit", "-qm", "add three candidate subdirs", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must succeed via e2e/\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str((main / "e2e").resolve())], lines
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_wins_over_rig_yaml(repo_with_pr_worktree, tmp_path):
+    """.ship-config outranks rig.yaml + `dev` too, not just auto-detect -- it exists to
+    correct EITHER heuristic guessing wrong."""
+    main, _wt = repo_with_pr_worktree
+    (main / "rig.yaml").write_text("scripts:\n  test: echo from rig\n", encoding="utf-8")
+    marker = tmp_path / "config-ran.log"
+    (main / ".ship-config").write_text(
+        f"SHIP_LOCAL_TEST_CMD=echo config-ran >> {marker}\n", encoding="utf-8"
+    )
+    _git("add", "rig.yaml", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add rig.yaml and .ship-config", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    dev_log = tmp_path / "dev.log"
+    dev = bindir / "dev"
+    dev.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [ \"$1\" = '--agenttools-dev-probe' ]; then exit 0; fi\n"
+        "if [ \"$1\" = 'has-script' ]; then exit 0; fi\n"
+        "printf '%s\\n' \"$*\" >> \"$SHIP_TEST_DEV_LOG\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    dev.chmod(0o755)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_TEST_DEV_LOG": str(dev_log),
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must run the .ship-config command\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert marker.read_text(encoding="utf-8").strip() == "config-ran"
+    assert not dev_log.exists(), "dev must not have run -- .ship-config outranks rig.yaml"
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_dir_only_fails_closed_when_no_manifest(
+    repo_with_pr_worktree, tmp_path
+):
+    """.ship-config scopes auto-detect to a real directory that has none of the three
+    manifests -- fail closed with a clear message, no silent fallback elsewhere."""
+    main, _wt = repo_with_pr_worktree
+    (main / "empty-dir").mkdir()
+    (main / "empty-dir" / "README.md").write_text("no tests here\n", encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=empty-dir\n", encoding="utf-8")
+    _git("add", ".ship-config", "empty-dir/README.md", cwd=main)
+    _git("commit", "-qm", "add .ship-config pointing at a dir with no manifest", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must fail closed\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "no recognized test runner found in empty-dir" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_dir_nonexistent_fails_closed(
+    repo_with_pr_worktree, tmp_path
+):
+    """.ship-config pointing SHIP_LOCAL_TEST_DIR at a directory that doesn't exist at all
+    fails closed with a distinct, clear message (not a generic test failure)."""
+    main, _wt = repo_with_pr_worktree
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=does-not-exist\n", encoding="utf-8")
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add .ship-config pointing at a nonexistent dir", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must fail closed\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "does not exist under" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_rejects_unsafe_dir_absolute(
+    repo_with_pr_worktree, tmp_path
+):
+    """An absolute SHIP_LOCAL_TEST_DIR is rejected (logged) and ignored -- falls through to
+    root auto-detect rather than scoping the gate outside the repo."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=/etc\n", encoding="utf-8")
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "add .ship-config with an absolute (unsafe) dir", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"an unsafe dir must be ignored, falling through to root auto-detect\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not a safe repo-relative subdirectory" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_rejects_unsafe_dir_dotdot(
+    repo_with_pr_worktree, tmp_path
+):
+    """A SHIP_LOCAL_TEST_DIR containing a `..` component is rejected the same way."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=../escape\n", encoding="utf-8")
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "add .ship-config with a traversal (unsafe) dir", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"an unsafe dir must be ignored, falling through to root auto-detect\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not a safe repo-relative subdirectory" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_subdir_pyproject_without_nested_tests_dir(
+    repo_with_pr_worktree, tmp_path
+):
+    """A pyproject.toml manifest found in a non-root dir (subdir/`.ship-config`-scoped
+    auto-detect) whose own directory has NO nested tests/ subdir must run bare `pytest -q`,
+    not force a `tests/` path arg that would look for a nonexistent nested tests/tests/."""
+    main, _wt = repo_with_pr_worktree
+    (main / "e2e").mkdir()
+    (main / "e2e" / "pyproject.toml").write_text("[project]\nname = 'e2e'\n", encoding="utf-8")
+    _git("add", "e2e/pyproject.toml", cwd=main)
+    _git("commit", "-qm", "add e2e pyproject.toml with no nested tests/ dir", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    uv_log = tmp_path / "uv.log"
+    uv_fake = bindir / "uv"
+    uv_fake.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> \"{uv_log}\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    uv_fake.chmod(0o755)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must run pytest without a bogus tests/ arg\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert uv_log.read_text(encoding="utf-8").strip() == "run --with pytest pytest -q"
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_warns_on_unrecognized_line(
+    repo_with_pr_worktree, tmp_path
+):
+    """A typo'd key (neither whitelisted key matches) is logged, not silently swallowed, and
+    the gate falls through to auto-detection instead of treating the typo as a real config."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DR=e2e\n", encoding="utf-8")  # typo
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "add .ship-config with a typo'd key", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "ignoring unrecognized line" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_trims_value_whitespace(repo_with_pr_worktree, tmp_path):
+    """Whitespace directly around the `=` in a .ship-config value is trimmed, so
+    `SHIP_LOCAL_TEST_DIR= e2e ` resolves to the directory `e2e`, not ` e2e `."""
+    main, _wt = repo_with_pr_worktree
+    (main / "e2e").mkdir()
+    (main / "e2e" / "package.json").write_text('{"scripts":{"test":"e2e-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR= e2e \n", encoding="utf-8")
+    _git("add", ".ship-config", "e2e/package.json", cwd=main)
+    _git("commit", "-qm", "add .ship-config with padded whitespace around the value", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"whitespace around the config value must be trimmed\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str((main / "e2e").resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_cmd_exit_code_2_blocks_not_falls_through(
+    repo_with_pr_worktree, tmp_path
+):
+    """Regression for the _ship_config_run exit-code-2 sentinel collision: a
+    SHIP_LOCAL_TEST_CMD that legitimately exits 2 must NOT be misread as 'no config to act
+    on' and silently fall through to a DIFFERENT, passing heuristic (root auto-detect here)
+    -- the audited, explicitly-configured command's own failure must block the merge."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_CMD=exit 2\n", encoding="utf-8")
+    _git("add", "package.json", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add .ship-config whose command exits 2, plus a root manifest", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        "ship must block on the .ship-config command's real exit-2 failure, not fall "
+        f"through to root auto-detect\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert not npm_log.exists(), "npm (root auto-detect) must never have run"
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_e2e_symlink_escape_is_rejected(repo_with_pr_worktree, tmp_path):
+    """A symlinked e2e/ pointing OUTSIDE the repo must not be treated as a valid e2e/
+    candidate -- the physical-descendant check catches what a lexical check on the
+    configured/discovered name alone can't."""
+    main, _wt = repo_with_pr_worktree
+    outside = tmp_path / "outside-repo"
+    outside.mkdir()
+    (outside / "package.json").write_text('{"scripts":{"test":"escape-suite"}}\n', encoding="utf-8")
+    (main / "e2e").symlink_to(outside)
+    _git("add", "e2e", cwd=main)
+    _git("commit", "-qm", "add e2e as a symlink escaping the repo", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must fail closed, not follow the symlink outside the repo\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert not npm_log.exists(), "npm must never have run in the symlink target"
+    assert "e2e/ resolves (via a symlink) outside the repo root" in r.stderr, (
+        "the e2e/ symlink-escape skip must log a specific diagnostic (matching the "
+        f".ship-config SHIP_LOCAL_TEST_DIR path), not silently fall through to the generic "
+        f"'no recognized test runner found' message\nSTDERR:\n{r.stderr}"
+    )
+
+
+def test_cidown_local_gate_ship_config_dir_symlink_escape_is_rejected(
+    repo_with_pr_worktree, tmp_path
+):
+    """A .ship-config SHIP_LOCAL_TEST_DIR that is lexically safe (no '..', not absolute) but
+    physically resolves outside the repo via a symlink must be rejected."""
+    main, _wt = repo_with_pr_worktree
+    outside = tmp_path / "outside-repo2"
+    outside.mkdir()
+    (outside / "package.json").write_text('{"scripts":{"test":"escape-suite"}}\n', encoding="utf-8")
+    (main / "escape-link").symlink_to(outside)
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=escape-link\n", encoding="utf-8")
+    _git("add", "escape-link", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add a symlinked SHIP_LOCAL_TEST_DIR escaping the repo", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must fail closed\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "resolves (via a symlink) outside the repo root" in r.stderr, r.stderr
+    assert not npm_log.exists()
+
+
+def test_cidown_local_gate_ship_config_dir_symlink_to_root_itself_is_rejected(
+    repo_with_pr_worktree, tmp_path
+):
+    """Regression: a SHIP_LOCAL_TEST_DIR that is lexically safe (a plain subdirectory name,
+    not '.'  or './') but is ITSELF a symlink resolving back to the repo root must be
+    rejected -- _dir_is_real_descendant_of_root requires a STRICT descendant, equal-to-root
+    is not good enough (a prior version of this check wrongly accepted root-equivalence,
+    which would have let this bypass the lexical '.' rejection entirely)."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / "suite").symlink_to(".", target_is_directory=True)
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=suite\n", encoding="utf-8")
+    _git("add", "suite", "package.json", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add a SHIP_LOCAL_TEST_DIR symlinked back to the repo root", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must fail closed, not accept a symlink-to-root as a scoped subdirectory\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert not npm_log.exists(), "npm must never have run via the root-equivalent symlink"
+
+
+def test_cidown_local_gate_ship_config_nul_byte_is_rejected(repo_with_pr_worktree, tmp_path):
+    """A .ship-config committed with a NUL byte embedded in a key name is refused outright,
+    not parsed -- defends against bash silently STRIPPING a NUL when the git-show output
+    becomes a variable's value, which could turn a byte sequence that never spells a
+    whitelisted key in the actual committed bytes into one that does."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_bytes(b"SHIP_LOCAL_TEST_C\x00MD=echo evil\n")
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "add .ship-config with an embedded NUL byte", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect, ignoring the NUL-containing config\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "contains a NUL byte" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_tree_is_rejected(repo_with_pr_worktree, tmp_path):
+    """If HEAD:.ship-config is a TREE (someone committed a `.ship-config/` directory) rather
+    than a blob, ship must reject it outright instead of feeding `git show`'s tree listing to
+    the KEY=value parser -- a tree entry's NAME is a plain filename that can legally contain
+    '=' and spaces, so a file literally named `SHIP_LOCAL_TEST_CMD=echo evil` inside that
+    directory must never be parsed as committed file CONTENT."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    cfg_dir = main / ".ship-config"
+    cfg_dir.mkdir()
+    (cfg_dir / "SHIP_LOCAL_TEST_CMD=echo evil").write_text("", encoding="utf-8")
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "commit .ship-config as a directory (tree), not a file", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect, ignoring the tree at .ship-config\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "is not a regular file" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], (
+        "the tree's entry name must never reach the eval'd command path\n"
+        f"npm.log: {lines}"
+    )
+
+
+def test_cidown_local_gate_ship_config_symlink_is_rejected(repo_with_pr_worktree, tmp_path):
+    """If .ship-config is committed as a SYMLINK (git tree mode 120000), ship must reject it
+    instead of parsing its blob content -- a symlink's blob content is the link TARGET
+    STRING, not test-runner config, and `git cat-file -t` reports `blob` for a symlink just
+    like it does for a regular file, so a type-only check can't tell them apart. Craft the
+    symlink target so it would parse as a valid KEY=value line if it reached the parser."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").symlink_to("SHIP_LOCAL_TEST_CMD=echo evil")
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "commit .ship-config as a symlink", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect, ignoring the symlinked .ship-config\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "is not a regular file" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], (
+        "the symlink target string must never reach the eval'd command path\n"
+        f"npm.log: {lines}"
+    )
+
+
+def test_cidown_local_gate_ship_config_empty_file_is_treated_as_absent(
+    repo_with_pr_worktree, tmp_path
+):
+    """A genuinely empty (0-byte) but COMMITTED .ship-config must fall through to
+    auto-detect quietly -- not be misreported as 'contains a NUL byte' (an empty file also
+    fails the raw grep-based NUL check for an unrelated reason, so it needs its own guard)."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("", encoding="utf-8")
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "add an empty .ship-config", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "contains a NUL byte" not in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_dir_only_wins_over_root_manifest(
+    repo_with_pr_worktree, tmp_path
+):
+    """.ship-config's DIR-only scoping (no explicit CMD) must win over a ROOT manifest too,
+    not just over rig.yaml/auto-detect in general -- a reordering bug that put root
+    auto-detect ahead of the config-file scoping would pass every other precedence test but
+    fail this one."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / "e2e").mkdir()
+    (main / "e2e" / "package.json").write_text('{"scripts":{"test":"e2e-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=e2e\n", encoding="utf-8")
+    _git("add", "package.json", "e2e/package.json", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add root+e2e package.json and a DIR-only .ship-config", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must scope to e2e/ per .ship-config\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str((main / "e2e").resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_unsafe_dir_invalidates_whole_file(
+    repo_with_pr_worktree, tmp_path
+):
+    """An unsafe SHIP_LOCAL_TEST_DIR alongside a SHIP_LOCAL_TEST_CMD must invalidate the
+    WHOLE file, not silently relocate the command to run from the repo root instead of the
+    (rejected) directory the author asked for -- that would verify a different suite than
+    intended. Falls through to normal root auto-detect instead."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    marker = tmp_path / "should-not-run.log"
+    (main / ".ship-config").write_text(
+        "SHIP_LOCAL_TEST_DIR=../escape\n"
+        f"SHIP_LOCAL_TEST_CMD=echo config-ran >> {marker}\n",
+        encoding="utf-8",
+    )
+    _git("add", "package.json", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add .ship-config with an unsafe dir plus a cmd", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not a safe repo-relative subdirectory" in r.stderr, r.stderr
+    assert not marker.exists(), "the .ship-config command must NOT have run anywhere"
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_dir_cmd_nonexistent_dir_fails_closed(
+    repo_with_pr_worktree, tmp_path
+):
+    """The DIR+CMD branch gets the same clear "does not exist under" diagnostic as the
+    DIR-only branch, instead of an opaque raw `cd` error."""
+    main, _wt = repo_with_pr_worktree
+    (main / ".ship-config").write_text(
+        "SHIP_LOCAL_TEST_DIR=does-not-exist\n"
+        "SHIP_LOCAL_TEST_CMD=true\n",
+        encoding="utf-8",
+    )
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add .ship-config with a nonexistent dir plus a cmd", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must fail closed\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "does not exist under" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_untracked_ship_config_is_ignored(repo_with_pr_worktree, tmp_path):
+    """An untracked (not `git add`ed) .ship-config is NOT honored -- the "audited, committed"
+    trust story is enforced (read from `git show HEAD:...`, not the working tree), not just
+    documented. Falls through to root auto-detect."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    _git("add", "package.json", cwd=main)
+    _git("commit", "-qm", "add root package.json", cwd=main)
+    marker = tmp_path / "should-not-run.log"
+    # Deliberately NOT git-added -- this file is untracked in the checkout ship.sh reads.
+    (main / ".ship-config").write_text(
+        f"SHIP_LOCAL_TEST_CMD=echo config-ran >> {marker}\n", encoding="utf-8"
+    )
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not committed at HEAD" in r.stderr, r.stderr
+    assert not marker.exists(), "the untracked .ship-config command must NOT have run"
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_reads_committed_content_not_dirty_worktree(
+    repo_with_pr_worktree, tmp_path
+):
+    """A TRACKED .ship-config that was subsequently modified in the working tree WITHOUT a
+    new commit must still be honored per its last COMMITTED content (the original command),
+    not the uncommitted edit -- proves the "audited" read goes through `git show HEAD:...`,
+    not the mutable worktree file."""
+    main, _wt = repo_with_pr_worktree
+    committed_marker = tmp_path / "committed-ran.log"
+    dirty_marker = tmp_path / "dirty-ran.log"
+    (main / ".ship-config").write_text(
+        f"SHIP_LOCAL_TEST_CMD=echo committed-ran >> {committed_marker}\n", encoding="utf-8"
+    )
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add .ship-config with the ORIGINAL command", cwd=main)
+    # Locally modify the tracked file WITHOUT committing -- this must be ignored.
+    (main / ".ship-config").write_text(
+        f"SHIP_LOCAL_TEST_CMD=echo dirty-ran >> {dirty_marker}\n", encoding="utf-8"
+    )
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must run the COMMITTED command\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert committed_marker.read_text(encoding="utf-8").strip() == "committed-ran"
+    assert not dirty_marker.exists(), "the uncommitted (dirty) edit must NOT have run"
+
+
+def test_cidown_local_gate_e2e_without_manifest_fails_closed(repo_with_pr_worktree, tmp_path):
+    """e2e/ exists but has NO manifest -- _LOCAL_TEST_MATCHED stays 0 and the gate correctly
+    fails closed instead of treating the mere existence of the directory as a pass. (Priority
+    5 auto-detect is narrowed to e2e/ ONLY -- test/ and tests/ are deliberately never probed,
+    see the priority-5 comment in _local_test_runner -- so there is no further candidate to
+    fall through to.)"""
+    main, _wt = repo_with_pr_worktree
+    (main / "e2e").mkdir()
+    (main / "e2e" / "README.md").write_text("not a test manifest\n", encoding="utf-8")
+    _git("add", "e2e/README.md", cwd=main)
+    _git("commit", "-qm", "add manifestless e2e/", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must fail closed\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "no recognized test runner found" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_test_and_tests_subdirs_are_never_auto_probed(
+    repo_with_pr_worktree, tmp_path
+):
+    """Regression pin for the narrowed priority-5 scope: test/ and tests/ manifests are
+    NEVER auto-detected (only e2e/ is), even when they are the ONLY subdirectories present
+    (no e2e/ at all) -- the gate must fail closed rather than guess a fixture-risk dir."""
+    main, _wt = repo_with_pr_worktree
+    (main / "test").mkdir()
+    (main / "test" / "package.json").write_text('{"scripts":{"test":"test-suite"}}\n', encoding="utf-8")
+    (main / "tests").mkdir()
+    (main / "tests" / "package.json").write_text('{"scripts":{"test":"tests-suite"}}\n', encoding="utf-8")
+    _git("add", "test/package.json", "tests/package.json", cwd=main)
+    _git("commit", "-qm", "add test/ and tests/ manifests, no e2e/", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must fail closed -- test/ and tests/ must never be auto-probed\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert not npm_log.exists(), "npm must never have run in test/ or tests/"
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_dir_dotslashdot_is_rejected(repo_with_pr_worktree, tmp_path):
+    """SHIP_LOCAL_TEST_DIR=./. (all path segments are '.') is rejected the same way plain
+    '.' is -- the safety check is component-wise, not a literal-string special case, so a
+    multi-segment all-dot path can't bypass the root-equivalence rejection."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=./.\n", encoding="utf-8")
+    _git("add", "package.json", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add .ship-config with DIR=./. (must be rejected)", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not a safe repo-relative" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_root_pyproject_with_tests_dir_still_uses_tests_arg(
+    repo_with_pr_worktree, tmp_path
+):
+    """Regression pin: a root pyproject.toml WITH a tests/ dir must still run the classic
+    `pytest tests/ -q` (byte-for-byte pre-existing root behavior) -- proves the "root" mode
+    parameter didn't accidentally loosen the primary production path to a bare `pytest -q`."""
+    main, _wt = repo_with_pr_worktree
+    (main / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+    (main / "tests").mkdir()
+    (main / "tests" / "test_x.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+    _git("add", "pyproject.toml", "tests/test_x.py", cwd=main)
+    _git("commit", "-qm", "add root pyproject.toml with a tests/ dir", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    uv_log = tmp_path / "uv.log"
+    uv_fake = bindir / "uv"
+    uv_fake.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> \"{uv_log}\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    uv_fake.chmod(0o755)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must succeed via the root pyproject.toml\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert uv_log.read_text(encoding="utf-8").strip() == "run --with pytest pytest tests/ -q"
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_subdir_suite_failure_blocks_merge(repo_with_pr_worktree, tmp_path):
+    """A matched subdirectory manifest whose test command FAILS blocks the merge -- the
+    subdir branch's own failure path, distinct from the root-exit-2 collision test."""
+    main, _wt = repo_with_pr_worktree
+    (main / "e2e").mkdir()
+    (main / "e2e" / "package.json").write_text('{"scripts":{"test":"e2e-suite"}}\n', encoding="utf-8")
+    _git("add", "e2e/package.json", cwd=main)
+    _git("commit", "-qm", "add e2e package.json", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm = bindir / "npm"
+    npm.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    npm.chmod(0o755)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must block on the e2e/ suite's failure\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_dir_with_dotdot_substring_is_not_rejected(
+    repo_with_pr_worktree, tmp_path
+):
+    """A legitimate directory whose NAME merely contains '..' as a substring (e.g. `v1..2`)
+    must NOT be rejected -- the safety check is a path-COMPONENT match, not a substring
+    match. Distinguishes this from an actual `../escape` traversal component."""
+    main, _wt = repo_with_pr_worktree
+    (main / "v1..2").mkdir()
+    (main / "v1..2" / "package.json").write_text('{"scripts":{"test":"v-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=v1..2\n", encoding="utf-8")
+    _git("add", "v1..2/package.json", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add a dir whose name merely contains '..' as a substring", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"a dir named 'v1..2' must be accepted, not rejected as unsafe\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not a safe repo-relative" not in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str((main / "v1..2").resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_dir_dot_is_rejected(repo_with_pr_worktree, tmp_path):
+    """SHIP_LOCAL_TEST_DIR=. (meaning 'the repo root itself') is rejected -- routing root
+    through non-root auto-detect would bypass the mode="root" pytest-args guarantee in
+    _local_test_try_dir. The author should omit the key entirely to mean root."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=.\n", encoding="utf-8")
+    _git("add", "package.json", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add .ship-config with DIR=. (must be rejected)", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not a safe repo-relative" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
 
 
 def test_cidown_leftover_markers_block(repo_with_pr_worktree, tmp_path):
