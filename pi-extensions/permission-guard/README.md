@@ -53,9 +53,11 @@ keys are accepted.
 
 ## Fail-closed
 
-If the policy file is **missing** the extension uses its baked-in baseline. If the file is present
-but **unparseable / invalid**, it also falls back to the baseline **and** logs a warning — the
-dangerous denies fire even with zero or corrupt config; a broken file never silently opens the gate.
+If the policy file is **missing** the extension uses its baked-in baseline, silently (a clean
+machine / not-yet-provisioned repo is expected and not an error). If the file is **present** but
+unreadable (permission/ownership drift, a directory in its place) or unparseable/invalid, it also
+falls back to the baseline but **logs a warning** — the dangerous denies fire even with zero or
+corrupt config, and a policy that exists-but-is-broken is surfaced rather than silently disabled.
 In a **non-interactive** run (`ctx.hasUI` false) an `ask` decision is **blocked** (nothing can
 prompt), while `deny` always blocks.
 
@@ -90,5 +92,6 @@ rules — which remain the deep enforcement layer underneath. For a hard boundar
 ## Test
 
 ```bash
-npm test   # tsx --test — pure matcher tests (policy.test.ts) + handler wiring tests (index.test.ts)
+npm test   # tsx --test — pure matcher tests (policy.test.ts), handler wiring tests (index.test.ts),
+           # and policy-loader tests (loader.test.ts)
 ```

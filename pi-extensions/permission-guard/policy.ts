@@ -174,8 +174,11 @@ export function splitSubCommands(command: string): string[] {
 
 /**
  * Tokenize one sub-command by whitespace, honoring single/double quotes and stripping the
- * surrounding quote characters from each token. Backslash-escapes are left as-is (over-matching a
- * guard rule is safe; under-matching is not).
+ * surrounding quote characters from each token. Unquoted backslash-escapes are RESOLVED (the
+ * backslash is consumed and the escaped character kept literally) because bash does the same
+ * before argv is built: `--for\ce` and `--no\-verify` execute as `--force` / `--no-verify`, so an
+ * exact-token flag match must see the unescaped flag or it silently under-matches (a guard
+ * bypass) instead of the safe direction (over-matching).
  */
 export function tokenize(sub: string): string[] {
 	const tokens: string[] = [];
@@ -185,13 +188,24 @@ export function tokenize(sub: string): string[] {
 	for (let i = 0; i < sub.length; i++) {
 		const ch = sub[i];
 		if (quote) {
-			if (ch === quote) quote = null;
-			else cur += ch;
+			if (ch === quote) {
+				quote = null;
+				continue;
+			}
+			cur += ch;
 			continue;
 		}
 		if (ch === '"' || ch === "'") {
 			quote = ch;
 			started = true;
+			continue;
+		}
+		// Unquoted backslash: bash consumes the backslash and keeps the next character literally
+		// (including a literal space, which must NOT become a token boundary here).
+		if (ch === "\\" && i + 1 < sub.length) {
+			cur += sub[i + 1];
+			started = true;
+			i++;
 			continue;
 		}
 		// Unquoted redirection metachars (`>`, `<`, `&`) are token boundaries, not part of a command
@@ -302,8 +316,20 @@ function ruleMatchesTokens(rule: PolicyRule, tokens: string[]): boolean {
 	if (basename(tokens[0]) !== rule.command) return false;
 	const rest = tokens.slice(1);
 	if (rule.argvAll) {
+		// Basename-broadening a match is the safe over-match direction ONLY for ask/deny — never for
+		// allow. `PolicyRule.action` is `"ask" | "deny"` by TYPE (there is no per-rule "allow"
+		// action; "allow" only ever comes from `Policy.default`), so this broadening can never widen
+		// an allow decision — it is safe by construction, not by convention.
+		// Compare by basename on BOTH sides, not the raw token: a subcommand naming a BINARY (e.g.
+		// sudo's "rm") can just as legitimately be invoked by absolute/relative path (`sudo /bin/rm`,
+		// `sudo ./rm`) as `git`/`gh`'s bare-word subcommands (`pr`, `merge`, `reset`) are —
+		// basename(need) is a no-op for the latter (no slash) and closes the path-prefix bypass for
+		// the former; taking `basename(need)` too (rather than only `basename(tok)`) also keeps a
+		// slash-containing `argvAll` entry (a rig-written rule spelled as `"bin/rm"`) matching
+		// instead of silently never firing.
 		for (const need of rule.argvAll) {
-			if (!rest.includes(need)) return false;
+			const needBase = basename(need);
+			if (!rest.some((tok) => basename(tok) === needBase)) return false;
 		}
 	}
 	if (rule.flagsAny && rule.flagsAny.length > 0) {
@@ -357,7 +383,18 @@ export function coercePolicy(value: unknown): Policy | null {
 			reason: typeof r.reason === "string" ? r.reason : "",
 		});
 	}
-	const def: Decision = v.default === "ask" || v.default === "deny" ? v.default : "allow";
+	// An absent default (or JSON `null`, e.g. from a generator that emits null for an unset field)
+	// is fine (implicit "allow"), but a PRESENT-and-invalid one (a typo like "dney") must fail the
+	// whole document closed rather than silently coerce to "allow" — a typo in a stricter policy's
+	// default must not quietly reopen the gate for unmatched commands.
+	let def: Decision;
+	if (v.default === undefined || v.default === null) {
+		def = "allow";
+	} else if (v.default === "allow" || v.default === "ask" || v.default === "deny") {
+		def = v.default;
+	} else {
+		return null;
+	}
 	const version = typeof v.version === "number" ? v.version : 1;
 	return { version, default: def, rules };
 }

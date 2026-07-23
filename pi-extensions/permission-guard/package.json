@@ -6,7 +6,7 @@
   "type": "module",
   "main": "index.ts",
   "scripts": {
-    "test": "tsx --test policy.test.ts index.test.ts"
+    "test": "tsx --test policy.test.ts index.test.ts loader.test.ts"
   },
   "keywords": ["pi", "coding-agent", "extension", "permissions", "rig"],
   "license": "MIT",

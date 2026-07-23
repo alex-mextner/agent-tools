@@ -183,6 +183,68 @@ test("coercePolicy rejects malformed documents (caller then fails closed to DEFA
 	assert.equal(coercePolicy({ rules: "nope" }), null);
 	assert.equal(coercePolicy({ rules: [{ id: "x" }] }), null); // missing command/action
 	assert.equal(coercePolicy({ rules: [{ id: "x", command: "git", action: "maybe" }] }), null);
+	assert.equal(coercePolicy({ rules: [{ id: "x", command: "git", action: "deny", argvAll: ["push", 1] }] }), null);
+});
+
+test("sudo rm matches by basename even through an absolute path (sudo /bin/rm)", () => {
+	assert.equal(decide("sudo /bin/rm -rf /tmp/x"), "deny");
+	assert.equal(decide("sudo ./rm -rf /tmp/x"), "deny");
+});
+
+test("unquoted backslash-escaped flags still match (bash strips the backslash before argv)", () => {
+	assert.equal(decide("git push --for\\ce"), "deny");
+	assert.equal(decide("git commit -m x --no\\-verify"), "deny");
+});
+
+test("an escaped space stays inside one token, it is not a token boundary", () => {
+	// `--for\ ce` is bash for the single argv token `--for ce` (one word, literal space) — it must
+	// NOT weld/split into something that spuriously matches (or evades) an exact-token flag rule.
+	assert.deepEqual(tokenize("git push --for\\ ce"), ["git", "push", "--for ce"]);
+	assert.equal(decide("git push --for\\ ce"), "allow");
+});
+
+test("a trailing lone backslash at end of input is kept literally (no crash; under-match is harmless here since a real trailing backslash also breaks the command bash would execute)", () => {
+	assert.deepEqual(tokenize("git push --force\\"), ["git", "push", "--force\\"]);
+});
+
+test("an escaped backslash collapses to one literal backslash; an escaped quote does not open a quote", () => {
+	assert.deepEqual(tokenize("echo a\\\\b"), ["echo", "a\\b"]);
+	assert.deepEqual(tokenize('echo a\\"b'), ["echo", 'a"b']);
+});
+
+test("sudo path-prefix basename matching over-matches (safe direction) when the binary name merely appears as an argument", () => {
+	// Deliberate: ruleMatchesTokens scans every remaining token, not just the one actually
+	// executed, so a path argument that happens to share a basename with a guarded subcommand also
+	// trips the rule. This is the documented safe-over-match trade-off for a deny rule, pinned here
+	// so a future edit that "fixes" this doesn't silently reopen the sudo/bin-path bypass instead.
+	assert.equal(decide("sudo cp /bin/rm /tmp/rm.bak"), "deny");
+});
+
+test("coercePolicy rejects an unknown/typo'd default instead of silently coercing to allow", () => {
+	assert.equal(coercePolicy({ version: 1, default: "dney", rules: [] }), null);
+	assert.equal(coercePolicy({ version: 1, default: "DENY", rules: [] }), null);
+	assert.equal(coercePolicy({ version: 1, default: 1, rules: [] }), null);
+	assert.equal(coercePolicy({ version: 1, default: true, rules: [] }), null);
+	assert.equal(coercePolicy({ version: 1, default: {}, rules: [] }), null);
+	// every valid default value, and an absent default, are all still accepted
+	assert.deepEqual(coercePolicy({ version: 1, default: "deny", rules: [] }), {
+		version: 1,
+		default: "deny",
+		rules: [],
+	});
+	assert.deepEqual(coercePolicy({ version: 1, default: "ask", rules: [] }), {
+		version: 1,
+		default: "ask",
+		rules: [],
+	});
+	assert.deepEqual(coercePolicy({ version: 1, rules: [] }), { version: 1, default: "allow", rules: [] });
+	// a JSON `null` default (e.g. a generator emitting null for an unset field) is treated the same
+	// as absent, NOT as an invalid value that discards the whole document
+	assert.deepEqual(coercePolicy({ version: 1, default: null, rules: [] }), {
+		version: 1,
+		default: "allow",
+		rules: [],
+	});
 });
 
 test("a custom policy default of deny blocks unmatched commands", () => {

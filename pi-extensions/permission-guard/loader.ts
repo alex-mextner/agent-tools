@@ -37,9 +37,18 @@ export function loadPolicy(env: NodeJS.ProcessEnv = process.env): LoadResult {
 	let text: string;
 	try {
 		text = readFileSync(path, "utf8");
-	} catch {
-		// missing / unreadable — clean machine or not yet provisioned. Use the baked baseline.
-		return { policy: DEFAULT_POLICY, warning: null };
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+			// genuinely missing — clean machine or not yet provisioned. Silent baked baseline.
+			return { policy: DEFAULT_POLICY, warning: null };
+		}
+		// present but unreadable (permission/ownership drift, a directory in its place, …): this is
+		// NOT the clean-machine case — a rig-installed stricter policy could be silently disabled,
+		// so surface the fallback instead of failing silently.
+		return {
+			policy: DEFAULT_POLICY,
+			warning: `permission-guard: policy at ${path} is unreadable (${String(err)}); using baked baseline (fail-closed)`,
+		};
 	}
 	let parsed: unknown;
 	try {
