@@ -58,19 +58,19 @@ never ✅.*
 - ⛔ **A real, unpatched security bypass exists on `block-raw-pr-merge`.** **Held privately, on purpose —
   NOT filed as a public GitHub issue**, because this repo is public and an issue would be premature exploit
   disclosure. The mechanics are intentionally NOT described here or in any public tracker. **Talk to the
-  CTO directly** for the dedicated private fix. This is the top security item outstanding.
-- ⏳ **agent-tools #294** — a salvaged WIP pi permission-guard extension with **5 unresolved P1/P2
-  security findings**. Deliberately held, not merged, pending a dedicated security review pass — do not
-  pick this back up casually.
-- ⛔ **The review-threads CI gate is blocking merges on live unresolved codex-bot findings** on
-  **review-cli #157** and **agent-tools #290 / #295**. There ARE two sanctioned resolution paths
-  (see `AGENTS.md` §gh-graphql: a direct single-quoted `resolveReviewThread` mutation for a
-  quorum-passed/advisory-only/bot-only finding on the agent's own PR, and `gh ship
-  --resolve-addressed-threads` for an outdated bot-only thread) — during the marathon neither applied
-  cleanly to these three PRs' actual thread state, but that per-PR eligibility was not re-verified before
-  writing this entry. **Before escalating this as a systemic gate-design problem, re-check each PR against
-  the two live paths above** — it may be a per-PR eligibility gap, not a gate redesign. If it still doesn't
-  resolve after that check, that's the **CTO decision** needed: how to handle this class of gate long-term.
+  CTO directly** for the dedicated private fix. This is the top security item outstanding — tracked in
+  "Remaining as of 2026-07-23" below.
+- 🔬 **agent-tools #294 is now MERGED** (was listed here as held, not merged). The salvaged WIP pi
+  permission-guard extension's 5 unresolved P1/P2 security findings were fixed by a dedicated security
+  review pass, which also surfaced and fixed additional, worse findings before merge — tracked for an
+  independent re-verify in "Remaining as of 2026-07-23" below.
+- 🔬 **The review-threads CI gate is no longer blocking review-cli #157 or agent-tools #290 / #295** —
+  all three have since merged (verified via `gh pr view --json state,mergedAt`; which of the two sanctioned
+  resolution paths — `AGENTS.md` §gh-graphql's direct `resolveReviewThread` mutation, or `gh ship
+  --resolve-addressed-threads` — applied per PR was not re-checked). review-cli #157 (provider-failover
+  hardening) itself carried 3 P2 codex findings fixed on the PR plus 5 follow-up issues filed for other
+  findings surfaced during the work (review-cli #169–#173, none blocking). Tracked in "Remaining as of
+  2026-07-23" below.
 - 🔬 **Correction to a prior assumption:** **task-cli #56**'s earlier finding ("the classifier denies
   merging non-authored PRs") turned out to be about one specific bad-faith retry attempt, **not** a
   permanent structural block. It was later legitimately merged by a different agent, who found and fixed a
@@ -87,6 +87,31 @@ never ✅.*
   It resumes the actual prior Claude Code conversation across a tmux server restart (`claude --resume
   <session-id>`), not just a fresh relaunch reusing the same window. Verified via isolated e2e tests plus
   live config inspection. No follow-up needed here.
+
+### Remaining as of 2026-07-23 (a snapshot, not a permanent section — supersede on the next dated block)
+
+- ⛔ **`block-raw-pr-merge` security bypass** — see "A real, unpatched security bypass exists on
+  `block-raw-pr-merge`" above. Still the single biggest open item; talk to the CTO directly, no further
+  status detail belongs in this public file.
+- ⏳ **task-cli #72** — a real design disagreement, not a bug: the codex bot flagged
+  `_daemon_bootstrapped`'s inconclusive-timeout-treated-as-healthy behavior as a P2 finding; Alex
+  responded on the PR thread that it is a deliberate, already-reviewed trade-off (an inconclusive
+  slow-but-fine bootstrap must never be misreported as a failure). PR is open, tests green, blocked only on
+  whether the repo owner wants to resolve/merge it as-is or push back further — needs Alex's own call, not
+  an agent's.
+- ⏳ **Unverified: did the review-cli #157 / agent-tools #290 / #295 merges actually go through one of
+  the two sanctioned resolution paths** (`AGENTS.md` §gh-graphql's `resolveReviewThread` mutation, or
+  `gh ship --resolve-addressed-threads`), **or around the gate some other way?** That was not re-checked
+  before this entry was written. Answer this before deciding whether "is the review-threads gate too
+  strict" is even the right question to escalate to the CTO.
+- ⏳ **agent-tools #294 (pi permission-guard) merged but not yet independently re-verified** — worth a
+  second pass before treating the fixed findings as fully closed.
+- 📋 **~16 untriaged bare branches across 5 repos**, found in a recent worktree audit — not yet triaged
+  into "finish" vs "abandon" per branch. Needs a dedicated sweep.
+- 📋 **Carried forward:** harden rig's provisioning of `ghgql`-style and `dev-cli`-style tools as
+  first-class capabilities (rather than one-off installs bolted on after the fact) — both shipped as real
+  tools this marathon but rig doesn't yet treat their provisioning as a reconciled, drift-checked target
+  the way skills/agent-hooks/CI are.
 
 ---
 
