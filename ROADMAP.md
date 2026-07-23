@@ -50,11 +50,10 @@ problem that still needs a CTO decision. As with every block above, 🔬 not ✅
 
 ### Held / deferred — deliberately, with real reasons (do not "just do it" without re-reading these)
 
-- ⛔ **A real, unpatched security bypass exists on `block-raw-pr-merge`** (clustered short `gh` flags can
-  smuggle a mutating call past the scan). **Held privately, on purpose — NOT filed as a public GitHub
-  issue**, because this repo is public and an issue would be premature exploit disclosure. The mechanics
-  are intentionally NOT described here or in any public tracker. **Talk to the CTO directly** for the
-  dedicated private fix. This is the top security item outstanding.
+- ⛔ **A real, unpatched security bypass exists on `block-raw-pr-merge`.** **Held privately, on purpose —
+  NOT filed as a public GitHub issue**, because this repo is public and an issue would be premature exploit
+  disclosure. The mechanics are intentionally NOT described here or in any public tracker. **Talk to the
+  CTO directly** for the dedicated private fix. This is the top security item outstanding.
 - ⏳ **agent-tools #294** — a salvaged WIP pi permission-guard extension with **5 unresolved P1/P2
   security findings**. Deliberately held, not merged, pending a dedicated security review pass — do not
   pick this back up casually.
