@@ -199,7 +199,10 @@ _FIELDISH = frozenset({"-F", "--field", "-f", "--raw-field"})
 # `_graphql_argument_role_is_unprovable`, `_rest_has_write_method`, `_rest_method_is_unprovable`)
 # only recognises a value flag at the START of a token (`-f`/`-F`/`-X`/...), so a merge query or a
 # write method smuggled behind a leading `-i` was invisible to all of them. Keep this set in sync
-# with `gh api --help`'s FLAGS section if a future `gh` adds another short boolean flag.
+# with `gh api --help`'s FLAGS section if a future `gh` adds another short boolean flag: if it is
+# NOT kept in sync, the new flag's char is unrecognized by BOTH short-char sets, which
+# `_gh_api_flags_contain_unprovable_cluster` (#333 review finding) now catches and blocks on —
+# drift here degrades to a (safe) over-block, never a silent bypass.
 _API_BOOL_SHORT_CHARS = frozenset({"i"})
 # Every value-taking short flag letter `gh api` defines (the short forms of `_API_VALUE_FLAGS`
 # plus `-f`/`-F`, which are tracked separately in `_FIELDISH`). Verified against `gh api --help`:
@@ -230,6 +233,67 @@ def _expand_clustered_short_flag(token: str) -> list[str] | None:
     if body[i] not in _API_VALUE_SHORT_CHARS:
         return None  # next char is not a recognized value flag in this position
     return [f"-{c}" for c in body[:i]] + [f"-{body[i:]}"]
+
+
+def _short_flag_cluster_is_unprovable(token: str) -> bool:
+    """True iff `token` looks like a pflag-style clustered short-flag group whose leading char, or
+    the char right after a recognized leading boolean run, is NEITHER a recognized boolean short
+    flag (`_API_BOOL_SHORT_CHARS`) NOR a recognized value-taking one (`_API_VALUE_SHORT_CHARS`) —
+    i.e. `_expand_clustered_short_flag` gave up on it (returned None) for a reason OTHER than "this
+    is a plain, already-handled direct value flag" (`-Ffoo`, `-Xvalue`, ...).
+
+    Why this matters (review finding on #333): `_expand_clustered_short_flag` returning None for
+    such a token leaves it completely UNEXPANDED, and every downstream detector
+    (`_gh_api_endpoint`, `_graphql_carries_merge_mutation`, `_graphql_query_field_values`,
+    `_rest_has_write_method`, ...) treats ANY `-`-prefixed token it doesn't specifically recognize
+    as an inert boolean flag and skips over it. So a token like `-zFquery=@merge.graphql` — a
+    hypothetical FUTURE `gh api` boolean short flag `-z` clustered ahead of `-F` — would sail
+    through completely invisible to every detector, reopening the exact bypass class this whole
+    clustered-flag fix exists to close, the moment `gh` adds a second boolean short flag and this
+    hard-coded set is not updated in lockstep. Fail closed: an unrecognized short-flag char at the
+    classification boundary is UNPROVABLE (might be a future bool flag hiding a merge-carrying
+    value), not benign — the caller must block rather than silently pass the token through.
+
+    Deliberately NOT triggered by a token whose leading char is already a recognized, standalone
+    value flag (`-Ffoo`, `-Xvalue`, `-tsomething`, ...) — those are handled directly, by their own
+    `-[fF]`/`-X`/... prefix checks elsewhere, and are not a gap."""
+    if not token.startswith("-") or token.startswith("--") or len(token) < 2:
+        return False
+    body = token[1:]
+    i = 0
+    while i < len(body) and body[i] in _API_BOOL_SHORT_CHARS:
+        i += 1
+    if i >= len(body):
+        return False  # a pure recognized-boolean cluster (or a single bool char) — nothing hidden
+    if body[i] in _API_VALUE_SHORT_CHARS:
+        # A recognized value flag right at the boundary — either a direct/glued value flag with no
+        # leading boolean (`-Ffoo`, `-Xvalue`, i == 0) or a legitimate boolean-then-value cluster
+        # (`-iFquery=x`, i > 0). Both are handled correctly elsewhere (by `_expand_clustered_short_flag`
+        # or by the plain `-[fF]`/`-X`/... prefix checks), not a gap.
+        return False
+    return True  # unrecognized char at the classification boundary — can't prove it's safe
+
+
+def _gh_api_flags_contain_unprovable_cluster(rest: list[str]) -> bool:
+    """True iff some token in FLAG POSITION within `rest` (args after `gh api`) is an unprovable
+    short-flag cluster (see `_short_flag_cluster_is_unprovable`). Mirrors
+    `_expand_clustered_gh_api_flags`'s value-position tracking so a preceding detached value flag's
+    OPERAND (which may itself happen to start with `-` and look cluster-shaped) is never
+    misclassified as a flag to judge."""
+    expect_value = False
+    for tok in rest:
+        if expect_value:
+            expect_value = False  # the operand of a preceding detached value flag — never a flag
+            continue
+        if tok in _API_VALUE_FLAGS or tok in _FIELDISH:
+            expect_value = True
+            continue
+        if _short_flag_cluster_is_unprovable(tok):
+            return True
+        expanded = _expand_clustered_short_flag(tok)
+        if expanded is not None and len(expanded[-1]) == 2:  # trailing value flag, value detached
+            expect_value = True
+    return False
 
 
 def _expand_clustered_gh_api_flags(rest: list[str]) -> list[str]:
@@ -913,7 +977,13 @@ def _gh_api_is_merge(rest: list[str], strict: bool = False) -> bool:
     that can't be proven safe). `strict` — see `_graphql_query_is_unprovable`.
 
     `rest` is expanded first (`_expand_clustered_gh_api_flags`) so a clustered short-flag spelling
-    (`-iFquery=...`, `-iXPUT`) is scanned exactly like its unclustered equivalent."""
+    (`-iFquery=...`, `-iXPUT`) is scanned exactly like its unclustered equivalent. Checked BEFORE
+    expansion for an unprovable cluster (`_gh_api_flags_contain_unprovable_cluster`, #333 review
+    finding): an unrecognized short-flag char is a token `_expand_clustered_gh_api_flags` leaves
+    completely untouched, invisible to every detector below — so it must force a block here rather
+    than silently fall through as "not a merge"."""
+    if _gh_api_flags_contain_unprovable_cluster(rest):
+        return True
     rest = _expand_clustered_gh_api_flags(rest)
     endpoint = _gh_api_endpoint(rest)
     is_graphql = endpoint == "graphql" or (endpoint or "").endswith("/graphql")

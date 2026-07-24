@@ -2007,6 +2007,99 @@ def test_gh_api_every_value_flag_operand_shaped_like_a_cluster_stays_allowed_whe
     assert _decision(out) == "allow"
 
 
+# ── Unrecognized short-flag char in a cluster — fails closed (#333 review finding) ──────────
+#
+# `-z` is not a real `gh api` flag today (neither in `_API_BOOL_SHORT_CHARS` nor
+# `_API_VALUE_SHORT_CHARS`), so it stands in for a hypothetical FUTURE boolean short flag this
+# hardcoded allowlist has not been updated for yet — exactly the drift scenario the review raised.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Glued value behind the unrecognized leading char.
+        "gh api -zFquery=@merge_payload.graphql graphql",
+        # Detached value flag behind the unrecognized leading char.
+        "gh api -zF query=@merge_payload.graphql graphql",
+        # A shell-variable-fed query is equally unreadable.
+        "gh api -zFquery=$Q graphql",
+        # A real, INLINE merge mutation hidden behind the unrecognized leading char — before the
+        # fix this was not merely "unprovable", it was a real, exploitable, silent bypass: the
+        # whole token was left unexpanded and treated as an inert boolean flag.
+        "gh api -zFquery='mutation{ mergePullRequest(input:{pullRequestId:\"x\"}){ clientMutationId } }' graphql",
+        # An unrecognized char clustered ahead of a write method on the REST merge endpoint.
+        "gh api -zXPUT repos/o/r/pulls/1/merge",
+        "gh api -zX PUT repos/o/r/pulls/1/merge",
+    ],
+)
+def test_gh_api_unrecognized_clustered_short_flag_char_is_blocked(command, monkeypatch):
+    """A leading short-flag char that is in NEITHER `_API_BOOL_SHORT_CHARS` NOR
+    `_API_VALUE_SHORT_CHARS` must block the call outright, not fall through to "not a merge".
+
+    Before this fix, `_expand_clustered_short_flag` returned None for such a token (it is neither a
+    recognized boolean-then-value cluster nor a plain value flag), and `_expand_clustered_gh_api_flags`
+    then left it completely UNTOUCHED in the output. Every downstream detector
+    (`_gh_api_endpoint`, `_graphql_carries_merge_mutation`, `_graphql_query_field_values`,
+    `_rest_has_write_method`) only recognizes a value flag at the START of a token, so an
+    unrecognized-prefixed token like `-zFquery=...` reads as an opaque, harmless boolean flag to
+    ALL of them — the query field, the write method, everything after the unrecognized char is
+    completely invisible. That is precisely the bypass class this whole clustered-flag fix (#333)
+    exists to close, reopened the moment `gh` adds a flag this hardcoded set hasn't caught up to.
+    The fix (`_gh_api_flags_contain_unprovable_cluster`) makes an unrecognized leading char
+    UNPROVABLE rather than silently inert, so the call blocks."""
+    out, _err, code = _run(command, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_short_flag_cluster_unprovable_detector_direct():
+    """Direct unit coverage of `_short_flag_cluster_is_unprovable`, independent of the full
+    CLI-simulation harness — pins the exact boundary the detector draws, since there is no real
+    `gh` flag today that exercises the "unrecognized leading char" branch through an actual `gh`
+    invocation other than a made-up one."""
+    # An unrecognized leading char followed by a recognized value char: genuinely unprovable.
+    assert hook._short_flag_cluster_is_unprovable("-zFquery=x") is True
+    # An unrecognized leading char with nothing recognizable after it either: still unprovable —
+    # we cannot rule out it hides a value flag/query behind more unrecognized structure.
+    assert hook._short_flag_cluster_is_unprovable("-zq") is True
+    # A recognized boolean run followed by an unrecognized char: also unprovable (case not caught
+    # by the pre-fix code, which only checked the FIRST unrecognized position after the leading
+    # booleans and likewise fell through to None/pass-through).
+    assert hook._short_flag_cluster_is_unprovable("-izquery=x") is True
+    # A plain, already-handled direct value flag (no leading boolean at all) is NOT unprovable —
+    # it's scanned correctly elsewhere by its own `-[fF]`/`-X`/... prefix check.
+    assert hook._short_flag_cluster_is_unprovable("-Ffoo") is False
+    assert hook._short_flag_cluster_is_unprovable("-Xvalue") is False
+    # A pure recognized-boolean cluster (nothing to hide behind it) is not unprovable.
+    assert hook._short_flag_cluster_is_unprovable("-ii") is False
+    assert hook._short_flag_cluster_is_unprovable("-i") is False
+    # A legitimate recognized boolean-then-value cluster is not unprovable (it's a normal,
+    # expandable cluster `_expand_clustered_short_flag` handles directly).
+    assert hook._short_flag_cluster_is_unprovable("-iFquery=x") is False
+    # Not cluster-shaped at all: long flags, `--`, and a bare non-flag token are never flagged.
+    assert hook._short_flag_cluster_is_unprovable("--field") is False
+    assert hook._short_flag_cluster_is_unprovable("graphql") is False
+    assert hook._short_flag_cluster_is_unprovable("-i") is False
+
+
+def test_gh_api_flags_contain_unprovable_cluster_respects_value_position():
+    """`_gh_api_flags_contain_unprovable_cluster` must not misjudge a preceding detached value
+    flag's OPERAND as a flag to classify, mirroring the same operand-protection guarantee proven
+    for `_expand_clustered_gh_api_flags` elsewhere in this file."""
+    # `-zX` here is `-t`'s template-string OPERAND, not a flag — must not be flagged.
+    assert hook._gh_api_flags_contain_unprovable_cluster(["-t", "-zX", "graphql"]) is False
+    # But a genuine unrecognized cluster in flag position is caught.
+    assert hook._gh_api_flags_contain_unprovable_cluster(["-zFquery=x", "graphql"]) is True
+
+
+def test_gh_api_is_merge_blocks_on_unrecognized_cluster_before_expansion():
+    """Direct coverage of the `_gh_api_is_merge` wiring: an unprovable cluster forces `True`
+    (block) even though, absent this check, the rest of the function would resolve the endpoint as
+    a harmless-looking bare `graphql` positional and find no merge mutation (the query field is
+    invisible to it, exactly as pre-fix)."""
+    assert hook._gh_api_is_merge(["graphql", "-zFquery=@merge.graphql"]) is True
+
+
 def test_api_bool_and_value_short_chars_stay_disjoint_and_in_sync():
     """`_API_BOOL_SHORT_CHARS` and `_API_VALUE_SHORT_CHARS` each mirror `gh api`'s flag grammar by
     hand (review flagged this as a drift risk: if a future `gh` adds a second boolean short flag
@@ -2021,11 +2114,13 @@ def test_api_bool_and_value_short_chars_stay_disjoint_and_in_sync():
     short_value_flags = {
         f.lstrip("-") for f in hook._API_VALUE_FLAGS if f.startswith("-") and not f.startswith("--")
     }
-    # Both directions matter: missing a real short flag fails CLOSED (an unrecognized value flag
-    # is simply never expanded as a cluster, so it's scanned as before this fix — no regression);
-    # an EXTRA, non-real char in `_API_VALUE_SHORT_CHARS` is the fail-OPEN direction a review
-    # flagged — it would make `_expand_clustered_short_flag` treat a bogus char as a real trailing
-    # value flag and swallow the next token as its operand, hiding the real endpoint/query.
+    # Both directions matter: a real short flag missing from either set now fails CLOSED for real
+    # (`_gh_api_flags_contain_unprovable_cluster`, #333 review finding — an unrecognized char at
+    # the classification boundary blocks the call outright, it is no longer silently left
+    # unexpanded and invisible to every detector); an EXTRA, non-real char in
+    # `_API_VALUE_SHORT_CHARS` is the fail-OPEN direction a review flagged — it would make
+    # `_expand_clustered_short_flag` treat a bogus char as a real trailing value flag and swallow
+    # the next token as its operand, hiding the real endpoint/query.
     assert short_value_flags <= hook._API_VALUE_SHORT_CHARS
     assert hook._API_VALUE_SHORT_CHARS - {"f", "F"} <= short_value_flags
 
