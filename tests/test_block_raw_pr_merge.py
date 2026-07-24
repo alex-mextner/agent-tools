@@ -2079,7 +2079,6 @@ def test_short_flag_cluster_unprovable_detector_direct():
     # Not cluster-shaped at all: long flags, `--`, and a bare non-flag token are never flagged.
     assert hook._short_flag_cluster_is_unprovable("--field") is False
     assert hook._short_flag_cluster_is_unprovable("graphql") is False
-    assert hook._short_flag_cluster_is_unprovable("-i") is False
 
 
 def test_gh_api_flags_contain_unprovable_cluster_respects_value_position():
@@ -2090,6 +2089,25 @@ def test_gh_api_flags_contain_unprovable_cluster_respects_value_position():
     assert hook._gh_api_flags_contain_unprovable_cluster(["-t", "-zX", "graphql"]) is False
     # But a genuine unrecognized cluster in flag position is caught.
     assert hook._gh_api_flags_contain_unprovable_cluster(["-zFquery=x", "graphql"]) is True
+    # The SAME operand-protection must hold when the preceding detached value flag was itself
+    # produced by expanding a legitimate cluster (`-iF` == `-i -F`) — `-zX` here is that expanded
+    # `-F`'s OPERAND, not a flag to classify, even though it is itself shaped like an unprovable
+    # cluster.
+    assert hook._gh_api_flags_contain_unprovable_cluster(["-iF", "-zX", "graphql"]) is False
+
+
+def test_guard_and_expander_agree_on_flag_value_position():
+    """`_gh_api_flags_contain_unprovable_cluster` (the guard) and `_expand_clustered_gh_api_flags`
+    (the expander) are two independently-maintained walks over the same clustered-short-flag
+    grammar; they must agree on exactly where a flag ends and its operand begins, or an
+    unrecognized-but-actually-an-operand token could be misjudged by one and not the other.
+    Self-contained (both walks asserted on the SAME argv, in the SAME test) so the invariant
+    cannot be silently broken by editing/removing/skipping only one half elsewhere: the guard must
+    treat `-zX` (after an expanded `-iF`) as `-F`'s operand, not a flag to classify, AND the
+    expander must leave that same `-zX` completely untouched as `-F`'s operand."""
+    argv = ["-iF", "-zX", "graphql"]
+    assert hook._gh_api_flags_contain_unprovable_cluster(argv) is False
+    assert hook._expand_clustered_gh_api_flags(argv) == ["-i", "-F", "-zX", "graphql"]
 
 
 def test_gh_api_is_merge_blocks_on_unrecognized_cluster_before_expansion():

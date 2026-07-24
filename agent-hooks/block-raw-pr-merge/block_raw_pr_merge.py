@@ -981,7 +981,21 @@ def _gh_api_is_merge(rest: list[str], strict: bool = False) -> bool:
     expansion for an unprovable cluster (`_gh_api_flags_contain_unprovable_cluster`, #333 review
     finding): an unrecognized short-flag char is a token `_expand_clustered_gh_api_flags` leaves
     completely untouched, invisible to every detector below — so it must force a block here rather
-    than silently fall through as "not a merge"."""
+    than silently fall through as "not a merge". This is the ONE call site wired to the guard
+    (`_is_merge_route` always reaches a `gh api` segment through this function); any future entry
+    point that scans `rest`/detector output directly, bypassing `_gh_api_is_merge`, would need the
+    same guard re-added — it is not (yet) structural to the expander itself (review finding).
+
+    Unconditional regardless of `strict` — unlike the graphql-query-value unprovability below
+    (which is genuinely quote-context-dependent: a nested caller may have already applied shell
+    expansion the top level hasn't), an unrecognized short-flag char is equally un-classifiable at
+    every recursion depth. It is the same class of "cannot be read at all" as a file/stdin-backed
+    query (`@f`/`--input`), which likewise blocks regardless of `strict` — not the class of "may be
+    expanded depending on quoting" that `strict` actually governs. A deliberate, broad
+    (endpoint-agnostic) over-block: an unrecognized cluster forces a block even on an unrelated
+    read-only endpoint, because the hidden char could be smuggling ANY flag/value, not only a
+    graphql query — narrowing the check to "only within a detected graphql/merge context" would
+    reopen exactly the invisibility gap this guard exists to close (review finding)."""
     if _gh_api_flags_contain_unprovable_cluster(rest):
         return True
     rest = _expand_clustered_gh_api_flags(rest)
