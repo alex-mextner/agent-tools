@@ -1287,7 +1287,15 @@ def test_core_bare_fix_command_is_paste_safe_for_special_path(tmp_path):
 # outage and run a local fallback gate instead of blocking the merge. Tests here use:
 #   SHIP_TEST_CI_DOWN=1  — force-trigger ci_appears_structurally_down() without network
 #   SHIP_LOCAL_TEST_CMD  — override the auto-detected test runner command
-#   SHIP_TEST_DIFF       — inject custom diff text for the leftover-marker check
+#   SHIP_TEST_DIFF       — inject custom diff text for the leftover-marker check. Pass via
+#                          env_extra, not the ambient shell: _run_ship_cidown scrubs any
+#                          inherited SHIP_TEST_DIFF/SHIP_TEST_DIFF_FILE first, then
+#                          transparently spills a non-empty SHIP_TEST_DIFF from env_extra to
+#                          a file and sets SHIP_TEST_DIFF_FILE instead (read by the fake
+#                          `gh` scripts below) — a raw diff string left in the environment
+#                          can trip Linux execve()'s per-argument/per-env-string limit
+#                          (MAX_ARG_STRLEN, 128 KiB) for large fixtures (e.g. a whole
+#                          source file).
 #
 # The fake gh for these tests returns two FAILED checks (100% failure rate), answers
 # the local-gate sub-queries (review threads → 0, PR body → empty, diff → configurable),
@@ -1321,6 +1329,9 @@ case "$sub" in
       diff)
         if printf '%s ' "$@" | grep -q -- --name-only; then
           printf 'src/a.py'
+        elif [ -n "${SHIP_TEST_DIFF_FILE:-}" ]; then
+          [ -r "$SHIP_TEST_DIFF_FILE" ] || { echo "fake gh: SHIP_TEST_DIFF_FILE not readable: $SHIP_TEST_DIFF_FILE" >&2; exit 1; }
+          cat < "$SHIP_TEST_DIFF_FILE"
         else
           printf '%s\\n' "${SHIP_TEST_DIFF:-+new line without markers}"
         fi ;;
@@ -1408,6 +1419,9 @@ case "$sub" in
       diff)
         if printf '%s ' "$@" | grep -q -- --name-only; then
           printf 'src/a.py'
+        elif [ -n "${SHIP_TEST_DIFF_FILE:-}" ]; then
+          [ -r "$SHIP_TEST_DIFF_FILE" ] || { echo "fake gh: SHIP_TEST_DIFF_FILE not readable: $SHIP_TEST_DIFF_FILE" >&2; exit 1; }
+          cat < "$SHIP_TEST_DIFF_FILE"
         else
           printf '%s\\n' "${SHIP_TEST_DIFF:-+new line without markers}"
         fi ;;
@@ -1437,12 +1451,58 @@ def _run_ship_cidown(main: Path, bindir: Path, env_extra: dict | None = None):
     # may carry, so a test only sees a foreign target when it sets one explicitly via env_extra.
     env.pop("GH_REPO", None)
     env.pop("GH_SHIP_REPO", None)
+    # Never inherit a stale SHIP_TEST_DIFF / SHIP_TEST_DIFF_FILE from the ambient shell —
+    # the fake `gh` scripts prefer the file over the inline var, so a leftover value would
+    # silently override (or, if a stale file no longer exists, break) a test that sets
+    # neither. A test that wants either passes it explicitly via env_extra below.
+    env.pop("SHIP_TEST_DIFF", None)
+    env.pop("SHIP_TEST_DIFF_FILE", None)
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
     env["SHIP_TEST_BRANCH"] = "feat"
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     if env_extra:
         env.update(env_extra)
+    # No caller passes both today (env_extra is dict[str, str] and diff fixtures are the
+    # ordinary source-text this fixture set always contains); fail loudly rather than
+    # silently pick a precedence if that ever changes, instead of guessing.
+    assert not (env.get("SHIP_TEST_DIFF") and env.get("SHIP_TEST_DIFF_FILE")), (
+        "_run_ship_cidown: env_extra set both SHIP_TEST_DIFF and SHIP_TEST_DIFF_FILE — "
+        "pick one (SHIP_TEST_DIFF is auto-spilled to a file for you)"
+    )
+    # Bash's `${SHIP_TEST_DIFF:-default}` (used by the fake `gh` scripts) falls through to
+    # the default on both unset AND empty — preserve that by only spilling a non-empty value.
+    diff_value = env.get("SHIP_TEST_DIFF")
+    if diff_value:
+        # Always spill through a file rather than a raw env string: Linux execve() rejects
+        # any single argv/envp string longer than MAX_ARG_STRLEN (128 KiB, kernel constant),
+        # independent of the overall ARG_MAX budget — a large fixture (e.g. this file's own
+        # ~427 KB source, prefixed with ci/ship/ship.sh) blows straight past that on GitHub's
+        # ubuntu-latest runners even though it silently "worked" locally (macOS has no
+        # equivalent per-string cap). Spilling unconditionally — not just above a size
+        # threshold — keeps exactly one code path so a small and a large fixture can never
+        # diverge, and exercises the file-read branch of the fake `gh` scripts on every
+        # platform and every cidown test that sets SHIP_TEST_DIFF at all (small or large),
+        # not only the rare oversized one.
+        # Match printf '%s\n' (what direct-env consumption used) so file-backed output is
+        # byte-identical to the old inline path for any consumer that's last-line sensitive.
+        # Plain strict UTF-8 (not surrogateescape): every fixture in this file is ordinary
+        # ASCII/UTF-8 source text, and `_sh` decodes ship.sh's stdout/stderr with strict
+        # UTF-8 too (see _sh above) — matching that keeps decode behavior consistent
+        # end-to-end instead of tolerating bytes on write that would crash on readback.
+        # Written into bindir (already the harness's own per-test scratch dir — unique per
+        # pytest invocation via `tmp_path`, and never the `main` checkout ship.sh operates
+        # on) so it can never surface as an untracked file or collide across parallel runs.
+        if "\x00" in diff_value:
+            # subprocess (the old direct-env path) rejects an embedded NUL in an env value
+            # with ValueError: embedded null byte — a file write wouldn't, but bash command
+            # substitution in ship.sh silently drops NULs, so a NUL fixture would silently
+            # change meaning instead of failing loudly. Match the old failure mode.
+            raise ValueError("SHIP_TEST_DIFF fixture contains an embedded NUL byte")
+        diff_file = bindir / "ship_test_diff.txt"
+        diff_file.write_text(diff_value + "\n", encoding="utf-8")
+        del env["SHIP_TEST_DIFF"]
+        env["SHIP_TEST_DIFF_FILE"] = str(diff_file)
     return _sh(
         "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
         cwd=main, env=env,
