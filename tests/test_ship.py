@@ -1287,7 +1287,15 @@ def test_core_bare_fix_command_is_paste_safe_for_special_path(tmp_path):
 # outage and run a local fallback gate instead of blocking the merge. Tests here use:
 #   SHIP_TEST_CI_DOWN=1  — force-trigger ci_appears_structurally_down() without network
 #   SHIP_LOCAL_TEST_CMD  — override the auto-detected test runner command
-#   SHIP_TEST_DIFF       — inject custom diff text for the leftover-marker check
+#   SHIP_TEST_DIFF       — inject custom diff text for the leftover-marker check. Pass via
+#                          env_extra, not the ambient shell: _run_ship_cidown scrubs any
+#                          inherited SHIP_TEST_DIFF/SHIP_TEST_DIFF_FILE first, then
+#                          transparently spills a non-empty SHIP_TEST_DIFF from env_extra to
+#                          a file and sets SHIP_TEST_DIFF_FILE instead (read by the fake
+#                          `gh` scripts below) — a raw diff string left in the environment
+#                          can trip Linux execve()'s per-argument/per-env-string limit
+#                          (MAX_ARG_STRLEN, 128 KiB) for large fixtures (e.g. a whole
+#                          source file).
 #
 # The fake gh for these tests returns two FAILED checks (100% failure rate), answers
 # the local-gate sub-queries (review threads → 0, PR body → empty, diff → configurable),
@@ -1321,6 +1329,9 @@ case "$sub" in
       diff)
         if printf '%s ' "$@" | grep -q -- --name-only; then
           printf 'src/a.py'
+        elif [ -n "${SHIP_TEST_DIFF_FILE:-}" ]; then
+          [ -r "$SHIP_TEST_DIFF_FILE" ] || { echo "fake gh: SHIP_TEST_DIFF_FILE not readable: $SHIP_TEST_DIFF_FILE" >&2; exit 1; }
+          cat < "$SHIP_TEST_DIFF_FILE"
         else
           printf '%s\\n' "${SHIP_TEST_DIFF:-+new line without markers}"
         fi ;;
@@ -1408,6 +1419,9 @@ case "$sub" in
       diff)
         if printf '%s ' "$@" | grep -q -- --name-only; then
           printf 'src/a.py'
+        elif [ -n "${SHIP_TEST_DIFF_FILE:-}" ]; then
+          [ -r "$SHIP_TEST_DIFF_FILE" ] || { echo "fake gh: SHIP_TEST_DIFF_FILE not readable: $SHIP_TEST_DIFF_FILE" >&2; exit 1; }
+          cat < "$SHIP_TEST_DIFF_FILE"
         else
           printf '%s\\n' "${SHIP_TEST_DIFF:-+new line without markers}"
         fi ;;
@@ -1437,12 +1451,58 @@ def _run_ship_cidown(main: Path, bindir: Path, env_extra: dict | None = None):
     # may carry, so a test only sees a foreign target when it sets one explicitly via env_extra.
     env.pop("GH_REPO", None)
     env.pop("GH_SHIP_REPO", None)
+    # Never inherit a stale SHIP_TEST_DIFF / SHIP_TEST_DIFF_FILE from the ambient shell —
+    # the fake `gh` scripts prefer the file over the inline var, so a leftover value would
+    # silently override (or, if a stale file no longer exists, break) a test that sets
+    # neither. A test that wants either passes it explicitly via env_extra below.
+    env.pop("SHIP_TEST_DIFF", None)
+    env.pop("SHIP_TEST_DIFF_FILE", None)
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
     env["SHIP_TEST_BRANCH"] = "feat"
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     if env_extra:
         env.update(env_extra)
+    # No caller passes both today (env_extra is dict[str, str] and diff fixtures are the
+    # ordinary source-text this fixture set always contains); fail loudly rather than
+    # silently pick a precedence if that ever changes, instead of guessing.
+    assert not (env.get("SHIP_TEST_DIFF") and env.get("SHIP_TEST_DIFF_FILE")), (
+        "_run_ship_cidown: env_extra set both SHIP_TEST_DIFF and SHIP_TEST_DIFF_FILE — "
+        "pick one (SHIP_TEST_DIFF is auto-spilled to a file for you)"
+    )
+    # Bash's `${SHIP_TEST_DIFF:-default}` (used by the fake `gh` scripts) falls through to
+    # the default on both unset AND empty — preserve that by only spilling a non-empty value.
+    diff_value = env.get("SHIP_TEST_DIFF")
+    if diff_value:
+        # Always spill through a file rather than a raw env string: Linux execve() rejects
+        # any single argv/envp string longer than MAX_ARG_STRLEN (128 KiB, kernel constant),
+        # independent of the overall ARG_MAX budget — a large fixture (e.g. this file's own
+        # ~427 KB source, prefixed with ci/ship/ship.sh) blows straight past that on GitHub's
+        # ubuntu-latest runners even though it silently "worked" locally (macOS has no
+        # equivalent per-string cap). Spilling unconditionally — not just above a size
+        # threshold — keeps exactly one code path so a small and a large fixture can never
+        # diverge, and exercises the file-read branch of the fake `gh` scripts on every
+        # platform and every cidown test that sets SHIP_TEST_DIFF at all (small or large),
+        # not only the rare oversized one.
+        # Match printf '%s\n' (what direct-env consumption used) so file-backed output is
+        # byte-identical to the old inline path for any consumer that's last-line sensitive.
+        # Plain strict UTF-8 (not surrogateescape): every fixture in this file is ordinary
+        # ASCII/UTF-8 source text, and `_sh` decodes ship.sh's stdout/stderr with strict
+        # UTF-8 too (see _sh above) — matching that keeps decode behavior consistent
+        # end-to-end instead of tolerating bytes on write that would crash on readback.
+        # Written into bindir (already the harness's own per-test scratch dir — unique per
+        # pytest invocation via `tmp_path`, and never the `main` checkout ship.sh operates
+        # on) so it can never surface as an untracked file or collide across parallel runs.
+        if "\x00" in diff_value:
+            # subprocess (the old direct-env path) rejects an embedded NUL in an env value
+            # with ValueError: embedded null byte — a file write wouldn't, but bash command
+            # substitution in ship.sh silently drops NULs, so a NUL fixture would silently
+            # change meaning instead of failing loudly. Match the old failure mode.
+            raise ValueError("SHIP_TEST_DIFF fixture contains an embedded NUL byte")
+        diff_file = bindir / "ship_test_diff.txt"
+        diff_file.write_text(diff_value + "\n", encoding="utf-8")
+        del env["SHIP_TEST_DIFF"]
+        env["SHIP_TEST_DIFF_FILE"] = str(diff_file)
     return _sh(
         "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
         cwd=main, env=env,
@@ -3367,16 +3427,31 @@ def test_cidown_local_gate_ship_config_dir_dot_is_rejected(repo_with_pr_worktree
     assert lines == ["test", str(main.resolve())], lines
 
 
+# Split so this file's OWN source never spells a leftover marker as one contiguous
+# token — ship.sh's _local_leftover_check scans this test file's added diff lines
+# too (it is one of the two files that legitimately needs to exercise these markers
+# as literal test data), so a fixture/docstring that wrote a marker literally would
+# self-trigger the CI-outage fallback whenever a PR touches this file
+# (agent-tools#318). Same idea as the bracket-expression idiom ship.sh applies to its
+# own regex definition line — construct the marker at runtime, never spell it whole
+# in source.
+MARK_T = "TO" "DO"
+MARK_F = "FIX" "ME"
+MARK_H = "HAC" "K"
+MARK_X = "XX" "X"
+
+
 def test_cidown_leftover_markers_block(repo_with_pr_worktree, tmp_path):
-    """CI-down path: local tests pass but PR diff has a TODO leftover → local gate fails."""
+    """CI-down path: local tests pass but PR diff has an unfinished-work ([T]ODO)
+    leftover -> local gate fails."""
     main, _wt = repo_with_pr_worktree
     bindir = _fake_gh_cidown_dir(tmp_path)
 
     r = _run_ship_cidown(main, bindir, {
         "SHIP_TEST_CI_DOWN": "1",
         "SHIP_LOCAL_TEST_CMD": "true",
-        # Inject a diff addition with a TODO leftover marker
-        "SHIP_TEST_DIFF": "+new code  # TODO: clean this up later",
+        # Inject a diff addition with a leftover marker
+        "SHIP_TEST_DIFF": f"+new code  # {MARK_T}: clean this up later",
     })
 
     assert r.returncode != 0, (
@@ -3384,6 +3459,265 @@ def test_cidown_leftover_markers_block(repo_with_pr_worktree, tmp_path):
     )
     assert "leftover markers" in r.stderr, r.stderr
     assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_mktemp_template_not_flagged_as_leftover(repo_with_pr_worktree, tmp_path):
+    """CI-down path: a diff addition using bash's conventional mktemp XXXXXX (6-X)
+    template suffix (e.g. `mktemp -d "/tmp/foo.XXXXXX"`) must NOT be flagged as a
+    leftover [X]XX marker — this is standard, legitimate shell code, not a debug
+    marker (issue #316)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",  # disable dwell gate: fake PR has no review timestamps
+        "SHIP_TEST_DIFF": '+  tmp=$(mktemp -d "/tmp/foo.' + MARK_X + MARK_X + '")',
+    })
+
+    assert r.returncode == 0, (
+        f"ship must NOT block on a mktemp XXXXXX template\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" not in r.stderr, r.stderr
+
+
+def test_cidown_standalone_xxx_marker_still_blocks(repo_with_pr_worktree, tmp_path):
+    """CI-down path: a genuine standalone [X]XX marker (not part of a longer X run)
+    must still be caught by the leftover-marker gate after the word-boundary fix."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",  # disable dwell gate: keep the marker gate the only cause
+        "SHIP_TEST_DIFF": f"+// {MARK_X}: this is broken, fix before merge",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on a standalone [X]XX marker\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_todo_substring_still_blocks(repo_with_pr_worktree, tmp_path):
+    """CI-down path: [T]ODO/[F]IXME/[H]ACK deliberately keep plain substring matching
+    (unlike [X]XX) so this fallback gate stays at least as strict as the CI-side
+    ci/leftover-grep/leftover-grep.sh untracked-marker check, which also
+    substring-matches — a sentinel identifier like `[T]ODO_REMOVE_BEFORE_MERGE` must
+    still be caught here too, otherwise the CI-outage fallback would be weaker than
+    the normal CI-up gate (agent-tools#316 review discussion)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": f"+const retryCount = 3; // {MARK_T}_REMOVE_BEFORE_MERGE",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on a [T]ODO_-prefixed sentinel identifier\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
+def test_cidown_fixme_substring_still_blocks(repo_with_pr_worktree, tmp_path):
+    """Companion to the [T]ODO substring test: [F]IXME must independently trip the
+    same regex alternation. Not previously exercised — the original 6 tests from
+    #317 only ever injected [T]ODO or [X]XX fixtures, leaving the [F]IXME and [H]ACK
+    arms of the regex unverified (found in review while fixing agent-tools#318)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": f"+// {MARK_F}: this still needs a real implementation",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on a [F]IXME marker\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
+def test_cidown_hack_substring_still_blocks(repo_with_pr_worktree, tmp_path):
+    """Companion to the [T]ODO substring test: [H]ACK must independently trip the
+    same regex alternation (see test_cidown_fixme_substring_still_blocks for why this
+    was previously unverified)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": f"+// {MARK_H}: workaround for the flaky retry logic",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on a [H]ACK marker\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
+def test_cidown_three_x_mktemp_template_still_blocks(repo_with_pr_worktree, tmp_path):
+    """Documented residual limitation: a 3-character mktemp template (`foo.[X]XX`) is
+    indistinguishable from a real standalone [X]XX marker under the word-boundary
+    regex and still blocks. This pins the documented trade-off in ship.sh's
+    _local_leftover_check comment so it doesn't silently change if the boundary
+    mechanism is reworked later."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": '+  tmp=$(mktemp -d "/tmp/foo.' + MARK_X + '")',
+    })
+
+    assert r.returncode != 0, (
+        f"a bare 3-X mktemp template is expected to still block (documented limitation)\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
+def test_cidown_xxx_sentinel_identifier_still_blocks(repo_with_pr_worktree, tmp_path):
+    """The [X]XX guard only excludes it inside a longer run of X's (4+, the
+    mktemp-template shape) — it must still catch a genuine marker embedded in an
+    identifier, like `[X]XX_REMOVE_BEFORE_MERGE` or `foo[X]XX_debug()`, which a full
+    word-boundary (\\b/-w) fix would have missed. Pins that this is deliberately
+    narrower than a generic word-boundary fix (agent-tools#316 review discussion)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": f"+const x = 1; // {MARK_X}_REMOVE_BEFORE_MERGE",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on an [X]XX_-prefixed sentinel identifier\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
+def test_cidown_gate_editing_its_own_source_does_not_self_trigger(repo_with_pr_worktree, tmp_path):
+    """Regression test for agent-tools#318 itself: a diff that edits
+    _local_leftover_check's own regex/comment block (as this exact PR does) must NOT
+    self-trigger the CI-outage fallback, even though that block legitimately spells
+    out example marker text using the bracket-expression idiom. This exercises the
+    ACTUAL fix (de-literalized source, no exemption mechanism) rather than a
+    mechanism under test — the fixture below mirrors the real shape of
+    ci/ship/ship.sh's own doc comment."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    fixture_diff = "\n".join([
+        "+# Scan the PR diff additions for leftover markers: an unfinished-work marker",
+        '+# ("[T]ODO"/"[F]IXME"/"[H]ACK") or a standalone "[X]XX" marker.',
+        "+  hits=$(printf '%s\\n' \"$diff_out\" \\",
+        "+    | grep -E '^\\+' | grep -vE '^\\+\\+\\+' \\",
+        "+    | grep -E '([T]ODO|[F]IXME|[H]ACK)|(^|[^X])[X]XX($|[^X])' || true)",
+    ])
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": fixture_diff,
+    })
+
+    assert r.returncode == 0, (
+        f"ship must NOT block on the gate's own de-literalized regex/comment block\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" not in r.stderr, r.stderr
+
+
+def test_cidown_near_miss_of_gates_own_filenames_still_blocks(repo_with_pr_worktree, tmp_path):
+    """Regression guard for the design this PR replaced: an EARLIER version of this gate
+    exempted ci/ship/ship.sh and tests/test_ship.py by path via `awk -v re=...` with a
+    backslash-escaped regex (`^(ci/ship/ship\\.sh|tests/test_ship\\.py)$`). `awk -v` runs
+    its own escape-sequence processing on the assigned value, and `\\.` is not a
+    recognized escape sequence, so gawk/mawk silently collapsed it to a bare `.` (regex
+    wildcard) — verified directly:
+        awk -v re='^(ci/ship/ship\\.sh|tests/test_ship\\.py)$' \\
+          'BEGIN{print ("ci/ship/ship_sh" ~ re)}'   # => 1 (wrongly matches!)
+    Under that design, a file named `ci/ship/ship_sh` (underscore instead of dot) — a
+    one-character near-miss of the real path — would have been WRONGLY exempted from
+    the leftover scan. That whole path-exemption mechanism has since been removed in
+    favor of de-literalizing this gate's own source (see _local_leftover_check's
+    comment), so there is no path-matching logic left to fool — but this test pins that
+    a near-miss filename gets no special treatment: a real leftover marker on it must
+    still block, exactly like any other file."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    near_miss_diff = "\n".join([
+        "diff --git a/ci/ship/ship_sh b/ci/ship/ship_sh",
+        "index 0000000..1111111 100644",
+        "--- a/ci/ship/ship_sh",
+        "+++ b/ci/ship/ship_sh",
+        "@@ -1,0 +1,1 @@",
+        f"+echo real leftover  # {MARK_T} forgot to remove this before merge",
+    ])
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": near_miss_diff,
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on a marker in a near-miss-named file "
+        f"(ci/ship/ship_sh, not the real ci/ship/ship.sh)\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
+def test_cidown_real_ship_sh_and_test_ship_py_source_do_not_self_trigger(repo_with_pr_worktree, tmp_path):
+    """Self-enforcing regression guard (review finding on this PR itself): the design this
+    PR ships relies on a CONVENTION — never spell a leftover marker as one contiguous token
+    anywhere in ci/ship/ship.sh or tests/test_ship.py — rather than a structural mechanism.
+    A convention with nothing checking it can silently break (exactly what happened earlier
+    in this same PR: a fixture literally spelled the unfinished-work marker as one contiguous
+    token and would have self-triggered this very gate). Rather than hand-copy a snapshot of
+    a comment block (which drifts the moment
+    the real file is next edited), this test feeds this gate the REAL, CURRENT contents of
+    both files — every line prefixed as a diff addition — and asserts a clean pass. If either
+    file's source ever regains a literal, contiguous marker, this test catches it directly."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    own_source_diff = "\n".join(
+        f"+{line}"
+        for path in (_SHIP, Path(__file__))
+        for line in path.read_text().splitlines()
+    )
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": own_source_diff,
+    })
+
+    assert r.returncode == 0, (
+        f"ship must NOT block on its own real, current source or this test file's own source\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" not in r.stderr, r.stderr
 
 
 def test_partial_ci_failure_below_threshold_blocks_normally(repo_with_pr_worktree, tmp_path):
