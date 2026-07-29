@@ -86,6 +86,13 @@ models:
     context: 200000
     notes: "GLM-5.2 — newest GLM on the z.ai Coding-Plan endpoint. review board priority 5."
 
+  # ── kimi-code (Kimi-for-Coding endpoint) — OpenAI-compatible /models on api.kimi.com ──
+  - id: k3
+    provider: kimi-code
+    capabilities: [vision, reasoning, code]
+    context: 1000000
+    notes: "Kimi K3 on the Kimi-for-Coding endpoint (https://api.kimi.com/coding/v1), OAuth-backed (omp `/login`), the omp default model. Endpoint-verified 2026-07-29 advertising k3 / k3-256k / kimi-for-coding / kimi-for-coding-highspeed. Vision is real (omp catalog: images yes), so the `vision` tag is correct."
+
   # ── Fireworks / glide — OpenAI-compatible. Currently down per ops; pinned for record. ──
   - id: accounts/fireworks/models/fable-5
     provider: fireworks
@@ -112,11 +119,12 @@ aliases:
   gemini:latest: gemini-2.5-flash
   commandcode:latest: moonshotai/Kimi-K2.7-Code
   zai:latest: glm-5.2
+  kimi-code:latest: k3
   fireworks:latest: accounts/fireworks/models/fable-5
 
 # ── fallback_chain: the agent-facing, CROSS-HARNESS resilience order ─────────────────────
 # THE single source of truth for "what does the agent fall to when its main model keeps
-# erroring (rate-limit / overload / 5xx)". Every harness — cc, codex, oc, pi — reads THIS
+# erroring (rate-limit / overload / 5xx)". Every harness — cc, codex, oc, pi, omp — reads THIS
 # one list so they all agree on the priority order; the model-error-fallback agent-hook and
 # the `model-fallback` skill both resolve the next executor from here, never from a hand-
 # copied list. The order is the priority (strongest/cheapest-preferred first); on the Nth
@@ -135,4 +143,5 @@ fallback_chain:
   - { harness: claude, model: opus,     notation: "claude:opus" }    # 2 — in-harness swap on repeated fable errors
   - { harness: oc,     model: GLM-5.2,  notation: "oc:GLM-5.2" }      # 3 — CROSS-HARNESS: opencode executor, different provider quota
   - { harness: codex,  model: gpt5.5,   notation: "codex:gpt5.5" }    # 4 — CROSS-HARNESS: codex executor, last resort
+  - { harness: omp,    model: k3,       notation: "omp:k3" }          # 5 — CROSS-HARNESS: omp+k3, the daily-driver harness
 

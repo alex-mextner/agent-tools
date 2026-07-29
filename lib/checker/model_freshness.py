@@ -466,6 +466,20 @@ def _poll_zai(timeout: float) -> PollResult:
     return PollResult("zai", True, model_ids=_ids_from_openai_list(data))
 
 
+def _poll_kimi_code(timeout: float) -> PollResult:
+    key = resolve_key(("KIMI_API_KEY",))
+    if not key:
+        return PollResult("kimi-code", False, skipped="no KIMI_API_KEY")
+    base = os.environ.get(
+        "KIMI_BASE_URL", "https://api.kimi.com/coding/v1"
+    ).rstrip("/")
+    try:
+        data = _http_get_json(f"{base}/models", {"Authorization": f"Bearer {key}"}, timeout)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return PollResult("kimi-code", False, error=str(exc))
+    return PollResult("kimi-code", True, model_ids=_ids_from_openai_list(data))
+
+
 # fireworks has no stable public model-list contract here; it routes through commandcode in
 # practice, so we don't poll it directly (skipped with a clear reason).
 def _poll_fireworks(timeout: float) -> PollResult:
@@ -478,6 +492,7 @@ POLLERS: dict[str, Callable[[float], PollResult]] = {
     "gemini": _poll_gemini,
     "commandcode": _poll_commandcode,
     "zai": _poll_zai,
+    "kimi-code": _poll_kimi_code,
     "fireworks": _poll_fireworks,
 }
 

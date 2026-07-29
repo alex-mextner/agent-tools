@@ -55,6 +55,23 @@ def test_kimi_code_has_no_vision_kimi_turbo_has_vision():
     assert "vision" in turbo.capabilities, "kimi-k2p6-turbo has vision"
 
 
+def test_kimi_code_k3_pin_on_real_manifest():
+    """The k3 pin: kimi-code:latest resolves to it, and it really is vision-capable."""
+    m = mf.load_manifest(MANIFEST)
+    assert m.aliases["kimi-code:latest"] == "k3"
+    entry = m.entry("k3")
+    assert entry is not None and entry.provider == "kimi-code"
+    assert "vision" in entry.capabilities  # omp catalog: images yes
+    assert entry.context == 1000000
+
+
+def test_fallback_chain_ends_with_omp_k3():
+    """The resilience order's LAST step is the omp+k3 daily-driver harness."""
+    data = yaml.safe_load(MANIFEST.read_text(encoding="utf-8"))
+    chain = data["fallback_chain"]
+    assert chain[-1] == {"harness": "omp", "model": "k3", "notation": "omp:k3"}
+
+
 def _write_manifest(tmp_path: Path, data: dict) -> Path:
     p = tmp_path / "models.yaml"
     p.write_text(yaml.safe_dump(data), encoding="utf-8")
@@ -148,6 +165,14 @@ def test_load_manifest_context_bool_not_coerced_to_int(tmp_path: Path):
         ("gpt-5.5-preview", "gpt-5.5", False),
         # …and an OLDER dated snapshot is never newer.
         ("claude-opus-4-7-20260201", "claude-opus-4-8", False),
+        # kimi-code k3: a next-major IS a bump…
+        ("k4", "k3", True),
+        # …but k3-256k is a CONTEXT VARIANT of the same generation (`-256k` is not a
+        # stripped snapshot suffix, so it lands in a different family) — never proposed.
+        ("k3-256k", "k3", False),
+        # …and the endpoint's task aliases are a different family entirely.
+        ("kimi-for-coding", "k3", False),
+        ("kimi-for-coding-highspeed", "k3", False),
     ],
 )
 def test_is_newer(candidate, current, expected):
@@ -406,6 +431,64 @@ def test_ids_from_openai_list():
 def test_ids_from_gemini_list():
     data = {"models": [{"name": "models/gemini-2.5-flash"}, {"name": "models/gemini-3.0"}]}
     assert mf._ids_from_gemini_list(data) == ["gemini-2.5-flash", "gemini-3.0"]
+
+
+# ── kimi-code poller ────────────────────────────────────────────────────────────────────
+def test_poll_kimi_code_skips_without_key(tmp_path: Path, monkeypatch):
+    """No KIMI_API_KEY (env or .env fallback) → a clean skip, never a crash."""
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.setenv("MODEL_FRESHNESS_ENV_FILE", str(tmp_path / "missing.env"))
+    result = mf._poll_kimi_code(1.0)
+    assert result.provider == "kimi-code"
+    assert result.ok is False
+    assert "KIMI_API_KEY" in result.skipped
+    assert result.error == ""
+
+
+def test_poll_kimi_code_parses_openai_list(monkeypatch):
+    """With a key, GET <base>/models and parse the OpenAI-compatible id list."""
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi")
+    monkeypatch.delenv("KIMI_BASE_URL", raising=False)
+    calls = []
+
+    def fake_get(url, headers, timeout):
+        calls.append((url, headers))
+        return {"data": [{"id": "k3"}, {"id": "k3-256k"}, {"id": "kimi-for-coding"}]}
+
+    monkeypatch.setattr(mf, "_http_get_json", fake_get)
+    result = mf._poll_kimi_code(1.0)
+    assert result.ok is True
+    assert result.model_ids == ["k3", "k3-256k", "kimi-for-coding"]
+    assert calls == [
+        ("https://api.kimi.com/coding/v1/models", {"Authorization": "Bearer sk-kimi"})
+    ]
+
+
+def test_poll_kimi_code_honors_base_url_override(monkeypatch):
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi")
+    monkeypatch.setenv("KIMI_BASE_URL", "https://kimi.example.test/v1/")
+    calls = []
+    monkeypatch.setattr(
+        mf, "_http_get_json", lambda url, headers, timeout: calls.append(url) or {"data": []}
+    )
+    mf._poll_kimi_code(1.0)
+    assert calls == ["https://kimi.example.test/v1/models"]  # trailing slash stripped
+
+
+def test_poll_kimi_code_http_error_is_error_not_crash(monkeypatch):
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi")
+
+    def boom(url, headers, timeout):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(mf, "_http_get_json", boom)
+    result = mf._poll_kimi_code(1.0)
+    assert result.ok is False
+    assert "connection refused" in result.error
+
+
+def test_kimi_code_poller_registered():
+    assert mf.POLLERS["kimi-code"] is mf._poll_kimi_code
 
 
 # ── schema conformance: the manifest validates against models.schema.json ───────────────

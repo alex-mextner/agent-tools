@@ -95,11 +95,12 @@ def test_normal_failures_not_transient(text):
 
 def test_default_chain_is_the_documented_cross_harness_order():
     labels = [s.label for s in fc.DEFAULT_CHAIN]
-    assert labels == ["claude:fable", "claude:opus", "oc:GLM-5.2", "codex:gpt5.5"]
-    # fable->opus is same-harness (a swap); claude->oc and oc->codex cross the boundary.
+    assert labels == ["claude:fable", "claude:opus", "oc:GLM-5.2", "codex:gpt5.5", "omp:k3"]
+    # fable->opus is same-harness (a swap); claude->oc, oc->codex, codex->omp cross the boundary.
     assert fc.DEFAULT_CHAIN[0].harness == fc.DEFAULT_CHAIN[1].harness == "claude"
     assert fc.DEFAULT_CHAIN[2].harness == "oc"
     assert fc.DEFAULT_CHAIN[3].harness == "codex"
+    assert fc.DEFAULT_CHAIN[4].harness == "omp"
 
 
 # ── count / threshold ────────────────────────────────────────────────────────────────────
@@ -266,13 +267,14 @@ def test_chain_exhaustion_is_loud_and_does_not_wrap():
     st = fc.FallbackState(threshold=1)
     st.observe(error=True, detail="429")  # opus
     st.observe(error=True, detail="429")  # oc
-    st.observe(error=True, detail="429")  # codex (last)
+    st.observe(error=True, detail="429")  # codex
+    st.observe(error=True, detail="429")  # omp (last)
     assert st.at_last_resort is True
     d = st.observe(error=True, detail="429")  # nowhere left to fall
     assert d.switched is False
     assert d.exhausted is True  # machine-readable, not just a grep of the reason
     assert "EXHAUSTED" in d.reason
-    assert st.active.label == "codex:gpt5.5"  # stays put, does not wrap to the top
+    assert st.active.label == "omp:k3"  # stays put, does not wrap to the top
 
 
 def test_exhausted_is_false_before_the_last_resort():
@@ -665,13 +667,13 @@ def test_hook_live_env_threshold_overrides_saved_one_mid_task(tmp_path, monkeypa
 def test_hook_exhaustion_is_surfaced_and_does_not_wrap(tmp_path, monkeypatch):
     env = {"AGENTTOOLS_FALLBACK_THRESHOLD": "1"}
     last = None
-    for _ in range(5):  # fall through the whole 4-step chain, then one extra error
+    for _ in range(6):  # fall through the whole 5-step chain, then one extra error
         raw, _, _ = _run_hook(
             _event(task_id="ex", error=True, error_text="529 overloaded"),
             monkeypatch, tmp_path, env,
         )
         last = json.loads(raw)
-    assert last["fallback"]["active"] == "codex:gpt5.5"  # stays at the last resort
+    assert last["fallback"]["active"] == "omp:k3"  # stays at the last resort
     assert last["fallback"]["switched"] is False
     assert "EXHAUSTED" in last["fallback"]["reason"]
 
@@ -839,13 +841,13 @@ def test_hook_resets_on_corrupt_state_file_without_crashing(file_body, tmp_path,
 def test_hook_surfaces_exhausted_flag(tmp_path, monkeypatch):
     env = {"AGENTTOOLS_FALLBACK_THRESHOLD": "1"}
     last = None
-    for _ in range(5):  # fall through all 4 steps, then one more error at the last resort
+    for _ in range(6):  # fall through all 5 steps, then one more error at the last resort
         raw, _, _ = _run_hook(
             _event(task_id="exh", error=True, error_text="429"), monkeypatch, tmp_path, env
         )
         last = json.loads(raw)
     assert last["fallback"]["exhausted"] is True
-    assert last["fallback"]["active"] == "codex:gpt5.5"
+    assert last["fallback"]["active"] == "omp:k3"
 
 
 def test_hook_runs_stateless_when_state_dir_cannot_be_created(tmp_path, monkeypatch):
