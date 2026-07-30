@@ -26,7 +26,7 @@ version: 1
 
 models:                                  # concrete pins, strongest-first within a provider
   - id: moonshotai/Kimi-K2.7-Code        # concrete, provider-resolvable id (never an alias)
-    provider: commandcode                # one of: anthropic openai gemini commandcode zai fireworks
+    provider: commandcode                # one of: anthropic openai gemini commandcode zai kimi-code fireworks
     capabilities: [code, reasoning]      # closed set; NO `vision` — Kimi-K2.7-Code is code-only
     context: 256000                      # advertised input window (tokens), optional
     notes: "code-specialized, NO vision (#3681)"
@@ -71,7 +71,7 @@ aliases:                                 # convenience + `<provider>:latest` poi
 
 ```sh
 python3 lib/checker/model_freshness.py --validate
-# manifest OK — 10 models, 5 roles, 6 aliases
+# manifest OK — 11 models, 5 roles, 7 aliases
 ```
 
 ---
@@ -95,6 +95,7 @@ SDKs, no third-party HTTP client.
    | gemini | `GET {GEMINI_BASE_URL}/v1beta/models` | `GEMINI_API_KEY` / `GOOGLE_API_KEY` |
    | commandcode | `GET {COMMANDCODE_BASE_URL}/models` | `COMMANDCODE_API_KEY` |
    | zai | `GET {ZAI_BASE_URL}/models` | `ZAI_API_KEY` / `ZHIPU_API_KEY` |
+   | kimi-code | `GET {KIMI_CODE_BASE_URL}/models` | `KIMI_API_KEY`, else the omp `kimi-code` OAuth login (read-only from `~/.omp/agent/agent.db`) |
    | fireworks | *(routed via commandcode — no direct list, skipped)* | — |
 
    A provider whose key is **absent** is **skipped**, never a crash. A network/parse error

@@ -466,12 +466,49 @@ def _poll_zai(timeout: float) -> PollResult:
     return PollResult("zai", True, model_ids=_ids_from_openai_list(data))
 
 
+def _omp_kimi_code_oauth_token() -> str | None:
+    """Best-effort: the OAuth access token omp stores for kimi-code after `omp /login`.
+
+    The Kimi-for-Coding endpoint is OAuth-backed, so on a machine whose only Kimi
+    credential is the omp login the poller can still run instead of skipping. Reads omp's
+    agent.db READ-ONLY; any failure (missing db, schema drift, lock, malformed row) returns
+    None and the caller falls through to the usual skip. Never raises, never refreshes —
+    token refresh stays omp's job; an expired token surfaces as the endpoint's 401 error.
+    """
+    import sqlite3  # lazy: stdlib, but only this one resolver needs it
+
+    db_path = Path.home() / ".omp" / "agent" / "agent.db"
+    try:
+        if not db_path.is_file():
+            return None
+        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1)
+        try:
+            row = db.execute(
+                "SELECT data FROM auth_credentials"
+                " WHERE provider = 'kimi-code' AND credential_type = 'oauth'"
+                " AND disabled_cause IS NULL"
+                " ORDER BY updated_at DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            db.close()
+        if not row:
+            return None
+        token = str(json.loads(row[0]).get("access", "")).strip()
+        return token or None
+    except (OSError, sqlite3.Error, ValueError):
+        return None
+
+
 def _poll_kimi_code(timeout: float) -> PollResult:
-    key = resolve_key(("KIMI_API_KEY",))
+    key = resolve_key(("KIMI_API_KEY",)) or _omp_kimi_code_oauth_token()
     if not key:
-        return PollResult("kimi-code", False, skipped="no KIMI_API_KEY")
+        return PollResult(
+            "kimi-code", False, skipped="no KIMI_API_KEY or omp kimi-code OAuth login"
+        )
+    # KIMI_CODE_BASE_URL is the OAuth-managed coding endpoint override; KIMI_BASE_URL is a
+    # DIFFERENT var (direct-API moonshot.ai) and must not redirect this poller.
     base = os.environ.get(
-        "KIMI_BASE_URL", "https://api.kimi.com/coding/v1"
+        "KIMI_CODE_BASE_URL", "https://api.kimi.com/coding/v1"
     ).rstrip("/")
     try:
         data = _http_get_json(f"{base}/models", {"Authorization": f"Bearer {key}"}, timeout)

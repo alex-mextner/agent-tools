@@ -435,9 +435,10 @@ def test_ids_from_gemini_list():
 
 # ── kimi-code poller ────────────────────────────────────────────────────────────────────
 def test_poll_kimi_code_skips_without_key(tmp_path: Path, monkeypatch):
-    """No KIMI_API_KEY (env or .env fallback) → a clean skip, never a crash."""
+    """No KIMI_API_KEY (env or .env fallback) and no omp OAuth login → a clean skip, never a crash."""
     monkeypatch.delenv("KIMI_API_KEY", raising=False)
     monkeypatch.setenv("MODEL_FRESHNESS_ENV_FILE", str(tmp_path / "missing.env"))
+    monkeypatch.setattr(mf, "_omp_kimi_code_oauth_token", lambda: None)
     result = mf._poll_kimi_code(1.0)
     assert result.provider == "kimi-code"
     assert result.ok is False
@@ -445,10 +446,99 @@ def test_poll_kimi_code_skips_without_key(tmp_path: Path, monkeypatch):
     assert result.error == ""
 
 
+def test_poll_kimi_code_uses_omp_oauth_token_without_api_key(tmp_path: Path, monkeypatch):
+    """No KIMI_API_KEY but an omp kimi-code OAuth login → the stored access token polls."""
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.setenv("MODEL_FRESHNESS_ENV_FILE", str(tmp_path / "missing.env"))
+    monkeypatch.setattr(mf, "_omp_kimi_code_oauth_token", lambda: "oauth-tok")
+    calls = []
+    monkeypatch.setattr(
+        mf,
+        "_http_get_json",
+        lambda url, headers, timeout: calls.append((url, headers)) or {"data": []},
+    )
+    result = mf._poll_kimi_code(1.0)
+    assert result.ok is True
+    assert calls == [
+        ("https://api.kimi.com/coding/v1/models", {"Authorization": "Bearer oauth-tok"})
+    ]
+
+
+def test_poll_kimi_code_api_key_beats_omp_oauth(tmp_path: Path, monkeypatch):
+    """Precedence: an explicit KIMI_API_KEY wins over the omp OAuth credential."""
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi")
+    monkeypatch.setattr(mf, "_omp_kimi_code_oauth_token", lambda: "oauth-tok")
+    calls = []
+    monkeypatch.setattr(
+        mf,
+        "_http_get_json",
+        lambda url, headers, timeout: calls.append(headers) or {"data": []},
+    )
+    result = mf._poll_kimi_code(1.0)
+    assert result.ok is True
+    assert calls == [{"Authorization": "Bearer sk-kimi"}]
+
+
+def test_omp_kimi_code_oauth_token_reads_agent_db(tmp_path: Path, monkeypatch):
+    """The resolver reads provider=kimi-code/credential_type=oauth from omp's agent.db."""
+    import sqlite3
+
+    db_dir = tmp_path / ".omp" / "agent"
+    db_dir.mkdir(parents=True)
+    db = sqlite3.connect(db_dir / "agent.db")
+    db.execute(
+        "CREATE TABLE auth_credentials"
+        " (id INTEGER, provider TEXT, credential_type TEXT, data TEXT,"
+        " disabled_cause TEXT, updated_at INTEGER)"
+    )
+    db.execute(
+        "INSERT INTO auth_credentials VALUES (1, 'kimi-code', 'oauth', ?, NULL, 10)",
+        (json.dumps({"access": "  tok-123  "}),),
+    )
+    # a disabled / wrong-provider / non-oauth row must NOT be picked
+    db.execute(
+        "INSERT INTO auth_credentials VALUES (2, 'kimi-code', 'oauth', ?, 'revoked', 20)",
+        (json.dumps({"access": "tok-disabled"}),),
+    )
+    db.execute(
+        "INSERT INTO auth_credentials VALUES (3, 'openai', 'oauth', ?, NULL, 30)",
+        (json.dumps({"access": "tok-other"}),),
+    )
+    db.commit()
+    db.close()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert mf._omp_kimi_code_oauth_token() == "tok-123"
+
+
+def test_omp_kimi_code_oauth_token_missing_db_is_none(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert mf._omp_kimi_code_oauth_token() is None
+
+
+def test_omp_kimi_code_oauth_token_malformed_row_is_none(tmp_path: Path, monkeypatch):
+    import sqlite3
+
+    db_dir = tmp_path / ".omp" / "agent"
+    db_dir.mkdir(parents=True)
+    db = sqlite3.connect(db_dir / "agent.db")
+    db.execute(
+        "CREATE TABLE auth_credentials"
+        " (id INTEGER, provider TEXT, credential_type TEXT, data TEXT,"
+        " disabled_cause TEXT, updated_at INTEGER)"
+    )
+    db.execute(
+        "INSERT INTO auth_credentials VALUES (1, 'kimi-code', 'oauth', 'not-json', NULL, 10)"
+    )
+    db.commit()
+    db.close()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert mf._omp_kimi_code_oauth_token() is None
+
+
 def test_poll_kimi_code_parses_openai_list(monkeypatch):
     """With a key, GET <base>/models and parse the OpenAI-compatible id list."""
     monkeypatch.setenv("KIMI_API_KEY", "sk-kimi")
-    monkeypatch.delenv("KIMI_BASE_URL", raising=False)
+    monkeypatch.delenv("KIMI_CODE_BASE_URL", raising=False)
     calls = []
 
     def fake_get(url, headers, timeout):
@@ -466,13 +556,27 @@ def test_poll_kimi_code_parses_openai_list(monkeypatch):
 
 def test_poll_kimi_code_honors_base_url_override(monkeypatch):
     monkeypatch.setenv("KIMI_API_KEY", "sk-kimi")
-    monkeypatch.setenv("KIMI_BASE_URL", "https://kimi.example.test/v1/")
+    monkeypatch.setenv("KIMI_CODE_BASE_URL", "https://kimi.example.test/v1/")
     calls = []
     monkeypatch.setattr(
         mf, "_http_get_json", lambda url, headers, timeout: calls.append(url) or {"data": []}
     )
     mf._poll_kimi_code(1.0)
     assert calls == ["https://kimi.example.test/v1/models"]  # trailing slash stripped
+
+
+def test_poll_kimi_code_ignores_kimi_base_url(monkeypatch):
+    """KIMI_BASE_URL is the direct-API moonshot var, NOT the coding-endpoint override —
+    setting it must not redirect this poller (only KIMI_CODE_BASE_URL does)."""
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi")
+    monkeypatch.setenv("KIMI_BASE_URL", "https://api.moonshot.ai/v1")
+    monkeypatch.delenv("KIMI_CODE_BASE_URL", raising=False)
+    calls = []
+    monkeypatch.setattr(
+        mf, "_http_get_json", lambda url, headers, timeout: calls.append(url) or {"data": []}
+    )
+    mf._poll_kimi_code(1.0)
+    assert calls == ["https://api.kimi.com/coding/v1/models"]
 
 
 def test_poll_kimi_code_http_error_is_error_not_crash(monkeypatch):
