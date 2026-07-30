@@ -466,6 +466,15 @@ def _poll_zai(timeout: float) -> PollResult:
     return PollResult("zai", True, model_ids=_ids_from_openai_list(data))
 
 
+def _omp_agent_db() -> Path:
+    """omp's agent.db location, honoring the agent-dir env vars omp itself reads."""
+    for var in ("OMP_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"):
+        override = os.environ.get(var, "").strip()
+        if override:
+            return Path(override).expanduser() / "agent.db"
+    return Path.home() / ".omp" / "agent" / "agent.db"
+
+
 def _omp_kimi_code_oauth_token() -> str | None:
     """Best-effort: the OAuth access token omp stores for kimi-code after `omp /login`.
 
@@ -477,7 +486,7 @@ def _omp_kimi_code_oauth_token() -> str | None:
     """
     import sqlite3  # lazy: stdlib, but only this one resolver needs it
 
-    db_path = Path.home() / ".omp" / "agent" / "agent.db"
+    db_path = _omp_agent_db()
     try:
         if not db_path.is_file():
             return None
@@ -493,23 +502,40 @@ def _omp_kimi_code_oauth_token() -> str | None:
             db.close()
         if not row:
             return None
-        token = str(json.loads(row[0]).get("access", "")).strip()
-        return token or None
+        data = json.loads(row[0])
+        if not isinstance(data, dict):
+            return None
+        token = data.get("access")
+        return token.strip() if isinstance(token, str) and token.strip() else None
     except (OSError, sqlite3.Error, ValueError):
         return None
 
 
+# The ONLY origin the harvested omp OAuth token may be sent to. A custom
+# KIMI_CODE_BASE_URL requires an explicit KIMI_API_KEY — otherwise one env var could
+# redirect a credential the user never handed this script to an arbitrary host.
+_KIMI_CODE_CANONICAL_BASE = "https://api.kimi.com/coding/v1"
+
+
 def _poll_kimi_code(timeout: float) -> PollResult:
-    key = resolve_key(("KIMI_API_KEY",)) or _omp_kimi_code_oauth_token()
+    key = resolve_key(("KIMI_API_KEY",))
+    from_oauth = key is None
+    if from_oauth:
+        key = _omp_kimi_code_oauth_token()
     if not key:
         return PollResult(
             "kimi-code", False, skipped="no KIMI_API_KEY or omp kimi-code OAuth login"
         )
     # KIMI_CODE_BASE_URL is the OAuth-managed coding endpoint override; KIMI_BASE_URL is a
     # DIFFERENT var (direct-API moonshot.ai) and must not redirect this poller.
-    base = os.environ.get(
-        "KIMI_CODE_BASE_URL", "https://api.kimi.com/coding/v1"
-    ).rstrip("/")
+    base = os.environ.get("KIMI_CODE_BASE_URL", _KIMI_CODE_CANONICAL_BASE).rstrip("/")
+    if from_oauth and base != _KIMI_CODE_CANONICAL_BASE:
+        return PollResult(
+            "kimi-code",
+            False,
+            skipped="custom KIMI_CODE_BASE_URL requires an explicit KIMI_API_KEY"
+            " (the omp OAuth token is only sent to the canonical endpoint)",
+        )
     try:
         data = _http_get_json(f"{base}/models", {"Authorization": f"Bearer {key}"}, timeout)
     except (urllib.error.URLError, OSError, ValueError) as exc:

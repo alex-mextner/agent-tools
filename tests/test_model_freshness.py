@@ -516,23 +516,89 @@ def test_omp_kimi_code_oauth_token_missing_db_is_none(tmp_path: Path, monkeypatc
 
 
 def test_omp_kimi_code_oauth_token_malformed_row_is_none(tmp_path: Path, monkeypatch):
+    """not-json, valid JSON of the wrong shape, and a null access must ALL resolve to None
+    (never raise, never produce a `Bearer None`)."""
     import sqlite3
 
     db_dir = tmp_path / ".omp" / "agent"
     db_dir.mkdir(parents=True)
-    db = sqlite3.connect(db_dir / "agent.db")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for payload in ("not-json", "[]", "null", json.dumps({"access": None})):
+        db_file = db_dir / "agent.db"
+        db_file.unlink(missing_ok=True)
+        db = sqlite3.connect(db_file)
+        db.execute(
+            "CREATE TABLE auth_credentials"
+            " (id INTEGER, provider TEXT, credential_type TEXT, data TEXT,"
+            " disabled_cause TEXT, updated_at INTEGER)"
+        )
+        db.execute(
+            "INSERT INTO auth_credentials VALUES (1, 'kimi-code', 'oauth', ?, NULL, 10)",
+            (payload,),
+        )
+        db.commit()
+        db.close()
+        assert mf._omp_kimi_code_oauth_token() is None, payload
+
+
+def test_omp_kimi_code_oauth_token_honors_agent_dir_env(tmp_path: Path, monkeypatch):
+    """omp can relocate its agent dir (OMP_CODING_AGENT_DIR / PI_CODING_AGENT_DIR) — the
+    resolver must follow the same env vars instead of only looking in ~/.omp/agent."""
+    import sqlite3
+
+    agent_dir = tmp_path / "custom-agent"
+    agent_dir.mkdir()
+    db = sqlite3.connect(agent_dir / "agent.db")
     db.execute(
         "CREATE TABLE auth_credentials"
         " (id INTEGER, provider TEXT, credential_type TEXT, data TEXT,"
         " disabled_cause TEXT, updated_at INTEGER)"
     )
     db.execute(
-        "INSERT INTO auth_credentials VALUES (1, 'kimi-code', 'oauth', 'not-json', NULL, 10)"
+        "INSERT INTO auth_credentials VALUES (1, 'kimi-code', 'oauth', ?, NULL, 10)",
+        (json.dumps({"access": "tok-relocated"}),),
     )
     db.commit()
     db.close()
-    monkeypatch.setenv("HOME", str(tmp_path))
-    assert mf._omp_kimi_code_oauth_token() is None
+    monkeypatch.setenv("HOME", str(tmp_path / "no-omp-here"))
+    monkeypatch.setenv("OMP_CODING_AGENT_DIR", str(agent_dir))
+    assert mf._omp_kimi_code_oauth_token() == "tok-relocated"
+    monkeypatch.delenv("OMP_CODING_AGENT_DIR")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent_dir))
+    assert mf._omp_kimi_code_oauth_token() == "tok-relocated"
+
+
+def test_poll_kimi_code_oauth_token_never_leaves_canonical_endpoint(monkeypatch):
+    """A custom KIMI_CODE_BASE_URL must NOT receive the harvested omp OAuth token —
+    endpoint overrides require an explicitly supplied KIMI_API_KEY."""
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.setattr(mf, "_omp_kimi_code_oauth_token", lambda: "oauth-tok")
+    monkeypatch.setenv("KIMI_CODE_BASE_URL", "http://evil.example.test/v1")
+    calls = []
+    monkeypatch.setattr(
+        mf, "_http_get_json", lambda url, headers, timeout: calls.append(url) or {"data": []}
+    )
+    result = mf._poll_kimi_code(1.0)
+    assert result.ok is False
+    assert "KIMI_API_KEY" in result.skipped
+    assert calls == [], "no request may be made with the OAuth token to a custom base"
+
+
+def test_poll_kimi_code_custom_base_ok_with_explicit_key(monkeypatch):
+    """The same custom base IS allowed when the caller supplied their own KIMI_API_KEY."""
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi")
+    monkeypatch.setenv("KIMI_CODE_BASE_URL", "https://kimi.example.test/v1")
+    calls = []
+    monkeypatch.setattr(
+        mf,
+        "_http_get_json",
+        lambda url, headers, timeout: calls.append((url, headers)) or {"data": []},
+    )
+    result = mf._poll_kimi_code(1.0)
+    assert result.ok is True
+    assert calls == [
+        ("https://kimi.example.test/v1/models", {"Authorization": "Bearer sk-kimi"})
+    ]
 
 
 def test_poll_kimi_code_parses_openai_list(monkeypatch):

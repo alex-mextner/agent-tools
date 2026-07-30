@@ -142,6 +142,6 @@ fallback_chain:
   - { harness: claude, model: fable,    notation: "claude:fable" }   # 1 — preferred: in-harness, cheapest-capable
   - { harness: claude, model: opus,     notation: "claude:opus" }    # 2 — in-harness swap on repeated fable errors
   - { harness: oc,     model: GLM-5.2,  notation: "oc:GLM-5.2" }      # 3 — CROSS-HARNESS: opencode executor, different provider quota
-  - { harness: codex,  model: gpt5.5,   notation: "codex:gpt5.5" }    # 4 — CROSS-HARNESS: codex executor, last resort
-  - { harness: omp,    model: k3,       notation: "omp:k3" }          # 5 — CROSS-HARNESS: omp+k3, the daily-driver harness
+  - { harness: codex,  model: gpt5.5,   notation: "codex:gpt5.5" }    # 4 — CROSS-HARNESS: codex executor
+  - { harness: omp,    model: k3,       notation: "omp:k3" }          # 5 — CROSS-HARNESS: omp+k3, the daily-driver harness, last resort
 
