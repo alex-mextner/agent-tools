@@ -99,7 +99,7 @@ def is_transient_model_error(text: str) -> bool:
 class ChainStep:
     """One executor on the fallback chain: a harness boundary + a concrete model id.
 
-    ``harness`` is the EXECUTOR (claude / oc / codex / pi) — equal to the running harness ->
+    ``harness`` is the EXECUTOR (claude / oc / codex / pi / omp) — equal to the running harness ->
     an in-process model swap; different -> a re-dispatch to that harness. ``model`` is the
     id passed to that harness's own selector. ``notation`` is the ``<harness>:<model>``
     label surfaced when this step goes active.
@@ -116,13 +116,14 @@ class ChainStep:
 
 
 # The default chain — mirrors lib/contracts/models.yaml `fallback_chain:`. The manifest is
-# the source of truth (so cc/codex/oc/pi all read ONE list); this baked-in copy is the
+# the source of truth (so cc/codex/oc/pi/omp all read ONE list); this baked-in copy is the
 # offline fallback for a host that can't load the manifest, and the thing tests pin against.
 DEFAULT_CHAIN: Tuple[ChainStep, ...] = (
     ChainStep("claude", "fable", "claude:fable"),
     ChainStep("claude", "opus", "claude:opus"),
     ChainStep("oc", "GLM-5.2", "oc:GLM-5.2"),
     ChainStep("codex", "gpt5.5", "codex:gpt5.5"),
+    ChainStep("omp", "k3", "omp:k3"),
 )
 
 

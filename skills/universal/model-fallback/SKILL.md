@@ -15,7 +15,7 @@ the chain** and keep working.
 ## The chain
 
 ```
-claude:fable  ->  claude:opus  ->  oc:GLM-5.2  ->  codex:gpt5.5
+claude:fable  ->  claude:opus  ->  oc:GLM-5.2  ->  codex:gpt5.5  ->  omp:k3
 ```
 
 `<harness>:<model>`, strongest/preferred first. The chain deliberately **crosses
@@ -24,11 +24,12 @@ harnesses** so a whole-provider outage (an Anthropic throttle) doesn't wedge eve
 - `claude:fable` -> `claude:opus` — an in-harness **model swap** (still Claude, new model).
 - `claude` -> `oc:GLM-5.2` — **cross-harness**: re-dispatch the unit of work to opencode as
   an executor (`opencode run`), on a different provider's quota.
-- `oc` -> `codex:gpt5.5` — **cross-harness**: re-dispatch to codex (`codex exec`), the
-  last resort.
+- `oc` -> `codex:gpt5.5` — **cross-harness**: re-dispatch to codex (`codex exec`).
+- `codex` -> `omp:k3` — **cross-harness**: re-dispatch to omp (the daily-driver harness,
+  k3 on the Kimi-for-Coding endpoint), the last resort.
 
 This is the ONE chain. It lives in `lib/contracts/models.yaml` under `fallback_chain:` and
-is read by every harness — cc, codex, opencode, pi — so they all agree on the order. Don't
+is read by every harness — cc, codex, opencode, pi, omp — so they all agree on the order. Don't
 hand-copy a different order anywhere; change the manifest and every harness follows.
 
 ## The discipline
@@ -56,7 +57,7 @@ hand-copy a different order anywhere; change the manifest and every harness foll
    definition. After a successful turn, promote back toward the preferred model — don't pin
    the rest of the session on the last-resort executor because of one bad minute.
 
-6. **At the end of the chain, fail loud.** If `codex:gpt5.5` is also erroring, there is
+6. **At the end of the chain, fail loud.** If `omp:k3` is also erroring, there is
    nowhere left to fall. Say so clearly (which executors failed, why) and stop — never
    pretend success or silent-empty (codex `exec` exit-0 lies about completion; verify the
    work actually landed, don't trust the exit code).

@@ -7,12 +7,12 @@ cross-harness chain instead of letting a throttle wedge the work.
 ## The chain
 
 ```
-claude:fable  ->  claude:opus  ->  oc:GLM-5.2  ->  codex:gpt5.5
+claude:fable  ->  claude:opus  ->  oc:GLM-5.2  ->  codex:gpt5.5  ->  omp:k3
 ```
 
 `<harness>:<model>`. Falling within Claude (`fable` -> `opus`) is an in-process **model
-swap**; crossing the harness boundary (`claude` -> `oc`/`codex`) is a **re-dispatch** of the
-unit of work to that harness as an executor (`opencode run` / `codex exec`). The chain
+swap**; crossing the harness boundary (`claude` -> `oc`/`codex`/`omp`) is a **re-dispatch**
+of the unit of work to that harness as an executor (`opencode run` / `codex exec`). The chain
 deliberately crosses harnesses so a whole-provider outage (an Anthropic throttle) doesn't
 stall everything — the next step runs on a *different provider's quota*.
 
@@ -23,7 +23,7 @@ mandates for humans/agents; the hook is the enforcement layer so it isn't a pros
 
 The chain is read from **one** place — `lib/contracts/models.yaml` under `fallback_chain:`.
 rig provisions this hook into cc (via `settings.json` + `cc_hook_bridge`), codex, opencode,
-and pi, and each reads the SAME manifest list, so every harness agrees on the priority. The
+pi, and omp, and each reads the SAME manifest list, so every harness agrees on the priority. The
 default baked into `fallback_chain.py` is the offline fallback for a host that can't load
 the manifest — it mirrors the manifest, which stays the source of truth.
 
