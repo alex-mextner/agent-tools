@@ -62,7 +62,8 @@ def test_kimi_code_k3_pin_on_real_manifest():
     entry = m.entry("k3")
     assert entry is not None and entry.provider == "kimi-code"
     assert "vision" in entry.capabilities  # omp catalog: images yes
-    assert entry.context == 1000000
+    # Kimi docs: set the context-window field to 1048576 for k3's full up-to-1M context.
+    assert entry.context == 1048576
 
 
 def test_fallback_chain_ends_with_omp_k3():
@@ -507,11 +508,13 @@ def test_omp_kimi_code_oauth_token_reads_agent_db(tmp_path: Path, monkeypatch):
     db.commit()
     db.close()
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(mf, "_omp_token_cli", lambda: None)  # force the db fallback path
     assert mf._omp_kimi_code_oauth_token() == "tok-123"
 
 
 def test_omp_kimi_code_oauth_token_missing_db_is_none(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(mf, "_omp_token_cli", lambda: None)  # force the db fallback path
     assert mf._omp_kimi_code_oauth_token() is None
 
 
@@ -523,6 +526,7 @@ def test_omp_kimi_code_oauth_token_malformed_row_is_none(tmp_path: Path, monkeyp
     db_dir = tmp_path / ".omp" / "agent"
     db_dir.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(mf, "_omp_token_cli", lambda: None)  # force the db fallback path
     for payload in ("not-json", "[]", "null", json.dumps({"access": None})):
         db_file = db_dir / "agent.db"
         db_file.unlink(missing_ok=True)
@@ -539,6 +543,77 @@ def test_omp_kimi_code_oauth_token_malformed_row_is_none(tmp_path: Path, monkeyp
         db.commit()
         db.close()
         assert mf._omp_kimi_code_oauth_token() is None, payload
+
+
+def test_omp_token_cli_output_is_used(monkeypatch):
+    """Primary path: `omp token kimi-code` stdout is the token (refresh-aware resolver)."""
+    import subprocess as _sp
+
+    def fake_run(cmd, **kwargs):
+        assert cmd == ["omp", "token", "kimi-code"]
+        return _sp.CompletedProcess(cmd, 0, stdout="fresh-tok\n", stderr="")
+
+    monkeypatch.setattr(mf.subprocess, "run", fake_run)
+    assert mf._omp_token_cli() == "fresh-tok"
+
+
+def test_omp_token_cli_failure_falls_back_to_db(tmp_path: Path, monkeypatch):
+    """omp CLI missing/failing → the read-only agent.db peek still resolves the token."""
+    import sqlite3
+
+    db_dir = tmp_path / ".omp" / "agent"
+    db_dir.mkdir(parents=True)
+    db = sqlite3.connect(db_dir / "agent.db")
+    db.execute(
+        "CREATE TABLE auth_credentials"
+        " (id INTEGER, provider TEXT, credential_type TEXT, data TEXT,"
+        " disabled_cause TEXT, updated_at INTEGER)"
+    )
+    db.execute(
+        "INSERT INTO auth_credentials VALUES (1, 'kimi-code', 'oauth', ?, NULL, 10)",
+        (json.dumps({"access": "db-tok"}),),
+    )
+    db.commit()
+    db.close()
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def boom(cmd, **kwargs):
+        raise FileNotFoundError("omp")
+
+    monkeypatch.setattr(mf.subprocess, "run", boom)
+    assert mf._omp_kimi_code_oauth_token() == "db-tok"
+
+
+def test_cross_origin_redirect_strips_authorization():
+    """A 30x to a different origin must NOT carry the caller's Authorization header."""
+    import urllib.request
+
+    handler = mf._NoCrossOriginAuthRedirect()
+    req = urllib.request.Request(
+        "https://api.kimi.com/coding/v1/models",
+        headers={"Authorization": "Bearer secret"},
+    )
+    new = handler.redirect_request(
+        req, None, 302, "Found", {}, "http://evil.example.test/models"
+    )
+    assert new is not None
+    assert "Authorization" not in new.headers
+    assert "Authorization" not in new.unredirected_hdrs
+
+
+def test_same_origin_redirect_keeps_authorization():
+    import urllib.request
+
+    handler = mf._NoCrossOriginAuthRedirect()
+    req = urllib.request.Request(
+        "https://api.kimi.com/coding/v1/models",
+        headers={"Authorization": "Bearer secret"},
+    )
+    new = handler.redirect_request(
+        req, None, 301, "Moved", {}, "https://api.kimi.com/coding/v2/models"
+    )
+    assert new is not None
+    assert new.headers.get("Authorization") == "Bearer secret"
 
 
 def test_omp_kimi_code_oauth_token_honors_agent_dir_env(tmp_path: Path, monkeypatch):
@@ -561,6 +636,7 @@ def test_omp_kimi_code_oauth_token_honors_agent_dir_env(tmp_path: Path, monkeypa
     db.commit()
     db.close()
     monkeypatch.setenv("HOME", str(tmp_path / "no-omp-here"))
+    monkeypatch.setattr(mf, "_omp_token_cli", lambda: None)  # force the db fallback path
     monkeypatch.setenv("OMP_CODING_AGENT_DIR", str(agent_dir))
     assert mf._omp_kimi_code_oauth_token() == "tok-relocated"
     monkeypatch.delenv("OMP_CODING_AGENT_DIR")

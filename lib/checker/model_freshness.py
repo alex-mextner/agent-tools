@@ -369,9 +369,36 @@ class PollResult:
     error: str = ""
 
 
+class _NoCrossOriginAuthRedirect(urllib.request.HTTPRedirectHandler):
+    """Strip Authorization when a redirect crosses to a different origin.
+
+    urllib's default redirect handler re-sends every original header to the redirect
+    target — a provider key (or the harvested omp OAuth token) would leak to any host the
+    endpoint 30x's to. Same-origin redirects keep the header; cross-origin drops it (the
+    request then fails auth honestly instead of exfiltrating the credential).
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is None:
+            return None
+        from urllib.parse import urlsplit  # lazy: only needed on an actual redirect
+
+        old, new_origin = urlsplit(req.full_url), urlsplit(new.full_url)
+        if (old.scheme, old.hostname, old.port) != (
+            new_origin.scheme,
+            new_origin.hostname,
+            new_origin.port,
+        ):
+            new.headers.pop("Authorization", None)
+            new.unredirected_hdrs.pop("Authorization", None)
+        return new
+
+
 def _http_get_json(url: str, headers: dict[str, str], timeout: float) -> dict[str, Any]:
     req = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — fixed https hosts
+    opener = urllib.request.build_opener(_NoCrossOriginAuthRedirect())
+    with opener.open(req, timeout=timeout) as resp:  # noqa: S310 — fixed https hosts
         body = resp.read().decode("utf-8", "replace")
     data = json.loads(body)
     return data if isinstance(data, dict) else {}
@@ -476,13 +503,50 @@ def _omp_agent_db() -> Path:
 
 
 def _omp_kimi_code_oauth_token() -> str | None:
-    """Best-effort: the OAuth access token omp stores for kimi-code after `omp /login`.
+    """Best-effort: a fresh OAuth access token for kimi-code from the local omp install.
 
     The Kimi-for-Coding endpoint is OAuth-backed, so on a machine whose only Kimi
-    credential is the omp login the poller can still run instead of skipping. Reads omp's
-    agent.db READ-ONLY; any failure (missing db, schema drift, lock, malformed row) returns
-    None and the caller falls through to the usual skip. Never raises, never refreshes —
-    token refresh stays omp's job; an expired token surfaces as the endpoint's 401 error.
+    credential is the omp login the poller can still run instead of skipping. Primary path
+    is `omp token kimi-code` — omp's own resolver, which handles refresh and profiles.
+    Fallback is a READ-ONLY peek at omp's agent.db for when the CLI can't run (e.g. cron
+    PATH). Any failure returns None and the caller falls through to the usual skip. Never
+    raises, never refreshes by itself — an expired stored token surfaces as the endpoint's
+    401 error.
+    """
+    return _omp_token_cli() or _omp_token_agent_db()
+
+
+def _omp_token_cli() -> str | None:
+    """`omp token kimi-code` — the canonical, refresh-aware resolver. None on any failure."""
+    try:
+        res = subprocess.run(
+            ["omp", "token", "kimi-code"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    token = res.stdout.strip()
+    return token or None
+
+
+def _omp_agent_db() -> Path:
+    """omp's agent.db location, honoring the agent-dir env vars omp itself reads."""
+    for var in ("OMP_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"):
+        override = os.environ.get(var, "").strip()
+        if override:
+            return Path(override).expanduser() / "agent.db"
+    return Path.home() / ".omp" / "agent" / "agent.db"
+
+
+def _omp_token_agent_db() -> str | None:
+    """READ-ONLY peek at omp's agent.db (fallback when the omp CLI can't run).
+
+    Reads the newest enabled kimi-code oauth row; any failure (missing db, schema drift,
+    lock, malformed row) returns None. Never raises.
     """
     import sqlite3  # lazy: stdlib, but only this one resolver needs it
 

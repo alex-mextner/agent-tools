@@ -95,7 +95,7 @@ SDKs, no third-party HTTP client.
    | gemini | `GET {GEMINI_BASE_URL}/v1beta/models` | `GEMINI_API_KEY` / `GOOGLE_API_KEY` |
    | commandcode | `GET {COMMANDCODE_BASE_URL}/models` | `COMMANDCODE_API_KEY` |
    | zai | `GET {ZAI_BASE_URL}/models` | `ZAI_API_KEY` / `ZHIPU_API_KEY` |
-   | kimi-code | `GET {KIMI_CODE_BASE_URL}/models` | `KIMI_API_KEY`, else the omp `kimi-code` OAuth login (read-only from `~/.omp/agent/agent.db`) |
+   | kimi-code | `GET {KIMI_CODE_BASE_URL}/models` | `KIMI_API_KEY`, else the omp `kimi-code` OAuth login (`omp token kimi-code`, with a read-only `agent.db` peek as fallback; OAuth token only ever goes to the canonical endpoint) |
    | fireworks | *(routed via commandcode — no direct list, skipped)* | — |
 
    A provider whose key is **absent** is **skipped**, never a crash. A network/parse error
