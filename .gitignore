@@ -27,3 +27,4 @@ dist/
 
 # JS/TS package installs (e.g. pi-extensions/*/node_modules) — never committed.
 node_modules/
+.test-repos/

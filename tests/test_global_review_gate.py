@@ -12,13 +12,25 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parents[1]
 _REVIEW_GATE = _ROOT / "git-hooks" / "global-dispatcher" / "hooks" / "review-gate"
 
+# Enforcement tests must NOT create repos inside the OS temp dirs: the gate
+# deliberately exempts temp/scratch repos, and pytest's tmp_path lives inside
+# one (e.g. /private/var/folders on macOS). Keep test repos outside the
+# exemption patterns so the gate's blocking behavior stays observable.
+_SCRATCH_ROOT = _ROOT / ".test-repos"
+
+
+def _scratch_base(tmp_path: Path) -> Path:
+    base = _SCRATCH_ROOT / tmp_path.name
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
 
 def _run(*args: str, cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True, check=False)
 
 
 def _repo_with_staged_change(tmp_path: Path, relpath: str = "x.txt") -> Path:
-    repo = tmp_path / "repo"
+    repo = _scratch_base(tmp_path) / "repo"
     repo.mkdir()
     assert _run("git", "init", cwd=repo).returncode == 0
     assert _run("git", "config", "user.email", "a@example.com", cwd=repo).returncode == 0
@@ -255,3 +267,30 @@ def test_no_current_docs_advertise_review_skip_bypass():
                 stale.append(path.relative_to(_ROOT).as_posix())
 
     assert stale == []
+
+
+def _fresh_temp_repo_with_staged_code(tmp_path: Path) -> Path:
+    """A repo that lives INSIDE the OS temp dir (exemption territory)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert _run("git", "init", cwd=repo).returncode == 0
+    assert _run("git", "config", "user.email", "a@example.com", cwd=repo).returncode == 0
+    assert _run("git", "config", "user.name", "A", cwd=repo).returncode == 0
+    (repo / "code.py").write_text("print('x')\n", encoding="utf-8")
+    assert _run("git", "add", "code.py", cwd=repo).returncode == 0
+    return repo
+
+
+def test_review_gate_exempts_repos_inside_os_temp_dirs(tmp_path):
+    # pytest's tmp_path IS inside the OS temp dir (e.g. /private/var/folders on
+    # macOS, /tmp on Linux) — exactly what the exemption covers. No review stamp.
+    repo = _fresh_temp_repo_with_staged_code(tmp_path)
+    proc = _run(str(_REVIEW_GATE), cwd=repo)
+    assert proc.returncode == 0
+
+
+def test_review_gate_still_blocks_non_temp_repo_without_stamp(tmp_path):
+    repo = _repo_with_staged_change(tmp_path, "src/tool.py")
+    proc = _run(str(_REVIEW_GATE), cwd=repo)
+    assert proc.returncode == 1
+    assert "staged changes have not been reviewed" in proc.stderr
