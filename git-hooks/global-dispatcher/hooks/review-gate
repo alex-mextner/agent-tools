@@ -13,6 +13,18 @@
 # rewrites `git diff` output), so the hash matches the one written by review-cli, which
 # also calls the real git binary directly. Without this, a shell alias rewriting `git diff`
 # could produce a different hash and block a legitimately-reviewed commit.
+
+# Scratch/temp repos are exempt: gating throwaway repos created by test suites and
+# one-off sandboxes breaks third-party test runs (conloca's content-api git-operations
+# tests on this machine, 2026-08-04 — 12 failures from this gate alone) for zero value:
+# nobody reviews commits in a mktemp dir.
+repo_root="$(command git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+_tmp_root="${TMPDIR:-/tmp}"; _tmp_root="${_tmp_root%/}"
+case "$repo_root" in
+  "$_tmp_root"/*|/tmp/*|/var/tmp/*|/var/folders/*|/private/tmp/*|/private/var/folders/*|*/AppData/Local/Temp/*) exit 0 ;;
+esac
+unset _tmp_root
+
 if ! files="$(command git -c core.quotepath=false diff --cached --name-only --no-renames)"; then
   echo "review-before-commit: could not list staged files; refusing to skip review." >&2
   exit 1
