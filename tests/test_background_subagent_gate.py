@@ -75,6 +75,47 @@ def test_allow_background_dispatch_string_true(monkeypatch):
     assert _decision(out) == "allow"
 
 
+# ── fork / isolation:remote are inherently background per CC's own Agent tool contract ────
+# (CC's `Agent` tool schema has no `run_in_background` property at all — see the module
+# docstring — so these are the two real allow paths a non-trivial dispatch actually has.)
+
+def test_allow_fork_dispatch_without_run_in_background(monkeypatch):
+    out, _err, code = _run({"args": {"subagent_type": "fork", "prompt": _LONG}}, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_allow_isolation_remote_dispatch_without_run_in_background(monkeypatch):
+    out, _err, code = _run({"args": {"isolation": "remote", "prompt": _LONG}}, monkeypatch)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_allow_isolation_remote_with_realistic_subagent_type(monkeypatch):
+    """The real production shape always carries `subagent_type` (schema-required) alongside
+    `isolation`. Prove `isolation: "remote"` allows even when `subagent_type` is a normal,
+    otherwise-blocking value like `general-purpose`, not just when `subagent_type` is absent."""
+    out, _err, code = _run(
+        {"args": {"subagent_type": "general-purpose", "isolation": "remote", "prompt": _LONG}},
+        monkeypatch,
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_plain_nontrivial_dispatch_without_fork_or_remote_still_blocks(monkeypatch):
+    """A non-fork, non-remote, non-trivial dispatch with no run_in_background must still
+    block — this gate still enforces backgrounding, it just recognizes the real allow paths."""
+    out, _err, code = _run(
+        {"args": {"subagent_type": "general-purpose", "prompt": _LONG}}, monkeypatch
+    )
+    assert code == gate.BLOCK_EXIT_CODE
+    message = json.loads(out)["message"]
+    assert _decision(out) == "block"
+    assert "fork" in message
+    assert "NOT a real field" in message
+
+
 def test_allow_trivial_one_liner(monkeypatch):
     out, _err, code = _run({"args": {"prompt": "rename foo to bar in one file"}}, monkeypatch)
     assert code == 0
