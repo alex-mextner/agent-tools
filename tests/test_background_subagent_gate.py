@@ -114,7 +114,12 @@ def test_isolation_worktree_alone_still_blocks(monkeypatch):
 def test_isolation_worktree_combined_with_fork_still_allows(monkeypatch):
     """`isolation: "worktree"` must be IGNORED by the allow logic, not an active block signal —
     combined with a real background shape (`fork`) it must still allow, proving worktree isn't
-    silently overriding an otherwise-valid background dispatch."""
+    silently overriding an otherwise-valid background dispatch.
+
+    This rests on an assumption not independently verified here: that CC actually backgrounds a
+    fork dispatch even when `isolation: "worktree"` is also set. If a future CC version makes
+    worktree isolation change fork's background behavior, this test's expectation — not just the
+    hook — would need revisiting."""
     out, _err, code = _run(
         {"args": {"isolation": "worktree", "subagent_type": "fork", "prompt": _LONG}}, monkeypatch
     )

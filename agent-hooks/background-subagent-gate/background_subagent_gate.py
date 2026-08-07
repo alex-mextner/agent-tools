@@ -149,12 +149,8 @@ def _is_background(args: dict) -> bool:
     non-background fork or a non-background `isolation: "remote"` would need this hook updated
     too — acceptable given on_error=open (an orchestration-discipline gate, not a security one).
 
-    `run_in_background: true` is also honored. CC's CURRENT `Agent` tool schema exposes no such
-    property (see the module docstring), so this branch is dead for a real CC dispatch — but it
-    is LIVE for opencode: `lib/opencode_hook_bridge/dispatch.py` normalizes opencode's own
-    native `background: true/false` field into `run_in_background` before this hook runs, so
-    for an opencode-driven orchestrator (no fork/isolation concept) this is the only real
-    background signal, not dead code.
+    `run_in_background: true` is also honored — dead for a real CC dispatch, LIVE for opencode
+    (see the module docstring's "Allowed" list for why).
     """
     if args.get("subagent_type") == "fork":
         return True

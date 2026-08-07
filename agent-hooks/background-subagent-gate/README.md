@@ -118,6 +118,7 @@ rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (worktree is IGNORED, 
 echo '{"args":{"run_in_background":true,"prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
 rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (forward-compat path; the live signal for opencode)
 
-echo '{"args":{"agent_id":"sub-1","prompt":"long..."}}' | ./background_subagent_gate.py
-rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (subagent-exempt)
+echo '{"args":{"agent_id":"sub-1","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
+rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (subagent-exempt — checked before triviality, so
+                          #   this demonstrates the agent_id path specifically, not just a short prompt)
 ```
