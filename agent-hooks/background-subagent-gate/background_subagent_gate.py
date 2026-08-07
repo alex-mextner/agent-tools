@@ -12,19 +12,22 @@ Allowed (let through):
     background... you get a completion notification", so it is inherently the desired shape
   - ``isolation: "remote"`` — CC's own tool description states this "always runs in
     background"
-  - a dispatch already marked ``run_in_background: true`` (kept for forward-compat with any
-    harness/tool version that does expose such a field)
+  - a dispatch already marked ``run_in_background: true`` — dead on CC (see NOTE below), but
+    LIVE for opencode: its bridge (`lib/opencode_hook_bridge/dispatch.py`) normalizes its own
+    native `background: true/false` field into `run_in_background` before this hook runs, so
+    for an opencode-driven orchestrator (no fork/isolation concept) this is the only real
+    background signal
   - a TRIVIAL one-liner dispatch (short, single-line prompt) — cheap enough to run inline
   - a dispatch made BY a subagent itself (subagent-exempt: ``agent_id`` present) — a subagent
     may fan out further, and this gate governs the orchestrator, not the workers
 
-NOTE: as of CC 2.1.177 the `Agent` tool's JSON schema carries no `run_in_background` property
-at all (only `description`, `isolation`, `model`, `prompt`, `subagent_type`) — under
-schema-constrained tool calling the model cannot produce that field, so treating it as the
-ONLY non-trivial allow path hard-blocked every fork/remote dispatch with no way through short
-of a Telegram hatch call every single time. Recognizing `subagent_type: "fork"` and
-`isolation: "remote"` — the two shapes CC's own docs already guarantee run in the background —
-is what actually satisfies this hook's intent instead.
+NOTE (CC-specific): as of CC 2.1.177 the `Agent` tool's JSON schema carries no
+`run_in_background` property at all (only `description`, `isolation`, `model`, `prompt`,
+`subagent_type`) — under schema-constrained tool calling the model cannot produce that field,
+so treating it as the ONLY non-trivial allow path hard-blocked every fork/remote dispatch with
+no way through short of a Telegram hatch call every single time. Recognizing
+`subagent_type: "fork"` and `isolation: "remote"` — the two shapes CC's own docs already
+guarantee run in the background — is what actually satisfies this hook's intent instead.
 
 External approval (deny-by-default): there is NO self-service bypass. For a genuine exception,
 ASK the human, or request a one-time Telegram approval by setting
@@ -103,12 +106,12 @@ TRIVIAL_MAX_CHARS = 200
 REMINDER = (
     "Dispatch this subagent in the BACKGROUND. "
     "(1) The orchestrator must dispatch non-trivial subagents in the BACKGROUND. "
-    "(2) On Claude Code, use `subagent_type: \"fork\"` or `isolation: \"remote\"` on the Agent "
-    "call — both run in the background by CC's own tool contract — or model the work as a "
-    "dynamic Workflow. (`run_in_background` is NOT a real field on CC's `Agent` tool; setting "
-    "it does nothing there.) On a harness with no fork/isolation concept (e.g. opencode), set "
-    "`run_in_background: true` (or that harness's own background flag) instead — for that "
-    "carrier it IS the real signal. "
+    "(2) If your harness has no fork/isolation concept (e.g. opencode), set its OWN native "
+    "background flag (opencode: `background: true`) — that IS the real signal there. "
+    "On Claude Code, use `subagent_type: \"fork\"` or `isolation: \"remote\"` on the Agent "
+    "call instead — both run in the background by CC's own tool contract — or model the work "
+    "as a dynamic Workflow. (`run_in_background` is NOT a real field on CC's `Agent` tool; "
+    "setting it does nothing there.) "
     "(3) A foreground subagent blocks the main thread until it finishes — that defeats "
     "orchestration. "
     "There is NO self-service bypass. For a genuine exception, ASK the human, or request a "
@@ -146,10 +149,12 @@ def _is_background(args: dict) -> bool:
     non-background fork or a non-background `isolation: "remote"` would need this hook updated
     too — acceptable given on_error=open (an orchestration-discipline gate, not a security one).
 
-    `run_in_background: true` is also honored, purely for forward-compat with a future/other
-    harness that might add such a field — CC's CURRENT `Agent` tool schema exposes no such
-    property (see the module docstring), so a real CC dispatch can never set it; this branch is
-    dead code today, not an active bypass.
+    `run_in_background: true` is also honored. CC's CURRENT `Agent` tool schema exposes no such
+    property (see the module docstring), so this branch is dead for a real CC dispatch — but it
+    is LIVE for opencode: `lib/opencode_hook_bridge/dispatch.py` normalizes opencode's own
+    native `background: true/false` field into `run_in_background` before this hook runs, so
+    for an opencode-driven orchestrator (no fork/isolation concept) this is the only real
+    background signal, not dead code.
     """
     if args.get("subagent_type") == "fork":
         return True

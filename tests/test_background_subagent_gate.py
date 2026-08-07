@@ -111,6 +111,17 @@ def test_isolation_worktree_alone_still_blocks(monkeypatch):
     assert _decision(out) == "block"
 
 
+def test_isolation_worktree_combined_with_fork_still_allows(monkeypatch):
+    """`isolation: "worktree"` must be IGNORED by the allow logic, not an active block signal —
+    combined with a real background shape (`fork`) it must still allow, proving worktree isn't
+    silently overriding an otherwise-valid background dispatch."""
+    out, _err, code = _run(
+        {"args": {"isolation": "worktree", "subagent_type": "fork", "prompt": _LONG}}, monkeypatch
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
 def test_plain_nontrivial_dispatch_without_fork_or_remote_still_blocks(monkeypatch):
     """A non-fork, non-remote, non-trivial dispatch with no run_in_background must still
     block — this gate still enforces backgrounding, it just recognizes the real allow paths."""

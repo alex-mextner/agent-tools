@@ -98,16 +98,24 @@ chmod +x background_subagent_gate.py
 echo '{"args":{"prompt":"'"$(python3 -c 'print("x"*300)')"'"}}' | ./background_subagent_gate.py
 rc=$?; echo "exit=$rc"   # → decision":"block ...  exit=10  (long foreground dispatch)
 
-echo '{"args":{"subagent_type":"fork","prompt":"long..."}}' | ./background_subagent_gate.py
+LONG=$(python3 -c 'print("x"*300)')
+
+echo '{"args":{"subagent_type":"fork","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
 rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (fork — inherently background)
 
-echo '{"args":{"isolation":"remote","prompt":"long..."}}' | ./background_subagent_gate.py
+echo '{"args":{"isolation":"remote","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
 rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (isolation:remote — inherently background)
 
-echo '{"args":{"isolation":"worktree","prompt":"long..."}}' | ./background_subagent_gate.py
+# NOTE: a short/trivial prompt would pass here too, but for the WRONG reason (triviality,
+# not backgrounding) — use a long prompt so this actually exercises the worktree-is-not-
+# background path, not the unrelated trivial-dispatch allow.
+echo '{"args":{"isolation":"worktree","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
 rc=$?; echo "exit=$rc"   # → decision":"block ...  exit=10  (worktree isolation is NOT background)
 
-echo '{"args":{"run_in_background":true,"prompt":"long..."}}' | ./background_subagent_gate.py
+echo '{"args":{"isolation":"worktree","subagent_type":"fork","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
+rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (worktree is IGNORED, not a block signal — fork still wins)
+
+echo '{"args":{"run_in_background":true,"prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
 rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (forward-compat path; the live signal for opencode)
 
 echo '{"args":{"agent_id":"sub-1","prompt":"long..."}}' | ./background_subagent_gate.py
