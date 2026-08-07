@@ -5,14 +5,28 @@
 Fires when the **main thread** dispatches a subagent (the CC `Agent`/`Task` tool). A
 non-trivial subagent run in the **foreground** blocks the orchestrator until it finishes —
 which defeats fanning work out. This gate **blocks** such a dispatch and tells the
-orchestrator to set `run_in_background: true` (or model the work as a dynamic Workflow).
+orchestrator to use `subagent_type: "fork"` or `isolation: "remote"` (or model the work as a
+dynamic Workflow).
 
 Lets through:
 
-- a dispatch already marked `run_in_background: true` (the desired shape)
+- `subagent_type: "fork"` — CC's own `Agent` tool description states a fork runs in the
+  background and reports back via a completion notification
+- `isolation: "remote"` — CC's own tool description states this always runs in background
+- a dispatch already marked `run_in_background: true` — kept for forward-compat with any
+  harness/carrier that exposes such a field. CC's own `Agent` tool schema, as of 2.1.177,
+  carries no such property, so this path is dead for CC specifically — but **opencode's**
+  bridge (`lib/opencode_hook_bridge/dispatch.py`) normalizes its own `background: true/false`
+  field into `run_in_background` before this hook ever runs, so for an opencode-driven
+  orchestrator (which has no `fork`/`isolation` concept) this IS the live, only background
+  signal
 - a **trivial** one-liner dispatch (prompt/description `< 200` chars and single-line)
 - a dispatch made **by a subagent itself** (subagent-exempt — `agent_id` present): a worker
   may fan out further, and this gate governs the orchestrator, not the workers
+
+`isolation: "worktree"` is deliberately **not** treated as inherently background — worktree
+isolation is about workspace separation, not execution timing, so a `worktree`-isolated
+dispatch still needs one of the paths above to pass.
 
 ## Why an agent-hook (and the `pre-agent` point)
 
@@ -84,9 +98,27 @@ chmod +x background_subagent_gate.py
 echo '{"args":{"prompt":"'"$(python3 -c 'print("x"*300)')"'"}}' | ./background_subagent_gate.py
 rc=$?; echo "exit=$rc"   # → decision":"block ...  exit=10  (long foreground dispatch)
 
-echo '{"args":{"run_in_background":true,"prompt":"long..."}}' | ./background_subagent_gate.py
-rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (already background)
+LONG=$(python3 -c 'print("x"*300)')
 
-echo '{"args":{"agent_id":"sub-1","prompt":"long..."}}' | ./background_subagent_gate.py
-rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (subagent-exempt)
+echo '{"args":{"subagent_type":"fork","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
+rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (fork — inherently background)
+
+echo '{"args":{"isolation":"remote","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
+rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (isolation:remote — inherently background)
+
+# NOTE: a short/trivial prompt would pass here too, but for the WRONG reason (triviality,
+# not backgrounding) — use a long prompt so this actually exercises the worktree-is-not-
+# background path, not the unrelated trivial-dispatch allow.
+echo '{"args":{"isolation":"worktree","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
+rc=$?; echo "exit=$rc"   # → decision":"block ...  exit=10  (worktree isolation is NOT background)
+
+echo '{"args":{"isolation":"worktree","subagent_type":"fork","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
+rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (worktree is IGNORED, not a block signal — fork still wins)
+
+echo '{"args":{"run_in_background":true,"prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
+rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (forward-compat path; the live signal for opencode)
+
+echo '{"args":{"agent_id":"sub-1","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
+rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (subagent-exempt — checked before triviality, so
+                          #   this demonstrates the agent_id path specifically, not just a short prompt)
 ```

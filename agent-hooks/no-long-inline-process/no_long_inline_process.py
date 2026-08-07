@@ -548,8 +548,9 @@ def main() -> int:
     block_message = (
         f"Run this in a BACKGROUND subagent, not the orchestrator: `{matched}` is a "
         "long-running process (review / --watch / build-or-test suite / long sleep) that "
-        "would block the main thread. Dispatch an Agent with run_in_background: true to run "
-        "it. There is NO self-service bypass. For a genuine exception, ASK the human, or "
+        "would block the main thread. Dispatch it as an Agent with `subagent_type: \"fork\"` "
+        "or `isolation: \"remote\"` (both run in the background). There is NO self-service "
+        "bypass. For a genuine exception, ASK the human, or "
         "request a one-time Telegram approval by setting "
         "RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS=\"<written justification>\" "
         "(deny-by-default; a bare 1 is rejected)."
