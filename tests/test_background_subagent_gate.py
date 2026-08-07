@@ -103,6 +103,14 @@ def test_allow_isolation_remote_with_realistic_subagent_type(monkeypatch):
     assert _decision(out) == "allow"
 
 
+def test_isolation_worktree_alone_still_blocks(monkeypatch):
+    """`isolation: "worktree"` is workspace isolation, not background execution — unlike
+    `isolation: "remote"`, it must NOT exempt a non-trivial dispatch on its own."""
+    out, _err, code = _run({"args": {"isolation": "worktree", "prompt": _LONG}}, monkeypatch)
+    assert code == 10
+    assert _decision(out) == "block"
+
+
 def test_plain_nontrivial_dispatch_without_fork_or_remote_still_blocks(monkeypatch):
     """A non-fork, non-remote, non-trivial dispatch with no run_in_background must still
     block — this gate still enforces backgrounding, it just recognizes the real allow paths."""
