@@ -138,7 +138,7 @@
 #                          just documentation. Simple `KEY=value` lines, no quote-stripping
 #                          (don't wrap values in quotes — `KEY="val"` means the literal value
 #                          `"val"`, not `val`); `#`-only-prefixed lines and blank lines are
-#                          ignored. Two whitelisted keys, nothing else is read or evaluated
+#                          ignored. Three whitelisted keys, nothing else is read or evaluated
 #                          from the file:
 #                            SHIP_LOCAL_TEST_DIR=<path>   directory (relative to repo root) to run
 #                                                  the test command from, or to scope
@@ -148,6 +148,28 @@
 #                                                  (same eval mechanism as the env var of the same
 #                                                  name — this is just a committed, per-repo
 #                                                  source for it instead of a per-invocation one).
+#                            SHIP_TASK_CODE_PREFIX=<PREFIX>   opt-in for the review-quorum gate's
+#                                                  task-code derivation (see below): when a bare
+#                                                  GitHub-issue-style code (#123) is found in the
+#                                                  branch name/PR body (and no HYP-123/XX-123 code
+#                                                  is present), synthesize <PREFIX>-123 as the task
+#                                                  code instead of using #123 verbatim. For repos
+#                                                  whose task-cli backend is GitHub Issues, which
+#                                                  has no ticket-code convention of its own.
+#                                                  REQUIRED (not just recommended): review-cli's
+#                                                  quorum store is a single GLOBAL file keyed only
+#                                                  by the task-code STRING, with no per-repo
+#                                                  scoping — two different repos both deriving the
+#                                                  bare code "#346" would silently share (and thus
+#                                                  falsely satisfy) each other's review-iteration
+#                                                  count. <PREFIX> must be unique per repo (e.g.
+#                                                  the repo name) to avoid that collision; PREFIX
+#                                                  must be 1-40 uppercase letters/digits (no
+#                                                  hyphen/whitespace/other punctuation — it is
+#                                                  spliced directly in front of "-<n>") or the
+#                                                  whole file is ignored, same as an unsafe
+#                                                  SHIP_LOCAL_TEST_DIR. Unset = bare issue numbers
+#                                                  are never picked up (existing behavior).
 #                          Precedence (highest first): SHIP_LOCAL_TEST_CMD env var (test-only) >
 #                          .ship-config file > rig.yaml + `dev` CLI (root-only) > root auto-detect
 #                          (pyproject.toml/package.json/Cargo.toml at repo root) > e2e/ subdirectory
@@ -569,6 +591,7 @@ _ship_config_load() {
   local root="$1" content line key val
   SHIP_CFG_DIR=""
   SHIP_CFG_CMD=""
+  SHIP_CFG_TASK_PREFIX=""
   if ! (cd "$root" && git show HEAD:.ship-config) >/dev/null 2>&1; then
     [ -f "$root/.ship-config" ] && \
       echo "[ship] local gate: .ship-config exists in the working tree but is not committed at HEAD — ignoring (uncommitted config is not audited)." >&2
@@ -625,11 +648,15 @@ _ship_config_load() {
     line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     case "$line" in
       ''|'#'*) continue ;;
-      SHIP_LOCAL_TEST_DIR=*|SHIP_LOCAL_TEST_CMD=*)
+      SHIP_LOCAL_TEST_DIR=*|SHIP_LOCAL_TEST_CMD=*|SHIP_TASK_CODE_PREFIX=*)
         key="${line%%=*}"
         val="${line#*=}"
         val="$(printf '%s' "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-        [ "$key" = "SHIP_LOCAL_TEST_DIR" ] && SHIP_CFG_DIR="$val" || SHIP_CFG_CMD="$val"
+        case "$key" in
+          SHIP_LOCAL_TEST_DIR) SHIP_CFG_DIR="$val" ;;
+          SHIP_LOCAL_TEST_CMD) SHIP_CFG_CMD="$val" ;;
+          SHIP_TASK_CODE_PREFIX) SHIP_CFG_TASK_PREFIX="$val" ;;
+        esac
         ;;
       *)
         echo "[ship] local gate: .ship-config: ignoring unrecognized line: $line" >&2 ;;
@@ -639,6 +666,29 @@ _ship_config_load() {
     echo "[ship] local gate: .ship-config: SHIP_LOCAL_TEST_DIR '$SHIP_CFG_DIR' is not a safe repo-relative subdirectory (absolute, a '..' path component, or '.'/repo root itself — omit the key to mean root) — ignoring the whole file." >&2
     SHIP_CFG_DIR=""
     SHIP_CFG_CMD=""
+    SHIP_CFG_TASK_PREFIX=""
+  fi
+  # SHIP_TASK_CODE_PREFIX must be 1-40 uppercase letters/digits — it is spliced directly in
+  # front of "-<n>" to synthesize a task code, so anything else (lowercase, punctuation,
+  # whitespace) either fails review-cli's own task-code token validation or, worse, silently
+  # produces a DIFFERENT collision-prone code than the operator intended. Rejection invalidates
+  # the whole file, same policy as an unsafe SHIP_LOCAL_TEST_DIR (a malformed knob must not
+  # silently degrade to "feature off" while the rest of the file's overrides still apply).
+  if [ -n "$SHIP_CFG_TASK_PREFIX" ]; then
+    case "$SHIP_CFG_TASK_PREFIX" in
+      *[!A-Z0-9]*|'')
+        echo "[ship] local gate: .ship-config: SHIP_TASK_CODE_PREFIX '$SHIP_CFG_TASK_PREFIX' is not 1-40 uppercase letters/digits — ignoring the whole file." >&2
+        SHIP_CFG_DIR=""
+        SHIP_CFG_CMD=""
+        SHIP_CFG_TASK_PREFIX=""
+        ;;
+    esac
+    if [ -n "$SHIP_CFG_TASK_PREFIX" ] && [ "${#SHIP_CFG_TASK_PREFIX}" -gt 40 ]; then
+      echo "[ship] local gate: .ship-config: SHIP_TASK_CODE_PREFIX '$SHIP_CFG_TASK_PREFIX' is longer than 40 characters — ignoring the whole file." >&2
+      SHIP_CFG_DIR=""
+      SHIP_CFG_CMD=""
+      SHIP_CFG_TASK_PREFIX=""
+    fi
   fi
 }
 
@@ -1638,12 +1688,23 @@ fi
 # UPPERCASE-PREFIX-<n> ticket token (2+ uppercase letters, a hyphen, digits) so other repos'
 # conventions (JIRA-style PROJ-123, etc.) are also picked up. The generic pattern is
 # deliberately uppercase-only so it doesn't false-match ordinary prose like "utf-8" or "step-2".
-_review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing; ALWAYS exits 0
-  local text="$1" m
+# $2 = a non-empty SHIP_CFG_TASK_PREFIX (from .ship-config) additionally tries a bare
+# GitHub-issue-style reference (#123) as a LAST-resort fallback, SYNTHESIZING "<$2>-123" —
+# never the bare "#123" itself. review-cli's quorum store is a single global file keyed only by
+# the task-code string with no per-repo scoping, so two repos both deriving bare "#346" would
+# silently share (and falsely satisfy) each other's review-iteration count; the synthesized
+# prefix is what keeps the code unique per repo. Never tried when $2 is empty (opt-in), so a
+# bare #123 in ordinary PR prose is never mistaken for a task code by default.
+_review_quorum_extract_ticket() {  # $1 = text, $2 = task-code prefix (empty = feature off) -> prints ticket code, or nothing; ALWAYS exits 0
+  local text="$1" prefix="${2:-}" m
   m=$(printf '%s\n' "$text" | grep -oiE 'HYP-[0-9]+' | head -1 || true)
   if [ -n "$m" ]; then printf '%s' "$m" | tr '[:lower:]' '[:upper:]'; return 0; fi
   m=$(printf '%s\n' "$text" | grep -oE '[A-Z][A-Z]+-[0-9]+' | head -1 || true)
-  printf '%s' "$m"
+  if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
+  if [ -n "$prefix" ]; then
+    m=$(printf '%s\n' "$text" | grep -oE '#[0-9]+' | head -1 || true)
+    if [ -n "$m" ]; then printf '%s-%s' "$prefix" "${m#\#}"; return 0; fi
+  fi
   return 0
 }
 
@@ -1896,11 +1957,16 @@ else
   # line and the hatch context.
   QITER=0; QMODELS_N=0; QMODELS=""; QERR=""; QPASSED=false
 
+  # Load the audited per-repo .ship-config for its SHIP_TASK_CODE_PREFIX opt-in (see "Knobs
+  # (file)" in the header doc). Reuses the same loader as the local-test gate above — cheap,
+  # idempotent, and the committed-at-HEAD trust story is identical.
+  _ship_config_load "$ROOT"
+
   TASK_CODE="${REVIEW_TASK_CODE:-}"
-  [ -n "$TASK_CODE" ] || TASK_CODE=$(_review_quorum_extract_ticket "$BRANCH")
+  [ -n "$TASK_CODE" ] || TASK_CODE=$(_review_quorum_extract_ticket "$BRANCH" "$SHIP_CFG_TASK_PREFIX")
   if [ -z "$TASK_CODE" ]; then
     PR_BODY_QC=$(gh pr view "$PR" --json body -q '.body // ""' 2>/dev/null) || PR_BODY_QC=""
-    TASK_CODE=$(_review_quorum_extract_ticket "$PR_BODY_QC")
+    TASK_CODE=$(_review_quorum_extract_ticket "$PR_BODY_QC" "$SHIP_CFG_TASK_PREFIX")
   fi
 
   if [ -z "$TASK_CODE" ]; then
