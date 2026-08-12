@@ -104,20 +104,15 @@ HOOK_API = "agents-hooks/v1"
 TRIVIAL_MAX_CHARS = 200
 
 REMINDER = (
-    "Dispatch this subagent in the BACKGROUND. "
-    "(1) The orchestrator must dispatch non-trivial subagents in the BACKGROUND. "
-    "(2) If your harness has no fork/isolation concept (e.g. opencode), set its OWN native "
-    "background flag (opencode: `background: true`) — that IS the real signal there. "
-    "On Claude Code, use `subagent_type: \"fork\"` or `isolation: \"remote\"` on the Agent "
-    "call instead — both run in the background by CC's own tool contract — or model the work "
-    "as a dynamic Workflow. (`run_in_background` is NOT a real field on CC's `Agent` tool; "
-    "setting it does nothing there.) "
-    "(3) A foreground subagent blocks the main thread until it finishes — that defeats "
-    "orchestration. "
-    "There is NO self-service bypass. For a genuine exception, ASK the human, or request a "
-    "one-time Telegram approval by setting "
-    "RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE=\"<written justification>\" (deny-by-default; "
-    "a bare 1 is rejected)."
+    "Dispatch this subagent in the BACKGROUND — foreground blocks the main thread until "
+    "it finishes.\n"
+    "Claude Code: subagent_type=\"fork\" or isolation=\"remote\" (both background per CC's "
+    "tool contract), or a dynamic Workflow. run_in_background is NOT a real field on CC's "
+    "Agent tool — it does nothing.\n"
+    "opencode: set its native background: true flag.\n"
+    "No self-service bypass — ask the human, or request one-time Telegram approval via "
+    "RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE=\"<justification>\" (deny-by-default; bare "
+    "\"1\" rejected)."
 )
 
 
