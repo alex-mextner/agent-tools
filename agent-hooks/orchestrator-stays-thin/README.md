@@ -34,6 +34,14 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   subagent (`agent_id` present) is exempt and runs gh/ship freely — the gate governs the
   orchestrator only.
 
+  **UPDATE (Alex tg#9977, agent-tools#159): one narrow exception restored — `gh ship <PR#>`.**
+  The orchestrator may run the gated merge itself inline again, matched only on the literal shape
+  `gh ship <bare-PR-number>` (head `gh`, next token exactly `ship`, next token all-ASCII-digits;
+  everything AFTER that — not just flags/redirects but any further bare token too — unrestricted).
+  `gh ship` with no PR number, `gh ship abc`, and every
+  OTHER gh subcommand (`gh pr merge`, `gh run`, `gh pr checks`/`view`, `gh api`, …) still delegate
+  — see "`gh ship <PR#>` — restored narrow carve-out" below for the full matrix.
+
 ## Per-repo opt-out (Alex tg#5743)
 
 Default **ON** (opt-OUT — this gate has always been always-on, so an un-enrolled repo keeps
@@ -53,8 +61,13 @@ subagent — shipping *and* CI/PR verification included. So `gh ship`, `gh pr ch
 orchestrator, single or chained, with or without `cd`/read-only plumbing (`gh ship 605 2>&1 | tail
 -30` blocks; a subagent runs it). Per-segment-head discipline is unchanged: `gh` as a
 substring/needle (`grep 'gh ship' log`, `git log | rg gh`) is **not** a gh command and exempts
-nothing. The **dispatched subagent** (`agent_id` present) is the one meant to ship/verify and is
-exempt.
+nothing. The **dispatched subagent** (`agent_id` present) is the one meant to verify and is
+exempt for everything.
+
+**UPDATE (Alex tg#9977, agent-tools#159):** `gh ship <PR#>` — the gated merge itself, matched
+narrowly on a bare PR-number argument — was restored as a sanctioned orchestrator exception. See
+"`gh ship <PR#>` — restored narrow carve-out" below. Every OTHER gh shape (including `gh ship`
+with no PR number) is still exactly as described above: an impl-signal that warn-then-blocks.
 
 **Report / verify carve-out — `tg` + read-only inspection (coordinator):** reporting to the user
 and *read-only* verification stay at orchestrator altitude and must **not** require a subagent. A
@@ -76,6 +89,76 @@ from CC's authoritative top-level event and drops any `tool_input`-forged copy (
 never writes a top-level `agent_id`; a non-CC carrier wiring this hook must replicate that filtering
 or a forged `agent_id` self-exempts the orchestrator (see `background-subagent-gate/README.md` for
 the full contract). This matches the sibling `skills-read-gate`'s narrowed read (agent-tools#115).
+
+## `gh ship <PR#>` — restored narrow carve-out (agent-tools#159, Alex tg#9977)
+
+The orchestrator may run `gh ship <PR#>` inline — the ONE gh mutation that is sanctioned, same as
+a dispatched subagent. Alex: *"the orchestrator CAN gh ship like agents can, but BY DEFAULT agents
+do it"* — the default is still delegation; this is the exception, not a reopening of "all gh".
+
+**Matched narrowly, on argv shape alone** (`_is_gh_ship_command`): the segment's command head must
+be `gh` (basename/env-prefix normalized, same as `_is_gh_command`), the very next token must be
+the literal `ship`, and the token after that must be a bare PR number (ASCII digits only,
+non-empty). Anything AFTER the PR number is genuinely UNRESTRICTED — not just flags/redirects
+(`--screenshot <path> <desc>`, `--repo <owner/repo>`, a trailing `2>&1` token) but ANY further bare
+token too, including a second bare number (`gh ship 605 606`); this predicate recognizes the ship
+*shape* only and does not vet ship's own arguments (`--skip-ci` has its own separate,
+independently-gated live Telegram hatch inside `ci/ship/ship.sh` — this gate is not the place to
+duplicate that; a second PR number is refused downstream by `ship.sh`'s own arg parser — "the lone
+bare arg" — a second, independent gate this hook does not need to replicate).
+
+**What matches (never warns, never blocks — same treatment as `tg`/`review`):**
+- `gh ship 605`
+- `gh ship 605 --screenshot out.png "desc"`
+- `gh ship 605 --repo alex-mextner/agent-tools`
+- `gh ship 605 2>&1 | tail -30 | grep -i merged` (a read-only tail companion)
+- `cd /repo && gh ship 605` (the `cd` companion)
+- `GH_PAGER=cat gh ship 605` (env-prefixed)
+- `/usr/bin/gh ship 605` (path-qualified)
+
+**What does NOT match — falls through to the general `gh` deny, still warn-then-blocks:**
+- `gh ship` (no PR number)
+- `gh ship abc` / `gh ship --help` (non-numeric argument)
+- `gh ship $PR` / `gh ship "$PR_NUMBER"` — the hook sees the LITERAL pre-expansion text, so a
+  genuinely numeric PR passed through a shell variable still misses (no shell runs before this
+  hook inspects the string). Pass the literal digits: `gh ship 605`, not a variable.
+- `gh ship --repo o/r 605` (a flag BEFORE the PR number — the number must be the token
+  immediately after `ship`; `gh ship 605 --repo o/r`, number first, DOES match)
+- `gh pr merge 605`, `gh run list`, `gh pr checks 605`, `gh api …` — every OTHER gh subcommand
+- `gh ship 605 'oops` (an unbalanced-quote segment shlex cannot parse — conservative fallback)
+
+**Does not launder a mutation elsewhere on the line** (agent-tools#159's original hardening,
+unchanged): a `gh ship 605` tacked onto an implementation chain does not exempt the rest of it — a
+build/edit (`sed -i … && gh ship 605`), a companion mutation (`gh ship 605 && git push`), a
+mutation smuggled in a substitution (`gh ship 605 $(git push origin main)`), a sibling gh mutation
+(`gh ship 605 | gh pr merge 606`), behind a bare `&` (`gh ship 605 & git push`), or a heredoc
+anywhere still warn-then-blocks on the line's full content — the ship exemption is per-segment,
+not per-line. What actually enforces this is a real chain operator (a genuine mutation becomes its
+OWN segment, judged independently) and the substitution-liveness scanner (a LIVE `$()`/backtick/
+`<()`/`>()` executes and is caught regardless). A sanctioned segment's own argument TEXT merely
+*looking* like a mutation (`gh ship 605 tee`) does NOT block — that matches the SAME precedent
+`tg`/`review` already have (`tg 'saw $(git push) in logs'` is allowed too); `tee` there is inert
+text, never an executed command.
+
+**Scope note:** ship's own flags are unvetted, so the carve-out also sanctions
+`gh ship 605 --repo some/other-repo` — an inline merge into a DIFFERENT repository than the
+orchestrator's cwd. Accepted within this gate's stated threat model (a cooperative orchestrator,
+not an adversarial one — see "Fail-open, on purpose" below), not an oversight.
+
+**Chaining note:** because the exemption is per-segment, `gh ship 605 && gh ship 606` (or any
+number of chained `gh ship <PR#>`s) is ALSO sanctioned — each merge is individually gated by its
+own full `ci/ship/ship.sh` pipeline (green CI, review quorum, screenshot, etc.), so chaining does
+not weaken any ONE merge's own safety checks; it just lets the orchestrator run several
+already-sanctioned merges on one line instead of several separate tool calls.
+
+**Plumbing-sensitivity caveat:** the "never warns, never blocks" pipe forms above assume the ship
+segment's own TEXT doesn't independently trip the `FIND_MUTATION` veto (`-delete`/`-exec`/…
+appearing anywhere in the segment, e.g. inside a `--note` value). An UNCHAINED line with such text
+still falls through to allowed (the veto only costs the fast path, and the resulting single-segment
+line has nothing else to trip); but adding ANY companion — even a fully read-only `| tail -3 |
+head -1` — pushes the chain to 3+ segments, where the `>= 3` chain-length fallback then applies,
+flipping the SAME ship line to warn-then-block. Same pre-existing behavior `tg`/`review` already
+have; more visible here only because this section advertises specific piped forms.
 
 ## Tiering — WARN then BLOCK
 
@@ -146,4 +229,9 @@ echo '{"point":"pre-write","cwd":"/r","args":{"file_path":"/r/README.md"}}' | ./
 rc=$?; echo "exit=$rc"   # docs → exit=0 (allow)
 echo '{"point":"pre-bash","cwd":"/r","args":{"command":"git status"}}' | ./orchestrator_stays_thin.py
 rc=$?; echo "exit=$rc"   # single read-only → exit=0 (allow)
+
+echo '{"point":"pre-bash","cwd":"/r","args":{"command":"gh ship 605"}}' | ./orchestrator_stays_thin.py
+rc=$?; echo "exit=$rc"   # gh ship <PR#> → exit=0 (allow, never warns — agent-tools#159)
+echo '{"point":"pre-bash","cwd":"/r","args":{"command":"gh pr merge 605"}}' | ./orchestrator_stays_thin.py
+rc=$?; echo "exit=$rc"   # every OTHER gh subcommand → exit=0 (first offense, WARN)
 ```

@@ -12,13 +12,17 @@ ONE script binds TWO points via two descriptors; it branches on ``event["point"]
                 warn-then-block. Read-only inspection AND sanctioned ORCHESTRATION are NEVER
                 blocked — a single one-liner (git status, ls, cat, grep, find) OR a chain of any
                 length whose every segment is read-only OR an orchestration command (tg, review,
-                git worktree list). ALL `gh` is DELEGATED (Alex tg#7103, reverting the #159/#162
-                gh-ship carve-out): `gh ship` AND CI/PR verification (`gh pr checks/view`, `gh
-                run`, `gh api`) are a subagent's job now, not inline orchestrator work — they are
-                treated as implementation and warn-then-block, exactly like a commit. Commits/
-                pushes and test runs (git commit/push, pytest, npm/bun/cargo test) are likewise
-                treated as implementation and warn-then-block. A dispatched subagent (agent_id
-                present) is exempt and runs gh/ship freely.
+                git worktree list). ALMOST ALL `gh` is DELEGATED (Alex tg#7103): CI/PR verification
+                (`gh pr checks/view`, `gh run`, `gh api`) and every other gh subcommand are a
+                subagent's job, not inline orchestrator work — treated as implementation and
+                warn-then-block, exactly like a commit. The ONE exception, restored narrowly (Alex
+                tg#9977, agent-tools#159): `gh ship <PR#>` — the gated merge itself, matched only on
+                that exact shape (a bare PR-number argument) — is sanctioned for the orchestrator to
+                run inline, same as a subagent; every other gh shape, including `gh ship` with no
+                PR number or any non-numeric argument, still delegates. Commits/pushes and test runs
+                (git commit/push, pytest, npm/bun/cargo test) are likewise treated as implementation
+                and warn-then-block. A dispatched subagent (agent_id present) is exempt and runs
+                gh/ship freely regardless.
 
 TIERED (warn → block): the FIRST offense in the TTL window WARNs (allow + message); a REPEAT
 in the window BLOCKs. The tier is tracked by a marker file keyed by a hash of cwd. This gives
@@ -131,14 +135,22 @@ READ_ONLY_BASH = re.compile(
 # a BLOCK. Head-anchored (`^\s*`) exactly like READ_ONLY_BASH so one of these tokens as an ARGUMENT
 # (`cat review.log`, `git log | rg tg`) is not waved through (the anchor invariant, #5/#80).
 #
-# `gh` IS DELIBERATELY ABSENT (Alex tg#7103: revert the #159/#162 gh-ship carve-out). The
-# orchestrator delegates ALL `gh` to a subagent now — shipping a gated PR (`gh ship`) AND CI/PR
-# verification (`gh pr checks/view`, `gh run`, `gh api`) are a subagent's job, not inline
-# orchestrator work. `gh` is instead an implementation signal (`_is_gh_command`, defined with the
-# other head-normalization helpers), so every gh invocation warn-then-blocks for the orchestrator
-# exactly like `git commit`. A dispatched subagent (`agent_id` present) is exempt and runs gh freely
-# — the gate governs the orchestrator only. `gh` delegation subsumes the old `gh api` GET-vs-mutation
-# distinction: it no longer matters whether a gh call reads or writes; the orchestrator runs no gh.
+# `gh` IS DELIBERATELY ABSENT from THIS head-only regex (Alex tg#7103: revert the #159/#162 gh-ship
+# carve-out). The orchestrator delegates almost all `gh` to a subagent — CI/PR verification (`gh pr
+# checks/view`, `gh run`, `gh api`) and every other subcommand are a subagent's job, not inline
+# orchestrator work. `gh` is instead an implementation signal by default (`_is_gh_command`, defined
+# with the other head-normalization helpers), so a generic gh invocation warn-then-blocks for the
+# orchestrator exactly like `git commit`. `gh` delegation subsumes the old `gh api` GET-vs-mutation
+# distinction: it no longer matters whether a gh call reads or writes; the orchestrator runs no gh
+# (except the one exception below). A dispatched subagent (`agent_id` present) is exempt and runs gh
+# freely regardless — the gate governs the orchestrator only.
+#
+# ONE narrow exception, restored (Alex tg#9977, agent-tools#159): `gh ship <PR#>` is sanctioned for
+# the orchestrator to run inline. It is NOT added to this head-only regex (ORCH_ALLOW has no
+# argument awareness — it cannot tell `gh ship 605` from `gh ship` or `gh pr merge`); instead it is
+# its own shlex-based predicate, `_is_gh_ship_command`, consulted directly by `_seg_is_allowed` /
+# `_seg_is_impl_signal` alongside this regex. Every OTHER gh shape — `gh ship` with no PR number,
+# `gh pr merge`, `gh run`, `gh pr checks/view`, `gh api`, and so on — still delegates.
 ORCH_ALLOW = re.compile(
     r"^\s*(?:"
     r"tg\b"                                               # Telegram status reports
@@ -232,20 +244,24 @@ FIND_MUTATION = re.compile(r"\s-(?:delete|exec|execdir|ok|okdir|fprintf|fprint0|
 # Rewritten per the CTO's explicit clarification (tg thread, 2026-07-08/#7103): this hook is an
 # INTENTIONAL, jointly-accepted operating model — not friction an agent should route around. The
 # orchestrator plans and dispatches; a subagent does the implementation-shaped work (an edit, a
-# build, a raw `git commit`/`git push`, a test run — AND all `gh`, including `gh ship` and CI/PR
+# build, a raw `git commit`/`git push`, a test run — AND nearly all `gh`, including CI/PR
 # verification). A prior draft framed this as a terse rule ("does not implement inline") that read
-# as adversarial and invited bypass attempts. The message now states WHY (the agreed model, not an
-# error), HOW to proceed (dispatch a subagent), and that fighting or working around it is out of
-# scope. The `gh ship` / read-only-`gh` carve-out (agent-tools#159/#162) was REMOVED here per
-# tg#7103: shipping and CI verification are delegated too, so this MESSAGE now DOES fire for an
-# inline `gh ship`/`gh pr`/`gh run`/`gh api` by the orchestrator.
+# as adversarial and invited unwanted workarounds. The message now states WHY (the agreed model,
+# not an error), HOW to proceed (dispatch a subagent), and that fighting it is out of scope. The
+# `gh ship` / read-only-`gh` carve-out (agent-tools#159/#162) was REMOVED here per tg#7103
+# (shipping and CI verification were both delegated), then PARTIALLY RESTORED (Alex tg#9977,
+# agent-tools#159): narrowly, `gh ship <PR#>` only. The orchestrator may run that one exact shape
+# inline again, same as a subagent ("the orchestrator CAN gh ship like agents can, but BY DEFAULT
+# agents do it"); CI/PR verification and every other gh subcommand stay delegated, so this MESSAGE
+# still fires for those.
 MESSAGE = (
     "By design, not a bug: this session is the orchestrator, and the operating model — agreed "
     "with the CTO — is that it never implements inline. Planning, dispatching, and reading "
     "reports back is its job; doing the Edit/Write/Bash itself is not — that includes an edit, a "
-    "build, a raw `git commit`/`git push`, a test run, AND all `gh` (shipping a PR with `gh ship` "
-    "and CI/PR verification like `gh pr checks`/`gh run` are a subagent's job too, not the "
-    "orchestrator's). Dispatch a subagent to do this (Agent tool with `subagent_type: \"fork\"` "
+    "build, a raw `git commit`/`git push`, a test run, AND nearly all `gh` (CI/PR verification "
+    "like `gh pr checks`/`gh run` are a subagent's job too, not the orchestrator's — `gh ship "
+    "<PR#>` is the one sanctioned exception, agent-tools#159). Dispatch a subagent to do this "
+    "(Agent tool with `subagent_type: \"fork\"` "
     "or `isolation: \"remote\"` — both run in the background) or model it as a Workflow, then "
     "read its report. This isn't friction to route around — if it's "
     "genuinely wrong for a case, raise that, don't bypass it. There is NO self-service bypass; for "
@@ -452,13 +468,38 @@ def _seg_is_allowed(segment: str) -> bool:
 
     Head-anchored, so a build/edit token appearing only as an ARGUMENT/needle (`cat tee.log`,
     `git log | rg gh`) stays allowed on its real head, not the needle (the anchor invariant, #5/#80).
-    `gh` (any subcommand) is NOT allowed here — it is delegated (`_is_gh_command`); this predicate
-    only covers `tg`/`review`/`git worktree list`, read-only inspection, and the `cd` companion.
+    `gh` (any OTHER subcommand) is NOT allowed here — it is delegated (`_is_gh_command`); this
+    predicate covers `tg`/`review`/`git worktree list`, read-only inspection, the `cd` companion,
+    and the ONE narrow gh exception (`gh ship <PR#>`, `_is_gh_ship_command` — agent-tools#159).
 
     A benign head does NOT launder a mutation the head-anchor cannot see: find's mutating primaries
     (delete/exec/file-write) and a `git branch` WITH an argument (its `-D`/create forms) are a read
     head that carries a write, so they forfeit the allow-list (agent-tools#159). `cd` (no repo
     state) is an allowed companion so `cd <repo> && tg 'done' | tail` stays an orchestration chain.
+
+    Deliberately NOT gated on `BUILD_EDIT`/other impl-signal regexes THIS FUNCTION DOESN'T ITSELF
+    ENFORCE: a sanctioned head/shape (`tg`, `review`, `gh ship <PR#>`, …) is allowed here even when
+    its OWN argument TEXT happens to match a mutation-shaped regex this predicate has no explicit
+    veto for (`gh ship 605 tee`, `tg 'saw $(git push) in logs'` — `BUILD_EDIT` is never checked by
+    THIS function at all) — that contract is "does this segment's HEAD/SHAPE look sanctioned", not
+    "does this segment's text contain no mutation-shaped substring anywhere THIS FUNCTION SCANS
+    FOR". It is NOT a blanket "sanctioned shape always wins": the two vetoes THIS FUNCTION DOES
+    check (`FIND_MUTATION`, `git branch <arg>`) still forfeit the allow-list even for an otherwise-
+    sanctioned segment — `gh ship 605 --note 'find -delete'` fails `_seg_is_allowed` for exactly
+    that reason (Fable review: an earlier version of this docstring overstated the uniformity; the
+    outer classifier can still end up ALLOWING that specific unchained example anyway, via a
+    DIFFERENT path — `_seg_is_impl_signal` doesn't check `FIND_MUTATION` either, so it falls through
+    to the chain-length fallback — see `test_gh_ship_find_mutation_text_falls_through_to_allowed`).
+    For genuine mutations THIS function has no veto for at all, the REAL protection is elsewhere and
+    unconditional: chain-splitting (a real `&&`/`;`/`|`/bare-`&` makes it a SEPARATE segment, judged
+    on its own) and the substitution-liveness scanner (a LIVE `$()`/backtick/`<()`/`>()` executes
+    and is caught by `_has_mutating_substitution` regardless of what this predicate says about the
+    outer segment). `gh ship <PR#>` intentionally matches the SAME "sanctioned shape wins over
+    argument text this function doesn't scan for" pattern `tg`/`review` already have — diverging it
+    (e.g. an extra `not BUILD_EDIT.search(...)` guard on the ship branch only) would make ship MORE
+    strict than its own precedent for the identical false-positive class, a new asymmetry rather
+    than a fix (an earlier draft of this predicate tried exactly that and broke the single-quoted-
+    substitution test — reverted).
     """
     if FIND_MUTATION.search(segment):
         return False
@@ -469,6 +510,7 @@ def _seg_is_allowed(segment: str) -> bool:
         or ORCH_ALLOW.search(segment)
         or _dev_segment_is_allowed(segment)
         or CD_HEAD.match(segment)
+        or _is_gh_ship_command(segment)
     ):
         return True
     return _git_subcommand(segment) in _GIT_READ_SUBS  # `git -C d status`, `/usr/bin/git log`, …
@@ -483,11 +525,32 @@ def _seg_is_allowed(segment: str) -> bool:
 _GH_HEAD_RE = re.compile(r"^\s*(?:\w+=\S*\s+)*(?:\S*/)?gh(?=\s|$)")
 
 
+def _gh_argv_after_env(toks: list[str]) -> list[str] | None:
+    """Skip leading `VAR=val` env-prefix tokens, then confirm the (now-first) token is `gh`
+    (basename-normalized, e.g. `/usr/bin/gh` -> `gh`). Returns the argv AFTER `gh` (an empty list
+    for a bare `gh` with no subcommand), or `None` when the env-stripped head is not `gh`.
+
+    Shared by `_is_gh_command` and `_is_gh_ship_command` so BOTH the env-skip AND the basename
+    check are written ONCE (Fable review: an earlier version of this helper skipped env-prefixes
+    only, leaving the basename check duplicated in both callers — a drift risk this closes). Each
+    caller still does its OWN try/except around this, because the two need DIFFERENT behavior on
+    an unparseable segment (deny falls back to a conservative head regex; the ship carve-out just
+    says no)."""
+    i = 0
+    while i < len(toks) and _ASSIGN_RE.match(toks[i]):
+        i += 1
+    if i >= len(toks) or toks[i].rsplit("/", 1)[-1] != "gh":
+        return None
+    return toks[i + 1:]
+
+
 def _is_gh_command(segment: str) -> bool:
-    """True when a segment's COMMAND head is `gh` (any subcommand) — the orchestrator delegates ALL
-    gh (tg#7103). shlex + basename, so a path-qualified head (`/usr/bin/gh ship`) is caught too — the
-    SAME normalization `_git_subcommand` applies to git, closing the asymmetry a bare `^gh\\b` regex
-    left open (Opus review). `gh` only as an ARGUMENT/needle (`cat gh.md`, `git log | rg gh`,
+    """True when a segment's COMMAND head is `gh` (any subcommand) — the orchestrator delegates
+    ALMOST ALL gh (tg#7103); a caller needing the ONE narrow exception (`gh ship <PR#>`,
+    agent-tools#159) consults `_is_gh_ship_command` separately, this predicate alone does not
+    carve it out. shlex + basename, so a path-qualified head (`/usr/bin/gh ship`) is caught too —
+    the SAME normalization `_git_subcommand` applies to git, closing the asymmetry a bare `^gh\\b`
+    regex left open (Opus review). `gh` only as an ARGUMENT/needle (`cat gh.md`, `git log | rg gh`,
     `grep 'gh ship' log`) is NOT a gh command: only `toks[0]` (the head) is inspected.
 
     Leading `VAR=val` env-prefixes are skipped in BOTH branches so the predicate is self-contained
@@ -500,17 +563,70 @@ def _is_gh_command(segment: str) -> bool:
         toks = shlex.split(segment)
     except ValueError:
         return bool(_GH_HEAD_RE.match(segment))  # unbalanced quotes → conservative head match
-    i = 0
-    while i < len(toks) and _ASSIGN_RE.match(toks[i]):  # skip leading VAR=val env-prefixes
-        i += 1
-    return i < len(toks) and toks[i].rsplit("/", 1)[-1] == "gh"
+    return _gh_argv_after_env(toks) is not None
+
+
+# A bare PR number: ASCII digits only (never a unicode digit look-alike, never a URL/branch name).
+# `\Z` (not `$`) so a trailing newline in the token can't sneak a match (Opus review) — a discipline
+# heuristic detail, not exploitable (any real newline in the raw command chain-splits first), but
+# the stricter anchor matches intent in a security-relevant predicate.
+_PR_NUMBER_RE = re.compile(r"^[0-9]+\Z")
+
+
+def _is_gh_ship_command(segment: str) -> bool:
+    """True when a segment's COMMAND is narrowly `gh ship <PR#>` — the ONE gh mutation carved back
+    out for the orchestrator (agent-tools#159, restored; Alex tg#9977: "the orchestrator CAN gh
+    ship like agents can, but BY DEFAULT agents do it"). Deliberately narrow: the head must be
+    `gh` (basename/env-prefix normalized exactly like `_is_gh_command`, via the shared
+    `_gh_argv_after_env`), the very next token must be the literal `ship`, and the token after THAT
+    must be a bare PR number (ASCII digits only, non-empty). `gh ship` alone (no PR number),
+    `gh ship --help`, `gh ship abc`, and every OTHER gh subcommand (`gh pr merge`, `gh run`,
+    `gh pr checks`/`view`, `gh api`, …) do NOT match and fall through to `_is_gh_command`'s general
+    (still-delegated) deny.
+
+    Anything AFTER the PR number — flags (`--screenshot`, `--repo`, even `--skip-ci`), a trailing
+    redirect token (`2>&1`) — is unrestricted: this predicate recognizes the ship *shape* only and
+    does not vet ship's own flags. `--skip-ci` in particular has its OWN separate,
+    independently-gated live-Telegram hatch inside `ci/ship/ship.sh` (`RIG_HATCH_REQUEST_SHIP_SKIP_CI`)
+    that this gate does not duplicate — an inline `gh ship 605 --skip-ci` passes THIS gate the same
+    as any other ship, and ship.sh's own gate is the sole control on the skip-ci bypass itself.
+
+    Basename/env-prefix normalization intentionally mirrors `_is_gh_command`'s DENY-side behavior
+    reused on the ALLOW side (Fable review flagged the asymmetry: a deny-side conservatism becomes
+    permissive when reused for a grant, e.g. a `gh` binary at a nonstandard path or under an
+    unrelated env-prefix also qualifies). Accepted as consistent with this module's stated threat
+    model — a cooperative orchestrator, not an adversarial one; `on_error: open` and the whole gate
+    are discipline, not a security boundary (see the module docstring) — rather than diverging the
+    two predicates' head-matching and risking the drift this shared helper exists to prevent.
+
+    On an UNPARSEABLE (unbalanced-quote) segment, shlex raises — return False (not recognized as
+    ship) rather than guessing, so the segment falls through to `_is_gh_command`'s OWN conservative
+    head-regex fallback and stays delegated. This is the mirror image of `_is_gh_command`'s own
+    unbalanced-quote fallback (which blocks): the safe default for GRANTING an allowance is "no
+    match", while the safe default for a DENY is "match" — same direction of caution, opposite
+    boolean outcome."""
+    try:
+        toks = shlex.split(segment)
+    except ValueError:
+        return False
+    argv = _gh_argv_after_env(toks)  # None if the (env-stripped) head isn't `gh`
+    if argv is None:
+        return False
+    return len(argv) >= 2 and argv[0] == "ship" and bool(_PR_NUMBER_RE.match(argv[1]))
 
 
 def _seg_is_impl_signal(segment: str) -> bool:
     """A single (env-stripped) segment is implementation on its own: a build/edit head (sed -i, tee,
     npm/…), a `git commit`/`push` or a `pytest`/`python -m pytest` test (all spellings), a
-    `uv run … pytest` wrapper, an unknown `dev` command, OR ANY `gh` command (ship/pr/run/api —
-    all delegated, tg#7103). Caught even unchained (codex P1)."""
+    `uv run … pytest` wrapper, an unknown `dev` command, OR almost any `gh` command (pr/run/api —
+    delegated, tg#7103) — EXCEPT the narrow `gh ship <PR#>` shape, restored as a sanctioned
+    orchestrator exception (agent-tools#159, tg#9977). Caught even unchained (codex P1).
+
+    The ship exception is applied ONLY to the gh check specifically (`_is_gh_command(segment) and
+    not _is_gh_ship_command(segment)`), not as an early return before the other checks — so it can
+    never accidentally exempt a FUTURE impl signal appended below it in this function (Fable
+    review: an early `if _is_gh_ship_command(segment): return False` would silently carve out any
+    later-added check too, exactly the drift class this module's comments elsewhere worry about)."""
     if (
         BUILD_EDIT.search(segment)
         or _is_uv_test(segment)
@@ -518,7 +634,7 @@ def _seg_is_impl_signal(segment: str) -> bool:
         or _dev_segment_is_unknown(segment)
     ):
         return True
-    return _is_gh_command(segment)
+    return _is_gh_command(segment) and not _is_gh_ship_command(segment)
 
 
 def _dev_tokens(segment: str) -> list[str] | None:
