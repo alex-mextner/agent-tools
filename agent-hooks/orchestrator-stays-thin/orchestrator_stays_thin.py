@@ -24,6 +24,18 @@ ONE script binds TWO points via two descriptors; it branches on ``event["point"]
                 and warn-then-block. A dispatched subagent (agent_id present) is exempt and runs
                 gh/ship freely regardless.
 
+                `tg` (the tg-cli Telegram reporting tool) is sanctioned for the orchestrator to run
+                inline — ALL subcommands, ALL flags (Alex, direct Telegram authorization: "все
+                команды tg-cli" / "ALL tg-cli commands"). This has been true since agent-tools#164;
+                this revision REPLACES the old `ORCH_ALLOW` plain-regex `tg\\b` with `_is_tg_command`,
+                a shlex-based predicate (bare `tg` + `VAR=val` env-prefix skip only — deliberately
+                NO path-qualification, see the predicate's own docstring for why two review rounds
+                landed there) that is now the SOLE authority for the tg allowance and, unlike the
+                old regex, correctly rejects a hyphen-suffixed lookalike like `tg-foo`
+                (agent-tools#370) — the same laundering-resistance `gh ship <PR#>` gets
+                (per-segment head match only, never a substring/needle; chain-splitting and the
+                substitution-liveness scanner still catch a mutation smuggled alongside it).
+
 TIERED (warn → block): the FIRST offense in the TTL window WARNs (allow + message); a REPEAT
 in the window BLOCKs. The tier is tracked by a marker file keyed by a hash of cwd. This gives
 the doctrine's "WARN then BLOCK" instead of a hard wall on the first inline edit.
@@ -151,10 +163,21 @@ READ_ONLY_BASH = re.compile(
 # its own shlex-based predicate, `_is_gh_ship_command`, consulted directly by `_seg_is_allowed` /
 # `_seg_is_impl_signal` alongside this regex. Every OTHER gh shape — `gh ship` with no PR number,
 # `gh pr merge`, `gh run`, `gh pr checks/view`, `gh api`, and so on — still delegates.
+#
+# `tg` is DELIBERATELY ABSENT from THIS head-only regex (moved out, tg-carveout-159, Fable review
+# round 3): it used to live here as a plain `tg\b` since agent-tools#164, but a plain regex has no
+# argument-position awareness and — worse — its `\b` boundary also matches a hyphen-suffixed
+# lookalike (`tg-foo`, agent-tools#370). ALL tg-cli commands (Alex, direct Telegram authorization:
+# "все команды tg-cli" / "ALL tg-cli commands", explicitly broader than `gh ship`'s single-shape
+# carve-out) are instead sanctioned by `_is_tg_command`, its own shlex-based predicate (defined with
+# the other head-normalization helpers), consulted directly by `_seg_is_allowed` — same wiring
+# pattern as `_is_gh_ship_command` above, and now the SOLE authority for "is this segment `tg`",
+# not a redundant addition alongside a regex. `review\b`/`git worktree list` remain here unchanged;
+# `review\b` has the SAME `\b`-boundary quirk (`review-foo` also matches) — out of scope for this
+# PR, tracked as the surviving half of agent-tools#370.
 ORCH_ALLOW = re.compile(
     r"^\s*(?:"
-    r"tg\b"                                               # Telegram status reports
-    r"|review\b"                                          # multi-model review CLI (read-only)
+    r"review\b"                                           # multi-model review CLI (read-only)
     r"|git\s+worktree\s+list\b"                           # worktree inspection
     r")"
 )
@@ -469,8 +492,9 @@ def _seg_is_allowed(segment: str) -> bool:
     Head-anchored, so a build/edit token appearing only as an ARGUMENT/needle (`cat tee.log`,
     `git log | rg gh`) stays allowed on its real head, not the needle (the anchor invariant, #5/#80).
     `gh` (any OTHER subcommand) is NOT allowed here — it is delegated (`_is_gh_command`); this
-    predicate covers `tg`/`review`/`git worktree list`, read-only inspection, the `cd` companion,
-    and the ONE narrow gh exception (`gh ship <PR#>`, `_is_gh_ship_command` — agent-tools#159).
+    predicate covers `review`/`git worktree list` (via `ORCH_ALLOW`), `tg` (via its own shlex-based
+    `_is_tg_command`), read-only inspection, the `cd` companion, and the ONE narrow gh exception
+    (`gh ship <PR#>`, `_is_gh_ship_command` — agent-tools#159).
 
     A benign head does NOT launder a mutation the head-anchor cannot see: find's mutating primaries
     (delete/exec/file-write) and a `git branch` WITH an argument (its `-D`/create forms) are a read
@@ -511,6 +535,7 @@ def _seg_is_allowed(segment: str) -> bool:
         or _dev_segment_is_allowed(segment)
         or CD_HEAD.match(segment)
         or _is_gh_ship_command(segment)
+        or _is_tg_command(segment)
     ):
         return True
     return _git_subcommand(segment) in _GIT_READ_SUBS  # `git -C d status`, `/usr/bin/git log`, …
@@ -571,8 +596,6 @@ def _is_gh_command(segment: str) -> bool:
 # heuristic detail, not exploitable (any real newline in the raw command chain-splits first), but
 # the stricter anchor matches intent in a security-relevant predicate.
 _PR_NUMBER_RE = re.compile(r"^[0-9]+\Z")
-
-
 def _is_gh_ship_command(segment: str) -> bool:
     """True when a segment's COMMAND is narrowly `gh ship <PR#>` — the ONE gh mutation carved back
     out for the orchestrator (agent-tools#159, restored; Alex tg#9977: "the orchestrator CAN gh
@@ -613,6 +636,77 @@ def _is_gh_ship_command(segment: str) -> bool:
     if argv is None:
         return False
     return len(argv) >= 2 and argv[0] == "ship" and bool(_PR_NUMBER_RE.match(argv[1]))
+
+
+
+def _is_tg_command(segment: str) -> bool:
+    """True when a segment's COMMAND head is `tg` (the tg-cli Telegram reporting tool) — ANY
+    subcommand, ANY flag combination is sanctioned: plain text, `--file`, `--photo`, `--format
+    html`, `--tag`, `--reply-to`, `voice setup`, and everything else tg-cli exposes. Authorized
+    explicitly and broadly by Alex (Telegram, direct reply, this thread): "оркестратор ещё и tg:*
+    должен уметь, т.е. все команды tg-cli" — "the orchestrator should ALSO be able to run tg:*,
+    i.e. ALL tg-cli commands". Unlike `gh ship <PR#>`'s PR-number-shape narrowing, this predicate
+    does NOT narrow by subcommand or argument position: tg is a leaf reporting/notification tool
+    with no subcommand this gate has reason to withhold from the orchestrator.
+
+    THE SOLE authority for "is this segment `tg`" (tg-carveout-159, Fable review round 3) —
+    `ORCH_ALLOW` used to carry a plain `tg\\b` regex alternative for this (agent-tools#164); that
+    regex is now REMOVED from `ORCH_ALLOW` and this predicate replaces it outright, not sitting
+    alongside it as a redundant addition (an earlier draft of this PR kept both — Fable correctly
+    flagged that `ORCH_ALLOW` being checked FIRST in `_seg_is_allowed`'s OR-chain made this
+    predicate unreachable dead code end-to-end, since the plain regex matched a strict superset of
+    what it could ever grant). Consolidating ALSO fixes agent-tools#370 for the `tg` case: `\\b` is
+    a WORD-boundary, which also fires before a hyphen, so the old regex incorrectly matched
+    `tg-foo` too — this predicate's basename-EXACT token check (`toks[i] == "tg"`) does not have
+    that quirk, and now that it is the only gate, `tg-foo` is correctly rejected end-to-end (see
+    `test_tg_foo_is_now_rejected_end_to_end`, which supersedes the pinned-quirk test an earlier
+    draft had). `review`'s matching `\\b` quirk (`review-foo`) is UNCHANGED and out of scope here —
+    the surviving half of agent-tools#370.
+
+    shlex-based, with a self-contained `VAR=val` env-prefix skip (matching `_is_gh_command`'s own
+    precedent, so a caller that invokes this predicate directly, without going through
+    `_strip_wrappers` first, still classifies `TG_BOT_TOKEN=x tg 'msg'` correctly).
+
+    **Deliberately NO path-qualification** (`/opt/homebrew/bin/tg`), despite `_is_gh_command`
+    accepting any path — resolved across two review rounds, not shipped as a guess. `_is_gh_command`
+    is a DENY-direction predicate (over-matching there only routes more things to a subagent, the
+    safe failure mode); this predicate is GRANT-direction (a match means "never even warn"), so the
+    same blanket path normalization would over-match in the UNSAFE direction — a relative path
+    (`./tg`) is trivial to place anywhere near the working directory, and narrowing to "absolute
+    paths only" does not actually narrow anything real (`/tmp/tg` is just as easy to write as
+    `./tg` — disproved empirically in round 2). A hardcoded bin-dir allowlist was also rejected: it
+    would be unreliable in practice (this predicate's own authoring machine resolves its real `tg`
+    to a non-standard, dotfiles-managed path, not any short "standard" list). Given this gate's own
+    stated threat model (discipline, not a security boundary — see the module docstring's
+    "Fail-open, on purpose") and that the practical need (Alex's ask) is fully met by subcommand
+    breadth alone, path-qualification was dropped entirely.
+
+    Deliberately does NOT exclude argument text that happens to look like a mutation (`tg 'ran
+    sed -i on it'`) — the SAME "sanctioned shape wins over argument text this function doesn't scan
+    for" precedent `gh ship`/`review` already have (see `_seg_is_allowed`'s own docstring and
+    `test_incidental_mutation_shaped_text_in_a_ship_segment_matches_tg_precedent`'s parallel `tg`
+    case). The real protection against a genuine mutation is unconditional and elsewhere:
+    chain-splitting (a real `&&`/`;`/`|`/bare-`&` makes it a SEPARATE segment) and the
+    substitution-liveness scanner (a LIVE `$()`/backtick/`<()`/`>()` executes and is caught
+    regardless of what this predicate says about the outer segment).
+
+    On an UNPARSEABLE (unbalanced-quote) segment, shlex raises — return `False`, mirroring
+    `_is_gh_ship_command`'s conservative-fallback DIRECTION (deny-by-default; a discipline gate
+    should not grant on an input it cannot confidently classify), NOT the old regex's "recognize
+    it anyway" fallback. That old direction was justified ONLY by parity with the (now-removed)
+    `tg\\b` regex, which had no notion of "unparseable" at all; now that this predicate is the sole
+    authority rather than a redundant addition, the parity argument no longer applies, and the safe
+    default for a GRANT-direction predicate facing uncertain input is to not grant (Opus/Fable
+    round 3: decide the fallback direction on its own merits once the predicate is load-bearing,
+    not by inheriting an old regex's behavior)."""
+    try:
+        toks = shlex.split(segment)
+    except ValueError:
+        return False
+    i = 0
+    while i < len(toks) and _ASSIGN_RE.match(toks[i]):
+        i += 1
+    return i < len(toks) and toks[i] == "tg"
 
 
 def _seg_is_impl_signal(segment: str) -> bool:
@@ -947,6 +1041,16 @@ def _is_all_inline_allowed(command: str) -> bool:
     the fast path returns. A BENIGN substitution (`cat $(find …) | grep | head`) is NOT rejected, so
     the #80 read-only-pipe-of-any-length invariant holds (agent-tools#159, Opus review). A bare `&`
     is handled by `_split_chain` splitting it, so its segments are judged individually.
+
+    NOT a "does this line contain at least one orchestration head" check (tg-carveout-159, Opus +
+    Fable review round 4 both independently misread it that way): `all(_seg_is_allowed(s) for s in
+    segs)` is a per-segment universal check with no minimum-count or specific-source requirement —
+    a chain whose ONLY orchestration head is `_is_tg_command`-matched (not `ORCH_ALLOW`-matched),
+    or a chain that is PURELY read-only with zero orchestration heads at all, both satisfy this the
+    SAME way. Moving `tg` out of `ORCH_ALLOW` and into its own predicate therefore does not change
+    which chains get the any-length exemption — every `_seg_is_allowed` source (`READ_ONLY_BASH`,
+    `ORCH_ALLOW`, `_is_tg_command`, `_is_gh_ship_command`, `_dev_segment_is_allowed`, `CD_HEAD`)
+    contributes equally to this `all(...)`.
     """
     if HEREDOC.search(command):
         return False

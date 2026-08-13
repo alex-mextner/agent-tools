@@ -1464,6 +1464,242 @@ def test_gh_delegation_judgement_matrix():
     assert impl("tg 'saw a & b' | tail") is False              # quoted metachar keeps the pass
 
 
+# ── tg-carveout-159 (Alex, direct Telegram authorization): `_is_tg_command` — ALL tg-cli commands ──
+# ─── formalizes `ORCH_ALLOW`'s pre-existing bare `tg\b` allowance (agent-tools#164) as an explicit,
+# unit-testable, shlex-based predicate wired the SAME way `_is_gh_ship_command` is — but grants ANY
+# tg subcommand (no argv-position narrowing — Alex: "все команды tg-cli" / "ALL tg-cli commands").
+# Deliberately NO path-qualification (see `_is_tg_command`'s own docstring: two review rounds
+# concluded that either over-grants in the unsafe direction or is not a real narrowing in practice —
+# `which tg` on the actual authoring machine resolves to a non-standard `~/.files/bin/tg`, which a
+# hardcoded bin-dir allowlist would have MISSED). The tests below exercise the full tg-cli surface
+# Alex named explicitly, through the same laundering guards `gh ship` gets, plus pin the predicate's
+# own scope (bare-only, basename-exact, self-contained env-prefix skip) precisely.
+
+@pytest.mark.parametrize("command", [
+    "tg 'shipped'",                                            # plain text report
+    "tg --format html '<b>done</b>'",                          # rich HTML report
+    "tg --file report.pdf 'caption'",                          # file attachment
+    "tg --photo screenshot.png 'caption'",                     # photo attachment
+    "tg --tag report 'status update'",                         # tagged report
+    "tg --reply-to 12345 'answer'",                             # threaded reply
+    "tg --format html --tag decision '<b>merged</b>'",          # combined flags
+    "tg voice setup",                                           # voice-reply setup subcommand
+    "tg help format",                                           # help subcommand
+    "TG_BOT_TOKEN=x tg 'shipped'",                              # env-prefixed head
+    "TG_BOT_TOKEN=x TG_CHAT_ID=y tg --format html 'x'",         # multiple env prefixes
+    "gtimeout 30 tg 'shipped'",                                 # gtimeout-wrapped
+    "cd /repo && tg 'shipped'",                                 # `cd` companion
+    "tg 'a' | tail -3 | head -1",                               # report + read-only plumbing
+    "tg 'a' && review diff && git worktree list",               # chained with sibling orchestration
+    "tg 'a' && tg 'b'",                                          # chained with itself
+])
+def test_tg_command_carve_out_allows(command, tmp_path, monkeypatch):
+    """The full tg-cli surface Alex named explicitly (plain text, `--file`, `--photo`, `--format
+    html`, `--tag`, `--reply-to`, `voice setup`, `help`) is sanctioned for the orchestrator to run
+    inline, including an env-prefixed head — it never even warns, never primes a block, same
+    treatment `gh ship <PR#>` gets, at any chain length alongside read-only/orchestration companions."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow", command
+    assert "message" not in json.loads(out1), command  # does not even warn
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")  # never primes a block
+    assert c2 == 0 and _decision(out2) == "allow", command
+
+
+def test_tg_command_unit_predicate():
+    """`_is_tg_command` recognizes ONLY a bare `tg` token (with a self-contained `VAR=val`
+    env-prefix skip) — deliberately NOT path-qualified, unlike `_is_gh_command`'s blanket basename
+    normalization (see the predicate's own docstring for the two-review-round rationale). `tg` is
+    recognized only at a segment HEAD (argv), never as a substring/needle, and is basename-exact —
+    `tg-foo` is a DIFFERENT command, and since this predicate is now the SOLE authority (the old
+    `ORCH_ALLOW` `tg\\b` regex was REMOVED, not kept alongside it — Fable review round 3), that
+    correctness now closes agent-tools#370 end-to-end for the `tg` case (see the dedicated
+    `test_tg_foo_is_now_rejected_end_to_end` below)."""
+    assert ost._is_tg_command("tg 'x'") is True
+    assert ost._is_tg_command("tg") is True                     # bare, no args at all
+    assert ost._is_tg_command("TG_BOT_TOKEN=x tg 'x'") is True
+    assert ost._is_tg_command("TG_BOT_TOKEN=x TG_CHAT_ID=y tg 'x'") is True
+    assert ost._is_tg_command(ost._strip_wrappers("gtimeout 30 tg 'x'")) is True
+    assert ost._is_tg_command(ost._strip_wrappers("env TG_BOT_TOKEN=x tg 'x'")) is True  # `env` wrapper
+    assert ost._is_tg_command("TG_BOT_TOKEN=x") is False        # env assignment with no command at all
+    assert ost._is_tg_command("cat tg.md") is False           # needle, not a head
+    assert ost._is_tg_command("grep 'tg send' log") is False  # needle inside a quoted arg
+    assert ost._is_tg_command("tg-foo bar") is False           # basename-exact
+    assert ost._is_tg_command("FOO=bar echo x") is False       # env-prefix on a non-tg head
+    assert ost._is_tg_command("gh ship 605") is False           # a different sanctioned command
+    # unbalanced-quote segment: shlex can't parse it — DENY (round 3: now that this predicate is
+    # the sole authority, not a redundant addition alongside a regex, the safe default for a
+    # GRANT-direction predicate facing uncertain input is to not grant — mirrors
+    # `_is_gh_ship_command`'s own "no match" fallback direction).
+    assert ost._is_tg_command("tg 'unterminated") is False
+    assert ost._is_tg_command("echo 'unterminated") is False
+
+
+def test_tg_command_rejects_any_path_qualified_head():
+    """(Fable review, both rounds) `_is_tg_command` grants ONLY a bare `tg` token — NEVER a
+    path-qualified one, relative OR absolute. Round 1 found that blanket path acceptance
+    (mirroring `_is_gh_command`) over-grants in the unsafe direction for this GRANT-direction
+    predicate (a relative path like `./tg` is trivial to place anywhere). Round 2 found that
+    narrowing to "absolute paths only" doesn't actually narrow anything real (`/tmp/tg` is just as
+    easy to write as `./tg`), and that a hardcoded bin-dir allowlist would be unreliable in practice
+    (this machine's actual `tg` resolves to `~/.files/bin/tg`, not any short "standard" list).
+    Given the gate's own stated threat model (discipline, not a security boundary) and that the
+    practical need is already met by subcommand breadth alone, path-qualification was dropped
+    entirely rather than shipped as a fig leaf. There is now only ONE exception path (`shlex`
+    raising `ValueError` on an unparseable segment returns `False` uniformly — round 3 removed the
+    old regex-fallback branch entirely once this predicate became the sole authority), so a
+    path-qualified head cannot be granted via any route, parseable or not."""
+    for command in ("/opt/homebrew/bin/tg 'x'", "/usr/local/bin/tg 'x'", "/tmp/tg 'x'", "/tg 'x'",
+                     "./tg 'x'", "scripts/tg 'x'", "../tg 'x'", "bin/tg 'x'", "relative/nested/tg 'x'"):
+        assert ost._is_tg_command(command) is False, command
+        # a lone, unchained rejected head still falls through to the SAME generic gray-zone
+        # fallthrough every unclassified single command gets (pre-existing, general, not
+        # tg-specific — see test_gh_ship_find_mutation_text_falls_through_to_allowed's parallel
+        # case for `gh ship`) — this predicate returning False does not itself create a block.
+        assert ost._is_implementation_bash(command) is False, command
+    # ...but chained with even fully read-only companions, a rejected path-qualified head now
+    # blocks — unlike a bare `tg`, which stays exempt at any chain length (test above).
+    assert ost._is_implementation_bash("/opt/homebrew/bin/tg 'x' | tail -3 | head -1") is True
+    assert ost._is_implementation_bash("./tg 'x' | tail -3 | head -1") is True
+    # the SAME path-qualified shapes, unparseable — denies the same way a bare unparseable `tg`
+    # does now (a single unified exception path, no regex fallback to diverge from).
+    for command in ("/opt/homebrew/bin/tg 'unterminated", "./tg 'unterminated", "/tg 'unterminated"):
+        assert ost._is_tg_command(command) is False, command
+
+
+def test_tg_foo_is_now_rejected_end_to_end():
+    """Closes agent-tools#370 for the `tg` case: the old `ORCH_ALLOW` plain `tg\\b` regex had a
+    word-boundary quirk (`\\b` also fires before a hyphen) that incorrectly matched `tg-foo`, a
+    DIFFERENT command, as sanctioned orchestration. That regex has been REMOVED from `ORCH_ALLOW`
+    and replaced outright by `_is_tg_command` (not kept alongside it — an earlier draft of this PR
+    did that and left the new predicate unreachable dead code, since the old regex matched a strict
+    superset of what it could ever grant). `_is_tg_command` is basename-exact, so `tg-foo` is now
+    correctly rejected END-TO-END, not just by this predicate in isolation — under the SAME
+    "chained >2 steps" doctrine any unclassified command gets: allowed alone or in a 2-segment
+    chain (the generic gray zone, not itself a new block), warn-then-blocks once chained into 3+
+    segments, exactly as any other non-orchestration command would. `review`'s matching `\\b` quirk
+    (`review-foo`) is UNCHANGED — the surviving half of #370, out of scope for this PR."""
+    assert ost.ORCH_ALLOW.search("tg-foo bar") is None            # the old quirk, gone: fixed
+    assert ost._is_tg_command("tg-foo bar") is False               # this predicate is correct
+    assert ost._is_implementation_bash("tg-foo bar") is False      # lone segment: generic fallthrough
+    assert ost._is_implementation_bash("tg-foo bar | tail") is False  # 2-segment: still gray zone
+    assert ost._is_implementation_bash("tg-foo bar | tail -3 | head -1") is True  # 3-seg: now blocks
+    # `review`'s matching quirk is untouched — still open (agent-tools#370's surviving half)
+    assert ost.ORCH_ALLOW.search("review-foo bar") is not None
+
+
+def test_tg_subagent_is_exempt(tmp_path, monkeypatch):
+    """A dispatched subagent (`agent_id` present) runs `tg` freely regardless — this gate governs
+    the orchestrator only, and was never the thing standing between a subagent and `tg` anyway."""
+    for command in ("tg 'shipped'", "tg --format html 'x'"):
+        event = {"point": "pre-bash", "cwd": "/repo",
+                 "args": {"agent_id": "sub-1", "command": command}}
+        _run(event, monkeypatch, tmp_path / "m")  # even on a repeat it must allow
+        out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+        assert c == 0 and _decision(out) == "allow", command
+
+
+@pytest.mark.parametrize("command", [
+    "sed -i 's/a/b/' f.py && tg 'done'",       # tg does not launder an in-place edit
+    "npm run build && tg 'done'",              # ...nor a build
+    "tg 'done'; tee out.txt; ls",              # ...nor a tee write
+    "tg done $(sed -i 's/a/b/' f)",            # ...nor an edit hidden in a subst
+    "cd $(npm run build) && tg 'done'",        # ...nor a build inside `cd`
+    "tg 'done' & sed -i 's/a/b/' f.py",        # ...nor behind a single `&`
+    "cd $(git push origin main) && tg 'done' | tail -3",  # push in the cd subst
+    "tg 'done' & git push origin main; ls",    # bare `&` hides a push
+    "cat <(git push origin main) && tg 'done'",  # process substitution smuggles a push
+    "tg 'done'; git branch -D tmp; ls",        # git branch mutating form
+    "tg 'done' || git push",                   # `||` is a chain split too
+    "tg 'done' --note `git push origin main`",  # backtick substitution
+    "tg 'done' > >(git push origin main)",     # output-side process subst
+    "tg 'done' --note <(git push origin main)",  # input-side process subst
+    "tg 'done' | gh pr merge 606",             # a sibling gh MUTATION
+    "tg 'done' |& git push origin main",       # `|&` still splits into 2
+    "tg 'done'\ngit push origin main",         # a NEWLINE chain-splits too
+    "tg 'done'; ( git push )",                 # a `(...)` subshell group
+    "TG_BOT_TOKEN=x tg 'done' && git commit -m x",  # env-prefixed head, real mutation
+])
+def test_tg_command_does_not_launder_impl_segments(command, tmp_path, monkeypatch):
+    """The tg allowance is per-segment, same as `gh ship`: tacking a (bare or env-prefixed) `tg`
+    call onto an implementation chain must NOT exempt the rest of it — only all-(tg|read-only|cd|
+    orchestration) lines pass. A mutation smuggled where no head can see it (inside `$()`/`<()`/
+    backticks, behind a bare `&`, a mutating git-branch form) is caught by the substitution-inner
+    scan, the `&` split, and the companion guards — identical laundering resistance to
+    `test_gh_ship_does_not_launder_impl_segments`."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow", command  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block", command
+
+
+def test_tg_command_with_heredoc_still_blocks(tmp_path, monkeypatch):
+    """A heredoc anywhere vetoes the tg carve-out too, exactly as it vetoes `gh ship`/read-only."""
+    event = {"point": "pre-bash", "cwd": "/repo",
+             "args": {"command": "cat <<EOF > notes\nbody\nEOF\ntg 'done' | tail -5"}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_tg_command_needle_or_prefix_word_is_not_exempt(tmp_path, monkeypatch):
+    """`tg` counts only at a segment HEAD (argv), never as a substring in text — a grep needle
+    must not self-exempt a chain (mirrors `test_gh_ship_needle_or_prefix_word_is_not_exempt`)."""
+    command = "python x.py | grep 'tg send' | python y.py"
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": command}}
+    out1, _e1, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
+    out2, _e2, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_tg_orchestrator_carve_out_acceptance_matrix(tmp_path, monkeypatch):
+    """End-to-end acceptance for the tg-carveout-159 extension (Alex, direct Telegram
+    authorization): the orchestrator running ANY tg-cli command (bare or env-prefixed, with the
+    full flag surface named explicitly) is allowed and never even warns; the orchestrator running
+    `gh pr merge`, another code Edit/Write, or other implementation-shaped Bash still warn-then-
+    blocks exactly as before this change; a dispatched subagent is unaffected either way. Mirrors
+    `test_orchestrator_carve_out_acceptance_matrix`'s structure for `gh ship`."""
+    # orchestrator: a flag-bearing tg call — allowed, never warns, never primes a block
+    tg_event = {"point": "pre-bash", "cwd": "/repo",
+                "args": {"command": "tg --format html '<b>done</b>'"}}
+    out1, _e1, c1 = _run(tg_event, monkeypatch, tmp_path / "tg")
+    assert c1 == 0 and _decision(out1) == "allow" and "message" not in json.loads(out1)
+    out2, _e2, c2 = _run(tg_event, monkeypatch, tmp_path / "tg")
+    assert c2 == 0 and _decision(out2) == "allow"
+
+    # orchestrator: gh pr merge — untouched by this change, still warn-then-blocks
+    merge_event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": "gh pr merge 605"}}
+    out1, _e1, c1 = _run(merge_event, monkeypatch, tmp_path / "merge")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense WARNs
+    out2, _e2, c2 = _run(merge_event, monkeypatch, tmp_path / "merge")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+    # orchestrator: a code Edit/Write — still warn-then-blocks (pre-write point, unaffected by tg)
+    write_event = {"point": "pre-write", "cwd": "/repo", "args": {"file_path": "/repo/src/a.ts"}}
+    out1, _e1, c1 = _run(write_event, monkeypatch, tmp_path / "write")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(write_event, monkeypatch, tmp_path / "write")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+    # orchestrator: other implementation-shaped Bash (a commit) — still warn-then-blocks
+    commit_event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": "git commit -m x"}}
+    out1, _e1, c1 = _run(commit_event, monkeypatch, tmp_path / "commit")
+    assert c1 == 0 and _decision(out1) == "allow"
+    out2, _e2, c2 = _run(commit_event, monkeypatch, tmp_path / "commit")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+    # subagent: unaffected either way — tg AND gh pr merge both run freely, even on a repeat
+    for i, cmd in enumerate(("tg 'x'", "gh pr merge 605")):
+        sub_event = {"point": "pre-bash", "cwd": "/repo", "args": {"agent_id": "sub-1", "command": cmd}}
+        marker = tmp_path / f"sub-{i}"
+        _run(sub_event, monkeypatch, marker)
+        out, _e, c = _run(sub_event, monkeypatch, marker)
+        assert c == 0 and _decision(out) == "allow", cmd
+
+
 # ── coordinator: report (`tg`) + read-only verification are orchestrator altitude, not impl ──────
 
 @pytest.mark.parametrize("command", [
@@ -1508,9 +1744,11 @@ def test_report_or_verify_does_not_launder_impl(command, tmp_path, monkeypatch):
 
 def test_report_verify_allowlist_surface():
     """Pin the doctrine under tg#7103: `tg`/`review`/`git worktree list` are the sanctioned
-    orchestration heads (ORCH_ALLOW). `gh` is NO LONGER one — it is delegated. `curl`/`ssh` were
-    never sanctioned (curl can POST, ssh runs any remote command)."""
-    assert ost.ORCH_ALLOW.search("tg 'x'") is not None
+    orchestration heads. `gh` is NO LONGER one — it is delegated. `curl`/`ssh` were never
+    sanctioned (curl can POST, ssh runs any remote command). `tg` moved OUT of `ORCH_ALLOW` and
+    into its own predicate, `_is_tg_command` (tg-carveout-159, Fable review round 3) — checked
+    separately here, not via `ORCH_ALLOW.search`, since it is no longer part of that regex."""
+    assert ost._is_tg_command("tg 'x'") is True
     assert ost.ORCH_ALLOW.search("review diff") is not None
     assert ost.ORCH_ALLOW.search("git worktree list") is not None
     assert ost.ORCH_ALLOW.search("gh pr checks 5") is None   # gh dropped from the allow-list
