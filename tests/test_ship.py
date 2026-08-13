@@ -4834,6 +4834,78 @@ def test_review_quorum_derives_code_from_pr_body(tmp_path):
     assert "AUTHORITY CONFIRMED" in r.stdout and "HYP-999" in r.stdout, r.stdout
 
 
+def test_review_quorum_synthesizes_prefixed_code_from_bare_issue_number(tmp_path):
+    """.ship-config declaring SHIP_TASK_CODE_PREFIX=RIG -> ship accepts a bare GitHub-issue-
+    style reference (#742, no HYP-/XX- code) from the PR body and SYNTHESIZES "RIG-742" as
+    the task code — never the bare "#742" itself, since review-cli's quorum store is a single
+    global file keyed only by the code string with no per-repo scoping: two repos both
+    deriving bare "#742" would silently share (and falsely satisfy) each other's count."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    (main / ".ship-config").write_text("SHIP_TASK_CODE_PREFIX=RIG\n", encoding="utf-8")
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "opt into prefixed issue-number task codes", cwd=main)
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": "Fixes #742 for the widget regression."},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "RIG-742" in r.stdout, r.stdout
+    assert "#742" not in r.stdout, "the bare issue number must never be used as the task code itself"
+
+
+def test_review_quorum_ignores_bare_issue_number_without_ship_config_optin(tmp_path):
+    """No .ship-config opt-in -> a bare #742 in the PR body is NOT picked up as a task code
+    (unchanged behavior — prevents accidental false-positive matches on ordinary PR prose)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": "Fixes #742 for the widget regression."},
+    )
+    assert r.returncode != 0, f"a bare issue number must not be picked up by default\n{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+
+
+def test_review_quorum_bare_issue_number_prefers_hyp_code_when_both_present(tmp_path):
+    """.ship-config opted in AND the PR body has both a HYP- code and a bare #NNN -> the
+    HYP- code still wins (existing precedence order is unchanged, issue-number support is
+    purely an additional fallback, never a higher-priority match)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    (main / ".ship-config").write_text("SHIP_TASK_CODE_PREFIX=RIG\n", encoding="utf-8")
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "opt into prefixed issue-number task codes", cwd=main)
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"SHIP_TEST_PR_BODY": "Relates to #742, actually fixes HYP-999."},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "HYP-999" in r.stdout and "RIG-742" not in r.stdout, r.stdout
+
+
+def test_review_quorum_rejects_malformed_task_code_prefix(tmp_path):
+    """.ship-config's SHIP_TASK_CODE_PREFIX must be 1-40 uppercase letters/digits — a lowercase
+    or punctuation-containing value invalidates the WHOLE file (same policy as an unsafe
+    SHIP_LOCAL_TEST_DIR), so a typo'd prefix fails closed rather than silently degrading to
+    "feature off" while other .ship-config overrides still apply."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    (main / ".ship-config").write_text(
+        "SHIP_TASK_CODE_PREFIX=rig-cli\nSHIP_LOCAL_TEST_CMD=true\n", encoding="utf-8",
+    )
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "malformed task-code prefix", cwd=main)
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": "Fixes #742 for the widget regression."},
+    )
+    assert r.returncode != 0, f"a malformed prefix must refuse rather than silently accept\n{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "not 1-40 uppercase letters/digits" in r.stderr, r.stderr
+
+
 def test_review_quorum_refuses_when_no_task_code_derivable(tmp_path):
     """No $REVIEW_TASK_CODE, no ticket in the branch, no ticket in the PR body -> refuse with
     guidance rather than silently skip the gate."""
