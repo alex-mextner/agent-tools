@@ -10,17 +10,17 @@ pre-commit:
       run: '"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" pre-commit'
 
     # ---- JavaScript / TypeScript: Oxc ---------------------------------------------
-    # These commands are enabled by Rig only after the repository declares the
-    # corresponding Oxc tools. The generic example must not make commits fail merely
-    # because a project has not adopted Oxc yet.
-    # oxlint:
-    #   glob: "*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"
-    #   run: node_modules/.bin/oxlint --type-aware {staged_files}
-    #   fail_text: "Oxlint / anti-slop policy failed"
-    # oxfmt:
-    #   glob: "*.{ts,tsx,js,jsx,mts,cts,mjs,cjs,json,jsonc}"
-    #   run: node_modules/.bin/oxfmt --check {staged_files}
-    #   fail_text: "Oxfmt check failed"
+    # Keep these active for the supported direct `lefthook install` path. The executable
+    # guard makes this generic template safe before Oxc adoption; once the repository declares
+    # repo-local Oxlint/Oxfmt, the gates become real blocking checks automatically.
+    oxlint:
+      glob: "*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"
+      run: 'if [ -x node_modules/.bin/oxlint ]; then node_modules/.bin/oxlint --type-aware {staged_files}; else echo "Oxlint not installed in this repository — Oxc lint gate skipped"; fi'
+      fail_text: "Oxlint / anti-slop policy failed"
+    oxfmt:
+      glob: "*.{ts,tsx,js,jsx,mts,cts,mjs,cjs,json,jsonc}"
+      run: 'if [ -x node_modules/.bin/oxfmt ]; then node_modules/.bin/oxfmt --check {staged_files}; else echo "Oxfmt not installed in this repository — Oxc format gate skipped"; fi'
+      fail_text: "Oxfmt check failed"
 
     typecheck:
       glob: "*.{ts,tsx,mts,cts}"
