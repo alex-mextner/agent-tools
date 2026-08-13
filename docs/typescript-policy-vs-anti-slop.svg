@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
+  <title id="title">Rig and anti-slop TypeScript policy</title>
+  <desc id="desc">Rig and agent-tools policy overlaps with the anti-slop plugin around preserving type evidence, rejecting assertion laundering, using concrete owner contracts, and keeping uncertainty at boundaries.</desc>
+  <rect width="1200" height="520" rx="24" fill="#ffffff"/>
+  <circle cx="455" cy="260" r="205" fill="#eef2ff" stroke="#5965d8" stroke-width="3"/>
+  <circle cx="745" cy="260" r="205" fill="#f2f8f2" stroke="#4f8a61" stroke-width="3"/>
+  <text x="325" y="82" font-family="system-ui, sans-serif" font-size="25" font-weight="700" fill="#202124">Rig / agent-tools</text>
+  <text x="732" y="82" font-family="system-ui, sans-serif" font-size="25" font-weight="700" fill="#202124">anti-slop</text>
+  <g font-family="system-ui, sans-serif" font-size="18" fill="#202124">
+    <text x="285" y="150">Strict TypeScript compiler</text>
+    <text x="260" y="184">Boundary parsing + domain modeling</text>
+    <text x="278" y="218">Oxlint built-ins + type-aware rules</text>
+    <text x="365" y="410">Oxfmt</text>
+    <text x="755" y="150">Known-value widening</text>
+    <text x="772" y="184">Widen then assert</text>
+    <text x="770" y="218">Unsafe dictionaries</text>
+    <text x="788" y="410">Optional opinionated rules</text>
+  </g>
+  <g font-family="system-ui, sans-serif" text-anchor="middle" fill="#202124">
+    <text x="600" y="245" font-size="19" font-weight="700">Shared concerns</text>
+    <text x="600" y="278" font-size="17">Preserve type evidence</text>
+    <text x="600" y="308" font-size="17">Reject assertion laundering</text>
+    <text x="600" y="338" font-size="17">Concrete owner contracts</text>
+    <text x="600" y="368" font-size="17">Uncertainty stays at boundaries</text>
+  </g>
+</svg>

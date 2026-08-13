@@ -1,36 +1,44 @@
 # anti-slop integration
 
-`anti-slop` is a specialized Oxlint plugin for rejecting TypeScript/JavaScript patterns that erase type evidence or push uncertainty into ordinary application code. It complements, rather than replaces, TypeScript strictness, `tsc`, and general lint/formatting.
+`anti-slop` is a specialized Oxlint plugin for patterns that erase TypeScript evidence or push uncertainty into ordinary application code. It is one layer of the broader [Mextner TypeScript policy](../skills/by-stack/frontend/ts/README.md).
+
+## Source model
+
+`agent-tools` pins the reviewed `alex-mextner/anti-slop` fork as the Git subrepo `vendor/anti-slop`. We do not consume anti-slop as a published/runtime dependency. Target repositories receive the supported vendoring payload from:
+
+```text
+vendor/anti-slop/skills/install-anti-slop/assets/anti-slop/
+```
+
+Rig copies that exact tree into `tools/oxlint/anti-slop/`. Updating anti-slop is an explicit reviewed subrepo-pointer change.
 
 ## Enforcement layers
 
-Use one AST-based lint surface instead of overlapping regex guards:
+1. **anti-slop** — specialized evidence-preservation AST rules.
+2. **type-aware Oxlint** — general semantic TypeScript rules, including `typescript/no-unsafe-type-assertion` and `typescript/no-unnecessary-type-assertion`.
+3. **Oxlint built-ins** — `typescript/no-non-null-assertion` and `typescript/ban-ts-comment` close the remaining escape hatches.
+4. **TypeScript compiler** — `tsc --noEmit` remains the type-correctness gate.
+5. **Oxfmt** — formatting. Biome is not part of the provisioned JS/TS baseline.
 
-1. **anti-slop plugin** — opinionated evidence-preservation rules.
-2. **Oxlint TypeScript built-ins** — cover remaining escape-hatch policy:
-   - `typescript/no-non-null-assertion`: forbid postfix `!` assertions.
-   - `typescript/ban-ts-comment`: forbid `@ts-ignore` and `@ts-nocheck`; permit `@ts-expect-error` only with a description.
-3. **TypeScript compiler** — keep `tsc --noEmit` (or the repo's equivalent) as the type correctness gate.
-4. **General linter/formatter** — keep Biome/Oxlint/general style rules as appropriate; anti-slop is not a formatter.
+## Replacement of the old grep gate
 
-## What replaces the old `no-type-escape-hatches` grep
-
-| Existing check | Replacement | Notes |
+| Existing check | Replacement | Why stronger |
 | --- | --- | --- |
-| `grep '\bas any\b|\bas unknown as\b'` | anti-slop assertion/evidence rules | AST-aware; catches more than the literal spelling. |
-| `grep '@ts-ignore'` | `typescript/ban-ts-comment` | Can also ban `@ts-nocheck` and require descriptions on `@ts-expect-error`. |
-| policy against postfix `!` | `typescript/no-non-null-assertion` | No custom regex needed. |
-| widening then casting back | `anti-slop/no-widen-then-assert` | Not reliably expressible with grep. |
-| chained assertions | `anti-slop/no-chained-type-assertions` | Covers multi-step assertion laundering. |
-| unjustified necessary assertions | `anti-slop/require-safety-comment-for-type-assertion` | Requires a local invariant explanation. |
+| `grep '\bas any\b|\bas unknown as\b'` | anti-slop + type-aware `no-unsafe-type-assertion` | AST/type relation, not spelling |
+| `grep '@ts-ignore'` | `typescript/ban-ts-comment` | also bans `@ts-nocheck` and requires descriptions for `@ts-expect-error` |
+| policy against postfix `!` | `typescript/no-non-null-assertion` | syntax-aware |
+| widening then casting back | `anti-slop/no-widen-then-assert` | structural pattern |
+| chained assertions | `anti-slop/no-chained-type-assertions` | structural laundering detection |
+| redundant assertions | `typescript/no-unnecessary-type-assertion` | type-aware and fixable |
+| unjustified necessary assertions | `anti-slop/require-safety-comment-for-type-assertion` | executable evidence requirement |
 
-Do **not** remove `tsc` or the normal lint/format gate when enabling anti-slop.
+## Oxc config baseline
 
-## Recommended policy config
-
-The anti-slop plugin registration is expected at `./tools/oxlint/anti-slop/index.ts`. Alongside all anti-slop rules, enable:
+The target `oxlint.config.ts` registers `./tools/oxlint/anti-slop/index.ts`, enables every anti-slop rule at error severity, sets type-aware mode, and also enables:
 
 ```ts
+"typescript/no-unsafe-type-assertion": "error",
+"typescript/no-unnecessary-type-assertion": "error",
 "typescript/no-non-null-assertion": "error",
 "typescript/ban-ts-comment": [
   "error",
@@ -42,47 +50,25 @@ The anti-slop plugin registration is expected at `./tools/oxlint/anti-slop/index
 ],
 ```
 
-The exact anti-slop rule list should come from the vendored upstream bundle, not be reconstructed from memory.
-
 ## Rig target model
-
-The intended committed repo configuration is terse:
 
 ```yaml
 linters:
   enabled: true
   bundles:
     anti-slop:
-      source: linters/anti-slop
+      source: vendor/anti-slop/skills/install-anti-slop/assets/anti-slop
       target: tools/oxlint/anti-slop
   items:
     oxlint:
       tool: oxlint
       role: linter
       path: oxlint.config.ts
-      preset: anti-slop
+      preset: mextner-ts
 ```
 
-`source` is relative to the resolved `agent_tools_source`; `target` is repo-relative. `rig apply` should copy/reconcile the bundle and render the preset config, while `rig status` should report drift in either surface. This avoids embedding a directory of TypeScript source into YAML and keeps anti-slop vendored/versioned with the agent-tools checkout.
+`source` is relative to `agent_tools_source`; `target` is repo-relative. An uninitialized/missing subrepo is an error, never a silent empty copy. Existing target content obeys Rig's normal `skip | overwrite | backup` policy.
 
-### Conflict semantics
+The target repository declares compatible local `oxlint`, `oxfmt`, and `@oxlint/plugins` development dependencies. Bundle provisioning does not install global binaries or download code during `rig apply`.
 
-A pre-existing `tools/oxlint/anti-slop/` or `oxlint.config.ts` must honor Rig's normal `defaults.on_conflict` policy. Rig must never silently overwrite a project-customized anti-slop fork. Migration should review the diff first; after Rig takes ownership, drift becomes explicit.
-
-### Dependencies
-
-The target repository still needs compatible local dev dependencies for `oxlint` and `@oxlint/plugins`. Dependency mutation should remain package-manager-aware rather than being hidden inside a file-copy action. Repositories can either declare these dependencies themselves or use a future package-dependency provisioning surface; the linter bundle must not install a global Oxlint binary.
-
-## Policy alignment for agents
-
-When fixing findings, prefer:
-
-- inference over explicit widening;
-- `satisfies` over replacing an inferred type with a broad annotation;
-- parsing/decoding at the I/O boundary, with named domain types inward;
-- discriminated unions and named owner contracts over broad dictionaries or `object`;
-- explicit dependency seams over module mocking;
-- direct typed calls/property access over reflection;
-- removing assertions where possible, or a specific `SAFETY:` invariant when an assertion is genuinely necessary.
-
-Do not “fix” anti-slop by laundering the same uncertainty through another top type or assertion.
+For the complete overlap/addition/replacement matrix, see [TypeScript Policy vs. anti-slop](typescript-policy-vs-anti-slop.md).
