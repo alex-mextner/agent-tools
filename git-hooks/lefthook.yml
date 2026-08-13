@@ -29,6 +29,15 @@ pre-commit:
       glob: "*.{ts,tsx}"
       run: node_modules/.bin/tsc --noEmit
       fail_text: "typecheck failed"
+    # Semantic TypeScript policy. In repos provisioned with anti-slop, Oxlint replaces
+    # the old grep-based `as any` / `as unknown as` / @ts-ignore gate with AST rules.
+    # The provisioned config should include anti-slop plus:
+    #   typescript/no-non-null-assertion
+    #   typescript/ban-ts-comment (@ts-ignore/@ts-nocheck banned; @ts-expect-error needs text)
+    anti-slop:
+      glob: "*.{ts,tsx,js,jsx}"
+      run: node_modules/.bin/oxlint {staged_files}
+      fail_text: "Oxlint / anti-slop policy failed"
     # ---- python (uv) ---------------------------------------------------------------
     # ruff:
     #   glob: "*.py"
@@ -43,19 +52,6 @@ pre-commit:
     # golangci:
     #   glob: "*.go"
     #   run: golangci-lint run ./...
-    # ---- universal: no type escape hatches (see no-type-escape-hatches skill) -------
-    no-type-escape-hatches:
-      glob: "*.{ts,tsx}"
-      # Flag unjustified casts/ignores in staged TS. A justified @ts-expect-error with
-      # an explanatory comment on the SAME line is allowed; bare ones are not.
-      run: |
-        if grep -nE '\bas any\b|\bas unknown as\b' {staged_files}; then
-          echo "no-type-escape-hatches: remove 'as any' / 'as unknown as' (see the skill)"; exit 1
-        fi
-        if grep -nE '@ts-ignore' {staged_files}; then
-          echo "no-type-escape-hatches: use @ts-expect-error with a justification, not @ts-ignore"; exit 1
-        fi
-      fail_text: "type escape hatch found"
     # ---- universal: secret scan -----------------------------------------------------
     # The dispatcher's `10-secret-scan` already covers this when the dispatcher line
     # above is present, so a separate local secret scan is redundant — keeping BOTH runs
