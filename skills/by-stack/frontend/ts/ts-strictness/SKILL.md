@@ -34,11 +34,11 @@ Never loosen strictness to make an error go away; fix the type.
   the error is intentional and document why. It fails if the suppressed error disappears, so it
   cannot silently rot.
 
-For repositories using Oxlint, prefer AST rules for assertion/type-evidence policy over grep-based
-checks. The `anti-slop` rule set covers chained assertions, known-value widening, widening followed
-by assertion, unsafe broad dictionary contracts, and required `SAFETY:` comments for necessary
-assertions. Keep separate enforcement for policies it does not cover, notably TypeScript directive
-comments and non-null assertions.
+For repositories using Oxlint, prefer AST rules over grep-based checks. The `anti-slop` plugin
+covers chained assertions, known-value widening, widening followed by assertion, unsafe broad
+dictionary contracts, and required `SAFETY:` comments for necessary assertions. Pair it with
+Oxlint's built-in `typescript/no-non-null-assertion` and `typescript/ban-ts-comment` rules so the
+whole escape-hatch policy is syntax-aware and the old grep checks can be removed.
 
 ## Make illegal states unrepresentable
 
