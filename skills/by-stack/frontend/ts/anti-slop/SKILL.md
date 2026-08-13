@@ -1,6 +1,6 @@
 ---
 name: anti-slop
-description: Use when a TypeScript/JavaScript repo adopts or hits anti-slop Oxlint rules. Explains preferred repairs, boundary parsing, the pinned vendored subrepo, and composition with type-aware Oxc rules.
+description: Use when a frontend TypeScript/JavaScript repo adopts or hits anti-slop Oxlint rules. Explains preferred repairs, boundary parsing, the pinned vendored subrepo, and composition with type-aware Oxc rules.
 ---
 
 # anti-slop inside the Mextner TypeScript policy
