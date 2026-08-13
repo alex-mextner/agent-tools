@@ -10,17 +10,17 @@ pre-commit:
       run: '"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" pre-commit'
 
     # ---- JavaScript / TypeScript: Oxc ---------------------------------------------
-    oxlint:
-      glob: "*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"
-      # Type-aware mode is required by the semantic assertion rules in our baseline.
-      # The repo config also loads the vendored anti-slop JS plugin.
-      run: node_modules/.bin/oxlint --type-aware {staged_files}
-      fail_text: "Oxlint / anti-slop policy failed"
-
-    oxfmt:
-      glob: "*.{ts,tsx,js,jsx,mts,cts,mjs,cjs,json,jsonc}"
-      run: node_modules/.bin/oxfmt --check {staged_files}
-      fail_text: "Oxfmt check failed"
+    # These commands are enabled by Rig only after the repository declares the
+    # corresponding Oxc tools. The generic example must not make commits fail merely
+    # because a project has not adopted Oxc yet.
+    # oxlint:
+    #   glob: "*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"
+    #   run: node_modules/.bin/oxlint --type-aware {staged_files}
+    #   fail_text: "Oxlint / anti-slop policy failed"
+    # oxfmt:
+    #   glob: "*.{ts,tsx,js,jsx,mts,cts,mjs,cjs,json,jsonc}"
+    #   run: node_modules/.bin/oxfmt --check {staged_files}
+    #   fail_text: "Oxfmt check failed"
 
     typecheck:
       glob: "*.{ts,tsx,mts,cts}"

@@ -11,11 +11,11 @@ Rig owns the effective development policy. Rule implementation repositories are 
 
 Both are Git submodules pinned by the parent repository commit. Updating a source is an explicit gitlink change that must be reviewed like code.
 
-`typeonce-dev/ai-automation` currently exposes no license metadata in its GitHub repository. The submodule therefore preserves provenance and lets reviewers inspect the exact upstream revision without copying its implementation into agent-tools. Until licensing is clarified, rules adopted from that catalog are independently implemented in our own providers or represented by equivalent existing Oxc/Rig policy.
+`typeonce-dev/ai-automation` currently exposes no license metadata in its GitHub repository. The submodule therefore preserves provenance and lets reviewers inspect the exact upstream revision without copying its implementation into agent-tools. Until licensing is clarified, its implementations are not copied into our distributable carriers. Equivalent behavior may already be supplied by Oxlint or anti-slop; otherwise the catalog remains reference material until a compatible implementation is available.
 
 ## Applicability is part of policy
 
-`all: true` means **all applicable rules**, not every rule known to every provider. A React rule is not applicable to a non-React repository; an Effect rule is not applicable merely because the project uses TypeScript.
+`all: true` means **all applicable policy concepts after provider selection and deduplication**, not every implementation ID known to every subrepo. A React rule is not applicable to a non-React repository; an Effect rule is not applicable merely because the project uses TypeScript. If two providers implement the same policy concept, Rig selects one canonical implementation and does not enable both.
 
 Rig determines applicability from the declared stack and explicit repository policy. Framework-specific profiles are opt-in through stack evidence; repository overrides can further disable rules or change severity but should not silently manufacture a framework assumption that the declared stack contradicts.
 
@@ -32,6 +32,33 @@ The intended profiles are:
 | `next-tailwind` | Next.js + Tailwind | Applicable only when both assumptions hold or the repository explicitly selects the profile. |
 | `review` | Changed-line review | Separate from full-repository lint; never silently promoted into a blocking full-tree rule. |
 
+## Default selection and duplicate resolution
+
+The default set is deliberately smaller than either source inventory. The current JS/TS baseline enables TypeScript type-aware correctness rules plus the reviewed anti-slop rules whose false-positive profile is acceptable across ordinary TypeScript projects. Context-dependent rules remain off until explicitly selected.
+
+When implementations overlap, selection uses this order:
+
+1. prefer a semantic/type-aware implementation over a syntax-only blanket prohibition;
+2. otherwise prefer the provider that already supplies the larger applicable family, to avoid loading two providers for one concept;
+3. within the same provider, prefer the implementation with stronger tests, diagnostics and fewer repository-specific assumptions;
+4. never enable two implementations of the same concept merely because `all: true` was requested.
+
+Concrete decisions today:
+
+| Policy concept | Canonical implementation | Default | `all: true` | Duplicate treatment |
+| --- | --- | --- | --- | --- |
+| unsafe/unnecessary assertions | Oxlint TypeScript type-aware rules | error | error | preferred over ai-automation blanket assertion bans because semantic analysis is more precise |
+| non-null assertions / TS suppression | Oxlint TypeScript rules | error | error | one built-in implementation only |
+| assertion laundering / widening | anti-slop assertion family | error | error | anti-slop is the canonical provider; equivalent ai-automation ideas are reference-only |
+| unsafe dictionaries / unknown aliases and returns | anti-slop | error | error | anti-slop canonical |
+| reflection / unknown parameters / module mocking | anti-slop | warn | error | anti-slop canonical; `all` deliberately tightens severity |
+| runtime `typeof`, conditional empty spread, shape-in-symbol names | anti-slop | off | error | context-sensitive but applicable generic rules; `all` opts into them |
+| multiple function parameters | anti-slop reviewed implementation | off | error | canonical duplicate; ai-automation implementation is not additionally loaded |
+| optional function parameters | anti-slop reviewed implementation | off | error | canonical duplicate; ai-automation implementation is not additionally loaded |
+| architecture / Effect / XState / React-culture / Next-Tailwind rules | no executable default provider yet | off | only after the corresponding profile is applicable and a distributable provider exists | pinned ai-automation code is not copied or silently executed |
+
+Thus `all: true` is strong, but it is not a provider dump. It expands the selected applicable concepts, not the union of every upstream rule registry.
+
 ## ai-automation adoption map
 
 The upstream catalog is useful because it separates rule behavior from applicability. We keep that distinction and do not treat its 49 custom Oxlint rules as one monolithic preset.
@@ -41,8 +68,8 @@ The upstream catalog is useful because it separates rule behavior from applicabi
 | Upstream idea | Rig/agent-tools treatment |
 | --- | --- |
 | banned/type assertions | Covered by type-aware `typescript/no-unsafe-type-assertion`, `typescript/no-unnecessary-type-assertion`, anti-slop assertion rules, and the safety-comment rule. We do not add a duplicate blanket rule. |
-| multiple function parameters | Independently implemented as `anti-slop/no-multiple-function-params`; off by default. |
-| optional function parameters | Independently implemented as `anti-slop/no-optional-function-parameters`; off by default. |
+| multiple function parameters | `anti-slop/no-multiple-function-params` is the selected implementation; off by default, included by `all: true`. |
+| optional function parameters | `anti-slop/no-optional-function-parameters` is the selected implementation; off by default, included by `all: true`. |
 | direct uncertainty/assertion laundering | Covered by anti-slop known-value widening, chained assertions, widen-then-assert, unsafe dictionary, unknown return/alias rules. |
 
 ### Architecture profile candidates
@@ -57,7 +84,7 @@ The upstream catalog is useful because it separates rule behavior from applicabi
 
 ### Effect profile candidates
 
-Rules such as ambient nondeterminism, direct fetch/storage, swallowed errors, direct JSON, try/catch, switch/Match, Layer composition, service-option use, and Effect-specific inference rules are meaningful only in an Effect codebase. They form a separate `effect` profile and should be reviewed against current Effect APIs before independent implementation.
+Rules such as ambient nondeterminism, direct fetch/storage, swallowed errors, direct JSON, try/catch, switch/Match, Layer composition, service-option use, and Effect-specific inference rules are meaningful only in an Effect codebase. They remain catalog candidates unless/until a distributable implementation is selected; the pinned reference subrepo alone does not activate them.
 
 ### XState profile candidates
 
@@ -75,11 +102,12 @@ Changed-line rules such as `no-let` or discouraging explicit implementation retu
 
 The effective order is:
 
-1. built-in Rig defaults for applicable profiles;
-2. global Rig config;
-3. repository `rig.yaml`;
-4. group/profile toggles and `all`;
-5. per-rule `enable` / `disable`;
-6. per-rule `severity`, which is final.
+1. built-in Rig defaults for applicable policy concepts;
+2. provider selection and duplicate collapse;
+3. global Rig config;
+4. repository `rig.yaml`;
+5. group/profile toggles and `all`;
+6. per-rule `enable` / `disable`;
+7. per-rule `severity`, which is final.
 
 A generated linter config is merely the resolved output of that policy. It is marked as Rig-managed and is not a second source of truth.

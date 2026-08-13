@@ -34,7 +34,7 @@ Rig copies that exact tree into `tools/oxlint/anti-slop/`. Updating anti-slop is
 
 ## Oxc config baseline
 
-The target `oxlint.config.ts` registers `./tools/oxlint/anti-slop/index.ts`, enables every anti-slop rule at error severity, sets type-aware mode, and also enables:
+The target `oxlint.config.ts` registers `./tools/oxlint/anti-slop/index.ts` and renders Rig’s audited per-rule severities. Context-sensitive/API-shape rules remain off unless policy enables them; warning rules remain warnings. Type-aware mode also enables:
 
 ```ts
 "typescript/no-unsafe-type-assertion": "error",

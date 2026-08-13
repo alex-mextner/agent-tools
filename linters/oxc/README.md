@@ -32,3 +32,7 @@ linters:
 The same block may live in the global Rig config to establish defaults for every repository. Repository `rig.yaml` refines those defaults. `all: true` enables every applicable discovered rule; `disable` and explicit `severity` entries can then narrow the result.
 
 Rig generates `oxlint.config.ts`, vendors the pinned anti-slop implementation when an enabled rule needs it, and reconciles drift on subsequent applies. `.oxfmtrc.jsonc` remains the reusable formatter baseline. The checked-in `oxlint.config.ts` here documents the built-in TypeScript baseline and is also useful for testing the policy independently, but projects should express deviations through Rig rather than editing generated output.
+## Formatter default
+
+For JS/TS repositories that adopt the Oxc baseline, **Oxfmt is the default formatter**. Rig should provision its carrier and enable the format check only when repository-local `oxfmt` is declared. A foreign formatter is a migration/coexistence signal, not something Rig silently deletes.
+
