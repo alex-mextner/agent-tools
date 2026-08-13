@@ -1,4 +1,4 @@
 [submodule "vendor/anti-slop"]
 	path = vendor/anti-slop
 	url = https://github.com/alex-mextner/anti-slop.git
-	branch = docs/rule-guides
+	branch = main
