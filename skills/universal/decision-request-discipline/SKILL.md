@@ -1,6 +1,6 @@
 ---
 name: decision-request-discipline
-description: 'Use before escalating any product or architecture decision to a human (the project owner / CTO) — any "should we A or B", "open the PR or drop it", "which approach", or any mention of an open PR awaiting review. ALSO fires the moment a code review raises findings on a PR and you''re deciding whether to ship, hold, or fold them in: that routing has a fixed standing answer for on-scope-vs-off-scope findings — see the "Decisions you must NOT escalate" section below for the full rule, including the P1/security sign-off carve-out. Brainstorm across models first and only escalate on genuine model disagreement or an irreversible high-blast-radius call (this is about the escalate-a-question decision; a repo's own required human sign-off gate on a merge is separate and still applies where it exists); never relabel a product feature as a "risk/vuln/hazard"; and when you do escalate, send it to the human''s channel in the strict question format so the decision takes 30 seconds without reading code.'
+description: 'Use before escalating any product or architecture decision to a human (the project owner / CTO) — any "should we A or B", "open the PR or drop it", "which approach", or any mention of an open PR awaiting review. ALSO fires the moment a code review raises findings on a PR and you''re deciding whether to ship, hold, or fold them in: that routing has a fixed standing answer for on-scope-vs-off-scope findings — see the "Decisions you must NOT escalate" section below for the full rule, including the P1/security sign-off carve-out. ALSO fires for a stale or dangling PR/branch — that has a fixed standing answer too: investigate, then autonomously salvage-and-close / close-as-obsolete / rebase / redo, then ship; never ask "what should I do with PR #NNN". Brainstorm across models first and only escalate on genuine model disagreement or an irreversible high-blast-radius call (this is about the escalate-a-question decision; a repo''s own required human sign-off gate on a merge is separate and still applies where it exists); never relabel a product feature as a "risk/vuln/hazard"; and when you do escalate, send it to the human''s channel in the strict question format so the decision takes 30 seconds without reading code.'
 ---
 
 # Decide what you can; escalate only what you can't — and only in the strict format
@@ -88,6 +88,93 @@ P1/security thread before merge — is not this routing decision and can still a
   irreversible, high-blast-radius call still escalates per "When to escalate" above. This
   section settles *where a finding gets fixed*, not whether the PR's whole approach is
   sound.
+
+**A second fixed-approach example: a PR or branch that has gone stale or dangling.**
+"What do I do with PR #NNN?" / "branch X has been sitting there for weeks" is never an
+escalation — it has the same fixed shape as the review-findings routing above:
+**investigate first, then decide and execute one of four actions yourself.**
+
+- **Investigate before deciding — and in this order, since it determines which action
+  applies:** (1) does a newer PR/branch already cover the same ground? (2) if not, is the
+  goal still wanted at all? (3) if yes, does it still rebase cleanly, or has the
+  implementation rotted past that? Read the branch's own commits and the ticket it
+  references (`git log`, `gh pr view`, the linked ticket) to answer these. This applies
+  identically to a branch that never had a PR opened — read "PR" below as "PR, or the bare
+  branch when no PR exists": there is no PR to close, and only update a ticket if one was
+  actually linked.
+- **The answers above point at exactly one of these four — DO it, proposing it is not the
+  deliverable:**
+  1. **Salvage-and-close** — a newer PR/branch already covers the same ground (question 1
+     was yes), REGARDLESS of whether the old implementation also rotted: diff the stale
+     one against the replacement, fold in anything valuable it has that the replacement is
+     missing (an edge case, a fix, a comment worth keeping), close the stale one with a
+     comment linking to the replacement (a bare branch with no PR has no comment thread —
+     put the link in the linked ticket instead; if there is truly no ticket either, a
+     one-line note in the team's decision log/changelog is enough — never rewrite an
+     already-pushed commit just to attach a note), **then delete the branch** — following
+     the recoverable-pointer safeguard below when it never had a PR. This is the standing
+     rule for superseded PR pairs specifically — salvaging first is the safeguard that
+     makes closing-and-deleting without a fresh approval safe.
+  2. **Close as obsolete** — nothing newer covers it, but the goal itself is no longer
+     wanted (superseded by product direction, a duplicate, or abandoned scope — question 2
+     was no). **Same salvage safeguard as action 1 first:** confirm via the investigate
+     step that there is no reusable piece worth keeping on its own merits — if there is,
+     cherry-pick it directly into main (not into a doomed feature) or file a follow-up
+     ticket for it before closing; do not skip straight to deletion. Then close the PR
+     with a comment stating why (a bare branch has no PR to comment on — use the same
+     ticket/changelog fallback as action 1), **delete the branch** — following the
+     recoverable-pointer safeguard below when it never had a PR — and update the linked
+     ticket to match (skip the ticket update if none was linked).
+  3. **Rebase** — nothing newer covers it, the goal is still wanted, and it still rebases
+     cleanly (question 3: not rotted): rebase onto the PR's own base (or current main),
+     resolve conflicts, re-run review/CI. Nothing is deleted in this path.
+  4. **Redo** — nothing newer covers it, the goal is still wanted, but the implementation
+     has rotted past a clean rebase (the architecture moved on, the approach it used is
+     now superseded — question 3: rotted). **Same salvage safeguard as actions 1 and 2:**
+     before closing the old branch, check it for edge-case fixes, comments, or test
+     scenarios worth carrying into the new implementation — don't let them get silently
+     discarded just because the code around them didn't survive. Reimplement fresh on a
+     new branch/PR against current main, referencing the same ticket, then close the old
+     one — following the recoverable-pointer safeguard below when it never had a PR.
+- **None of this is time-based.** There is no day/week threshold that makes a PR "stale" —
+  the trigger is the semantic answer to the three investigate questions above, not how long
+  something has sat. A PR that's simply awaiting review, with nothing superseding it and
+  nothing rotted, answers "not covered / still wanted / not rotted" — that's action 3
+  (rebase, a no-op if the base hasn't moved), never a close. Only a PR/branch whose own
+  content actually answers "superseded" or "no longer wanted" reaches the destructive
+  actions (1, 2).
+- **Report after executing, every time — autonomy is not silence.** Closing a PR or
+  deleting a branch is visible to anyone else watching it; after you act, post what you did
+  and why (which action, what you salvaged, the linked ticket) to the human's channel as a
+  **report, not a request** — this satisfies any repo policy requiring an explanation for a
+  close/delete without turning the triage decision itself back into a question.
+- **Hard-deleting a branch that never had a PR needs a recoverable pointer first.** A local
+  `git branch -D` keeps commits in the reflog for months, but `git push origin --delete` on
+  a branch with no PR leaves no server-side trace of the diff. Before that push, either open
+  a throwaway PR (even just to close it — GitHub then retains the diff/history) or push a
+  cheap `archive/<branch-name>` ref pointing at the tip SHA. The goal is autonomy without
+  irrecoverable loss, not skipping the record.
+- **Then run it to green and ship — same as any other PR.** Whichever action you took,
+  iterate `review diff` / fix cycles until the PR is clean, pass CI, and merge it. A
+  rebased-but-otherwise-normal PR is not exempt from the repo's usual merge gate, and it
+  is not exempt from the usual autonomy to run that gate without asking permission
+  first, either.
+- **The only thing that still escalates:** the investigation step turns up something
+  genuinely ambiguous — two branches represent CONFLICTING design decisions for the same
+  problem (not just "one has an extra fix the other lacks"), or the ticket itself is
+  contested. That is an open architecture call, not housekeeping — escalate it per "When
+  to escalate" above, in the strict format (see "PR or drop" below for that format).
+
+**This does NOT override:**
+- **A repo's own required merge sign-off / quorum gate, or a required close/delete
+  notification** (e.g. a policy that a human must approve any merge, or specifically
+  P1/security-flagged PRs, before it lands; or a rule that closing a PR needs an explanation
+  posted somewhere). This section settles that the TRIAGE decision — which of the four
+  actions to take — is never escalated as a question; it does not waive a merge gate, or a
+  requirement to explain the close, that the repo already imposes. Where such a gate or
+  requirement exists, you still decide and execute the triage yourself, get review/CI
+  clean, post the report above, and then wait on the sign-off like any other PR — you just
+  never ask "what should I do with this PR" first.
 
 The general shape: **if a class of decision already has a written standing rule — in this
 skill, or in another policy document this repo's agents are bound to (its `AGENTS.md`,
@@ -264,6 +351,12 @@ So:
 
 ## "PR or drop" / "open a PR or close it" decisions
 
+**This is the escalation format for the rare case that survives the investigation in "a PR or
+branch that has gone stale or dangling" above** — a genuinely contested call (conflicting
+design decisions, a disputed ticket), not routine housekeeping. A PR/branch that's simply
+stale, superseded, or forgotten is **not** this case: follow that section instead
+(salvage-and-close, close as obsolete, rebase, or redo — autonomously, no escalation).
+
 Never write just "need to: open a PR or drop". That's offloading the decision with no context.
 A PR-or-drop request must state:
 
@@ -292,6 +385,10 @@ A PR-or-drop request must state:
   escalation failed its one job. Paste the literal sentence(s) from the section, every time.
 - **Escalating "ship or hold" over review findings.** That routing is settled (fix on-scope
   findings in the PR; off-scope → follow-up ticket + ship). Apply the fixed rule, don't ask.
+- **Asking "what should I do with this PR/branch?" instead of triaging it.** A stale or
+  dangling PR/branch is housekeeping with a fixed answer (salvage-and-close / close as
+  obsolete / rebase / redo) — investigate and execute it yourself, then ship. Don't forward
+  the triage call upward.
 
 ## Why
 
