@@ -1,6 +1,6 @@
 ---
 name: ts-strictness
-description: Use when writing or configuring TypeScript — turning on strict compiler flags, modeling types precisely, and avoiding escape hatches (any / as / non-null !). Triggers on tsconfig strictness, a type error you're tempted to cast away, unions/discriminated unions, or "how do I type this". Applies to any TypeScript frontend stack (lang-level at `frontend/ts`), not just React.
+description: Use when writing or configuring TypeScript — turning on strict compiler flags, modeling types precisely, and avoiding escape hatches (any / assertions / non-null !). Triggers on tsconfig strictness, a type error you're tempted to cast away, unions/discriminated unions, boundary parsing, or "how do I type this". Applies to any TypeScript frontend stack (lang-level at `frontend/ts`), not just React.
 ---
 
 # TypeScript: keep the type checker honest
@@ -20,14 +20,25 @@ Never loosen strictness to make an error go away; fix the type.
 
 ## No escape hatches
 
-- **`any`** erases checking and spreads silently through everything it touches. Reach for
-  `unknown` and narrow, or model the real type.
-- **`as` / `as unknown as`** asserts a lie the compiler then trusts. Use a type guard or a
-  schema parse (`zod`) at the boundary instead of casting.
-- **`!` (non-null assertion)** claims "trust me, not null". Prefer an explicit check or
-  optional chaining; a wrong `!` is a runtime crash the checker could have caught.
-- **`@ts-ignore` / `@ts-expect-error`** — only with a comment explaining why, and prefer
-  `@ts-expect-error` (it fails if the error disappears, so it can't rot).
+- **`any`** erases checking and spreads silently through everything it touches. At an actual
+  untyped I/O boundary, keep the value `unknown` only long enough to run the expected parser or
+  schema; do not pass `unknown` through ordinary application contracts and narrow it ad hoc later.
+- **`as` / `as unknown as`** asserts a fact the compiler did not establish. Prefer inference,
+  `satisfies`, a parser/schema at the boundary, or a domain-owned interface. If an assertion is
+  genuinely necessary because TypeScript cannot express a checked invariant, document that exact
+  invariant next to the assertion.
+- **`!` (non-null assertion)** claims "trust me, not null". Prefer an explicit check, an invariant
+  established by construction, or optional chaining; a wrong `!` is a runtime crash the checker
+  could have caught.
+- **`@ts-ignore` / `@ts-expect-error`** — never use `@ts-ignore`; use `@ts-expect-error` only when
+  the error is intentional and document why. It fails if the suppressed error disappears, so it
+  cannot silently rot.
+
+For repositories using Oxlint, prefer AST rules over grep-based checks. The `anti-slop` plugin
+covers chained assertions, known-value widening, widening followed by assertion, unsafe broad
+dictionary contracts, and required `SAFETY:` comments for necessary assertions. Pair it with
+Oxlint's built-in `typescript/no-non-null-assertion` and `typescript/ban-ts-comment` rules so the
+whole escape-hatch policy is syntax-aware and the old grep checks can be removed.
 
 ## Make illegal states unrepresentable
 
@@ -47,14 +58,25 @@ type State =
 
 Switching on `status` gives exhaustiveness (with a `never` default) and no impossible combos.
 
-## Parse, don't assume, at the boundary
+## Parse, don't narrow, at the boundary
 
-Data from the network, `JSON.parse`, `process.env`, or a form is `unknown` in reality. Validate
-it into a typed value with a schema (`zod`, `valibot`) at the edge; inside the app the type is
-then *earned*, not asserted. A `response.json() as User` is a cast, not a check.
+Data from the network, `JSON.parse`, environment/config input, message queues, or forms is
+untrusted in reality. Keep the raw value at the boundary, validate it with the expected schema or
+parser (`zod`, `valibot`, a generated decoder, or an owner-provided parser), and hand the parsed
+domain type inward.
 
-## Prefer `type` inference and narrow types
+```ts
+const payload: unknown = await response.json();
+const user = UserSchema.parse(payload);
+renderUser(user);
+```
 
-Let inference do the work for locals; annotate public function signatures and boundaries.
-Use `readonly` and `as const` for data that shouldn't mutate, and literal unions
+Do not replace parsing with a chain of `typeof`, property-existence checks, or casts spread across
+business logic. A `response.json() as User` is a cast, not a check.
+
+## Prefer inference and narrow types
+
+Let inference do the work for locals; annotate public function signatures and real boundaries.
+Use `satisfies` when you want to validate a value against a broader contract without replacing its
+inferred type. Use `readonly` and `as const` for data that should not mutate, and literal unions
 (`'sm' | 'md' | 'lg'`) over bare `string` where the set is known.
