@@ -1,49 +1,37 @@
 ---
 name: anti-slop
-description: Use when a TypeScript/JavaScript repo adopts or hits anti-slop Oxlint rules. Explains the preferred replacement patterns, boundary-parsing policy, and how anti-slop composes with Oxlint's built-in TypeScript safety rules.
+description: Use when a TypeScript/JavaScript repo adopts or hits anti-slop Oxlint rules. Explains preferred repairs, boundary parsing, the pinned vendored subrepo, and composition with type-aware Oxc rules.
 ---
 
-# anti-slop TypeScript policy
+# anti-slop inside the Mextner TypeScript policy
 
-Use `anti-slop` as a narrow semantic layer on top of normal TypeScript strictness and Oxlint. It is not a formatter, a replacement for `tsc`, or a general-purpose lint preset.
+Anti-slop is a specialized semantic layer inside the broader policy documented in [`../README.md`](../README.md). Do not consume it as a remote runtime dependency. `agent-tools` pins the reviewed fork at `vendor/anti-slop`; Rig vendors the supported asset tree from that pinned source into each target repository.
 
 ## Preferred repairs
 
-When a rule fires, preserve type evidence instead of suppressing the rule:
+When a rule fires, preserve evidence rather than suppressing the rule:
 
-- keep inference rather than widening a known value;
-- use `satisfies` when a value must be checked against a broader contract without replacing its inferred type;
-- parse untrusted input once at the I/O boundary and pass named domain types inward;
-- use discriminated unions or named owner contracts for dynamic domain state;
-- replace module mocking with dependency seams that production code also understands;
-- avoid reflection when ordinary typed calls/property access can express the operation;
-- if a type assertion is genuinely required, document the exact checked invariant with a nearby `SAFETY:` comment.
+- keep inference rather than widening a known value — [preserve inference](../rules/preserve-inference.md);
+- use `satisfies` when a value must satisfy a broader contract without replacing its inferred type;
+- parse untrusted input once at the I/O boundary — [parse at boundaries](../rules/parse-at-boundaries.md);
+- use discriminated unions or named owner contracts — [illegal states](../rules/make-illegal-states-unrepresentable.md);
+- replace module mocking with real dependency seams and reflection with direct typed operations — [typed reflection](../rules/no-reflection-for-typed-code.md);
+- remove unsafe assertions; if TypeScript cannot express a runtime-checked invariant, document that exact invariant with `SAFETY:` — [unsafe assertions](../rules/no-unsafe-assertions.md).
 
-Do not mechanically silence findings with `as`, `unknown`, `object`, broad dictionaries, `typeof` chains, or module mocks. Those are exactly the evidence-erasing patterns this policy is meant to expose.
+The anti-slop subrepo contains the authoritative per-rule guides for every anti-slop rule. Do not duplicate or fork those implementations inside agent-tools.
 
-## Complete escape-hatch baseline
+## Complete Oxc assertion baseline
 
-Anti-slop deliberately focuses on its own opinionated rules. Pair it with Oxlint built-ins for the two TypeScript escape hatches that previously needed grep checks:
+Anti-slop catches important structural assertion/evidence patterns. Type-aware Oxlint supplies the general semantic net around them:
 
-```ts
-"typescript/no-non-null-assertion": "error",
-"typescript/ban-ts-comment": [
-  "error",
-  {
-    "ts-ignore": true,
-    "ts-nocheck": true,
-    "ts-expect-error": "allow-with-description"
-  }
-],
-```
+- `typescript/no-unsafe-type-assertion` — reject assertions that narrow the actual type;
+- `typescript/no-unnecessary-type-assertion` — remove assertions that do not change the type;
+- `typescript/no-non-null-assertion` — reject postfix `!`;
+- `typescript/ban-ts-comment` — ban `@ts-ignore`/`@ts-nocheck` and require a description for `@ts-expect-error`.
 
-Keep `tsc --noEmit` (or the repo's equivalent typecheck) as a separate gate. Keep the repo's formatter/general lint rules as well; anti-slop is additive.
+Run Oxlint in type-aware mode and keep `tsc --noEmit` as a separate compiler gate. Use Oxfmt for formatting; Biome is not part of the provisioned JS/TS baseline.
 
-## Provisioning
-
-For repos managed by Rig, prefer a vendored anti-slop bundle plus a Rig-managed Oxlint config instead of an npm dependency on the anti-slop repository. The upstream project is intentionally designed to be vendored and customized per team.
-
-The target layout is:
+## Target layout
 
 ```text
 tools/oxlint/anti-slop/
@@ -53,4 +41,4 @@ tools/oxlint/anti-slop/
 oxlint.config.ts
 ```
 
-`rig.yaml` should declare the anti-slop bundle and the Oxlint config; `rig apply` then owns convergence and `rig status` reports drift. See `docs/anti-slop.md` in agent-tools for the migration and replacement matrix.
+See `docs/typescript-policy-vs-anti-slop.md` for the complete overlap/addition/replacement matrix.

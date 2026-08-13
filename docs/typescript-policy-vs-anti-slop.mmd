@@ -1,0 +1,25 @@
+flowchart LR
+  subgraph R["Rig / agent-tools policy"]
+    R1[Strict TypeScript compiler]
+    R2[Boundary parsing and domain modeling]
+    R3[Oxlint built-ins and type-aware rules]
+    R4[Oxfmt]
+  end
+
+  subgraph O["Shared concerns"]
+    O1[Preserve type evidence]
+    O2[Reject assertion laundering]
+    O3[Prefer concrete owner contracts]
+    O4[Keep uncertainty at boundaries]
+  end
+
+  subgraph A["anti-slop plugin"]
+    A1[Known-value widening]
+    A2[Widen then assert]
+    A3[Unsafe dictionaries]
+    A4[Reflection and module mocking]
+    A5[Opinionated optional rules]
+  end
+
+  R --> O
+  A --> O

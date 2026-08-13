@@ -1,82 +1,44 @@
 ---
 name: ts-strictness
-description: Use when writing or configuring TypeScript — turning on strict compiler flags, modeling types precisely, and avoiding escape hatches (any / assertions / non-null !). Triggers on tsconfig strictness, a type error you're tempted to cast away, unions/discriminated unions, boundary parsing, or "how do I type this". Applies to any TypeScript frontend stack (lang-level at `frontend/ts`), not just React.
+description: Use when writing or configuring TypeScript — strict compiler flags, precise domain modeling, boundary parsing, inference preservation, and avoiding type escape hatches. Applies to any TypeScript frontend stack, not only React.
 ---
 
 # TypeScript: keep the type checker honest
 
-TypeScript only pays off if you let it fail. The goal is that an illegal state is
-*unrepresentable*, not that the red squiggle is silenced.
+TypeScript only pays off if you let it fail. The target state is that illegal states are unrepresentable and runtime uncertainty is resolved at the boundary where it enters.
 
-## Turn on strict mode (and keep it on)
+The canonical rule index is [`../README.md`](../README.md). Each rule there links to a dedicated guide with **Avoid / Prefer / Why**, matching the documentation structure used by the vendored anti-slop rules.
 
-`"strict": true` in `tsconfig.json` is the baseline. Add the ones strict does not include:
+## Core rules
 
-- `noUncheckedIndexedAccess` — `arr[i]` is `T | undefined`, forcing you to handle the miss.
-- `exactOptionalPropertyTypes` — `{ x?: number }` is not the same as `{ x: number | undefined }`.
-- `noImplicitOverride`, `noFallthroughCasesInSwitch` — cheap correctness guards.
+- **Strict compiler** — keep `strict: true`; add `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `noImplicitOverride`, and `noFallthroughCasesInSwitch`. [Guide](../rules/strict-compiler.md)
+- **No `any`** — use the real domain type; `unknown` is a temporary boundary representation, not an application-layer contract. [Guide](../rules/no-any.md)
+- **Parse at boundaries** — decode HTTP/JSON/config/forms/queues once and hand a named domain type inward. [Guide](../rules/parse-at-boundaries.md)
+- **No unsafe assertions** — prove the type by control flow/schema; type-aware Oxlint rejects narrowing assertions, while anti-slop catches laundering patterns and requires `SAFETY:` evidence for the exceptional residue. [Guide](../rules/no-unsafe-assertions.md)
+- **No unnecessary assertions** — remove assertions that add no type information. [Guide](../rules/no-unnecessary-assertions.md)
+- **No postfix `!`** — establish presence explicitly or by construction. [Guide](../rules/no-non-null-assertion.md)
+- **No TS suppression** — ban `@ts-ignore`/`@ts-nocheck`; narrowly justified `@ts-expect-error` only. [Guide](../rules/ban-ts-suppression.md)
+- **Preserve inference** — prefer inference, `satisfies`, literal precision and owner contracts over widening then casting back. [Guide](../rules/preserve-inference.md)
+- **Make illegal states unrepresentable** — discriminated unions and exhaustive handling over contradictory bags of optionals. [Guide](../rules/make-illegal-states-unrepresentable.md)
+- **No reflection for ordinary typed code** — direct typed calls/property access and real dependency seams over reflection/module mocking. [Guide](../rules/no-reflection-for-typed-code.md)
 
-Never loosen strictness to make an error go away; fix the type.
+## Oxc enforcement baseline
 
-## No escape hatches
+Use Oxc rather than Biome for this stack: Oxlint for linting and Oxfmt for formatting. TypeScript linting is type-aware.
 
-- **`any`** erases checking and spreads silently through everything it touches. At an actual
-  untyped I/O boundary, keep the value `unknown` only long enough to run the expected parser or
-  schema; do not pass `unknown` through ordinary application contracts and narrow it ad hoc later.
-- **`as` / `as unknown as`** asserts a fact the compiler did not establish. Prefer inference,
-  `satisfies`, a parser/schema at the boundary, or a domain-owned interface. If an assertion is
-  genuinely necessary because TypeScript cannot express a checked invariant, document that exact
-  invariant next to the assertion.
-- **`!` (non-null assertion)** claims "trust me, not null". Prefer an explicit check, an invariant
-  established by construction, or optional chaining; a wrong `!` is a runtime crash the checker
-  could have caught.
-- **`@ts-ignore` / `@ts-expect-error`** — never use `@ts-ignore`; use `@ts-expect-error` only when
-  the error is intentional and document why. It fails if the suppressed error disappears, so it
-  cannot silently rot.
+At minimum, combine the complete vendored anti-slop rules with:
 
-For repositories using Oxlint, prefer AST rules over grep-based checks. The `anti-slop` plugin
-covers chained assertions, known-value widening, widening followed by assertion, unsafe broad
-dictionary contracts, and required `SAFETY:` comments for necessary assertions. Pair it with
-Oxlint's built-in `typescript/no-non-null-assertion` and `typescript/ban-ts-comment` rules so the
-whole escape-hatch policy is syntax-aware and the old grep checks can be removed.
+- `typescript/no-unsafe-type-assertion`
+- `typescript/no-unnecessary-type-assertion`
+- `typescript/no-non-null-assertion`
+- `typescript/ban-ts-comment` configured to ban `@ts-ignore`/`@ts-nocheck` and require a description for `@ts-expect-error`
 
-## Make illegal states unrepresentable
+Keep `tsc --noEmit` as a separate compiler gate. Oxc linting complements the TypeScript compiler; it does not make the compiler optional.
 
-Model with discriminated unions, not a bag of optional booleans that can contradict:
+## Why `unknown` is boundary-only
 
-```ts
-// bad: isLoading && data can both be set; error && data ambiguous
-type State = { isLoading: boolean; data?: User; error?: Error }
+`unknown` is the correct static type for a value whose runtime shape is genuinely not yet known. The mistake is not receiving `unknown`; the mistake is preserving that uncertainty after the system has enough information to resolve it.
 
-// good: exactly one variant is real at a time
-type State =
-  | { status: 'idle' }
-  | { status: 'loading' }
-  | { status: 'success'; data: User }
-  | { status: 'error'; error: Error }
-```
+At an HTTP boundary, for example, `response.json()` is untrusted. Treat it as `unknown`, run `UserSchema.parse(raw)`, and from that point inward use `User`. If instead services return `unknown`, callers repeatedly write `typeof`/`in` checks and casts. Validation becomes duplicated, different callers infer different shapes, and the application no longer has one owner for the contract.
 
-Switching on `status` gives exhaustiveness (with a `never` default) and no impossible combos.
-
-## Parse, don't narrow, at the boundary
-
-Data from the network, `JSON.parse`, environment/config input, message queues, or forms is
-untrusted in reality. Keep the raw value at the boundary, validate it with the expected schema or
-parser (`zod`, `valibot`, a generated decoder, or an owner-provided parser), and hand the parsed
-domain type inward.
-
-```ts
-const payload: unknown = await response.json();
-const user = UserSchema.parse(payload);
-renderUser(user);
-```
-
-Do not replace parsing with a chain of `typeof`, property-existence checks, or casts spread across
-business logic. A `response.json() as User` is a cast, not a check.
-
-## Prefer inference and narrow types
-
-Let inference do the work for locals; annotate public function signatures and real boundaries.
-Use `satisfies` when you want to validate a value against a broader contract without replacing its
-inferred type. Use `readonly` and `as const` for data that should not mutate, and literal unions
-(`'sm' | 'md' | 'lg'`) over bare `string` where the set is known.
+So the rule is **unknown at the uncertainty boundary → parse once → named type inward**, not “never use `unknown`.”

@@ -1,43 +1,40 @@
 # lefthook.yml — example git-hook config for the lefthook runner.
 #
 # Pick the block matching your stack (bun/node, python-uv, or go) and delete the others,
-# or merge them — lefthook only runs commands whose tools exist. `lefthook install` wires
-# these into the repo's git hooks; the config is committed, so every clone gets the same
-# gates. See README.md.
-#
-# These mirror the standalone hooks in this directory. Run fast/scoped checks on
-# pre-commit and the full suite on pre-push (see the pre-commit-gate skill).
+# or merge them. For JS/TS the standard toolchain is Oxc: Oxlint + Oxfmt.
 
 pre-commit:
   parallel: true
   commands:
-    # ---- global git-hook dispatcher (runs secret-scan + every future global hook) ---
-    # This ONE command wires the repo into ~/.config/git/global-hooks.d/ so any hook
-    # dropped there runs here too, with no further per-repo edits. The run: value MUST
-    # be a single-quoted YAML scalar. See global-dispatcher/README.md and the
-    # global-git-hooks skill. The dispatcher's `10-secret-scan` supersedes the standalone
-    # `no-secrets` command below — keep that one commented to avoid running gitleaks twice
-    # (the dispatcher's DEDUP / `.githooks-skip` is the documented way to reconcile both).
     global-git-hooks-dispatcher:
       run: '"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" pre-commit'
-    # ---- bun / node ----------------------------------------------------------------
-    lint:
-      glob: "*.{ts,tsx,js,jsx}"
-      run: node_modules/.bin/biome check --no-errors-on-unmatched {staged_files}
-      fail_text: "lint failed — fix before committing (no --no-verify)"
+
+    # ---- JavaScript / TypeScript: Oxc ---------------------------------------------
+    oxlint:
+      glob: "*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"
+      # Type-aware mode is required by the semantic assertion rules in our baseline.
+      # The repo config also loads the vendored anti-slop JS plugin.
+      run: node_modules/.bin/oxlint --type-aware {staged_files}
+      fail_text: "Oxlint / anti-slop policy failed"
+
+    oxfmt:
+      glob: "*.{ts,tsx,js,jsx,mts,cts,mjs,cjs,json,jsonc}"
+      run: node_modules/.bin/oxfmt --check {staged_files}
+      fail_text: "Oxfmt check failed"
+
     typecheck:
-      glob: "*.{ts,tsx}"
+      glob: "*.{ts,tsx,mts,cts}"
       run: node_modules/.bin/tsc --noEmit
       fail_text: "typecheck failed"
-    # Semantic TypeScript policy. In repos provisioned with anti-slop, Oxlint replaces
-    # the old grep-based `as any` / `as unknown as` / @ts-ignore gate with AST rules.
-    # The provisioned config should include anti-slop plus:
+
+    # The old regex `as any` / `as unknown as` / @ts-ignore gate is intentionally gone.
+    # AST + type-aware policy is stronger:
+    #   anti-slop/*
+    #   typescript/no-unsafe-type-assertion
+    #   typescript/no-unnecessary-type-assertion
     #   typescript/no-non-null-assertion
-    #   typescript/ban-ts-comment (@ts-ignore/@ts-nocheck banned; @ts-expect-error needs text)
-    anti-slop:
-      glob: "*.{ts,tsx,js,jsx}"
-      run: node_modules/.bin/oxlint {staged_files}
-      fail_text: "Oxlint / anti-slop policy failed"
+    #   typescript/ban-ts-comment
+
     # ---- python (uv) ---------------------------------------------------------------
     # ruff:
     #   glob: "*.py"
@@ -45,6 +42,7 @@ pre-commit:
     # mypy:
     #   glob: "*.py"
     #   run: uv run mypy .
+
     # ---- go ------------------------------------------------------------------------
     # gofmt:
     #   glob: "*.go"
@@ -52,16 +50,6 @@ pre-commit:
     # golangci:
     #   glob: "*.go"
     #   run: golangci-lint run ./...
-    # ---- universal: secret scan -----------------------------------------------------
-    # The dispatcher's `10-secret-scan` already covers this when the dispatcher line
-    # above is present, so a separate local secret scan is redundant — keeping BOTH runs
-    # gitleaks TWICE. Leave it commented if you use the dispatcher. If you DO want a
-    # local one (e.g. a repo not wired to the dispatcher), uncomment it AND add a tracked
-    # `.githooks-skip` with a `secret-scan` line so the dispatcher skips its global copy
-    # (run-global-hooks DEDUP — install-local-hooks.sh writes that file automatically).
-    # no-secrets:
-    #   run: ./git-hooks/no-secrets-scan
-    #   fail_text: "secret detected in staged changes"
 
 commit-msg:
   commands:
@@ -77,6 +65,5 @@ pre-push:
     global-git-hooks-dispatcher:
       run: '"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" pre-push'
     test:
-      # bun/node — swap for `uv run pytest` or `go test ./...` per stack.
       run: npm test
       fail_text: "tests failed — not pushing red"
