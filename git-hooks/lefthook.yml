@@ -10,16 +10,38 @@ pre-commit:
       run: '"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" pre-commit'
 
     # ---- JavaScript / TypeScript: Oxc ---------------------------------------------
-    # Keep these active for the supported direct `lefthook install` path. The executable
-    # guard makes this generic template safe before Oxc adoption; once the repository declares
-    # repo-local Oxlint/Oxfmt, the gates become real blocking checks automatically.
+    # Direct Lefthook installs distinguish "not adopted" from "adopted but unavailable":
+    # only the former skips. If ANY tracked package.json declares the tool, failure to execute it
+    # blocks the commit so a stale install / PnP / workspace layout can never silently bypass a gate.
     oxlint:
       glob: "*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"
-      run: 'if [ -x node_modules/.bin/oxlint ]; then node_modules/.bin/oxlint --type-aware {staged_files}; else echo "Oxlint not installed in this repository — Oxc lint gate skipped"; fi'
+      run: >-
+        if ! command -v node >/dev/null 2>&1; then
+          echo "Node.js is required to evaluate the JS/TS Oxlint gate" >&2; exit 127;
+        elif node -e 'const fs=require("fs"),cp=require("child_process");const tool=process.argv[1];const files=cp.execFileSync("git",["ls-files","*package.json"],{encoding:"utf8"}).trim().split(/\r?\n/).filter(Boolean);for(const f of files){try{const p=JSON.parse(fs.readFileSync(f,"utf8"));for(const k of ["dependencies","devDependencies","peerDependencies","optionalDependencies"]){if(p[k]&&Object.prototype.hasOwnProperty.call(p[k],tool))process.exit(0)}}catch{}}process.exit(1)' oxlint; then
+          if [ -x node_modules/.bin/oxlint ]; then node_modules/.bin/oxlint --type-aware {staged_files};
+          elif [ -f pnpm-lock.yaml ] && command -v pnpm >/dev/null 2>&1; then pnpm exec oxlint --type-aware {staged_files};
+          elif [ -f yarn.lock ] && command -v yarn >/dev/null 2>&1; then yarn oxlint --type-aware {staged_files};
+          elif command -v npx >/dev/null 2>&1; then npx --no-install oxlint --type-aware {staged_files};
+          else echo "Oxlint is declared in this repository but cannot be executed; install dependencies or configure the workspace invocation" >&2; exit 127; fi;
+        else
+          echo "Oxlint is not declared in tracked package manifests — Oxc lint gate not applicable";
+        fi
       fail_text: "Oxlint / anti-slop policy failed"
     oxfmt:
       glob: "*.{ts,tsx,js,jsx,mts,cts,mjs,cjs,json,jsonc}"
-      run: 'if [ -x node_modules/.bin/oxfmt ]; then node_modules/.bin/oxfmt --check {staged_files}; else echo "Oxfmt not installed in this repository — Oxc format gate skipped"; fi'
+      run: >-
+        if ! command -v node >/dev/null 2>&1; then
+          echo "Node.js is required to evaluate the JS/TS Oxfmt gate" >&2; exit 127;
+        elif node -e 'const fs=require("fs"),cp=require("child_process");const tool=process.argv[1];const files=cp.execFileSync("git",["ls-files","*package.json"],{encoding:"utf8"}).trim().split(/\r?\n/).filter(Boolean);for(const f of files){try{const p=JSON.parse(fs.readFileSync(f,"utf8"));for(const k of ["dependencies","devDependencies","peerDependencies","optionalDependencies"]){if(p[k]&&Object.prototype.hasOwnProperty.call(p[k],tool))process.exit(0)}}catch{}}process.exit(1)' oxfmt; then
+          if [ -x node_modules/.bin/oxfmt ]; then node_modules/.bin/oxfmt --check {staged_files};
+          elif [ -f pnpm-lock.yaml ] && command -v pnpm >/dev/null 2>&1; then pnpm exec oxfmt --check {staged_files};
+          elif [ -f yarn.lock ] && command -v yarn >/dev/null 2>&1; then yarn oxfmt --check {staged_files};
+          elif command -v npx >/dev/null 2>&1; then npx --no-install oxfmt --check {staged_files};
+          else echo "Oxfmt is declared in this repository but cannot be executed; install dependencies or configure the workspace invocation" >&2; exit 127; fi;
+        else
+          echo "Oxfmt is not declared in tracked package manifests — Oxc format gate not applicable";
+        fi
       fail_text: "Oxfmt check failed"
 
     typecheck:
