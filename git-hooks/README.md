@@ -49,6 +49,16 @@ lefthook install
 This is the team-friendly path — the config is committed, so every clone gets the same
 gates after one `lefthook install`.
 
+For JS/TS, the example keeps the **Oxlint and Oxfmt entries active** and distinguishes two states.
+If no tracked `package.json` declares the tool, that particular Oxc gate is not applicable and
+prints a skip notice. Once any tracked package declares Oxlint/Oxfmt, the gate is considered
+**adopted and fail-closed**: the hook tries the root shim and then the repository package manager;
+a stale install, broken PnP/workspace invocation, or otherwise unavailable adopted tool blocks the
+commit instead of silently bypassing the check. Monorepos whose Oxc binary is intentionally only
+available through a workspace-specific command should customize the invocation rather than rely on
+a successful skip. Rig-managed repositories use Rig's richer readiness/migration layer to surface
+that setup as an explicit target state.
+
 ## Stack detection
 
 The standalone hooks first prefer the repo-owned test script:
