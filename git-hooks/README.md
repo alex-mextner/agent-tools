@@ -49,6 +49,14 @@ lefthook install
 This is the team-friendly path — the config is committed, so every clone gets the same
 gates after one `lefthook install`.
 
+For JS/TS, the example keeps the **Oxlint and Oxfmt entries active**. Each command checks for the
+repository-local executable first: once `node_modules/.bin/oxlint` / `oxfmt` exists, the hook is a
+real blocking quality gate; before that toolchain is adopted, the generic template prints a skip
+message instead of making unrelated repositories unable to commit. This preserves the direct
+`lefthook install` workflow without pretending a missing linter passed. Rig-managed repositories
+use Rig's readiness/policy layer to decide when Oxc should be present and can surface migration
+work explicitly.
+
 ## Stack detection
 
 The standalone hooks first prefer the repo-owned test script:
