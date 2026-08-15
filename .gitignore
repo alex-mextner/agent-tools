@@ -2,10 +2,6 @@
 .cache/
 *.done
 
-# Local git worktrees used by parallel agents; never committed.
-# Remove with `git worktree remove`, not by deleting source files.
-.worktrees/
-
 # OS / editor noise
 .DS_Store
 *.swp
