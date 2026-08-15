@@ -1,6 +1,6 @@
 # Agent CLI Ecosystem — Roadmap
 
-Status snapshot: **2026-07-23** (newest session block first, right below the north-star). This is
+Status snapshot: **2026-08-15** (newest session block first, right below the north-star). This is
 the handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, `rig-cli`,
 `draw-cli`, `3d-cli`, `task-cli`) + the `agent-tools` umbrella.
 
@@ -24,7 +24,7 @@ the handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, 
 > precise per-item count, tally the §Open-ticket ledger and newest dated block only.
 
 > **Reading order:** the AUTHORITATIVE current state is the **newest dated session block at the very
-> top** (currently **2026-07-18 → 07-23**), then **§Remaining work (prioritized)** and the **§Open-ticket
+> top** (currently **2026-08-15**), then **§Remaining work (prioritized)** and the **§Open-ticket
 > ledger** below. ⚠️ The dated session blocks lead; the lower §Remaining-work / §Open-ticket ledger lag
 > behind the newest block and may still list items the top block has since shipped — when they disagree,
 > the newest dated block wins. The two collapsed `📜 …` blocks are older dated transcript (2026-06-15 →
@@ -36,6 +36,26 @@ the handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, 
 > New tools are built in Python on that lib so a new tool spins up fast on one architecture.
 > `rig` is the front door (`rig init` onboarding, `rig apply` reconcile — two distinct commands,
 > interactivity orthogonal). `agent-tools` = WHAT (the catalog), `rig` = HOW (installs it).
+
+---
+
+## 2026-08-15 — flow-metrics system scoped for pm-cli (⏳ tickets filed, nothing built yet)
+
+*Answers the CTO's direct ask: a metrics system for tasks, starting with average time-in-status,
+grounded in standard flow-metrics practice (cycle time, lead time, throughput, WIP, work-item age
+as the leading-indicator counterpart to cycle time, aging alerts, and reviewing the metrics
+periodically as the actual improvement process — not a one-off dashboard). `pm-cli`'s
+append-only transition-event log already carries every timestamp this needs; nothing like it
+exists yet (`pm report` today only has `queue | stuck | retro | monthly`, all counts/snapshots,
+no duration computation). Per the CTO's own instruction, details live in the tickets below, not
+here.*
+
+- ⏳ **pm-cli#8** — `pm report metrics`: average + percentile time-in-status per lifecycle state,
+  computed from existing transition events.
+- ⏳ **pm-cli#9** — aging alert: flag items whose time in their *current* state passes a
+  threshold, catching slow work before it becomes a full `stuck` exception.
+- ⏳ **pm-cli#10** — weekly metrics digest via `tg`, reusing the existing `pm-reminders-push`
+  cron pattern, so the numbers actually get looked at on a cadence instead of only on demand.
 
 ---
 
@@ -1130,6 +1150,8 @@ packaging systemic), #33 (lib-advertise). SYSTEMIC TODO → `lib/pyproject.toml`
 - 🔬 **3d-cli** — **PR #1** slim AGENTS.md (rollout).
 - ⏳ **task-cli** — #1 Phase-2 deps+Gantt · #2 daemon+webhooks · #3 completion/due notify · #4 integrations.
   *(foundation in-flight, agent a9cef4ca — check for its branch/PR.)*
+- ⏳ **pm-cli** — #8 `pm report metrics` (time-in-status) · #9 aging alert · #10 weekly metrics digest via `tg`.
+  *(filed 2026-08-15, see the flow-metrics roadmap block at top.)*
 - 📋 **draw-cli** — none open.
 
 > Bridge subagent (agent-tools#18) will likely open NEW PRs (agent-tools + maybe rig-cli) — add them here when it reports.
