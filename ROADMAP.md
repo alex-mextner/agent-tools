@@ -39,6 +39,26 @@ the handoff/roadmap for the agent-native CLI ecosystem (`tg-cli`, `review-cli`, 
 
 ---
 
+## 2026-08-15 — flow-metrics system scoped for pm-cli (⏳ tickets filed, nothing built yet)
+
+*Answers the CTO's direct ask: a metrics system for tasks, starting with average time-in-status,
+grounded in standard flow-metrics practice (cycle time, lead time, throughput, WIP, work-item age
+as the leading-indicator counterpart to cycle time, aging alerts, and reviewing the metrics
+periodically as the actual improvement process — not a one-off dashboard). `pm-cli`'s
+append-only transition-event log already carries every timestamp this needs; nothing like it
+exists yet (`pm report` today only has `queue | stuck | retro | monthly`, all counts/snapshots,
+no duration computation). Per the CTO's own instruction, details live in the tickets below, not
+here.*
+
+- ⏳ **pm-cli#8** — `pm report metrics`: average + percentile time-in-status per lifecycle state,
+  computed from existing transition events.
+- ⏳ **pm-cli#9** — aging alert: flag items whose time in their *current* state passes a
+  threshold, catching slow work before it becomes a full `stuck` exception.
+- ⏳ **pm-cli#10** — weekly metrics digest via `tg`, reusing the existing `pm-reminders-push`
+  cron pattern, so the numbers actually get looked at on a cadence instead of only on demand.
+
+---
+
 ## 2026-07-18 → 07-23 — multi-day autonomous backlog marathon (🔬 under CTO review)
 
 *A long multi-day autonomous shipping run across the whole ecosystem, tracked live via `gh` throughout.
