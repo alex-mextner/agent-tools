@@ -314,6 +314,34 @@ them to *every* project and user. If you want the catalog of always-apply behavi
 - **Fresh worktrees, off the origin default branch.** Don't work in the primary checkout (another
   agent may hold it). A fresh worktree bases on `origin/<default branch>`, not your current HEAD —
   verify the base before you start if your work is stacked on unmerged branches.
+- **Create worktrees with `rig worktree create <name> --from origin/main`** (rig-cli — the
+  explicit `--from` matters: the command defaults to branching off your current `HEAD`, which
+  contradicts the "off the origin default branch" rule above if you run it from inside an
+  existing feature worktree). It lands the tree at the standardized `<repo>/.worktrees/<name>`
+  and, *before* creating it, registers `/.worktrees/` in this **clone's** `.git/info/exclude`
+  (shared by every linked worktree of this clone, never committed) — that's why `.worktrees/`
+  is intentionally NOT in the committed `.gitignore`: it's a local scratch convention, not
+  something every clone should carry. Remove a worktree with **`rig worktree remove <name>`**,
+  never by deleting its source files by hand (leaves stale `git worktree` metadata) and never
+  with plain `git worktree remove` either — that leaves the branch behind, and a later `rig
+  worktree create <same-name>` then fails because the branch already exists; `rig worktree
+  remove` deletes both the tree and its branch together.
+  - **First time in a clone** (including right after pulling this change, or on a brand new
+    clone/CI checkout): the exclude entry doesn't exist yet, so `git status` will show any
+    `.worktrees/*` content — pre-existing or hand-made — as untracked. Fix it by running `rig
+    worktree create <a-new-name> --from origin/main` once (same `--from` reasoning as above —
+    this bootstrap worktree is throwaway, remove it with `rig worktree remove` right after) —
+    the registration covers the whole `.worktrees/` directory, not just that one name, so it
+    retroactively ignores any existing entries too. (It must be a name that doesn't already
+    exist under `.worktrees/`: the command checks `target.exists()` and errors "already exists"
+    *before* it reaches the exclude reconcile, so re-running it for an already-created
+    worktree's own name does nothing.) The other fix is to append `/.worktrees/` to
+    `.git/info/exclude` by hand, no `rig worktree create` involved — run this from the
+    **primary checkout**, or resolve the shared path first with `git rev-parse
+    --git-common-dir` (inside a *linked* worktree `.git` is a file, not a directory, so a
+    literal `.git/info/exclude` path doesn't exist there). Do this before running `git add
+    -A`/`git add .` from the primary checkout — otherwise a stray `.worktrees/*` entry can get
+    staged as a broken gitlink (or, if a worktree's own `.git` file is missing, as plain files).
 - **The gates apply to you too.** Atomic, conventional commits (one logical change each); review
   before each commit (refresh the marker, *then* commit); never `--no-verify`; land only via the
   ship gate. These are the same guards this catalog installs for any repo — here they're
