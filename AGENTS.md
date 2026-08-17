@@ -193,7 +193,9 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   literal (skill: `bump-version-on-release`); override a genuine no-release ship with
   `--no-version-bump-ok <reason>` or `SHIP_SKIP_VERSION_BUMP=1`;
 - the **review-quorum bar is met** (Guard-B of the self-merge-authority program) — the PR's task
-  code (`$REVIEW_TASK_CODE`, else a `HYP-<n>`/uppercase ticket token from the branch name or PR
+  code (`$REVIEW_TASK_CODE`, else a `HYP-<n>`/uppercase ticket token, else a purely descriptive
+  ALL-CAPS/hyphenated code (`SME-ROADMAP-WORKTREE-NOTE`-shaped, 3+ segments, no digits) — all
+  tried against the branch name or PR
   body) has ≥ `SHIP_REVIEW_QUORUM_MIN_ITER` PASSED review-cli iterations across ≥
   `SHIP_REVIEW_QUORUM_MIN_MODELS` distinct models (`review task <code> --check`). Both floors are
   **clamped to a hard minimum of 3** — the env knobs can only RAISE the bar, never lower it (a

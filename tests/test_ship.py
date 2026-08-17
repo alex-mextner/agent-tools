@@ -4834,6 +4834,144 @@ def test_review_quorum_derives_code_from_pr_body(tmp_path):
     assert "AUTHORITY CONFIRMED" in r.stdout and "HYP-999" in r.stdout, r.stdout
 
 
+def test_review_quorum_derives_descriptive_code_from_pr_body(tmp_path):
+    """No $REVIEW_TASK_CODE and no ticket in the branch name -> ship also derives a purely
+    descriptive (non-numeric) review-cli task code from the PR body — the real-world #384
+    case: a docs-only PR whose 3 review-quorum iterations were recorded under task
+    `SME-ROADMAP-WORKTREE-NOTE`, same shape as review-cli's own run-stats.jsonl."""
+    main, _wt = _make_repo_with_branch(tmp_path, "roadmap-worktree-convention-note")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        branch="roadmap-worktree-convention-note",
+        env_extra={
+            "SHIP_TEST_PR_BODY": "Review findings addressed, task SME-ROADMAP-WORKTREE-NOTE.",
+        },
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "SME-ROADMAP-WORKTREE-NOTE" in r.stdout, r.stdout
+
+
+def test_review_quorum_derives_descriptive_code_from_branch_name(tmp_path):
+    """A branch name carrying an all-uppercase, hyphen-joined descriptive task code (no
+    digits) is picked up too, same as the numeric HYP-<n> case."""
+    branch = "fix/WT-GITIGNORE-EXCLUDE-followup"
+    main, _wt = _make_repo_with_branch(tmp_path, branch)
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, rv, branch=branch)
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "WT-GITIGNORE-EXCLUDE" in r.stdout, r.stdout
+
+
+def test_review_quorum_descriptive_pattern_does_not_match_bare_acronyms(tmp_path):
+    """The descriptive-code pattern requires 2+ hyphens (3+ segments), so ordinary PR-body
+    prose full of unrelated all-caps acronyms (PASSED, PR, CI, README) — but no 3-segment
+    hyphenated all-caps token — must NOT be mistaken for a task code; ship still refuses."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "SHIP_TEST_PR_BODY": "All models PASSED. See README and CI, updates in PR body.",
+        },
+    )
+    assert r.returncode != 0, f"bare acronyms must not be treated as a task code\n{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_descriptive_pattern_does_not_match_two_word_prose(tmp_path):
+    """Common TWO-word hyphenated English (READ-ONLY, CI-CD, PRE-COMMIT, API-KEY) is exactly
+    the false-positive class two independent review-cli models flagged against an earlier,
+    looser version of this pattern (#384 review round 1) — the 3-segment floor must reject all
+    of it, not just hyphen-less acronyms."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "SHIP_TEST_PR_BODY": (
+                "sandbox: READ-ONLY. Ran CI-CD, added a PRE-COMMIT hook, rotated the API-KEY."
+            ),
+        },
+    )
+    assert r.returncode != 0, f"two-word hyphenated prose must not be treated as a task code\n{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_descriptive_pattern_rejects_digit_bearing_token(tmp_path):
+    """A token with a digit buried mid-segment (`SME-ROADMAP-V2-NOTE`) must be rejected
+    outright, not silently truncate-matched down to a bogus prefix (`SME-ROADMAP-V`) — the
+    boundary bug an earlier version of this pattern had (#384 review round 1)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"SHIP_TEST_PR_BODY": "Task code SME-ROADMAP-V2-NOTE covers this."},
+    )
+    assert r.returncode != 0, f"a digit-bearing token must not derive a truncated code\n{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "SME-ROADMAP-V" not in r.stderr, f"must not silently truncate-match: {r.stderr}"
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_descriptive_pattern_filters_per_candidate(tmp_path):
+    """A rejected digit-bearing candidate must not shadow a CLEAN descriptive code appearing
+    later in the same text -- pins the per-candidate (not whole-text) filtering design (#384
+    review round 2): a whole-text-reject-all implementation would also pass the
+    `rejects_digit_bearing_token` test above without actually filtering per candidate, so this
+    is the test that distinguishes the two."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "SHIP_TEST_PR_BODY": "Task SME-ROADMAP-V2-NOTE superseded by REAL-TASK-CODE-HERE.",
+        },
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "REAL-TASK-CODE-HERE" in r.stdout, r.stdout
+
+
+def test_review_quorum_descriptive_code_is_case_sensitive(tmp_path):
+    """A lowercase descriptive code must NOT match — only the fully-uppercase shape counts,
+    same posture as the numeric generic pattern."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"SHIP_TEST_PR_BODY": "Part of sme-roadmap-worktree-note, lowercase."},
+    )
+    assert r.returncode != 0, f"lowercase must not derive a task code\n{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_numeric_code_takes_precedence_over_descriptive(tmp_path):
+    """When a PR body carries both a numeric-suffix ticket and a descriptive code, the numeric
+    arm (tried first) wins — pinning the fallback order the function's docblock describes."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "SHIP_TEST_PR_BODY": "Fixes ABC-123, related to SME-ROADMAP-WORKTREE-NOTE.",
+        },
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "ABC-123" in r.stdout, r.stdout
+    assert "SME-ROADMAP-WORKTREE-NOTE" not in r.stdout, r.stdout
+
+
 def test_review_quorum_refuses_when_no_task_code_derivable(tmp_path):
     """No $REVIEW_TASK_CODE, no ticket in the branch, no ticket in the PR body -> refuse with
     guidance rather than silently skip the gate."""
