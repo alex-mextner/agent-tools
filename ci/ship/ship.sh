@@ -1636,13 +1636,47 @@ fi
 # Prints the first ticket-like token found in $1, or nothing. Tries the repo's own HYP-<n>
 # convention first (case-insensitive, normalized to uppercase), then a generic
 # UPPERCASE-PREFIX-<n> ticket token (2+ uppercase letters, a hyphen, digits) so other repos'
-# conventions (JIRA-style PROJ-123, etc.) are also picked up. The generic pattern is
-# deliberately uppercase-only so it doesn't false-match ordinary prose like "utf-8" or "step-2".
+# conventions (JIRA-style PROJ-123, etc.) are also picked up, then a purely descriptive
+# review-cli task code (2+ uppercase letters, then 2-OR-MORE hyphen-joined 2+-letter uppercase
+# segments -- 3+ segments total, no digits) so hand-picked codes like `SME-ROADMAP-WORKTREE-NOTE`
+# or `WT-GITIGNORE-EXCLUDE` -- real task codes review-cli's own run-stats log records fine, just
+# without a numeric suffix -- are also auto-derived (#384). `LC_ALL=C` on every grep here: outside
+# the C locale, `[A-Z]` bracket ranges are collation-dependent (glibc's en_US.UTF-8 can interleave
+# case), which would make the "uppercase-only" guarantee below hold only by luck of the ambient
+# locale -- same fix idiom the `tr` calls elsewhere in this file already use.
+#
+# The descriptive arm is extracted in two stages: first the FULL boundary-delimited token
+# (letters/digits/hyphens, stops at the first char outside that set), then an exact whole-token
+# match against the letters-only shape, evaluated per CANDIDATE (not the whole text), so one
+# rejected candidate never shadows a clean one appearing later. That order matters: a token with
+# a stray digit buried inside a segment (`SME-ROADMAP-V2-NOTE`) is rejected outright instead of
+# silently grep -o'ing a truncated prefix (`SME-ROADMAP-V`) as if it were the real code.
+#
+# The 3-segment floor (each segment 2+ letters) is a deliberate, documented trade-off: it rules
+# out the common TWO-word hyphenated English that would otherwise false-positive on ordinary
+# PR-body prose -- "READ-ONLY", "CI-CD", "PRE-COMMIT", "API-KEY", "OPT-IN" are all 2 segments and
+# do NOT match. Two known, ACCEPTED residuals remain, same class of imprecision the numeric
+# pattern above already tolerates for stray "AB-12"-shaped text, and both fail CLOSED regardless
+# -- review-cli has no record for a wrongly-derived code, so ship still refuses, just with a less
+# friendly message than "could not derive a task code" (#384 review notes):
+#   - a rarer three-word phrase ("END-TO-END", "DO-NOT-MERGE") can still slip through uncaught;
+#   - a digit fused directly onto (or hyphen-separated immediately before) the token's OWN first
+#     segment ("2FA-SETUP-FLOW", "123-ABC-DEF-GHI") isn't caught by the boundary-free `[A-Z]`
+#     start -- POSIX ERE has no lookbehind to assert "not preceded by a digit/letter" here;
+#   - the numeric arm above runs FIRST and returns on its first match anywhere in the text, so an
+#     incidental uppercase-acronym-plus-digit token that has nothing to do with the real ticket
+#     ("UTF-8", "SHA-256", "RFC-2119", "ISO-8601" all match `[A-Z][A-Z]+-[0-9]+`) can shadow a
+#     valid descriptive code appearing later in the same PR body -- the descriptive arm below then
+#     never even runs. Same fail-closed trade-off: review-cli has no record for "UTF-8" either, so
+#     ship still refuses, just without ever trying the real code (#384 review round 3).
 _review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing; ALWAYS exits 0
   local text="$1" m
-  m=$(printf '%s\n' "$text" | grep -oiE 'HYP-[0-9]+' | head -1 || true)
-  if [ -n "$m" ]; then printf '%s' "$m" | tr '[:lower:]' '[:upper:]'; return 0; fi
-  m=$(printf '%s\n' "$text" | grep -oE '[A-Z][A-Z]+-[0-9]+' | head -1 || true)
+  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE 'HYP-[0-9]+' | head -1 || true)
+  if [ -n "$m" ]; then printf '%s' "$m" | LC_ALL=C tr '[:lower:]' '[:upper:]'; return 0; fi
+  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z]+-[0-9]+' | head -1 || true)
+  if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
+  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z0-9]*(-[A-Z0-9]+)*' \
+        | LC_ALL=C grep -xE '[A-Z][A-Z]+(-[A-Z][A-Z]+){2,}' | head -1 || true)
   printf '%s' "$m"
   return 0
 }
