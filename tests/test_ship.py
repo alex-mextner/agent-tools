@@ -333,6 +333,446 @@ def test_ship_from_inside_dirty_pr_worktree_is_not_removed(repo_with_pr_worktree
     assert str(wt) in remaining, f"dirty worktree was unlinked:\n{remaining}"
 
 
+def _screenshot_upload_env(main: Path, bindir: Path, uploader: Path) -> dict:
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_IMAGE_UPLOAD_CMD"] = str(uploader)
+    return env
+
+
+def test_upload_png_quote_in_path_is_not_shell_injected(repo_with_pr_worktree, tmp_path):
+    """HYP-1260 regression: upload_png() must never let a screenshot PATH re-enter `eval`.
+
+    The pre-fix implementation did `eval "$SHIP_IMAGE_UPLOAD_CMD \\"$png\\""` — a literal `"`
+    in the path could close that quote and splice arbitrary shell syntax into the eval'd
+    string. Proven exploitable via PoC before the fix (a path containing
+    `evil"; touch PWNED; echo "` ran `touch`). Here a screenshot path containing a double
+    quote AND a `;`-separated shell command must reach the uploader as ONE inert argument —
+    no command runs, and the argument the uploader receives is byte-for-byte the raw path."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    injection_marker = tmp_path / "PWNED"
+    # A single path COMPONENT can't itself contain '/', so the injected payload reaches the
+    # absolute marker path via an inherited env var expansion (evaluated only if the eval-
+    # injection actually fires) rather than embedding a literal slash-bearing path in the
+    # directory name.
+    evil_dir = tmp_path / 'evil"; touch "$PWNED_TARGET"; echo "'
+    evil_dir.mkdir()
+    png = evil_dir / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, uploader)
+    env["PWNED_TARGET"] = str(injection_marker)
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert not injection_marker.exists(), (
+        "shell injection via the screenshot path executed `touch`!\n" + r.stdout + r.stderr
+    )
+    assert argv_log.exists(), f"uploader was never invoked:\n{r.stdout}\n{r.stderr}"
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == [str(png)], f"uploader must receive the raw path as ONE argument, got: {got}"
+    assert f"uploaded 'desc' -> https://example.invalid/uploaded.png" in r.stdout, r.stdout
+
+
+def test_upload_png_file_token_quote_in_path_is_not_shell_injected(repo_with_pr_worktree, tmp_path):
+    """Same HYP-1260 regression as above, but for the `{FILE}` token branch of upload_png()
+    (`SHIP_IMAGE_UPLOAD_CMD` containing a literal `{FILE}` placeholder rather than appending
+    the path as $1) — the pre-fix code built this branch via
+    `eval "${SHIP_IMAGE_UPLOAD_CMD//\\{FILE\\}/$png}"`, equally vulnerable to a quote in the
+    path breaking out of the template."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    injection_marker = tmp_path / "PWNED_FILE_TOKEN"
+    evil_dir = tmp_path / 'evil"; touch "$PWNED_TARGET"; echo "'
+    evil_dir.mkdir()
+    png = evil_dir / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded-file-token.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, uploader)
+    env["PWNED_TARGET"] = str(injection_marker)
+    # {FILE} branch: the config template embeds the placeholder plus an extra fixed arg,
+    # proving both the substituted element AND the surrounding trusted words survive intact.
+    env["SHIP_IMAGE_UPLOAD_CMD"] = f"{uploader} --file {{FILE}} --tag ci"
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert not injection_marker.exists(), (
+        "shell injection via the screenshot path executed `touch`!\n" + r.stdout + r.stderr
+    )
+    assert argv_log.exists(), f"uploader was never invoked:\n{r.stdout}\n{r.stderr}"
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == ["--file", str(png), "--tag", "ci"], (
+        f"uploader must receive the raw path as ONE argument in place of {{FILE}}, got: {got}"
+    )
+    assert "uploaded 'desc' -> https://example.invalid/uploaded-file-token.png" in r.stdout, r.stdout
+
+
+def test_upload_png_path_with_ampersand_and_backslash_is_not_corrupted(repo_with_pr_worktree, tmp_path):
+    """Regression pinned from multi-model review of the HYP-1260 fix: an earlier draft spliced
+    the path into a bash argv array via `${word//\\{FILE\\}/$png}`, an UNQUOTED `${var//pat/rep}`
+    replacement. Under bash's `patsub_replacement` option (default-on since bash 5.2), a bare
+    `&` in the replacement text is re-interpreted as "insert the matched pattern" and `\\` as an
+    escape character — so a path containing `&` or `\\` would come out mangled even though no
+    injection occurred. The shipped fix (`printf %q` + plain-string splice, no `${var//pat/rep}`
+    anywhere) must reproduce the path byte-for-byte regardless of `&`/`\\` in it."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    tricky_dir = tmp_path / "a&b\\c"
+    tricky_dir.mkdir()
+    png = tricky_dir / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded-ampersand.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, uploader)
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert argv_log.exists(), f"uploader was never invoked:\n{r.stdout}\n{r.stderr}"
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == [str(png)], f"path with '&'/'\\\\' must survive byte-for-byte, got: {got}"
+
+
+def test_upload_png_preserves_shell_pipeline_template(repo_with_pr_worktree, tmp_path):
+    """Regression pinned from multi-model review of the HYP-1260 fix: an earlier draft parsed
+    SHIP_IMAGE_UPLOAD_CMD into a plain argv array and ran it directly (no eval at all), which
+    silently broke any operator-configured template using shell syntax — a pipe, `&&`, an
+    env-var prefix, etc. (a realistic real-world config, e.g.
+    `curl -sF file=@{FILE} https://uploader.example | jq -r .url`). The shipped fix keeps
+    eval'ing the FULL trusted template (only the untrusted path is neutralized via `printf %q`),
+    so a template built from two chained commands must still work end-to-end."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n" + b"x" * 100)
+
+    # A template that only works if the WHOLE string is still eval'd as one pipeline: cat the
+    # file, count bytes, and print a URL that embeds the count — impossible to produce via a
+    # single argv-array `exec`, only via real shell chaining (| and &&).
+    stage = tmp_path / "url_from_size.sh"
+    stage.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -e\n"
+        f'n=$(wc -c < "{png}")\n'
+        'echo "https://example.invalid/size-${n// /}.png"\n',
+        encoding="utf-8",
+    )
+    stage.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, stage)
+    env["SHIP_IMAGE_UPLOAD_CMD"] = f"cat {{FILE}} | wc -c > /dev/null && {stage}"
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "uploaded 'desc' -> https://example.invalid/size-106.png" in r.stdout, (
+        "pipe/&&-based SHIP_IMAGE_UPLOAD_CMD template did not run end-to-end:\n" + r.stdout + r.stderr
+    )
+
+
+def test_upload_png_preserves_quoted_multiword_arg_template(repo_with_pr_worktree, tmp_path):
+    """Regression pinned from multi-model review of the HYP-1260 fix: a template with a quoted
+    multi-word argument (e.g. `my-uploader --token "a b" {FILE}`) must still pass that argument
+    as ONE word, exactly as the pre-fix eval-based implementation did."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded-quoted-arg.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, uploader)
+    env["SHIP_IMAGE_UPLOAD_CMD"] = f'{uploader} --token "a b" {{FILE}}'
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert argv_log.exists(), f"uploader was never invoked:\n{r.stdout}\n{r.stderr}"
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == ["--token", "a b", str(png)], (
+        f"quoted multi-word template arg must stay ONE word, got: {got}"
+    )
+
+
+@pytest.mark.parametrize("quote_style", ['"{FILE}"', "'{FILE}'"], ids=["double-quoted", "single-quoted"])
+def test_upload_png_quoted_file_token_with_space_in_path(repo_with_pr_worktree, tmp_path, quote_style):
+    """Regression pinned from a SECOND round of multi-model review of the HYP-1260 fix: quoting
+    the `{FILE}` placeholder (`uploader "{FILE}"` / `uploader '{FILE}'`) was the RECOMMENDED way
+    to handle a screenshot path containing a space under the pre-fix raw-substitution behavior.
+    A naive `%q`-then-splice-into-the-template's-own-quotes fix breaks exactly this case (the
+    %q token nests inside the operator's quotes and comes out corrupted, e.g. a backslash-
+    escaped space that no longer re-parses as one word). The shipped fix recognizes a
+    quote-wrapped `{FILE}` and replaces the WHOLE quoted form (dropping the now-redundant
+    operator quotes, since the %q token supplies its own), so this must still work."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    spaced_dir = tmp_path / "my shots"
+    spaced_dir.mkdir()
+    png = spaced_dir / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded-quoted-file-token.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, uploader)
+    env["SHIP_IMAGE_UPLOAD_CMD"] = f"{uploader} {quote_style}"
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert argv_log.exists(), f"uploader was never invoked:\n{r.stdout}\n{r.stderr}"
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == [str(png)], (
+        f"a space-containing path via a quoted {{FILE}} placeholder must arrive as ONE "
+        f"unmangled argument, got: {got}"
+    )
+
+
+def test_upload_png_quoted_file_token_blocks_injection(repo_with_pr_worktree, tmp_path):
+    """The quote-wrapped-`{FILE}` code path (added for the space-in-path regression above) is a
+    DISTINCT branch from the bare-`{FILE}` and appended-arg branches already covered by the
+    injection tests above — it must independently resist the same HYP-1260 injection PoC."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    injection_marker = tmp_path / "PWNED_QUOTED_FILE_TOKEN"
+    evil_dir = tmp_path / 'evil"; touch "$PWNED_TARGET"; echo "'
+    evil_dir.mkdir()
+    png = evil_dir / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded-quoted-file-token-injection.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, uploader)
+    env["PWNED_TARGET"] = str(injection_marker)
+    env["SHIP_IMAGE_UPLOAD_CMD"] = f'{uploader} "{{FILE}}"'
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert not injection_marker.exists(), (
+        "shell injection via a quoted {FILE} placeholder executed `touch`!\n" + r.stdout + r.stderr
+    )
+    assert argv_log.exists(), f"uploader was never invoked:\n{r.stdout}\n{r.stderr}"
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == [str(png)], f"uploader must receive the raw path as ONE argument, got: {got}"
+
+
+def test_upload_png_mixed_quoted_and_bare_file_token_forms_both_substitute(repo_with_pr_worktree, tmp_path):
+    """Regression pinned from a THIRD round of multi-model review of the HYP-1260 fix: an
+    earlier draft picked exactly ONE recognized `{FILE}` form per template (via `case`/`elif`),
+    so a template mixing a quoted and a bare occurrence — `--src "{FILE}" --thumb {FILE}`, a
+    realistic shape for e.g. attaching both a full image and deriving a checksum from the same
+    path — only substituted the first-matched form and left the other as the LITERAL string
+    `{FILE}`. The pre-fix `${var//pat/rep}` replaced every occurrence (global replace); the
+    shipped fix restores that: `_upload_png_compose_cmd` recognizes and substitutes every
+    occurrence of any of the three `{FILE}` forms in one left-to-right pass."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded-mixed-forms.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, uploader)
+    env["SHIP_IMAGE_UPLOAD_CMD"] = f'{uploader} --src "{{FILE}}" --thumb {{FILE}}'
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert argv_log.exists(), f"uploader was never invoked:\n{r.stdout}\n{r.stderr}"
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == ["--src", str(png), "--thumb", str(png)], (
+        f"both the quoted AND bare {{FILE}} occurrences must be substituted, got: {got}"
+    )
+
+
+def test_upload_png_path_containing_literal_file_token_text_is_not_corrupted(repo_with_pr_worktree, tmp_path):
+    """Regression pinned from a FOURTH round of multi-model review of the HYP-1260 fix: an
+    earlier draft chained three SEPARATE replacement passes (quoted-double, quoted-single,
+    bare), each operating on the OUTPUT of the previous. `printf %q` does not escape `{`/`}`,
+    so if the screenshot path itself contains the literal 7-character substring `{FILE}`, that
+    text survives into the %q-quoted replacement token spliced in by an earlier pass — and a
+    LATER pass (scanning the accumulated string) then re-matches and re-substitutes THAT text,
+    corrupting the composed command (e.g. duplicating/mangling the path). The shipped fix
+    (`_upload_png_compose_cmd`) does a SINGLE pass over the ORIGINAL template, so it can never
+    rescan text it already emitted. A directory literally named `{FILE}` is a real (if
+    unusual) shape — e.g. an operator's own placeholder convention colliding by coincidence."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    tricky_dir = tmp_path / "{FILE}"
+    tricky_dir.mkdir()
+    png = tricky_dir / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded-literal-file-token-path.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    # Quoted-{FILE} template: the exact shape where an earlier draft's pass ordering let a
+    # later pass re-scan the quoted form's already-spliced-in replacement text.
+    env = _screenshot_upload_env(main, bindir, uploader)
+    env["SHIP_IMAGE_UPLOAD_CMD"] = f'{uploader} "{{FILE}}"'
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert argv_log.exists(), f"uploader was never invoked:\n{r.stdout}\n{r.stderr}"
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == [str(png)], (
+        f"a path containing the literal text '{{FILE}}' must survive unmangled, got: {got}"
+    )
+
+
+def test_upload_png_trailing_newline_template_still_appends_path(repo_with_pr_worktree, tmp_path):
+    """Regression pinned from a FIFTH round of multi-model review of the HYP-1260 fix: an
+    earlier draft detected "no {FILE} placeholder -> append the path" by comparing the composed
+    output back to the template via `[ "$cmd" = "$SHIP_IMAGE_UPLOAD_CMD" ]`. `cmd=$(...)`
+    (command substitution) strips trailing newlines, so a placeholder-free template ending in a
+    newline would never equal its own (newline-stripped) compose output, the append branch
+    would never fire, and the path argument would be silently DROPPED — the uploader runs with
+    no file at all. The shipped fix detects the placeholder directly from the template
+    (`case "$SHIP_IMAGE_UPLOAD_CMD" in *'{FILE}'*)`), immune to that stripping, matching the
+    pre-fix `grep -q '{FILE}'` check exactly."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded-trailing-newline.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, uploader)
+    env["SHIP_IMAGE_UPLOAD_CMD"] = f"{uploader}\n"  # placeholder-free, trailing newline
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert argv_log.exists(), (
+        f"uploader was never invoked (path silently dropped):\n{r.stdout}\n{r.stderr}"
+    )
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == [str(png)], f"path must still be appended for a trailing-newline template, got: {got}"
+
+
 def test_cleanup_guard_leaves_worktree_dirtied_after_preflight(repo_with_pr_worktree, tmp_path):
     """Directly exercise the CLEANUP-time clean-check (not the preflight one): the worktree is
     clean at preflight, then the (faked) merge writes an untracked file into it, so by the
