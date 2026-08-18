@@ -1552,16 +1552,88 @@ else
 fi
 
 # --- screenshot gate (optional uploader + UI-touching check) ---------------------------
+# Compose the SHIP_IMAGE_UPLOAD_CMD template with `replacement` spliced in wherever `{FILE}`
+# appears — bare (`{FILE}`) or wrapped in its OWN dedicated matching quotes (`"{FILE}"` /
+# `'{FILE}'`, replaced WHOLE, quotes included: the caller's `replacement` already supplies its
+# own quoting via `%q`, so nesting it inside the operator's quotes would corrupt it — see
+# upload_png). A SINGLE left-to-right pass over the ORIGINAL `haystack` finds, at each point,
+# whichever of the three forms starts EARLIEST (ties broken toward the quoted forms, since a
+# bare `{FILE}` match is always a substring of a quoted one at the same position — `%%pat*`'s
+# "not found" case is used AS its own sentinel: an unmatched candidate's prefix equals the
+# full remaining haystack length, which is never shorter than a real match's prefix, so it
+# can never incorrectly win). Never rescans `out`/`replacement` for a later pass to find
+# another `{FILE}` in already-emitted text — REQUIRED, not cosmetic: `replacement` is a %q
+# escaped path, and `%q` does not escape `{`/`}`, so a screenshot path containing the literal
+# substring `{FILE}` would otherwise get corrupted by a later pass re-matching text this same
+# call already emitted (regression pinned in tests). `%%"$needle"*` / `#*"$needle"` are
+# pattern-REMOVAL operators (needle is quoted = literal, no glob), not `${var//pat/rep}`
+# replacement, so `replacement`'s own content (which may contain `&`/`\`) is never reinterpreted
+# by patsub_replacement (default-on since bash 5.2 for the two-argument replace form).
+_upload_png_compose_cmd() {  # $1=template $2=replacement -> stdout composed command
+  local haystack="$1" replacement="$2" out=""
+  local dq='"{FILE}"' sq="'{FILE}'" bare='{FILE}'
+  local prefix_dq prefix_sq prefix_bare best_prefix needle
+  while :; do
+    case "$haystack" in
+      *"$bare"*) : ;;
+      *) out+="$haystack"; break ;;
+    esac
+    prefix_dq="$haystack"; case "$haystack" in *"$dq"*) prefix_dq="${haystack%%"$dq"*}" ;; esac
+    prefix_sq="$haystack"; case "$haystack" in *"$sq"*) prefix_sq="${haystack%%"$sq"*}" ;; esac
+    prefix_bare="${haystack%%"$bare"*}"
+    best_prefix="$prefix_dq"; needle="$dq"
+    if [ "${#prefix_sq}" -lt "${#best_prefix}" ]; then best_prefix="$prefix_sq"; needle="$sq"; fi
+    if [ "${#prefix_bare}" -lt "${#best_prefix}" ]; then best_prefix="$prefix_bare"; needle="$bare"; fi
+    out+="$best_prefix$replacement"
+    haystack="${haystack#*"$needle"}"
+  done
+  printf '%s' "$out"
+}
+# upload_png (HYP-1260): the untrusted screenshot PATH must never be interpolated into
+# SHIP_IMAGE_UPLOAD_CMD as raw text before `eval` — a `"`/`;`/`$(...)`/backtick in the path
+# would otherwise break out of the template's quoting and inject arbitrary shell syntax (the
+# pre-fix code did exactly that: `eval "$SHIP_IMAGE_UPLOAD_CMD \"$png\""`).
+#
+# Fix: shell-quote the path via `printf %q` into a single, syntactically-inert token, splice
+# THAT into the (trusted) template via `_upload_png_compose_cmd`, then eval the composed
+# string exactly as before. A %q-quoted token always re-parses back to precisely the original
+# string as one shell word, so the untrusted content can never break out of its own quoting —
+# while the template keeps its full shell semantics (pipes, redirects, `&&`, an env-var prefix
+# all still work, unlike an argv-array split of the template, which loses them).
+#
+# NOT supported: `{FILE}` embedded inside a larger quoted word alongside other text (e.g.
+# `"file=@{FILE}"` — the quote isn't adjacent to the placeholder, so it doesn't match a
+# recognized form and the bare substitution fires instead, landing the %q token inside the
+# operator's quotes) — give `{FILE}` its OWN dedicated quotes instead, or use `--data=@{FILE}`
+# unquoted (%q's own escaping handles a space-containing path there too).
 upload_png() {
   local png="$1"
   [ -n "${SHIP_IMAGE_UPLOAD_CMD:-}" ] || return 1
   if [ "$DRY_RUN" = "1" ]; then printf 'https://example.invalid/dry-run/%s' "$(basename "$png")"; return 0; fi
-  local out
-  if printf '%s' "$SHIP_IMAGE_UPLOAD_CMD" | grep -q '{FILE}'; then
-    out=$(eval "${SHIP_IMAGE_UPLOAD_CMD//\{FILE\}/$png}" 2>/dev/null)
-  else
-    out=$(eval "$SHIP_IMAGE_UPLOAD_CMD \"$png\"" 2>/dev/null)
-  fi
+  local out quoted_png cmd tmpl="$SHIP_IMAGE_UPLOAD_CMD"
+  printf -v quoted_png '%q' "$png"
+  # Strip trailing newline(s) from the template before doing anything else: a config value
+  # that picked up a stray trailing newline (e.g. from an unguarded `$(cat file)`, or a
+  # heredoc) is never semantically meaningful as "extra command syntax" here, but if left in
+  # place it becomes an EMBEDDED newline once the path is appended below — and `eval` treats a
+  # raw newline as a statement separator, silently splitting the composed command into two
+  # garbled statements (verified via test: the uploader then runs with zero real args).
+  while :; do
+    case "$tmpl" in
+      *$'\n') tmpl="${tmpl%$'\n'}" ;;
+      *) break ;;
+    esac
+  done
+  # Detect "no {FILE} placeholder at all -> append the path" from the (now newline-stripped)
+  # TEMPLATE itself (matches the pre-fix `grep -q '{FILE}'` check), not by comparing composed
+  # output back to the template: a path whose value happens to be the literal string `{FILE}`
+  # would slip past an output-equality check (compose-then-compare is not a substitute for
+  # asking the template directly).
+  case "$tmpl" in
+    *'{FILE}'*) cmd=$(_upload_png_compose_cmd "$tmpl" "$quoted_png") ;;
+    *)          cmd="$tmpl $quoted_png" ;;
+  esac
+  out=$(eval "$cmd" 2>/dev/null)
   out=$(printf '%s' "$out" | grep -oE 'https?://[^ ]+' | tail -1)
   [ -n "$out" ] || return 1; printf '%s' "$out"
 }
