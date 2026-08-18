@@ -206,7 +206,22 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   is requested via `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>"`, which asks Alex live
   on Telegram (shared `agenttools_hatch_escalation` lib) and proceeds ONLY on his real-time
   approval. Disable the whole gate with `SHIP_REVIEW_QUORUM=0`. Every non-dry-run gated ship is
-  audited to `SHIP_AUDIT_FILE`; dry-runs print the would-be audit without writing it;
+  audited to `SHIP_AUDIT_FILE`; dry-runs print the would-be audit without writing it. **Every
+  `RIG_HATCH_REQUEST_*` hatch across every agent-hook** (not just ship's own two) is separately
+  audited by the shared lib itself: any attempt that REACHES `request_hatch_approval` with the env
+  var carrying a value — blank, bare-flag, denied, or approved — appends one JSON line to
+  `overrides.log` (default `<real-home>/.config/agent-tools/overrides.log`,
+  `default_overrides_log_path()`), closing gap G-8 from the 2026-07-01 agent-ecosystem retrospective
+  (`docs/specs/…` in hyperide, section 5.2.3 item 3: "escape hatches have no audit sink"). One
+  pre-existing exception: `ci/ship/skip_ci_hatch.py` denies a blank/bare
+  `RIG_HATCH_REQUEST_SHIP_SKIP_CI` LOCALLY (a deliberate, lib-version-independent guard, unrelated
+  to this feature) before ever calling the shared lib, so that specific blank/bare case is recorded
+  only in `SHIP_AUDIT_FILE` on the non-dry-run path — and in NEITHER file on `--dry-run` (its local
+  guard denies without calling `_audit`, and `ship.sh`'s own dry-run audit helper prints the
+  would-be line without writing it). Every other outcome (denied/approved, and the review-quorum
+  hatch's own blank/bare case) routes through the lib as described above. A `rig
+  status` "overrides this week" section and a weekly tg digest reading this file are tracked as
+  follow-up work, not yet built;
 - the local branch has **no unpushed/diverged commits** and a **clean worktree**.
 
 Then it squash-merges, deletes the remote branch, removes the local worktree + branch (unless
