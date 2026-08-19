@@ -68,12 +68,16 @@ case "$sub" in
 esac
 """
 
-# A fake `task` that logs its own argv (one line, space-joined) to $TASK_LOG and exits
-# $SHIP_TEST_TASK_EXIT (default 0) — lets a test assert exactly what ship called it with, and
-# exercise "task itself fails" without a real task-cli install.
+# A fake `task` that logs its own argv (one line, space-joined) to $TASK_LOG and its OWN cwd
+# (one line) to $TASK_LOG.pwd — a separate file, so the existing plain-argv format (and every
+# test that does `calls[0].split()` expecting pure argv) is untouched — and exits
+# $SHIP_TEST_TASK_EXIT (default 0). Lets a test assert exactly what ship called it with AND
+# from where (ship.sh runs it via a subshell `cd "$ROOT"`, not a `-C` flag — see the ordering
+# bug this guards against), and exercise "task itself fails" without a real task-cli install.
 _FAKE_TASK = """\
 #!/usr/bin/env bash
 printf '%s\\n' "$*" >> "${TASK_LOG}"
+printf '%s\\n' "$PWD" >> "${TASK_LOG}.pwd"
 exit "${SHIP_TEST_TASK_EXIT:-0}"
 """
 
@@ -388,7 +392,17 @@ def test_notify_batches_title_body_and_url_mergecommit_into_two_gh_calls(repo_wi
     assert len(notify_calls) == 2, gh_calls
 
 
-def test_notify_passes_the_local_repo_root_via_dash_c(repo_with_pr_worktree, tmp_path):
+def test_notify_runs_task_cli_from_the_local_repo_root(repo_with_pr_worktree, tmp_path):
+    """ship.sh runs `task mark-shipped` FROM "$ROOT" (a subshell `cd`) rather than passing
+    `-C "$ROOT"` as an argument — task-cli's argparse adds `-C`/`--cwd` as a PER-SUBCOMMAND
+    flag (via a `parents=[common]` subparser), not a top-level one, so `task -C <dir>
+    mark-shipped ...` is rejected ("invalid choice: '<dir>'"). A REAL, un-faked, previous
+    version of this exact bug shipped live and failed silently on its own merge (best-effort
+    logging swallowed it). Running from the target directory sidesteps the ordering question
+    entirely rather than merely fixing its position — verified here via the fake `task`'s own
+    logged `$PWD`, and `test_notify_mark_shipped_argv_is_accepted_by_the_real_task_cli` (below)
+    additionally validates the argv shape against the REAL installed `task` binary, since a
+    fake that only logs argv can never catch a real argparse rejection."""
     main, _wt = repo_with_pr_worktree
     bindir = _bindir(tmp_path, with_task=True)
 
@@ -396,4 +410,59 @@ def test_notify_passes_the_local_repo_root_via_dash_c(repo_with_pr_worktree, tmp
 
     assert r.returncode == 0
     assert len(calls) == 1
-    assert calls[0].split()[:2] == ["-C", str(main)]
+    argv = calls[0].split()
+    assert argv[:2] == ["mark-shipped", "HYP-931"]
+    assert "-C" not in argv and "--cwd" not in argv
+
+    pwd_log = tmp_path / "task.log.pwd"
+    logged_pwds = [Path(line).resolve() for line in pwd_log.read_text(encoding="utf-8").splitlines()]
+    assert logged_pwds == [main.resolve()]
+
+
+def test_notify_mark_shipped_argv_is_accepted_by_the_real_task_cli(repo_with_pr_worktree, tmp_path):
+    """Regression guard for the real argument-shape bug above: run the EXACT argv ship.sh
+    builds through the real, installed `task` binary's own argparse (not the logging fake).
+    `--help` short-circuits argparse's LEFT-TO-RIGHT consumption before any ticket lookup or
+    network/backend call — zero execution, zero risk of touching a real ticket store — but
+    that also SCOPES what this proves: argparse's `--help` action fires (and exits 0) the
+    moment it's consumed, before `parse_args` reaches its end-of-parse checks, so this test
+    catches an invalid SUBCOMMAND CHOICE (the original bug — `mark-shipped` misplaced after a
+    top-level `-C`) but would NOT catch `--pr`/`--commit` becoming unrecognized options or a
+    missing-required-argument error, both of which are reported only at end-of-parse. Skipped
+    if `task` isn't installed — a real-binary integration check, not a hermetic unit test.
+    HOME/XDG_CONFIG_HOME are pointed at an empty tmp dir (belt-and-suspenders): task-cli's own
+    architecture guarantees `--help` stays fast/dependency-light with no eager backend init,
+    but scrubbing the environment means this assertion doesn't SILENTLY depend on that staying
+    true."""
+    real_task = shutil.which("task")
+    if not real_task:
+        pytest.skip("task-cli not installed on this machine")
+
+    main, _wt = repo_with_pr_worktree
+    bindir = _bindir(tmp_path, with_task=True)
+    r, calls = _run_ship(main, bindir, tmp_path, branch="hyp-931-fix-thing")
+    assert r.returncode == 0 and len(calls) == 1
+    argv = calls[0].split()
+    assert argv[:2] == ["mark-shipped", "HYP-931"]  # pin what argv shape --help below validates
+
+    # --help short-circuits argparse before any ticket lookup/network/backend call — zero
+    # execution, zero risk of touching a real ticket store. It's appended AFTER the full argv
+    # (not standalone) so the check still exercises the actual flag positions ship.sh builds.
+    # HOME/XDG_CONFIG_HOME scrubbed to an empty tmp dir — see the docstring's belt-and-suspenders
+    # note — so this can't reach the developer's real task-cli config/credentials either way.
+    scrub_home = tmp_path / "real-task-help-home"
+    scrub_home.mkdir(exist_ok=True)
+    check_env = {**os.environ, "HOME": str(scrub_home), "XDG_CONFIG_HOME": str(scrub_home / ".config")}
+    check = subprocess.run([real_task, *argv, "--help"], capture_output=True, text=True, env=check_env)
+    assert check.returncode == 0, check.stderr
+    assert "invalid choice" not in check.stderr, check.stderr
+    # `shutil.which("task")` only proves SOME binary named `task` exists — `task` is also the
+    # name of the unrelated go-task/Taskfile runner, commonly installed on the same machines
+    # (review finding). Assert task-cli's own subparser usage line actually printed, so a
+    # wrong binary can't make this pass vacuously (an unrelated `task` that also happens to
+    # accept `--help` and never print the literal string "invalid choice").
+    assert "mark-shipped" in check.stdout, check.stdout
+    # Closes part of the admitted --help blind spot above (two independent review findings):
+    # the subparser's own help text lists its options, so this also catches --pr/--commit
+    # being renamed or removed — end-of-parse errors --help itself can't reach.
+    assert "--pr" in check.stdout and "--commit" in check.stdout, check.stdout
