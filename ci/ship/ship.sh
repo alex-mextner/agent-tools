@@ -2195,9 +2195,16 @@ _ship_notify_task_cli() {
     return 0
   fi
   echo "[ship] notifying task-cli: ${code} shipped via ${pr_url} ..."
-  local -a mark_args=(-C "$ROOT" mark-shipped "$code" --pr "$pr_url")
+  # Run task-cli FROM "$ROOT" (a subshell `cd`, scoped to this call only) rather than passing
+  # `-C "$ROOT"` as an argument: task-cli's `-C`/`--cwd` is a PER-SUBCOMMAND flag and must
+  # follow the subcommand name — `task -C <dir> mark-shipped ...` fails with "invalid choice:
+  # '<dir>'" (a bug that shipped live and failed silently on its own merge). Running from the
+  # target directory sidesteps the ordering question entirely (task-cli's own `-C` default is
+  # `.`). `run` is a stateless passthrough (see its definition above) with no parent-shell side
+  # effects, so scoping the `cd` around it too is safe.
+  local -a mark_args=(mark-shipped "$code" --pr "$pr_url")
   [ -n "$merge_sha" ] && mark_args+=(--commit "$merge_sha")
-  if ! run task "${mark_args[@]}"; then
+  if ! (cd "$ROOT" || { echo "[ship] WARNING: could not cd to $ROOT for task-cli notify." >&2; exit 1; }; run task "${mark_args[@]}"); then
     echo "[ship] WARNING: 'task mark-shipped ${code}' failed — the ticket may be out of sync with this merge. Update it manually: task read ${code}" >&2
   fi
 }
