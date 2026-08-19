@@ -18,10 +18,18 @@
 #     a one-time bypass goes through a live Telegram approval to Alex (see the hatch escalation
 #     below), never a reason flag.
 #
+# After a successful merge, IF a `task` (task-cli) binary is on PATH and a ticket code can be
+# derived from the branch/PR title/PR body, ship calls `task mark-shipped <code> --pr <url>
+# [--commit <sha>]` so the ticket records the merge and prints its own acceptance instructions
+# — this NEVER closes the ticket (only proof-backed acceptance does that) and NEVER blocks or
+# fails the ship (best-effort: task-cli absent, an undetectable ticket code, or a task-cli
+# error are all logged and skipped, not fatal). See "task-cli notify" below the merge step.
+#
 # All project-specific coupling is OPTIONAL and configured by env/flags — no issue-tracker,
 # no path layout, no org is hard-coded.
 #
 # Requires: gh (authenticated), git. jq strongly recommended (required-checks-only gating).
+# task-cli (the `task` binary) is optional — its absence only skips the post-merge ticket notify.
 #
 # Usage:
 #   ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run]
@@ -99,6 +107,10 @@
 #                          gate refuses (fail-closed) with guidance.
 #   SHIP_REVIEW_QUORUM_ENABLED / SHIP_REVIEW_QUORUM  set either to 0 to disable the
 #                          review-quorum gate entirely (default: enabled).
+#   SHIP_TASK_NOTIFY_ENABLED  set to 0/false/no to disable the post-merge task-cli notify step
+#                          (default: enabled). Best-effort and never blocks the merge either
+#                          way — this only controls whether `task mark-shipped` gets called at
+#                          all. See "task-cli notify" below the merge step for the full story.
 #   SHIP_REVIEW_QUORUM_MIN_ITER    quorum floor: PASSED review-cli iterations (default 3). CLAMPED
 #                          to a hard minimum of 3 — raise-only, an unset/0/negative/below-3 value
 #                          resolves to 3 (fail-closed #242).
@@ -2073,6 +2085,130 @@ if [ "$SKIP_CI" = "1" ]; then
 else
   echo "[ship] preflight clean — merging PR #${PR} (${BRANCH}) --${MERGE_METHOD} ..."
   run gh pr merge "$PR" "--$MERGE_METHOD"
+fi
+
+# --- task-cli notify (best-effort; never blocks or fails the ship) --------------------
+# The merge above already succeeded. Tell task-cli about it so the ticket TRACKS the merge
+# instead of drifting out of sync (the class of bug behind a real 13-ticket status-divergence
+# cleanup) — and so the ticket surfaces its acceptance instructions (what proof is still
+# needed) instead of silently going quiet. This is pure notification: `task mark-shipped`
+# (task-cli) never closes the ticket itself, only PROPER acceptance does that — see its own
+# docstring. A failure anywhere in this step is a WARNING, never a ship failure: the merge is
+# already durable, this is best-effort bookkeeping on top of it.
+#
+# SHIP_TASK_NOTIFY_ENABLED=0 disables the whole step (ops off-switch, same shape as
+# SHIP_REVIEW_QUORUM_ENABLED above) — the test harness's shared fixtures (tests/test_ship.py)
+# default it off process-wide (review finding: those ~30 pre-existing fixtures never stub a
+# fake `task`, so leaving this on-by-default there would invoke whatever REAL task-cli happens
+# to be on the developer's PATH, against a fake PR carrying garbage `--pr`/`--commit` values —
+# a real, unintended mutation of a real ticket store during a test run).
+#
+# Task-code derivation reuses _review_quorum_extract_ticket (the same matcher the review-quorum
+# gate above uses) but tries MORE sources, each validated independently, falling through to the
+# next on rejection: the gate's own $TASK_CODE (if it already ran and found one — avoids a
+# redundant `gh pr view` on the common path) → branch → PR TITLE → PR body. The title is a
+# deliberate gap-fix over the quorum gate (which only ever tries branch → body): a PR whose
+# ticket code lives only in its title (a common shape — "HYP-931: fix the thing") would
+# otherwise never be found here even though a human reads it immediately.
+#
+# EACH candidate — including a reused $TASK_CODE — is validated (must contain a DIGIT) before
+# being accepted; a rejected one falls through to try the NEXT source rather than giving up
+# (review finding — an earlier version validated only the FINAL chosen source, so a digit-free
+# $TASK_CODE reuse — e.g. an explicit REVIEW_TASK_CODE=SME-ROADMAP-NOTE, or the branch matching
+# the matcher's descriptive arm — short-circuited past a title/body that DID carry a real,
+# numeric ticket id). The digit requirement itself: the matcher's third arm is a
+# purely-descriptive, digit-free pattern (`SME-ROADMAP-NOTE`) meant for review-cli's own
+# hand-picked task codes — safe for the quorum gate (an unknown code just fails closed, refusing
+# the merge) but NOT safe here, where a false positive gets executed as a real `task
+# mark-shipped <code>` call: a generic PR title like "Fix UTF-8 decoding" would derive `UTF-8`
+# and could silently mark an unrelated ticket "shipped" if that code happens to exist — exactly
+# the status-divergence class this feature exists to prevent, not cause. Every genuine ticket id
+# this project uses (HYP-931, PROJ-12, …) carries a numeric suffix, so this costs nothing on the
+# real path.
+_ship_looks_like_a_ticket_id() {  # $1 = candidate code; true (exit 0) iff it contains a digit
+  case "$1" in *[0-9]*) return 0 ;; *) return 1 ;; esac
+}
+_ship_derive_task_code_for_notify() {
+  local candidate
+
+  candidate="${TASK_CODE:-}"
+  [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
+
+  candidate=$(_review_quorum_extract_ticket "$BRANCH")
+  [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
+
+  local pr_title pr_body_local
+  # One combined query for title+body (2 round trips instead of 2 separate `gh pr view` calls).
+  #
+  # IFS=$'\t' (review finding): a bare `read -r a b` splits on DEFAULT IFS (space/tab/newline),
+  # not just the `@tsv` separator — a real title/body is virtually never a single word, so the
+  # default-IFS form silently truncated `pr_title` to its first word and dumped the rest into
+  # `pr_body_local`. Concretely: "Fix the thing (HYP-931)" read as `pr_title="Fix"` (no match)
+  # instead of finding HYP-931 — the exact wrong-ticket hazard the digit check above exists to
+  # catch, reachable because the RIGHT code got mis-parsed away before the check ever saw it.
+  # jq's `@tsv` escapes any literal tab in a value, so splitting on tab alone is the correct,
+  # unambiguous delimiter (title/body may freely contain spaces and newlines — the `gsub` above
+  # only strips newlines so a MULTI-LINE body still round-trips as ONE tsv line).
+  IFS=$'\t' read -r pr_title pr_body_local < <(gh pr view "$PR" --json title,body \
+    -q '[(.title // ""), (.body // "")] | map(gsub("\n";" ")) | @tsv' 2>/dev/null) \
+    || { pr_title=""; pr_body_local=""; }
+
+  candidate=$(_review_quorum_extract_ticket "$pr_title")
+  [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
+
+  candidate=$(_review_quorum_extract_ticket "$pr_body_local")
+  [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
+
+  return 0
+}
+
+# Call `task mark-shipped <code> --pr <url> [--commit <sha>]` for the just-merged PR. Skipped
+# (with a logged reason, never an error) when: the feature is disabled (SHIP_TASK_NOTIFY_ENABLED=0);
+# `task` isn't on PATH (task-cli not installed — ship must work in a repo that never adopted it);
+# the invocation targets a foreign --repo (any local `task` here would write into the WRONG
+# project, same guard cleanup() already applies to git ops); or no task code can be derived (the
+# PR simply isn't tied to a ticket task-cli tracks — not every PR is, e.g. a dependency bump).
+_ship_notify_task_cli() {
+  case "${SHIP_TASK_NOTIFY_ENABLED:-1}" in
+    0|false|no) echo "[ship] task-cli notify disabled (SHIP_TASK_NOTIFY_ENABLED=${SHIP_TASK_NOTIFY_ENABLED})." >&2; return 0 ;;
+  esac
+  command -v task >/dev/null 2>&1 || { echo "[ship] task-cli not on PATH — skipping ticket notify." >&2; return 0; }
+  if [ "${_FOREIGN_REPO_INVOKE:-0}" = "1" ]; then
+    echo "[ship] --repo targets a foreign remote — skipping ticket notify (a local 'task' here would write into the wrong project)." >&2
+    return 0
+  fi
+  local code; code=$(_ship_derive_task_code_for_notify)
+  if [ -z "$code" ]; then
+    echo "[ship] could not derive a task code for #$PR — skipping ticket notify (not every PR is tied to a tracked ticket; update it manually if this one is)." >&2
+    return 0
+  fi
+  # One combined query for url+mergeCommit (review finding: 2 round trips instead of 2 separate
+  # `gh pr view` calls). IFS=$'\t' for the same reason as the title/body read above — url and
+  # a commit SHA never legitimately contain whitespace so default-IFS `read` was not actually
+  # broken here, but splitting on the SAME unambiguous delimiter everywhere this pattern is
+  # used is worth the one extra token (consistency; review finding).
+  local pr_url merge_sha
+  IFS=$'\t' read -r pr_url merge_sha < <(gh pr view "$PR" --json url,mergeCommit \
+    -q '[(.url // ""), (.mergeCommit.oid // "")] | @tsv' 2>/dev/null) || { pr_url=""; merge_sha=""; }
+  if [ -z "$pr_url" ]; then
+    echo "[ship] could not resolve PR #$PR's URL — skipping ticket notify." >&2
+    return 0
+  fi
+  echo "[ship] notifying task-cli: ${code} shipped via ${pr_url} ..."
+  local -a mark_args=(-C "$ROOT" mark-shipped "$code" --pr "$pr_url")
+  [ -n "$merge_sha" ] && mark_args+=(--commit "$merge_sha")
+  if ! run task "${mark_args[@]}"; then
+    echo "[ship] WARNING: 'task mark-shipped ${code}' failed — the ticket may be out of sync with this merge. Update it manually: task read ${code}" >&2
+  fi
+}
+if [ "$DRY_RUN" = "1" ]; then
+  echo "[ship] [dry-run] would notify task-cli of the merge."
+else
+  # `_ship_notify_task_cli` already returns 0 on every path (each failure mode is caught and
+  # logged internally) — the `|| echo` here is defence-in-depth matching the `cleanup ||`
+  # guard below: a best-effort post-merge step must NEVER be able to abort the script and
+  # mask an already-successful merge, even if a future edit adds a path that returns non-zero.
+  _ship_notify_task_cli || echo "[ship] WARNING: task-cli notify step hit an unexpected error — #$PR IS merged; check/update the ticket manually." >&2
 fi
 
 # --- cleanup --------------------------------------------------------------------------

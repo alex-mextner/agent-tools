@@ -37,6 +37,18 @@ _SHIP = Path(__file__).resolve().parents[1] / "ci" / "ship" / "ship.sh"
 # so a later explicit assignment there still wins over this default).
 os.environ.setdefault("SHIP_REVIEW_QUORUM", "0")
 
+# The post-merge task-cli notify step (`_ship_notify_task_cli`) also defaults to ENABLED, but
+# none of the ~30 fixtures in this file stub a fake `task` binary — leaving it on here would
+# invoke whatever REAL task-cli happens to be on the developer's PATH, against a fake merged
+# PR carrying garbage `--pr`/`--commit` values (an unintended mutation of a real ticket store
+# during a test run). Unconditional assignment, NOT `setdefault` (review finding: `setdefault`
+# yields to an ambient `SHIP_TASK_NOTIFY_ENABLED=1` a developer's shell might already export,
+# silently reproducing the exact hazard this line exists to prevent — unlike the quorum gate
+# below, a missed override here mutates a real ticket store, not just a loud gate refusal, so
+# it gets the stronger form). tests/test_ship_notify_task_cli.py exercises the feature itself
+# in isolation, with its own fake `task` binary, and overrides this back to "1" per-call.
+os.environ["SHIP_TASK_NOTIFY_ENABLED"] = "0"
+
 # A fake `gh` that answers exactly the calls ship.sh makes (with --skip-ci the CI rollup
 # is not queried). Branch name is read from $SHIP_TEST_BRANCH so the test controls it.
 _FAKE_GH = """\
