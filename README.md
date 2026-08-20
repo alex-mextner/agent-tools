@@ -272,9 +272,12 @@ that nobody is required to stop at — see #543.
 - **By-stack skills:** 5 — `frontend/ts` (ts-strictness) + `frontend/ts/react`
   (vercel-react-patterns); `mobile/swift` (swift-concurrency) + `mobile/swift/swiftui`
   (swiftui-mvvm, tca-swiftui). Selected by declared stack prefix, not project shape.
-- **Agent-hooks:** 8 — block-no-verify, block-raw-pr-merge, block-secrets-write,
+- **Agent-hooks:** see `agent-hooks/` for the current directory listing and
+  `agent-hooks/README.md`'s point table for the full, authoritative set and count — a
+  representative sample: block-no-verify, block-raw-pr-merge, block-secrets-write,
   require-review-before-commit, enforce-timeout-on-bash, block-raw-process-env,
-  stop-completion-selfcheck, **format-on-write** (runs the project's configured formatter
+  stop-completion-selfcheck, pkill-guard (blocks a pattern-based kill of a shared process
+  name), **format-on-write** (runs the project's configured formatter
   on each file the agent writes — oxfmt/prettier/biome/ruff/black/gofmt/rustfmt; never
   blocks).
 - **Git-hooks:** 4 templates — pre-commit, commit-msg, pre-push, no-secrets-scan (+ a
