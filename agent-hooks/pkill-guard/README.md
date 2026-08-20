@@ -8,8 +8,10 @@ matched is a generic, widely-shared tool/process name (`node`, `codex`, `claude`
 diff`, `playwright`, ...). `pkill -f`/`killall`/`pgrep` match against **every process on the
 machine** whose command line contains the pattern, not just the caller's own.
 
-Ref: [2026-07-01 agent-ecosystem retrospective](../../../hyperide/docs/specs/2026-07-01-agent-ecosystem-retrospective.md),
-gap **G-5**.
+Ref: the 2026-07-01 agent-ecosystem retrospective (`hyperide` repo,
+`docs/specs/2026-07-01-agent-ecosystem-retrospective.md`), gap **G-5**. Not linked directly —
+`hyperide` is a separate, private repository, so a relative path here would escape this repo
+and 404 on GitHub's web UI for anyone without that repo as a sibling checkout.
 
 ## Why this incident needed a hook
 
@@ -52,19 +54,33 @@ the command is tokenized (a newline is a command separator, same as `;`), split 
 **pipeline groups** — separators `;`/`&&`/`||`/`&` start a new group, `|`/`|&` continue the
 same group as a new stage — and each stage's real argv is recovered after stripping leading
 shell-grouping tokens, inline `VAR=value` assignments, and a wrapper table (`sudo`, `timeout`,
-`env`, `nice`, `time`, ...).
+`env`, `nice`, `time`, ...). A `#` comment is recognized with the same dual-pass (quoted vs.
+raw token) scan `block-reset-hard` uses — a stray quote character sitting inside a real
+comment (`echo ok # it's a comment`) is never mistaken for a genuinely unclosed quote that
+would otherwise merge the comment forward into a later line and swallow a real command inside
+what looks like one giant quoted argument. `xargs`'s wrapped command is resolved through the
+same wrapper table too, so `pgrep -f node | xargs env kill` / `xargs sudo kill` are caught, not
+just a bare `xargs kill`.
 
 Three shapes are classified:
 
-1. **Direct `pkill`/`killall`**: the pattern is the stage's own trailing positional argument.
+1. **Direct `pkill`/`killall`**: EVERY non-flag positional operand is checked, not just the
+   trailing one — both tools accept multiple names (`killall node worker`), and a flag that
+   itself takes a value (`pkill -f node -u root`) must not let that value be mistaken for "the"
+   pattern and hide the real one. Trailing shell redirections (`>/dev/null 2>&1`) are stripped
+   before this scan, so their target never gets treated as a candidate pattern either.
 2. **`kill` fed a command substitution**: `$(pgrep ...)` / `` `pgrep ...` `` spans are replaced
    with opaque placeholder tokens *before* shlex tokenizing (so the substitution's own internal
    whitespace doesn't fragment `kill`'s argv), then re-parsed as their own mini pipeline to find
    the wrapped `pgrep` pattern. One level of substitution nesting is resolved.
-3. **A pipeline that resolves PIDs by pattern and kills them**: an earlier `pgrep`/`grep`/
-   `egrep`/`fgrep` stage feeding a later `kill` or `xargs ... kill ...` stage in the same
-   pipeline group — covers both `pgrep <pattern> | xargs kill` and the "narrow grep" shape
-   `ps aux | grep <pattern> | ... | xargs kill`.
+3. **A pipeline that resolves PIDs by pattern and kills them**: ANY stage that actually issues
+   the kill (bare `kill` or `xargs ... kill ...`), not just the last one — a kill can genuinely
+   execute in a middle stage with a trailing consumer after it (`pgrep -f node | xargs kill |
+   tee log.txt`); every OTHER `pgrep`/`grep`/`egrep`/`fgrep` stage in the same pipeline group is
+   checked for a pattern (not just the first one — an accidental filtering stage before the real
+   pattern, `grep -v noise | grep <pattern>`, must not hide it). Covers `pgrep <pattern> | xargs
+   kill`, the "narrow grep" shape `ps aux | grep <pattern> | ... | xargs kill`, and a kill
+   followed by more pipeline stages.
 
 ## No self-service bypass — Telegram hatch only
 
@@ -96,11 +112,42 @@ process via `pkill`/`killall`/`kill`/`pgrep`, are also treated as **unparseable 
   documented incidents are both on the denylist).
 - Only **one level** of command-substitution nesting is resolved for `kill $(...)`; a
   substitution containing a further nested substitution is not recursed into.
-- The pipeline scan classifies the pattern from the **earliest** `pgrep`/`grep`-family stage in
-  a group that also has a kill-capable last stage; an exotic multi-grep pipeline with the real
-  pattern in a later stage is not specially handled.
+- `pkill -u <user>` / `pkill -g <pgrp>` and similar value-taking flags are not recognized as
+  consuming the next token, so their VALUE (e.g. `node` in `pkill -u node`) is read as a
+  candidate pattern and can trigger a block that's really about a username filter, not a kill
+  pattern — an **over**-block, never a bypass, and a deliberate tradeoff (see the source
+  docstring) rather than an oversight.
+- Process filtering via `awk '/pattern/{print $2}'` piped into a kill is not recognized — only
+  `pgrep`/`grep`/`egrep`/`fgrep` stages are scanned for a pattern.
+- A **relative** path (`pkill -f "node scripts/dev.js"`) is treated as session-scoping even
+  though it's identical across every checkout of the same repo — only a bare, well-known
+  **global** bin directory (`/usr/bin/node`, `/opt/homebrew/bin/python3`) is excluded from the
+  path signal, not a shared relative path. Telling "unique to my session" apart from "merely
+  contains a slash" in general needs the caller's actual worktree root, which this hook doesn't have.
 - A shell **alias** for `pkill`/`kill`/`killall` is not resolved — same documented gap as every
   sibling hook in this catalog (aliases don't expand under a harness's `bash -c` anyway).
+- The session-scoping check treats "a scoping-shaped token ANYWHERE in the pattern" as
+  sufficient, which a **deliberately** crafted pattern can defeat: `pkill -f
+  "node|session-a1b2c3d4"` is a regex alternation (pkill's `-f` pattern is a POSIX extended
+  regex) that still matches every `node` process. Same class of gap as a variable / nested-shell
+  indirection (`TARGET=node pkill -f "$TARGET"`, `sh -c 'pkill -f node'`) — the real pattern is
+  only known after expansion this hook can't see. Both require deliberate crafting, not an
+  accidental shape (this hook's stated threat model); not fixed here.
+- The "global bin dir" exclusion only recognizes a handful of well-known system prefixes
+  (`/usr/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, `/bin`, `/sbin`) — a version-manager
+  interpreter path (Homebrew Cellar, `nvm`, `pyenv`, `asdf`) still reads as session-scoped
+  purely because it contains a `/`. Enumerating every version manager's path convention is an
+  unbounded list not worth chasing here.
+- A heredoc BODY that happens to mention a denylisted name is treated like a real command (no
+  heredoc awareness in the newline-as-`;` tokenizer, unlike `block-raw-pr-merge`) — an
+  **over**-block, never a bypass, but worth knowing before reaching for the Telegram hatch on a
+  legitimately blocked doc edit.
+- Command substitution is only inspected in the narrow `kill $(...)` shape — a substitution
+  OUTSIDE a direct argument to `kill` (`echo $(pkill -f node)`, `x=$(pkill -f node)`) is not
+  resolved at all.
+- An inverted-match filtering stage ahead of the real pattern (`grep -v <shared-name> | xargs
+  kill`) reads `<shared-name>` as the pattern the same as a normal `grep` would, even though
+  `-v` means it's being **excluded**, not matched — an over-block, never a bypass.
 
 ## Install
 
