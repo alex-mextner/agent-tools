@@ -28,6 +28,7 @@ HATCH_HOOKS = (
     "agent-hooks/no-shell-file-edit/no_shell_file_edit.py",
     "agent-hooks/orchestrator-stays-thin/orchestrator_stays_thin.py",
     "agent-hooks/pin-primary-worktree/pin_primary_worktree.py",
+    "agent-hooks/pkill-guard/pkill_guard.py",
     "agent-hooks/require-review-before-commit/require_review.py",
     "agent-hooks/require-ticket-before-commit/require_ticket_before_commit.py",
     "agent-hooks/skills-read-gate/skills_read_gate.py",
