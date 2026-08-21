@@ -4187,6 +4187,298 @@ def test_partial_ci_failure_below_threshold_blocks_normally(repo_with_pr_worktre
     assert "CI infrastructure appears structurally unavailable" not in r.stderr, r.stderr
     assert "local fallback" not in r.stderr.lower(), r.stderr
     assert "merged #1" not in r.stdout, r.stdout
+    # The refusal must point at the known-flake mechanism so an agent facing this exact
+    # shape (one check red, everything else green) doesn't need to remember a doc page.
+    assert "--known-flake" in r.stderr, r.stderr
+    assert "does NOT need human escalation" in r.stderr, r.stderr
+
+
+# ---------------------------------------------------------------------------------------
+# known-flake gate (--known-flake NAME) — a narrower sibling of the CI-down path: covers "one
+# specific check is a confirmed pre-existing flake, everything else is green" (below the 80%
+# ci_appears_structurally_down threshold), rather than a whole-infrastructure outage.
+#
+# The fake `gh` below answers the SAME statusCheckRollup shape as _FAKE_GH_PARTIAL_FAIL (one
+# FAILED "pytest" check, one SUCCESS "lint" check — 50%, below the outage threshold) plus:
+#   - `gh pr view --json baseRefName` -> the base branch name
+#   - `gh run list --branch <base> ...` -> one COMPLETED run, controllable conclusion
+#   - `gh run view <id> --json jobs -q .jobs` -> that run's per-job conclusions, controllable
+# so a test can dial "the base branch run also failed the same check" on or off.
+# ---------------------------------------------------------------------------------------
+
+_FAKE_GH_KNOWN_FLAKE = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q baseRefName; then
+          # No colon: an explicitly-set EMPTY SHIP_TEST_BASE stays empty (simulates an
+          # unreadable/blank baseRefName) — only an UNSET var falls back to "main". `:-` would
+          # treat empty-and-unset the same, which the unreadable-base test needs to tell apart.
+          printf '%s' "${SHIP_TEST_BASE-main}"
+        elif printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          printf '[{"name":"pytest","workflowName":"ci","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"lint","workflowName":"ci","conclusion":"SUCCESS","status":"COMPLETED","state":"SUCCESS"}]'
+        elif printf '%s ' "$@" | grep -q reviewThreads; then
+          echo "0"
+        elif printf '%s ' "$@" | grep -q body; then
+          echo ""
+        else
+          echo '[]'
+        fi ;;
+      diff)
+        if printf '%s ' "$@" | grep -q -- --name-only; then printf 'src/a.py'; else printf '+ok'; fi ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged"; [ -n "${SHIP_TEST_MERGE_LOG:-}" ] && printf '%s\\n' "$*" >> "$SHIP_TEST_MERGE_LOG" || true ;;
+      *) : ;;
+    esac ;;
+  run)
+    action="$1"; shift || true
+    case "$action" in
+      list)
+        printf '[{"databaseId":555,"conclusion":"%s"}]' "${SHIP_TEST_BASE_RUN_CONCLUSION:-failure}" ;;
+      view)
+        printf '[{"name":"pytest","conclusion":"%s"},{"name":"lint","conclusion":"success"}]' "${SHIP_TEST_BASE_JOB_CONCLUSION:-failure}" ;;
+      *) : ;;
+    esac ;;
+  api) echo 0 ;;
+  *) : ;;
+esac
+"""
+
+
+def _fake_gh_known_flake_dir(tmp_path: Path) -> Path:
+    bindir = tmp_path / "binkf"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_KNOWN_FLAKE, encoding="utf-8")
+    gh.chmod(0o755)
+    return bindir
+
+
+def _run_ship_known_flake(main: Path, bindir: Path, *known_flake_names: str, env_extra: dict | None = None):
+    """Like _run_ship_cidown, but the argv carries a --known-flake per name (this gate needs
+    the flag on the command line, which _run_ship_cidown's hardcoded argv does not support)."""
+    env = dict(os.environ)
+    env.pop("GH_REPO", None)
+    env.pop("GH_SHIP_REPO", None)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_REVIEW_DWELL"] = "0"  # disable dwell gate: fake PR has no review timestamps
+    if env_extra:
+        env.update(env_extra)
+    argv = ["bash", str(_SHIP), "1", "--no-screenshot-ok", "test"]
+    for name in known_flake_names:
+        argv += ["--known-flake", name]
+    return _sh(*argv, cwd=main, env=env)
+
+
+def test_known_flake_confirmed_runs_local_gate_and_merges(repo_with_pr_worktree, tmp_path):
+    """--known-flake pytest, and the base branch's own recent CI history shows the SAME check
+    also failed there -> confirmed, local gate runs and (green) ship merges normally. Also
+    pins the POSITIVE half of the audit-deferral invariant (review finding, round 3): the
+    `confirmed` line is written, and written exactly once, only once a real merge happened —
+    the negative half (no `confirmed` on a local-gate failure) was already covered by
+    test_known_flake_confirmed_but_local_gate_fails_still_blocks, but nothing previously
+    verified the deferred write actually FIRES on the success path; a regression that dropped
+    the post-merge `_known_flake_audit_log confirmed` call entirely would have passed every
+    test here before this assertion existed."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_known_flake_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+
+    r = _run_ship_known_flake(main, bindir, "pytest", env_extra={
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_AUDIT_FILE": str(audit),
+    })
+
+    assert r.returncode == 0, (
+        f"ship must merge when the sole failing check is a CONFIRMED known flake\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "CONFIRMED against main's recent CI history" in r.stderr, r.stderr
+    assert "known-flake gate PASSED" in r.stderr, r.stderr
+    assert "merged #1" in r.stdout, r.stdout
+    lines = [json.loads(line) for line in audit.read_text(encoding="utf-8").splitlines() if line.strip()]
+    known_flake_lines = [line for line in lines if line.get("gate") == "known-flake"]
+    assert len(known_flake_lines) == 1, f"expected exactly one known-flake audit line: {lines}"
+    assert known_flake_lines[0]["decision"] == "confirmed", f"audit trail: {lines}"
+
+
+def test_known_flake_unconfirmed_still_blocks(repo_with_pr_worktree, tmp_path):
+    """--known-flake pytest, but the base branch's recent runs do NOT show pytest failing there
+    (the base job conclusion is "success") -> NOT confirmed, ship still refuses. Proves this
+    gate cannot be satisfied by the flag alone — it independently checks reality."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_known_flake_dir(tmp_path)
+
+    # The base branch's own history never shows "pytest" failing (green there) — the claim a
+    # shipper would be making with --known-flake pytest is simply false here.
+    r = _run_ship_known_flake(main, bindir, "pytest", env_extra={
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_TEST_BASE_JOB_CONCLUSION": "success",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must NOT merge on an unconfirmed --known-flake claim\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "could NOT be confirmed" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_known_flake_not_asserted_for_failing_check_blocks(repo_with_pr_worktree, tmp_path):
+    """--known-flake names a DIFFERENT check than the one that's actually failing -> the real
+    failure ("pytest") is uncovered, ship still refuses even though the base-branch evidence
+    for the (irrelevant) asserted name would have checked out."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_known_flake_dir(tmp_path)
+
+    r = _run_ship_known_flake(main, bindir, "some-other-check", env_extra={"SHIP_LOCAL_TEST_CMD": "true"})
+
+    assert r.returncode != 0, (
+        f"ship must NOT merge when the actually-failing check has no matching --known-flake\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "was not asserted via --known-flake" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_known_flake_confirmed_but_local_gate_fails_still_blocks(repo_with_pr_worktree, tmp_path):
+    """A confirmed known flake is NOT a free pass on testing: if the local fallback gate itself
+    fails (e.g. the actual local test run is red), ship still refuses. The audit trail must
+    distinguish this ("confirmed the claim, but never actually merged") from a clean
+    `confirmed` decision — reviewing SHIP_AUDIT_FILE alone must not misread this as a merge."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_known_flake_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+
+    r = _run_ship_known_flake(main, bindir, "pytest", env_extra={
+        "SHIP_LOCAL_TEST_CMD": "false",
+        "SHIP_AUDIT_FILE": str(audit),
+    })
+
+    assert r.returncode != 0, (
+        f"ship must NOT merge when the known-flake IS confirmed but the local gate fails\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "local fallback gates also failed" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+    lines = audit.read_text(encoding="utf-8").splitlines()
+    decisions = [json.loads(line)["decision"] for line in lines if line.strip()]
+    assert "confirmed-local-gate-failed" in decisions, f"audit trail: {decisions}"
+    assert "confirmed" not in decisions, (
+        f"audit trail must not show a bare 'confirmed' for a ship that never merged: {decisions}"
+    )
+
+
+# Two FAILED checks ("pytest" and "codeql"); "pytest" is confirmable against the base branch,
+# "codeql" is not (its base-run job conclusion is controllable, defaulting to "success" — never
+# seen failing there). Proves "no partial credit": confirming ONE of two failing checks must
+# not be enough to pass the whole gate.
+_FAKE_GH_KNOWN_FLAKE_TWO_CHECKS = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q baseRefName; then
+          printf '%s' "${SHIP_TEST_BASE:-main}"
+        elif printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          printf '[{"name":"pytest","workflowName":"ci","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"codeql","workflowName":"ci","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"lint","workflowName":"ci","conclusion":"SUCCESS","status":"COMPLETED","state":"SUCCESS"}]'
+        elif printf '%s ' "$@" | grep -q reviewThreads; then
+          echo "0"
+        elif printf '%s ' "$@" | grep -q body; then
+          echo ""
+        else
+          echo '[]'
+        fi ;;
+      diff)
+        if printf '%s ' "$@" | grep -q -- --name-only; then printf 'src/a.py'; else printf '+ok'; fi ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged"; [ -n "${SHIP_TEST_MERGE_LOG:-}" ] && printf '%s\\n' "$*" >> "$SHIP_TEST_MERGE_LOG" || true ;;
+      *) : ;;
+    esac ;;
+  run)
+    action="$1"; shift || true
+    case "$action" in
+      list)
+        printf '[{"databaseId":555,"conclusion":"failure"}]' ;;
+      view)
+        printf '[{"name":"pytest","conclusion":"failure"},{"name":"codeql","conclusion":"%s"},{"name":"lint","conclusion":"success"}]' "${SHIP_TEST_CODEQL_BASE_CONCLUSION:-success}" ;;
+      *) : ;;
+    esac ;;
+  api) echo 0 ;;
+  *) : ;;
+esac
+"""
+
+
+def _fake_gh_known_flake_two_checks_dir(tmp_path: Path) -> Path:
+    bindir = tmp_path / "binkf2"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_KNOWN_FLAKE_TWO_CHECKS, encoding="utf-8")
+    gh.chmod(0o755)
+    return bindir
+
+
+def test_known_flake_partial_coverage_of_multiple_failures_still_blocks(repo_with_pr_worktree, tmp_path):
+    """Two checks are failing; only ONE ("pytest") is asserted+confirmable, the other
+    ("codeql") is not confirmable on the base branch. The gate must require ALL failing
+    checks to be covered — one confirmed check must not paper over another genuine failure.
+    ship's own DEDUP_FILTER groups/sorts the rollup before this gate ever sees it, so which of
+    the two is evaluated first is an implementation detail (also exercises the short-circuit:
+    once one row is a certain loss, later rows are skipped, not individually re-verified) —
+    assert on the invariant (codeql's unconfirmable claim is surfaced, nothing merges), not on
+    a specific per-check message ordering."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_known_flake_two_checks_dir(tmp_path)
+
+    r = _run_ship_known_flake(main, bindir, "pytest", "codeql", env_extra={
+        "SHIP_LOCAL_TEST_CMD": "true",
+        # codeql never failed on the base branch — its --known-flake assertion is false.
+        "SHIP_TEST_CODEQL_BASE_CONCLUSION": "success",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must NOT merge when even ONE of several asserted checks is unconfirmed\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "'codeql' was asserted via --known-flake but could NOT be confirmed" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_known_flake_unreadable_base_branch_fails_closed(repo_with_pr_worktree, tmp_path):
+    """If the PR's base branch can't be read (gh pr view --json baseRefName fails/empty), the
+    gate must refuse rather than silently falling back to guessing a branch to verify against
+    (a prior version of this gate did exactly that, review finding)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_known_flake_dir(tmp_path)
+    # Force the baseRefName query to return an empty/unsafe value.
+    r = _run_ship_known_flake(main, bindir, "pytest", env_extra={
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_TEST_BASE": "",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must refuse when the base branch can't be read, not guess $DEFAULT_BRANCH\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "could not read this PR's base branch" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
 
 
 # ---------------------------------------------------------------------------------------
