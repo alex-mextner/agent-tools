@@ -65,6 +65,28 @@
 #                          comments is fail-closed (never auto-resolved).
 #   --screenshot P [D]     attach a local screenshot P (desc D) via SHIP_IMAGE_UPLOAD_CMD,
 #                          then post it as a PR comment. Repeatable.
+#   --known-flake NAME     assert that the FAILED check named NAME (as printed by the green-CI
+#                          gate's own "x <name> -> <conclusion>" refusal lines) is a pre-existing
+#                          failure unrelated to this diff — a confirmed CI flake, not the "CI is
+#                          structurally down" case ci_appears_structurally_down() already covers
+#                          (that one needs ~80% of ALL checks failing; this is for the common
+#                          shape where ONE check is flaky and everything else is green). NOT a
+#                          blind trust-me flag: ship independently VERIFIES the assertion before
+#                          it does anything — it queries the last SHIP_FLAKE_LOOKBACK_RUNS
+#                          completed runs of the SAME workflow on the PR's BASE branch and
+#                          requires that this exact check name also FAILED on at least one of
+#                          them (see _known_flake_confirmed). An assertion that cannot be
+#                          verified this way is REFUSED, same as not passing the flag at all — so
+#                          this closes, rather than reopens, the exact escalate-to-Alex-for-a-
+#                          confirmed-unrelated-flake gap this flag exists to remove (see the
+#                          AGENTS.md "CI billing-block" note in the repos that document it).
+#                          Repeatable — every check currently FAILED in the rollup must be
+#                          covered by a verified --known-flake or the gate still hard-refuses
+#                          (an unaccounted-for failure is never silently waved through). On
+#                          success this runs the SAME local fallback gate as the CI-down path
+#                          (run_local_ci_gate) and merges only if it passes — a known flake still
+#                          gets a real local verification pass, it does not skip testing
+#                          entirely. Logged to SHIP_AUDIT_FILE like every other gate decision.
 #
 # NOTE: the review-quorum gate (Guard-B) has NO override FLAG. When its bar is not met and you
 # genuinely need to proceed, request a one-time bypass by setting the env var
@@ -176,6 +198,12 @@ set -euo pipefail
 ORIG_PWD=$(pwd -P)
 PR=""; SKIP_CI=0; DRY_RUN=0; NO_SHOT_OK=""; NO_VBUMP_OK=""; NO_DWELL_OK=""; REPO_FLAG=""
 SHOT_PATHS=(); SHOT_DESCS=()
+# --known-flake NAME, repeatable — see the "known-flake gate" block below _ci_github_status_indicator.
+KNOWN_FLAKES=()
+# Set by the known-flake gate once its local test pass succeeds; consumed at the merge section
+# below to log the "confirmed" audit line only once `gh pr merge` has actually succeeded — see
+# that gate's own comment for why the audit must wait for the true terminal event.
+KF_AUDIT_PENDING=""
 # Auto-resolve addressed bot-nit review threads before the unresolved-threads gate (opt-in, #268).
 # Enabled by --resolve-addressed-threads or SHIP_RESOLVE_ADDRESSED_THREADS=1; only ever closes a
 # thread that is unresolved, OUTDATED (its code changed), authored ENTIRELY by bots, and has no
@@ -183,7 +211,7 @@ SHOT_PATHS=(); SHOT_DESCS=()
 # current thread is never touched (see the gate below).
 RESOLVE_THREADS=0
 case "${SHIP_RESOLVE_ADDRESSED_THREADS:-}" in 1|true|yes) RESOLVE_THREADS=1 ;; esac
-USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--resolve-addressed-threads] [--screenshot <path> [desc]]...'
+USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--resolve-addressed-threads] [--screenshot <path> [desc]]... [--known-flake <check-name>]...'
 
 # Path to the review-quorum gate's hatch-escalation helper (ci/ship/review_quorum_hatch.py),
 # derived ONLY from this script's own location. That helper imports the shared
@@ -219,6 +247,10 @@ while [ "$i" -lt "$n" ]; do
     --no-review-dwell-ok)
       i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "--no-review-dwell-ok needs a <reason>." >&2; exit 1; }
       NO_DWELL_OK=${args[$i]}; [ -n "$NO_DWELL_OK" ] || { echo "--no-review-dwell-ok reason empty." >&2; exit 1; } ;;
+    --known-flake)
+      i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "--known-flake needs a <check-name>." >&2; exit 1; }
+      [ -n "${args[$i]}" ] || { echo "--known-flake check-name empty." >&2; exit 1; }
+      KNOWN_FLAKES+=("${args[$i]}") ;;
     --screenshot|--shot)
       i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "$a needs a <path>." >&2; exit 1; }
       p=${args[$i]}; case "$p" in /*) : ;; *) p="$ORIG_PWD/$p" ;; esac
@@ -486,6 +518,106 @@ fi
 # verifying, same as it could already add a stub `"test": "true"` script to package.json —
 # this file does not change what a malicious PR could already get away with, review still
 # has to look at test-affecting changes either way.
+
+# --- known-flake gate (--known-flake NAME) --------------------------------------------
+# A NARROWER sibling of the CI-down path above: ci_appears_structurally_down() only fires when
+# ~80% of ALL checks fail (a whole-infrastructure outage). The far more common real shape is
+# "one specific check is a flaky, already-broken-on-main test and every other check is green" —
+# that does not look like an outage at all, so the CI-down path never triggers for it, and
+# without this gate the only way through was a human escalation for something a quick check of
+# the base branch's own recent CI history already answers (this repeated, avoidable escalation
+# is exactly what this gate exists to close — see AGENTS.md's "CI billing-block" note in repos
+# that document that history).
+#
+# $1 = check NAME as it appears in the rollup (.name // .context — the same string the green-CI
+# gate's own refusal already prints). $2 = that check's workflowName (may be empty for a
+# StatusContext, which has none), used to scope the base-branch lookup to the SAME workflow so a
+# same-named check from an unrelated workflow can't manufacture a false match. $3 = the PR's
+# ACTUAL base branch (baseRefName), resolved ONCE by the caller (see the call site) — NOT
+# re-derived per check. Two reasons this is a required argument, not an internal lookup: (a) a
+# `gh pr view` failure inside a per-check helper is easy to silently paper over with a
+# same-shaped fallback (a real prior version of this function did exactly that — see the caller
+# for why that direction is wrong for THIS gate specifically), and (b) it avoids re-querying the
+# identical answer once per failing check.
+#
+# Evidence, not trust: queries the last SHIP_FLAKE_LOOKBACK_RUNS (default 5) COMPLETED runs of
+# that workflow on $3 and requires a job of the SAME name to have FAILED in at least one of
+# them. A flake does not have to fail every run — that is what makes it a flake rather than a
+# hard break — so ANY match in the window is sufficient; the absence of any match is what
+# refuses the claim. Fail-closed throughout: a gh/jq read failure, an empty run list, or no
+# matching failure anywhere in the window all return 1 (NOT confirmed) — the caller then treats
+# the check as a genuine, blocking failure exactly as if --known-flake had never been passed
+# for it.
+#
+# Scope, stated plainly: this confirms "this check NAME has also failed recently on the base
+# branch, independent of this PR" — job-name granularity, not a guarantee that the SAME
+# sub-test/assertion failed both times (a job that bundles a large suite, like this repo's own
+# monorepo-wide "Tests" check, could in principle fail for two DIFFERENT reasons on two
+# different runs and still match here). That is a real, accepted limitation, not an oversight —
+# a shipper should still glance at the failure output before asserting the flag (the refusal
+# message this gate's caller prints tells them exactly what failed), and the base-branch match
+# is logged to SHIP_AUDIT_FILE precisely so an asserted-but-wrong claim is reviewable after the
+# fact, same as the review-quorum and skip-ci gates already are.
+_known_flake_confirmed() {
+  local check_name="$1" wf_name="$2" base="$3" runs_json rid concl jobs_json match found=0 n
+  [ -n "$base" ] || return 1
+  n="${SHIP_FLAKE_LOOKBACK_RUNS:-5}"
+  case "$n" in ''|*[!0-9]*) n=5 ;; esac
+  [ "$n" -gt 0 ] || n=5
+  # Clamped upper bound: an unbounded SHIP_FLAKE_LOOKBACK_RUNS turns the refusal path (every
+  # candidate run inspected, none matching) into dozens-to-hundreds of sequential `gh run view`
+  # calls — minutes of wall time before ship even gets to refuse. 25 is generous for "how many
+  # recent runs could plausibly contain the same flake" while keeping the worst case bounded.
+  [ "$n" -le 25 ] || n=25
+  if [ -n "$wf_name" ]; then
+    runs_json=$(gh run list --branch "$base" --workflow "$wf_name" --status completed --limit "$n" \
+      --json databaseId,conclusion 2>/dev/null) || return 1
+  else
+    runs_json=$(gh run list --branch "$base" --status completed --limit "$n" \
+      --json databaseId,conclusion 2>/dev/null) || return 1
+  fi
+  [ -n "$runs_json" ] && [ "$runs_json" != "null" ] || return 1
+  while IFS=$'\t' read -r rid concl; do
+    [ -n "$rid" ] || continue
+    # A fully green run cannot contain a failing job with this name — cheap skip before the
+    # extra `gh run view` call that would otherwise be needed for every recent run.
+    case "$concl" in failure|cancelled|timed_out|action_required) : ;; *) continue ;; esac
+    jobs_json=$(gh run view "$rid" --json jobs -q '.jobs' 2>/dev/null) || continue
+    match=$(printf '%s' "$jobs_json" | jq -r --arg n "$check_name" \
+      '(. // [])[] | select(.name == $n) | .conclusion' 2>/dev/null)
+    if printf '%s\n' "$match" | grep -qx "failure"; then
+      found=1
+      echo "[ship] known-flake evidence: '$check_name' also FAILED on ${base} run ${rid} (recent, same workflow) — treating as pre-existing, not introduced by this PR." >&2
+      break
+    fi
+  done < <(printf '%s' "$runs_json" | jq -r '(. // [])[] | [(.databaseId|tostring), .conclusion] | @tsv' 2>/dev/null)
+  [ "$found" = "1" ]
+}
+
+# One known-flake audit line -> SHIP_AUDIT_FILE, mirroring _skip_ci_audit_log's shape/dry-run
+# contract. $1 = decision (confirmed | refused), $2 = space-joined check names asserted.
+_known_flake_audit_log() {
+  local decision="$1" checks="$2"
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "[dry-run] would append known-flake audit: decision=${decision} checks=${checks}" >&2
+    return 0
+  fi
+  local file="${SHIP_AUDIT_FILE:-$HOME/.config/agent-tools/ship-audit.jsonl}"
+  mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
+  local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if command -v jq >/dev/null 2>&1; then
+    jq -nc --arg ts "$ts" --arg pr "$PR" --arg dec "$decision" --arg gate "known-flake" \
+      --arg checks "$checks" \
+      '{ts:$ts, pr:$pr, gate:$gate, decision:$dec, checks:$checks}' \
+      >> "$file" 2>/dev/null || true
+  else
+    local esc_pr esc_checks
+    esc_pr=$(printf '%s' "$PR" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    esc_checks=$(printf '%s' "$checks" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    printf '{"ts":"%s","pr":"%s","gate":"known-flake","decision":"%s","checks":"%s"}\n' \
+      "$ts" "$esc_pr" "$decision" "$esc_checks" >> "$file" 2>/dev/null || true
+  fi
+}
 
 # Query the GitHub status page for Actions component health.
 # Stdout: "degraded" if Actions is not fully operational, "ok" if fine, "unknown" on error.
@@ -980,15 +1112,16 @@ _local_review_threads_check() {
 
 # Orchestrate all local CI fallback gates. Called when CI infra appears structurally down.
 # Returns 0 if ALL gates pass, 1 if any fail (conservative: block unless everything is clean).
-run_local_ci_gate() {
-  echo "[ship] === Running local CI fallback gates (CI infrastructure appears down) ==="
+run_local_ci_gate() {  # $1 (optional) = why this is running, for the banner (default: CI-down wording)
+  local why="${1:-CI infrastructure appears down}"
+  echo "[ship] === Running local CI fallback gates (${why}) ==="
   local gate_failed=0
   _local_test_runner "$ROOT"       || gate_failed=1
   _local_leftover_check "$PR"      || gate_failed=1
   _local_pr_checklist_check "$PR"  || gate_failed=1
   _local_review_threads_check "$PR" || gate_failed=1
   if [ "$gate_failed" = "0" ]; then
-    echo "[ship] === Local CI fallback: ALL gates passed — safe to merge despite CI outage. ==="
+    echo "[ship] === Local CI fallback: ALL gates passed — safe to merge. ==="
     return 0
   fi
   echo "[ship] === Local CI fallback: FAILED — see above; not safe to merge. ===" >&2
@@ -1275,10 +1408,135 @@ if [ "$SKIP_CI" = "0" ]; then
         exit 1
       fi
     else
-      echo "Refusing: PR #$PR has $FAILED check(s) not passing:" >&2
-      printf '%s' "$ROLLUP" | jq -r ".[] | select($SUCCESS_FILTER | not) | \"  x \(.name // .context) -> \(.conclusion // .state)\"" >&2 2>/dev/null || true
-      echo "  Fix CI, then re-run. If CI is genuinely billing-blocked/down, re-run WITHOUT --skip-ci — the normal path auto-detects a real outage and merges after its own local checks. (--skip-ci is now a deny-by-default hatch-gated admin bypass, NOT the billing path.)" >&2
-      exit 1
+      # known-flake gate (--known-flake NAME, repeatable) — narrower than the CI-down path
+      # above: that one needs ~80% of ALL checks failing (a whole-infra outage); this covers
+      # "one specific check is a confirmed pre-existing flake and everything else is green",
+      # the far more common shape a human used to get pinged for. Only consulted when at
+      # least one --known-flake was passed; EVERY currently-failed check must be BOTH
+      # asserted via --known-flake AND independently CONFIRMED by _known_flake_confirmed
+      # against the base branch's own recent CI history (see that function's doc comment for
+      # what "confirmed" means and its scope) — one uncovered or unconfirmed failure still
+      # hard-refuses the whole gate; there is no partial credit.
+      #
+      # CAVEAT (review finding, not yet closed): this gate confirms the CLAIM and runs a real
+      # local test pass, then falls through to the SAME plain, non-admin `gh pr merge` every
+      # other success path here uses. If the flaky check is also a REQUIRED status check under
+      # branch protection, GitHub still refuses that merge — a required check FAILING (not
+      # merely absent, unlike the empty-rollup outage case above) blocks the merge regardless
+      # of what ship itself has already verified. In that shape a shipper still ends up at the
+      # `--skip-ci` hatch after doing all the extra work this flag exists to avoid. This is not
+      # silently unsafe (ship never bypasses branch protection here), just an unresolved UX
+      # gap — tracked as a follow-up rather than fixed in this change.
+      #
+      # KNOWN_FLAKE_GATE_OK is POSITIVE confirmation, not "innocent until proven guilty": it
+      # starts at 0 and is set to 1 ONLY after the loop has actually run over every failing
+      # check and every single one confirmed. An earlier version of this gate started
+      # optimistic (=1, flipped to 0 only inside the loop) — if the jq extraction of failing
+      # check names ever came back EMPTY while $FAILED was still nonzero (a jq hiccup, or any
+      # drift between how $FAILED was counted and this independent re-extraction from
+      # $ROLLUP), the loop would run ZERO iterations, nothing would flip the flag off, and the
+      # gate would silently PASS with no check ever actually confirmed — a fail-OPEN past red
+      # CI (review finding). CHECKED_COUNT below makes the pass condition "every failing check
+      # was individually confirmed", verified by counting, not by absence-of-a-negative-signal.
+      KNOWN_FLAKE_GATE_OK=0
+      if [ "${#KNOWN_FLAKES[@]}" -gt 0 ]; then
+        # Resolve the PR's ACTUAL base branch ONCE (not per failing check — avoids redundant
+        # gh calls) and FAIL CLOSED if it can't be read. This gate is evidence-gated by
+        # design: an unreadable base isn't "assume main and proceed", it's "cannot verify the
+        # claim" — same fail-closed posture the review-threads and dwell gates already use for
+        # their own unreadable-data cases (review finding: an earlier version silently
+        # defaulted to $DEFAULT_BRANCH here, which could verify a stacked PR's flake against
+        # the WRONG branch's history on a transient gh failure, or on any base other than
+        # $DEFAULT_BRANCH).
+        KF_BASE=""
+        if [ "${_FOREIGN_REPO_INVOKE:-0}" != "1" ]; then
+          KF_BASE=$(gh pr view "$PR" --json baseRefName -q '.baseRefName' 2>/dev/null) || KF_BASE=""
+          case "$KF_BASE" in ''|-*|*[!A-Za-z0-9._/-]*) KF_BASE="" ;; esac
+        fi
+        if [ -z "$KF_BASE" ]; then
+          if [ "${_FOREIGN_REPO_INVOKE:-0}" = "1" ]; then
+            # Same #166 hole the empty-rollup CI-down path already guards against: with a
+            # foreign --repo/GH_SHIP_REPO target, run_local_ci_gate below would verify against
+            # THIS (ambient) checkout's tests, not the target repo's — never let the
+            # known-flake gate paper over that by "confirming" evidence for the right repo and
+            # then testing the wrong one.
+            echo "[ship] known-flake: refusing for a foreign --repo/GH_SHIP_REPO target — the local fallback gate below verifies THIS checkout, not the target repo (same #166 class the CI-down path guards against)." >&2
+          else
+            echo "[ship] known-flake: could not read this PR's base branch (gh pr view failed or returned an unsafe value) — refusing rather than guessing which branch's history to verify against." >&2
+          fi
+        else
+          FAILED_NAMES_TSV=$(printf '%s' "$ROLLUP" | jq -r ".[] | select($SUCCESS_FILTER | not) | [(.name // .context), (.workflowName // \"\")] | @tsv" 2>/dev/null)
+          KF_FAILED_COUNT=0
+          KF_CONFIRMED_COUNT=0
+          KF_ALREADY_LOST=0
+          while IFS=$'\t' read -r fname fwf; do
+            # Count EVERY row from this loop, including one whose name/context both render
+            # empty — it still counted toward the earlier $FAILED total, so treating it as
+            # "nothing to check" here (the previous `[ -n "$fname" ] || continue` skipped the
+            # counter too) would let a genuinely-failing-but-unnamed row escape the "every
+            # failure confirmed" requirement entirely (review finding). An empty $fname can
+            # never match a --known-flake assertion anyway, so it falls straight to "not
+            # asserted" below and correctly blocks.
+            KF_FAILED_COUNT=$((KF_FAILED_COUNT + 1))
+            if [ "$KF_ALREADY_LOST" = "1" ]; then
+              # The gate has already failed on an earlier row this pass — the outcome is
+              # decided (refuse). Skip the remaining gh-API evidence lookups entirely: they
+              # cannot change the verdict, only cost latency (review finding, perf).
+              echo "[ship] known-flake: '${fname:-<unnamed check>}' not evaluated — an earlier failing check already sank this gate." >&2
+              continue
+            fi
+            asserted=0
+            for kf in "${KNOWN_FLAKES[@]}"; do
+              [ -n "$fname" ] && [ "$kf" = "$fname" ] && { asserted=1; break; }
+            done
+            if [ "$asserted" = "1" ] && _known_flake_confirmed "$fname" "$fwf" "$KF_BASE"; then
+              KF_CONFIRMED_COUNT=$((KF_CONFIRMED_COUNT + 1))
+              echo "[ship] known-flake: '$fname' asserted via --known-flake and CONFIRMED against ${KF_BASE}'s recent CI history." >&2
+            elif [ "$asserted" = "1" ]; then
+              echo "[ship] known-flake: '$fname' was asserted via --known-flake but could NOT be confirmed as a pre-existing failure on ${KF_BASE} — this alone blocks the merge." >&2
+              KF_ALREADY_LOST=1
+            else
+              echo "[ship] known-flake: '${fname:-<unnamed check>}' is FAILED and was not asserted via --known-flake — this alone blocks the merge." >&2
+              KF_ALREADY_LOST=1
+            fi
+          done <<< "$FAILED_NAMES_TSV"
+          # Pass ONLY when every failing row (by count, matching $FAILED — not merely
+          # "nonzero", closing the partial-undercount gap review flagged) was individually
+          # confirmed, with no earlier-loss short-circuit having fired.
+          [ "$KF_ALREADY_LOST" = "0" ] && [ "$KF_FAILED_COUNT" -gt 0 ] \
+            && [ "$KF_FAILED_COUNT" -eq "$FAILED" ] && [ "$KF_CONFIRMED_COUNT" -eq "$KF_FAILED_COUNT" ] \
+            && KNOWN_FLAKE_GATE_OK=1
+        fi
+      fi
+      if [ "$KNOWN_FLAKE_GATE_OK" = "1" ]; then
+        echo "[ship] known-flake gate PASSED — every failing check is a confirmed pre-existing flake on ${KF_BASE}, not something this PR introduced. Running local fallback gates instead of blocking on CI." >&2
+        # Audit AFTER the terminal outcome, not before: a "confirmed" line means this ship
+        # actually proceeded to merge, not merely that the base-branch evidence checked out —
+        # SHIP_AUDIT_FILE is "one line per gated ship", so a reader must never see `confirmed`
+        # for a run that in fact refused later (review finding, round 2: the FIRST fix only
+        # deferred past run_local_ci_gate — every gate BELOW this one in the script
+        # (unresolved-threads, review-dwell, branch sanity, version-bump, screenshot,
+        # review-quorum) and the actual `gh pr merge` call can still refuse afterward, so the
+        # audit line has to wait for the REAL terminal event, not just this gate's own local
+        # check). KF_AUDIT_PENDING carries the asserted names to the merge section below,
+        # which logs `confirmed` only once `gh pr merge` has actually succeeded — see "merge".
+        if run_local_ci_gate "a confirmed pre-existing flake on ${KF_BASE}, not a CI outage"; then
+          KF_AUDIT_PENDING="${KNOWN_FLAKES[*]}"
+          echo "[ship] known-flake local gate PASSED — proceeding with merge."
+          # Do not exit 1 — fall through to the merge below.
+        else
+          _known_flake_audit_log confirmed-local-gate-failed "${KNOWN_FLAKES[*]}"
+          echo "Refusing: known-flake confirmed, but local fallback gates also failed — not safe to merge." >&2
+          exit 1
+        fi
+      else
+        [ "${#KNOWN_FLAKES[@]}" -gt 0 ] && _known_flake_audit_log refused "${KNOWN_FLAKES[*]}"
+        echo "Refusing: PR #$PR has $FAILED check(s) not passing:" >&2
+        printf '%s' "$ROLLUP" | jq -r ".[] | select($SUCCESS_FILTER | not) | \"  x \(.name // .context) -> \(.conclusion // .state)\"" >&2 2>/dev/null || true
+        echo "  Fix CI, then re-run. If CI is genuinely billing-blocked/down, re-run WITHOUT --skip-ci — the normal path auto-detects a real outage and merges after its own local checks. (--skip-ci is now a deny-by-default hatch-gated admin bypass, NOT the billing path.)" >&2
+        echo "  If a failing check looks UNRELATED to this diff, check whether it ALSO fails on this PR's BASE branch (e.g. \`gh run list --branch <base>\`, or re-run the same test locally against the base branch's HEAD — note this may not be ${DEFAULT_BRANCH} for a stacked PR). A CONFIRMED pre-existing flake does NOT need human escalation: re-run with \`--known-flake <check-name>\` (repeatable, one per failing check) — ship independently VERIFIES the claim against the PR's actual base branch's recent CI history before doing anything with it (see --known-flake in this script's own header comment); it refuses the same as now if the claim doesn't hold up. Escalate to a human only for a genuine billing-block or a failure that is actually related to this diff." >&2
+        exit 1
+      fi
     fi
   fi
 fi
@@ -2085,6 +2343,13 @@ if [ "$SKIP_CI" = "1" ]; then
 else
   echo "[ship] preflight clean — merging PR #${PR} (${BRANCH}) --${MERGE_METHOD} ..."
   run gh pr merge "$PR" "--$MERGE_METHOD"
+fi
+# `run gh pr merge` above runs under `set -e` — a merge failure would have already aborted the
+# script, so reaching here means the merge (or its --dry-run stand-in) succeeded. ONLY now is it
+# true that a known-flake claim was "confirmed" in the sense the audit trail promises (an
+# actual merge happened, not merely a passed local check that a LATER gate then refused).
+if [ -n "$KF_AUDIT_PENDING" ]; then
+  _known_flake_audit_log confirmed "$KF_AUDIT_PENDING"
 fi
 
 # --- task-cli notify (best-effort; never blocks or fails the ship) --------------------
