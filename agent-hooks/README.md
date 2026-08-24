@@ -139,10 +139,11 @@ inside tool args are stripped.
 
 `pre-skill` fires before a Skill-tool call runs (CC's `PreToolUse` on the `Skill` tool). It
 exists for exactly one consumer today: `skills-marker-writer`, which touches
-`~/.cache/agent-tools/skills-invoked/<skill-name>` so `skills-read-gate`'s freshness check
-(on `pre-bash`) has something real to read. A `pre-skill` hook should never block — the point
-is a recording tap, not a gate — so hooks here should be `on_error: open` and always emit
-`allow`.
+`~/.cache/agent-tools/skills-invoked/<session-id>/<skill-name>` (session-scoped by CC's own
+session id, so one session invoking a skill can't satisfy another concurrent session's gate)
+so `skills-read-gate`'s freshness check (on `pre-bash`) has something real to read. A
+`pre-skill` hook should never block — the point is a recording tap, not a gate — so hooks
+here should be `on_error: open` and always emit `allow`.
 
 ### `post-write` — react to a *completed* write
 

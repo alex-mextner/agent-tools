@@ -27,6 +27,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 _HOOK = (
     Path(__file__).resolve().parents[1]
     / "agent-hooks"
@@ -199,6 +201,54 @@ def test_symlink_inside_marker_dir_cannot_escape_it(tmp_path, monkeypatch):
     assert not (outside / "x").exists()
 
 
+def test_session_scoped_marker_nests_under_session_id(tmp_path, monkeypatch):
+    invoked = tmp_path / "skills-invoked"
+    out, _err, code = _run(
+        "delegate-work-to-subagents", monkeypatch, invoked=invoked,
+        extra_args={"session_id": "sess-1"},
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+    marker = invoked / "sess-1" / "delegate-work-to-subagents"
+    assert marker.is_file()
+    # not written at the old global (non-session-scoped) location
+    assert not (invoked / "delegate-work-to-subagents").is_file()
+
+
+def test_two_sessions_get_independent_markers(tmp_path, monkeypatch):
+    invoked = tmp_path / "skills-invoked"
+    _run("visual-proof-cycle", monkeypatch, invoked=invoked, extra_args={"session_id": "sess-a"})
+    _run("visual-proof-cycle", monkeypatch, invoked=invoked, extra_args={"session_id": "sess-b"})
+    assert (invoked / "sess-a" / "visual-proof-cycle").is_file()
+    assert (invoked / "sess-b" / "visual-proof-cycle").is_file()
+
+
+def test_missing_or_invalid_session_id_falls_back_to_global_marker(tmp_path, monkeypatch):
+    invoked = tmp_path / "skills-invoked"
+    # no session_id at all
+    _run("delegate-work-to-subagents", monkeypatch, invoked=invoked)
+    assert (invoked / "delegate-work-to-subagents").is_file()
+
+    # a session_id containing "/" is rejected (never split/nested) → falls back to global
+    invoked2 = tmp_path / "skills-invoked-2"
+    _run(
+        "visual-proof-cycle", monkeypatch, invoked=invoked2,
+        extra_args={"session_id": "a/b"},
+    )
+    assert (invoked2 / "visual-proof-cycle").is_file()
+    assert not (invoked2 / "a").exists()
+
+    # a non-string session_id (model/serialization glitch) is ignored, not crashed on
+    invoked3 = tmp_path / "skills-invoked-3"
+    out, _err, code = _run(
+        "visual-proof-cycle", monkeypatch, invoked=invoked3,
+        extra_args={"session_id": 12345},
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+    assert (invoked3 / "visual-proof-cycle").is_file()
+
+
 def test_written_marker_satisfies_skills_read_gate_freshness_check(tmp_path, monkeypatch):
     """End-to-end: the marker this hook writes is what skills-read-gate's own freshness
     check reads — the two hooks must agree on the marker dir/filename shape."""
@@ -218,3 +268,54 @@ def test_written_marker_satisfies_skills_read_gate_freshness_check(tmp_path, mon
 
     # after invocation: the marker-writer's output satisfies the gate's own freshness check
     assert srg._missing_skills(subagent=False) == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "sess-1234-abcd", "  padded  ", "", "x" * 500, "a/b", "a\\b", ".", "..",
+        "bad\x00id", "x" * 128, "x" * 129,
+    ],
+)
+def test_sanitize_session_id_agrees_between_writer_and_reader(value):
+    """The writer's and reader's `_sanitize_session_id` are duplicated by design (# SYNC:
+    comment, same convention as the hatch-escalation loader) rather than shared via import —
+    but they MUST still agree on every input, or the two hooks would compute different
+    marker paths for the same session and session-scoping would silently break. This test
+    is the guard: if a future edit to one copy diverges from the other, it fails loudly here
+    instead of manifesting as a confusing marker-not-found in production."""
+    assert smw._sanitize_session_id(value) == srg._sanitize_session_id(value)
+
+
+def test_session_scoped_write_only_satisfies_the_same_session_read(tmp_path, monkeypatch):
+    """End-to-end, session isolation: a marker written under session A's id must NOT
+    satisfy skills-read-gate's freshness check when it computes session B's marker path —
+    the whole point of session-scoping is that concurrent sessions can't borrow each
+    other's fresh markers."""
+    invoked = tmp_path / "skills-invoked"
+    monkeypatch.setenv("MANDATORY_SKILLS", "delegate-work-to-subagents,visual-proof-cycle")
+
+    _run(
+        "delegate-work-to-subagents", monkeypatch, invoked=invoked,
+        extra_args={"session_id": "sess-a"},
+    )
+    _run(
+        "visual-proof-cycle", monkeypatch, invoked=invoked,
+        extra_args={"session_id": "sess-a"},
+    )
+
+    sess_a_seg = srg._sanitize_session_id("sess-a")
+    sess_b_seg = srg._sanitize_session_id("sess-b")
+
+    def missing(*, invoked_dir: Path, session_seg: str | None) -> list[str]:
+        monkeypatch.setattr(srg, "INVOKED_DIR", invoked_dir)
+        monkeypatch.setattr(srg, "FRESH_WINDOW_S", 7200)
+        return srg._missing_skills(subagent=False, session_seg=session_seg)
+
+    # session A sees both its own markers as fresh
+    assert missing(invoked_dir=invoked, session_seg=sess_a_seg) == []
+    # session B (never invoked anything) still sees both as missing — no cross-session leak
+    assert missing(invoked_dir=invoked, session_seg=sess_b_seg) == [
+        "delegate-work-to-subagents",
+        "visual-proof-cycle",
+    ]

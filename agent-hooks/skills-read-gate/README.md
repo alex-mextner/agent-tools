@@ -9,15 +9,33 @@ UI "done"); doing the work without reading the skill skips those rules.
 
 ## The marker contract (how it knows a skill was invoked)
 
-A skill-invocation wrapper **touches one file per invoked skill** in a marker dir:
+A skill-invocation wrapper **touches one file per invoked skill**, nested under the Claude
+Code session id that invoked it, in a marker dir:
 
 ```
-~/.cache/agent-tools/skills-invoked/<skill-name>     # mtime = invocation time
+~/.cache/agent-tools/skills-invoked/<session-id>/<skill-name>     # mtime = invocation time
 ```
 
 A skill counts as invoked if its marker is **fresh** (within `SKILLS_FRESH_WINDOW_S`,
-default `7200`s). The wrapper is `skills-marker-writer` (sibling hook, `pre-skill` point):
-it fires on every Skill-tool invocation and touches the marker for the invoked skill — see
+default `7200`s) and EITHER was written by **this session**, OR — as a lower-precedence
+fallback — the pre-session-scoping global marker is fresh. The session id comes from
+`args.session_id`, which `lib/cc_hook_bridge/dispatch.py` forwards with the same T2
+precedence as `agent_id` (CC's own top-level value is authoritative; a value riding in via
+`tool_input` is dropped) — see `_marker_path`/`_missing_skills`/`_sanitize_session_id` in
+`skills_read_gate.py`. The session-scoped check is what closes the cross-session leak: in
+practice, `skills-marker-writer` (CC's own producer) always writes to the session-scoped
+path when a real CC session id is available (i.e. on every live CC invocation), so CC's own
+writes never land on the shared global path anymore. The global-path fallback exists for
+harnesses that have NO session-aware producer of their own — Codex/opencode have no
+`pre-skill` mapping yet (same gap the `pre-agent` point had before it was wired — see
+`agent-hooks/README.md`'s `pre-skill` section for the current per-harness status) — and for
+the manual `touch` recipe further down in this README; without the fallback, either one
+would silently stop working the moment ANY session id happens to ride along on the event
+(Codex's own bridge forwards one on `pre-bash` too, even with no writer behind it). The
+WARN/BLOCK escalation TIER (below) is also session-scoped, with no such fallback — see
+`_tier_marker` in `skills_read_gate.py`. The wrapper is `skills-marker-writer` (sibling hook,
+`pre-skill` point): it fires on every Skill-tool invocation and touches the marker for the
+invoked skill under the same session-id nesting — see
 `agent-hooks/skills-marker-writer/README.md`. In Claude Code this is live once rig registers
 a `Skill` PreToolUse matcher for the bridge (`riglib` `hook_bridge_entries`); Codex/opencode
 are not mapped yet (same gap the `pre-agent` point had before it was wired — see
@@ -39,8 +57,11 @@ Configure via env:
 ## Tiering — WARN then BLOCK
 
 If a mandatory skill has no fresh marker, the **first** work action WARNs (allow + message);
-a **repeat** in the window BLOCKs (tracked by a cwd-keyed marker). The default WARN-first tier
-means the gate never wedges while the marker-writer is still being wired everywhere.
+a **repeat** in the window BLOCKs (tracked by a marker keyed by `cwd` and, when a valid
+session id is on the event, that session too — so session B's first action in a cwd where
+session A already WARNed still gets its OWN warn, not an inherited block). The default
+WARN-first tier means the gate never wedges while the marker-writer is still being wired
+everywhere.
 
 ## Subagents: exempt from the orchestration/visual defaults, still gated on project skills
 

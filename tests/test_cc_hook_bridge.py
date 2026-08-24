@@ -194,6 +194,52 @@ def test_to_v1_event_forged_tool_input_agent_id_dropped_for_pre_write():
     assert "agent_type" not in v1["args"]
 
 
+def test_to_v1_event_top_level_session_id_overrides_tool_input():
+    """session_id gets the SAME T2 precedence as agent_id: CC's TOP-LEVEL session id is
+    authoritative, a (possibly forged) tool_input.session_id must be OVERWRITTEN, not win
+    over it. This matters for any hook that uses args.session_id to SCOPE a decision
+    (skills-read-gate's freshness marker), not just record it — a forged value could
+    otherwise let one session borrow another session's fresh marker."""
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Skill",
+          "tool_input": {"skill": "delegate-work-to-subagents", "session_id": "forged"},
+          "session_id": "real-session", "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="pre-skill")
+    assert v1["args"]["session_id"] == "real-session"
+
+
+def test_to_v1_event_forged_tool_input_session_id_dropped_when_top_level_absent():
+    """A forged tool_input.session_id with NO top-level session id must be DROPPED, not
+    passed through — mirrors the agent_id forged-signal protection (T2)."""
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Skill",
+          "tool_input": {"skill": "delegate-work-to-subagents", "session_id": "forged"},
+          "cwd": "/repo"}  # ← no top-level session_id
+    v1 = dispatch.to_v1_event(cc, point="pre-skill")
+    assert "session_id" not in v1["args"]
+
+
+def test_to_v1_event_forwards_session_id_for_stop():
+    """The pre-existing, narrower use of session_id (a stop hook keying its own marker) must
+    keep working under the now-unified T2 loop: `stop` has no tool_input, so args starts
+    empty and the top-level session id lands in args unconditionally."""
+    cc = {"hook_event_name": "Stop", "stop_hook_active": True,
+          "session_id": "sess-xyz", "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="stop")
+    assert v1["args"]["session_id"] == "sess-xyz"
+
+
+def test_to_v1_event_empty_string_top_level_session_id_overwrites_tool_input():
+    """The T2 loop tests identity (`is not None`), not truthiness, so a top-level
+    session_id == "" now OVERWRITES a tool_input copy too (the old standalone rule used
+    truthiness and would have skipped this case). Harmless downstream — an empty string
+    fails `_sanitize_session_id` on both hooks and falls back to the global marker path —
+    but pin the T2 loop's actual behavior explicitly since it now gates a real decision."""
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Skill",
+          "tool_input": {"skill": "delegate-work-to-subagents", "session_id": "tool-input-copy"},
+          "session_id": "", "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="pre-skill")
+    assert v1["args"]["session_id"] == ""
+
+
 def test_to_v1_event_emits_the_point_for_each_logical_point():
     """`point` must round-trip into the v1 event for every point. orchestrator-stays-thin reads
     `event.get("point")`; if the bridge ever stopped setting it the hook would silently
@@ -464,6 +510,29 @@ def test_pre_skill_writes_the_skills_read_gate_marker_clean_room(tmp_path):
         assert out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", out
     marker = home / ".cache" / "agent-tools" / "skills-invoked" / "delegate-work-to-subagents"
     assert marker.is_file(), "skills-marker-writer did not touch the freshness marker"
+
+
+def test_pre_skill_marker_is_session_scoped_clean_room(tmp_path):
+    """Same end-to-end path as above, but with a CC session id on the event — the real
+    subprocess hook must nest the marker under it (session-scoping), and a forged
+    tool_input.session_id must not override CC's own top-level value."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="skills-marker-writer", point="pre-skill",
+                        cmd=SKILLS_MARKER_WRITER, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Skill",
+        "tool_input": {"skill": "visual-proof-cycle", "session_id": "forged"},
+        "session_id": "sess-real",
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    marker = home / ".cache" / "agent-tools" / "skills-invoked" / "sess-real" / "visual-proof-cycle"
+    assert marker.is_file(), "marker was not written under the real (top-level) session id"
+    forged = home / ".cache" / "agent-tools" / "skills-invoked" / "forged" / "visual-proof-cycle"
+    assert not forged.exists(), "a forged tool_input.session_id must not have been used"
 
 
 def test_unmatched_tool_does_not_run_pre_bash_hook(tmp_path):

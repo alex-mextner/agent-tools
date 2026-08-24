@@ -3,9 +3,10 @@
 
 skills-read-gate (the sibling hook) blocks/warns on work-shaped actions (a commit, a
 build/test run) unless the MANDATORY_SKILLS were invoked recently. It decides "recently
-invoked" by checking mtime freshness on a marker file per skill:
+invoked" by checking mtime freshness on a marker file per skill, nested under the CC
+session id that invoked it:
 
-    ~/.cache/agent-tools/skills-invoked/<skill-name>
+    ~/.cache/agent-tools/skills-invoked/<session-id>/<skill-name>
 
 Before this hook, NOTHING ever touched that directory — the gate's own README documented
 the exact wrapper contract needed and said "wire the wrapper to touch it on every
@@ -24,6 +25,24 @@ invoke, and a legitimate directory-scoped skill name contains a `/` (e.g.
 expected and allowed to nest under the marker dir, but an absolute path, a `..` segment,
 or an oversized/NUL-containing value must never be able to write outside
 SKILLS_INVOKED_DIR — see `_sanitize_skill_name` / `_write_marker`.
+
+Session scoping: the marker is additionally nested under `args.session_id` (CC's own
+session id — lib/cc_hook_bridge/dispatch.py gives it the same T2 precedence as
+`agent_id`, so a value riding in via `tool_input` cannot spoof it) when one is present and
+sane, falling back to the pre-existing global (non-session) path otherwise. Without this,
+`skills-read-gate`'s marker check is a single mtime file shared by every concurrent Claude
+Code session on the machine — session A invoking a mandatory skill silently satisfies
+session B's freshness check even though B never read it. `args.session_id` is treated as
+ONE flat path component (never split on `/`) — see `_sanitize_session_id`.
+
+Session-dir growth (NOT addressed here, deliberately deferred): every CC session mints its
+own `<session-id>/` subdirectory and nothing removes it, so the marker dir grows by one
+subdirectory per session forever. An earlier revision of this hook attempted in-process GC
+here and was reverted — the design space (a per-pass time budget vs. a per-child scan bound
+vs. the retention floor vs. `SKILLS_FRESH_WINDOW_S`, all interacting) turned out to need its
+own focused PR rather than living inside this one; the accumulated findings are captured in
+the follow-up ticket referenced from this PR. An external periodic sweep (cron/launchd)
+outside the hook's own 800ms timeout budget is the leading candidate, not more in-hook GC.
 
 Accepted tradeoff: this fires on PreToolUse — the ATTEMPT to invoke the skill, before CC
 resolves/runs it — because that is the only reliably-shaped signal available (a
@@ -58,6 +77,7 @@ INVOKED_DIR = Path(os.path.expanduser(os.environ.get(
     "SKILLS_INVOKED_DIR", "~/.cache/agent-tools/skills-invoked")))
 
 _MAX_SKILL_LEN = 200
+_MAX_SESSION_ID_LEN = 128
 
 
 def emit(decision: str, message: str | None = None) -> None:
@@ -90,20 +110,37 @@ def _sanitize_skill_name(skill: str) -> list[str] | None:
     return segments
 
 
-def _write_marker(invoked_dir: Path, segments: list[str]) -> bool:
+def _sanitize_session_id(session_id: str) -> str | None:
+    """Return `session_id` if it is safe to use as a SINGLE path segment, else None (the
+    caller falls back to the pre-existing global, non-session-scoped marker location).
+    Unlike a skill name, a session id is never expected to contain `/` — CC generates it,
+    not the model — so any `/`/`\\` in it is treated as a sign the value is not a real
+    session id (or, defensively, an attempt to nest/escape) rather than something to
+    split and nest under."""
+    session_id = session_id.strip()
+    if not session_id or len(session_id) > _MAX_SESSION_ID_LEN or "\x00" in session_id:
+        return None
+    if "/" in session_id or "\\" in session_id or session_id in (".", ".."):
+        return None
+    return session_id
+
+
+def _write_marker(invoked_dir: Path, segments: list[str], session_seg: str | None = None) -> bool:
     """Touch the freshness marker at `segments` (already validated by
-    `_sanitize_skill_name`). Returns False (never raises) on any failure — a permission
+    `_sanitize_skill_name`), nested under `session_seg` when present (already validated by
+    `_sanitize_session_id`). Returns False (never raises) on any failure — a permission
     error, a race, or a resolved path that would escape `invoked_dir` (belt and suspenders
     on top of the caller's sanitization, in case a future caller skips it)."""
-    candidate = invoked_dir.joinpath(*segments)
+    parts = ([session_seg] if session_seg else []) + segments
+    candidate = invoked_dir.joinpath(*parts)
     try:
         resolved_dir = invoked_dir.resolve()
         resolved_candidate = candidate.resolve()
     except OSError as exc:
-        warn(f"could not resolve marker path for {segments!r}: {exc}")
+        warn(f"could not resolve marker path for {parts!r}: {exc}")
         return False
     if resolved_candidate != resolved_dir and resolved_dir not in resolved_candidate.parents:
-        warn(f"refusing to write marker outside {resolved_dir}: {segments!r} -> {resolved_candidate}")
+        warn(f"refusing to write marker outside {resolved_dir}: {parts!r} -> {resolved_candidate}")
         return False
     try:
         candidate.parent.mkdir(parents=True, exist_ok=True)
@@ -148,7 +185,12 @@ def main() -> int:
         emit("allow")
         return 0
 
-    _write_marker(INVOKED_DIR, segments)  # best-effort; failure is logged, never blocks
+    raw_session_id = args.get("session_id")
+    session_seg = (
+        _sanitize_session_id(raw_session_id) if isinstance(raw_session_id, str) else None
+    )
+
+    _write_marker(INVOKED_DIR, segments, session_seg)  # best-effort; never blocks on failure
     emit("allow")
     return 0
 

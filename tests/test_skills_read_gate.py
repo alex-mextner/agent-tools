@@ -41,11 +41,14 @@ _MANDATORY = "delegate-work-to-subagents,visual-proof-cycle"
 
 def _run(command, monkeypatch, *, invoked: Path, tier: Path,
          env: dict | None = None, agent_id: str | None = None,
+         session_id: str | None = None,
          mandatory: str = _MANDATORY) -> tuple[str, str, int]:
     out, err = io.StringIO(), io.StringIO()
     args: dict = {"command": command}
     if agent_id is not None:
         args["agent_id"] = agent_id  # forwarded by the bridge inside a dispatched subagent
+    if session_id is not None:
+        args["session_id"] = session_id  # forwarded by the bridge (T2 precedence)
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"cwd": "/repo", "args": args})))
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
@@ -69,10 +72,11 @@ def _fake_tg_ctl(path: Path, body: str) -> Path:
     return path
 
 
-def _touch_all_skills(invoked: Path) -> None:
-    invoked.mkdir(parents=True, exist_ok=True)
+def _touch_all_skills(invoked: Path, *, session_id: str | None = None) -> None:
+    base = invoked / session_id if session_id else invoked
+    base.mkdir(parents=True, exist_ok=True)
     for skill in _MANDATORY.split(","):
-        (invoked / skill).write_text("x")
+        (base / skill).write_text("x")
 
 
 # ── BLOCK (missing skill, on repeat) ───────────────────────────────────────────────────
@@ -119,6 +123,157 @@ def test_allow_when_all_mandatory_skills_invoked(tmp_path, monkeypatch):
     assert c == 0 and _decision(out) == "allow"
     out2, _e2, c2 = _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier)
     assert c2 == 0 and _decision(out2) == "allow"
+
+
+# ── SESSION SCOPING (no cross-session marker leak) ─────────────────────────────────────
+
+def test_allow_when_markers_invoked_in_this_own_session(tmp_path, monkeypatch):
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _touch_all_skills(invoked, session_id="sess-a")
+    out, _e, c = _run(
+        "git commit -m x", monkeypatch, invoked=invoked, tier=tier, session_id="sess-a",
+    )
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_block_when_markers_invoked_only_in_a_different_session(tmp_path, monkeypatch):
+    """The core regression this change fixes: session B's commit must NOT be satisfied by
+    session A's marker just because both belong to the same user/machine."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _touch_all_skills(invoked, session_id="sess-a")
+    # session B, first offense → WARN (still allow, but the message names it missing)
+    out1, _e1, c1 = _run(
+        "git commit -m x", monkeypatch, invoked=invoked, tier=tier, session_id="sess-b",
+    )
+    assert c1 == 0 and _decision(out1) == "allow"
+    assert "not invoked" in json.loads(out1)["message"]
+    # session B, repeat → BLOCK — session A's marker never counted for it
+    out2, _e2, c2 = _run(
+        "git commit -m x", monkeypatch, invoked=invoked, tier=tier, session_id="sess-b",
+    )
+    assert c2 == srg.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+def test_falls_back_to_global_marker_when_no_session_id_on_event(tmp_path, monkeypatch):
+    """No session_id at all (e.g. a non-CC harness) → the pre-session-scoping global marker
+    path is used, unchanged from before this feature existed."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _touch_all_skills(invoked)  # global path, no session subdir
+    out, _e, c = _run("git commit -m x", monkeypatch, invoked=invoked, tier=tier)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_invalid_session_id_falls_back_to_global_marker(tmp_path, monkeypatch):
+    """A session_id containing `/` is rejected by `_sanitize_session_id` (never split/nested)
+    and the gate falls back to the global marker path, same as if none was sent at all."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _touch_all_skills(invoked)  # global path
+    out, _e, c = _run(
+        "git commit -m x", monkeypatch, invoked=invoked, tier=tier, session_id="a/b",
+    )
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_global_marker_still_satisfies_a_session_scoped_check(tmp_path, monkeypatch):
+    """A harness/workflow with no session-aware marker producer (Codex/opencode today have
+    no pre-skill mapping — see agent-hooks/README.md; or a human's manual `touch` recipe
+    from this hook's own README) can still only ever write the GLOBAL marker path. That
+    must keep satisfying the gate even when the event carries a session id (Codex's own
+    bridge forwards one on pre-bash too) — otherwise session-scoping silently breaks the
+    only workaround those harnesses have."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _touch_all_skills(invoked)  # global path only, no session subdir
+    out, _e, c = _run(
+        "git commit -m x", monkeypatch, invoked=invoked, tier=tier, session_id="codex-sess-1",
+    )
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_global_fallback_is_intentional_even_alongside_a_different_sessions_marker(tmp_path, monkeypatch):
+    """Pins the residual, DELIBERATE tradeoff explicitly (not a bug to silently 'fix' later):
+    session B has invoked nothing itself, session A HAS invoked the mandatory skills (its own
+    session-scoped markers exist), and additionally the GLOBAL marker is fresh (e.g. from a
+    manual touch, or a pre-session-scoping producer). Session B's check still passes, because
+    the global marker is a valid lower-precedence signal independent of what any OTHER
+    session's own scoped markers say. This is the documented tradeoff (see `_missing_skills`'s
+    docstring and this hook's own README, "The marker contract") that keeps a harness/manual
+    workaround with no session-aware producer working — it is not the automatic, silent,
+    per-invocation cross-session leak this whole change exists to close (that leak required NO
+    manual action at all; this requires someone/something to have written the global marker)."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _touch_all_skills(invoked, session_id="sess-a")
+    _touch_all_skills(invoked)  # also fresh at the global path
+    out, _e, c = _run(
+        "git commit -m x", monkeypatch, invoked=invoked, tier=tier, session_id="sess-b",
+    )
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_non_string_session_id_on_read_side_is_ignored_not_crashed_on(tmp_path, monkeypatch):
+    """Mirrors the writer-side non-string session_id test: a model/serialization glitch that
+    puts a non-string value in args.session_id must fall back to the global path, not crash."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _touch_all_skills(invoked)  # global path
+    out, err = io.StringIO(), io.StringIO()
+    monkeypatch.setattr(
+        sys, "stdin",
+        io.StringIO(json.dumps({"cwd": "/repo", "args": {"command": "git commit -m x", "session_id": 12345}})),
+    )
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    monkeypatch.setattr(srg, "INVOKED_DIR", invoked)
+    monkeypatch.setattr(srg, "TIER_DIR", tier)
+    monkeypatch.setenv("MANDATORY_SKILLS", _MANDATORY)
+    monkeypatch.delenv("RIG_HATCH_REQUEST_SKILLS_READ_GATE", raising=False)
+    code = srg.main()
+    assert code == 0, err.getvalue()
+    assert _decision(out.getvalue()) == "allow"
+
+
+def test_tier_escalation_is_session_scoped_not_just_cwd(tmp_path, monkeypatch):
+    """The core tiering-side regression this change closes: session A WARNing in a cwd must
+    NOT push session B's first action in that SAME cwd straight to BLOCK — B gets its own
+    WARN first, exactly like a brand-new cwd would."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    # session A: first offense WARNs, repeat BLOCKs (unaffected by this change)
+    out_a1, _e, c_a1 = _run(
+        "git commit -m x", monkeypatch, invoked=invoked, tier=tier, session_id="sess-a",
+    )
+    assert c_a1 == 0 and _decision(out_a1) == "allow"
+    out_a2, _e, c_a2 = _run(
+        "git commit -m x", monkeypatch, invoked=invoked, tier=tier, session_id="sess-a",
+    )
+    assert c_a2 == srg.BLOCK_EXIT_CODE and _decision(out_a2) == "block"
+
+    # session B, same cwd: must still get its OWN first-offense WARN, not inherit A's BLOCK tier
+    out_b1, _e, c_b1 = _run(
+        "git commit -m x", monkeypatch, invoked=invoked, tier=tier, session_id="sess-b",
+    )
+    assert c_b1 == 0 and _decision(out_b1) == "allow"
+    out_b2, _e, c_b2 = _run(
+        "git commit -m x", monkeypatch, invoked=invoked, tier=tier, session_id="sess-b",
+    )
+    assert c_b2 == srg.BLOCK_EXIT_CODE and _decision(out_b2) == "block"
+
+
+def test_marker_path_helper_nests_under_session_seg():
+    assert srg._marker_path("delegate-work-to-subagents", None) == (
+        srg.INVOKED_DIR / "delegate-work-to-subagents"
+    )
+    assert srg._marker_path("delegate-work-to-subagents", "sess-1") == (
+        srg.INVOKED_DIR / "sess-1" / "delegate-work-to-subagents"
+    )
+
+
+@pytest.mark.parametrize(
+    "bad", ["", "x" * 200, "a/b", "a\\b", ".", "..", "bad\x00id"],
+)
+def test_sanitize_session_id_rejects_unsafe_values(bad):
+    assert srg._sanitize_session_id(bad) is None
+
+
+def test_sanitize_session_id_accepts_a_plausible_session_id():
+    assert srg._sanitize_session_id("  sess-1234-abcd  ") == "sess-1234-abcd"
 
 
 # ── regression: the OLD self-service escape hatch is DEAD (env AND inline sentinel) ───────

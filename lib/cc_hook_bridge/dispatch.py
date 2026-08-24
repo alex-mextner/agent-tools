@@ -54,8 +54,9 @@ _AGENT_TOOLS = frozenset({"Agent", "Task"})
 # CC's Skill tool (invoking a named skill). A PreToolUse on it maps to `pre-skill`, the point
 # a skill-invocation marker writer uses to satisfy skills-read-gate's freshness check (that
 # gate's marker contract — agent-hooks/skills-read-gate/README.md — needs SOMETHING to touch
-# `~/.cache/agent-tools/skills-invoked/<skill-name>` on every real invocation; before this,
-# nothing did, so the gate could never leave its WARN-forever tier). Same rig-cli follow-up
+# `~/.cache/agent-tools/skills-invoked/<session-id>/<skill-name>` (session-scoped, using the
+# same T2-hardened `session_id` this file forwards below) on every real invocation; before
+# this, nothing did, so the gate could never leave its WARN-forever tier). Same rig-cli follow-up
 # note as `_AGENT_TOOLS` above applies: this half only maps the point, rig-cli's
 # `hook_bridge_entries` must register a `Skill` PreToolUse matcher for it to actually fire.
 _SKILL_TOOLS = frozenset({"Skill"})
@@ -86,7 +87,8 @@ def to_v1_event(cc_event: dict, *, point: str) -> dict:
     """Translate a CC hook event into the agents-hooks/v1 event a hook script reads.
 
     ``args`` carries the action payload the v1 hooks look for: ``args.command`` for a bash
-    command, ``args.file_path``/``args.content`` for a write, ``args.session_id`` for stop,
+    command, ``args.file_path``/``args.content`` for a write, ``args.session_id`` (CC's own
+    session id, at every point, not just stop — see the T2 precedence note below),
     ``args.run_in_background``/``args.prompt`` for a pre-agent dispatch, and (when CC fires
     inside a subagent) ``args.agent_id``/``args.agent_type``. We pass the WHOLE ``tool_input``
     through under ``args`` so a hook can read any field, and additionally surface ``command``
@@ -119,9 +121,6 @@ def to_v1_event(cc_event: dict, *, point: str) -> dict:
         if path:
             args.setdefault("file_path", path)
             args.setdefault("path", path)
-    # stop has no tool_input; carry the CC session id so a stop hook can key its marker.
-    if "session_id" not in args and cc_event.get("session_id"):
-        args["session_id"] = cc_event["session_id"]
     # Forward the subagent signal: when CC fires this event INSIDE a dispatched subagent it
     # carries TOP-LEVEL {agent_id, agent_type}. Surfacing them under `args` is what lets a
     # subagent-exempt gate (background-subagent-gate, orchestrator-stays-thin,
@@ -129,12 +128,26 @@ def to_v1_event(cc_event: dict, *, point: str) -> dict:
     # `_is_subagent`. (The Agent/Task tool_input — incl. `run_in_background` — is already in
     # `args` from `dict(tool_input)`.)
     #
-    # PRECEDENCE (T2): CC's TOP-LEVEL agent_id/agent_type are the ONLY authoritative source.
-    # A value sitting in tool_input is attacker/prompt-controllable — a forged
-    # `tool_input.agent_id` must NOT exempt a main-thread dispatch. So: if the signal is present
-    # at the top level, it OVERWRITES whatever was in args; if it is ABSENT at the top level, we
-    # DROP any copy that rode in via tool_input. The exemption can only come from CC itself.
-    for key in ("agent_id", "agent_type"):
+    # `session_id` gets the SAME treatment, for the SAME reason. It used to be forwarded with a
+    # weaker "add only if `args` doesn't already have one" rule (`stop` has no `tool_input`, so
+    # `args` starts empty there and the weak rule was harmless in that one context). That rule is
+    # NOT safe for any point where `args = dict(tool_input)` is non-empty (pre-skill, pre-bash,
+    # ...): a `session_id` key riding in via `tool_input` would win over CC's own value, because
+    # "already present" was true before we ever looked at `cc_event`. That is fine for hooks that
+    # only use `args.session_id` for BOOKKEEPING (model-error-fallback, stop-completion-selfcheck
+    # — both fire on `stop`, where this was never reachable anyway), but a hook that uses
+    # `args.session_id` to SCOPE a gating decision (skills-read-gate keys its freshness marker on
+    # it) must not trust a value the model can set on its own tool call — a spoofed `session_id`
+    # would let one session claim another session's fresh marker on purpose, which is worse than
+    # the cross-session leak it exists to close.
+    #
+    # PRECEDENCE (T2): CC's TOP-LEVEL agent_id/agent_type/session_id are the ONLY authoritative
+    # source. A value sitting in tool_input is attacker/prompt-controllable — a forged
+    # `tool_input.agent_id` (or `.session_id`) must NOT exempt a main-thread dispatch or borrow
+    # another session's identity. So: if the signal is present at the top level, it OVERWRITES
+    # whatever was in args; if it is ABSENT at the top level, we DROP any copy that rode in via
+    # tool_input. The exemption/identity can only come from CC itself.
+    for key in ("agent_id", "agent_type", "session_id"):
         if cc_event.get(key) is not None:
             args[key] = cc_event[key]
         else:
