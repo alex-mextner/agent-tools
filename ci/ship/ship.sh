@@ -493,9 +493,9 @@ MAIN_CHECKOUT="${SHIP_MAIN_CHECKOUT:-$(git worktree list --porcelain | awk '/^wo
 abort_if_core_bare "$MAIN_CHECKOUT" "main checkout"
 
 # --- resolve PR state -----------------------------------------------------------------
-read -r BRANCH STATE MERGEABLE CROSS_REPO MERGE_STATE < <(gh pr view "$PR" \
-  --json headRefName,state,mergeable,isCrossRepository,mergeStateStatus \
-  -q '[.headRefName,.state,.mergeable,.isCrossRepository,.mergeStateStatus]|@tsv')
+read -r BRANCH STATE MERGEABLE CROSS_REPO MERGE_STATE HEAD_SHA < <(gh pr view "$PR" \
+  --json headRefName,state,mergeable,isCrossRepository,mergeStateStatus,headRefOid \
+  -q '[.headRefName,.state,.mergeable,.isCrossRepository,.mergeStateStatus,.headRefOid]|@tsv')
 [ -n "$BRANCH" ] || { echo "Could not resolve PR #$PR" >&2; exit 1; }
 [ "$STATE" = "OPEN" ] || { echo "Refusing: PR #$PR is $STATE, not OPEN." >&2; exit 1; }
 [ "$MERGEABLE" = "CONFLICTING" ] && { echo "Refusing: PR #$PR is CONFLICTING — resolve the conflict first." >&2; exit 1; }
@@ -1129,6 +1129,23 @@ _local_review_threads_check() {
 # Returns 0 if ALL gates pass, 1 if any fail (conservative: block unless everything is clean).
 run_local_ci_gate() {  # $1 (optional) = why this is running, for the banner (default: CI-down wording)
   local why="${1:-CI infrastructure appears down}"
+  # Fail-closed identity check: local-checks.sh runs lint/typecheck/tests against whatever is
+  # ACTUALLY checked out at $ROOT — it has no notion of "PR #$PR" of its own. If $ROOT's HEAD
+  # doesn't match this PR's real head commit (e.g. `gh ship` invoked from a worktree sitting on
+  # unrelated work, a stale/foreign checkout, or a worktree mid-rebase), the local fallback gate
+  # would silently grade the WRONG code — passing (and merging) a PR whose actual diff was never
+  # checked, or failing it over an unrelated pre-existing issue. Skip this only for a genuinely
+  # foreign --repo/GH_SHIP_REPO target (its own separate, correctly-scoped call path already
+  # documents this exception above) — $ROOT there is deliberately a different repo's checkout.
+  if [ "${_FOREIGN_REPO_INVOKE:-0}" != "1" ]; then
+    local _actual_sha; _actual_sha=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo "")
+    if [ -z "$_actual_sha" ] || [ -z "${HEAD_SHA:-}" ] || [ "$_actual_sha" != "$HEAD_SHA" ]; then
+      echo "Refusing: local-checks fallback needs \$ROOT ($ROOT) checked out AT PR #$PR's actual head commit (${HEAD_SHA:-<unknown>}), but it is at ${_actual_sha:-<unknown>}." >&2
+      echo "  Running local checks against the wrong tree would grade the wrong code — never a safe local-fallback substitute for real CI." >&2
+      echo "  Re-run 'gh ship $PR' from a checkout that is actually ON this PR's branch/commit (fetch + reset --hard to the PR head SHA ${HEAD_SHA:-<unknown>} first if needed)." >&2
+      return 1
+    fi
+  fi
   echo "[ship] === Running local CI fallback gates (${why}) ==="
   local gate_failed=0
   _local_test_runner "$ROOT"       || gate_failed=1

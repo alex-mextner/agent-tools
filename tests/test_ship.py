@@ -64,9 +64,14 @@ case "$sub" in
     action="$1"; shift || true
     case "$action" in
       view)
-        # --json headRefName,state,mergeable,isCrossRepository,mergeStateStatus
+        # --json headRefName,state,mergeable,isCrossRepository,mergeStateStatus,headRefOid
         if printf '%s ' "$@" | grep -q headRefName; then
-          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+          # headRefOid: the PR's real head SHA per ship.sh's run_local_ci_gate identity guard.
+          # Default to whatever's ACTUALLY checked out right now (these tests' whole premise is
+          # a correctly-checked-out repo) so the guard passes without every test needing to know
+          # the commit SHA in advance; SHIP_TEST_HEAD_SHA overrides for a deliberate-mismatch test.
+          _head_sha="${SHIP_TEST_HEAD_SHA:-$(git rev-parse HEAD 2>/dev/null || echo "")}"
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\t%s\\n' "${SHIP_TEST_BRANCH}" "${_head_sha}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           # One GREEN check so the CI gate passes on the normal (non-admin) merge path — this is
           # how tests that used to pass a bare --skip-ci (a shortcut to skip CI mocking) now run
@@ -841,7 +846,8 @@ case "$sub" in
     case "$action" in
       view)
         if printf '%s ' "$@" | grep -q headRefName; then
-          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+          _head_sha="${SHIP_TEST_HEAD_SHA:-$(git rev-parse HEAD 2>/dev/null || echo "")}"
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\t%s\\n' "${SHIP_TEST_BRANCH}" "${_head_sha}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           printf '%s\\n' '[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI"}]'
         else
@@ -1766,7 +1772,8 @@ case "$sub" in
     case "$action" in
       view)
         if printf '%s ' "$@" | grep -q headRefName; then
-          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+          _head_sha="${SHIP_TEST_HEAD_SHA:-$(git rev-parse HEAD 2>/dev/null || echo "")}"
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\t%s\\n' "${SHIP_TEST_BRANCH}" "${_head_sha}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           # Two checks, both FAILED — 100% failure rate.
           printf '[{"name":"pytest","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"codeql","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"}]'
@@ -1807,7 +1814,8 @@ case "$sub" in
     case "$action" in
       view)
         if printf '%s ' "$@" | grep -q headRefName; then
-          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+          _head_sha="${SHIP_TEST_HEAD_SHA:-$(git rev-parse HEAD 2>/dev/null || echo "")}"
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\t%s\\n' "${SHIP_TEST_BRANCH}" "${_head_sha}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           printf '[{"name":"pytest","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"lint","conclusion":"SUCCESS","status":"COMPLETED","state":"SUCCESS"}]'
         else
@@ -1858,7 +1866,8 @@ case "$sub" in
         if printf '%s ' "$@" | grep -q baseRefName; then
           printf '%s' "${SHIP_TEST_BASE:-main}"
         elif printf '%s ' "$@" | grep -q headRefName; then
-          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+          _head_sha="${SHIP_TEST_HEAD_SHA:-$(git rev-parse HEAD 2>/dev/null || echo "")}"
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\t%s\\n' "${SHIP_TEST_BRANCH}" "${_head_sha}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           printf '[]'
         elif printf '%s ' "$@" | grep -q reviewThreads; then
@@ -2071,7 +2080,8 @@ case "$sub" in
         if printf '%s ' "$@" | grep -q baseRefName; then
           printf '%s' "${SHIP_TEST_BASE:-main}"
         elif printf '%s ' "$@" | grep -q headRefName; then
-          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+          _head_sha="${SHIP_TEST_HEAD_SHA:-$(git rev-parse HEAD 2>/dev/null || echo "")}"
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\t%s\\n' "${SHIP_TEST_BRANCH}" "${_head_sha}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           echo "gh: API error (simulated)" >&2; exit 7
         elif printf '%s ' "$@" | grep -q reviewThreads; then
@@ -2142,7 +2152,8 @@ case "$sub" in
     case "$action" in
       view)
         if printf '%s ' "$@" | grep -q headRefName; then
-          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+          _head_sha="${SHIP_TEST_HEAD_SHA:-$(git rev-parse HEAD 2>/dev/null || echo "")}"
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\t%s\\n' "${SHIP_TEST_BRANCH}" "${_head_sha}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           printf '[{"name":"pytest","conclusion":"SUCCESS","status":"COMPLETED","state":"SUCCESS"}]'
         elif printf '%s ' "$@" | grep -q reviewThreads; then
@@ -4221,7 +4232,8 @@ case "$sub" in
           # treat empty-and-unset the same, which the unreadable-base test needs to tell apart.
           printf '%s' "${SHIP_TEST_BASE-main}"
         elif printf '%s ' "$@" | grep -q headRefName; then
-          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+          _head_sha="${SHIP_TEST_HEAD_SHA:-$(git rev-parse HEAD 2>/dev/null || echo "")}"
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\t%s\\n' "${SHIP_TEST_BRANCH}" "${_head_sha}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           printf '[{"name":"pytest","workflowName":"ci","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"lint","workflowName":"ci","conclusion":"SUCCESS","status":"COMPLETED","state":"SUCCESS"}]'
         elif printf '%s ' "$@" | grep -q reviewThreads; then
@@ -4395,7 +4407,8 @@ case "$sub" in
         if printf '%s ' "$@" | grep -q baseRefName; then
           printf '%s' "${SHIP_TEST_BASE:-main}"
         elif printf '%s ' "$@" | grep -q headRefName; then
-          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+          _head_sha="${SHIP_TEST_HEAD_SHA:-$(git rev-parse HEAD 2>/dev/null || echo "")}"
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\t%s\\n' "${SHIP_TEST_BRANCH}" "${_head_sha}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           printf '[{"name":"pytest","workflowName":"ci","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"codeql","workflowName":"ci","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"lint","workflowName":"ci","conclusion":"SUCCESS","status":"COMPLETED","state":"SUCCESS"}]'
         elif printf '%s ' "$@" | grep -q reviewThreads; then
@@ -4504,7 +4517,8 @@ case "$sub" in
     case "$action" in
       view)
         if printf '%s ' "$@" | grep -q headRefName; then
-          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+          _head_sha="${SHIP_TEST_HEAD_SHA:-$(git rev-parse HEAD 2>/dev/null || echo "")}"
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\t%s\\n' "${SHIP_TEST_BRANCH}" "${_head_sha}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           printf '%s' "${SHIP_TEST_ROLLUP}"
         elif printf '%s ' "$@" | grep -q body; then
@@ -4565,7 +4579,8 @@ case "$sub" in
     case "$action" in
       view)
         if printf '%s ' "$@" | grep -q headRefName; then
-          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+          _head_sha="${SHIP_TEST_HEAD_SHA:-$(git rev-parse HEAD 2>/dev/null || echo "")}"
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\t%s\\n' "${SHIP_TEST_BRANCH}" "${_head_sha}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           n=0; [ -f "${SHIP_TEST_COUNTER}" ] && n=$(cat "${SHIP_TEST_COUNTER}")
           n=$((n+1)); printf '%s' "$n" > "${SHIP_TEST_COUNTER}"
@@ -5258,7 +5273,7 @@ case "$sub" in
     case "$action" in
       view)
         case "$*" in
-          *headRefName*) printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}" ;;
+          *headRefName*) printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\t%s\\n' "${SHIP_TEST_BRANCH}" "$(git rev-parse HEAD 2>/dev/null || echo "")" ;;
           *"--json body"*) printf '%s' "${SHIP_TEST_PR_BODY:-}" ;;
           *statusCheckRollup*) printf '%s\\n' '[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI"}]' ;;
           *) echo '[]' ;;
@@ -6852,7 +6867,8 @@ case "$sub" in
     case "$action" in
       view)
         if printf '%s ' "$@" | grep -q headRefName; then
-          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+          _head_sha="${SHIP_TEST_HEAD_SHA:-$(git rev-parse HEAD 2>/dev/null || echo "")}"
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\t%s\\n' "${SHIP_TEST_BRANCH}" "${_head_sha}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           # One GREEN check so the normal (non-admin) CI gate passes — --skip-ci is now hatch-gated.
           printf '%s\\n' '[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI"}]'
@@ -6971,7 +6987,8 @@ case "$sub" in
     case "$action" in
       view)
         if printf '%s ' "$@" | grep -q headRefName; then
-          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+          _head_sha="${SHIP_TEST_HEAD_SHA:-$(git rev-parse HEAD 2>/dev/null || echo "")}"
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\t%s\\n' "${SHIP_TEST_BRANCH}" "${_head_sha}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           printf '[{"name":"pytest","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"codeql","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"}]'
         elif printf '%s ' "$@" | grep -q reviewThreads; then
