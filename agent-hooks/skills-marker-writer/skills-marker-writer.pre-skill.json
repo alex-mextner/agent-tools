@@ -1,0 +1,9 @@
+{
+  "id": "skills-marker-writer",
+  "point": "pre-skill",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/skills-marker-writer/skills_marker_writer.py",
+  "priority": 50,
+  "timeout_ms": 800,
+  "on_error": "open",
+  "description": "On every Skill-tool invocation, touches ~/.cache/agent-tools/skills-invoked/<skill-name> (mtime = invocation time) — the freshness marker skills-read-gate's pre-bash check reads. This is the wrapper skills-read-gate's own README calls for; without it that gate's marker directory is never written and the gate can never leave its WARN-forever tier. Sanitizes the skill name against path traversal (rejects '..'/absolute/oversized/NUL values; a legitimate directory-scoped skill name containing '/' is allowed to nest). Never blocks: on_error=open and every code path emits allow, because a marker-write hiccup must not stop a skill from being invoked."
+}

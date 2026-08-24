@@ -16,12 +16,12 @@ A skill-invocation wrapper **touches one file per invoked skill** in a marker di
 ```
 
 A skill counts as invoked if its marker is **fresh** (within `SKILLS_FRESH_WINDOW_S`,
-default `7200`s). Wire the wrapper to touch it on every Skill-tool invocation:
-
-```bash
-mkdir -p "${SKILLS_INVOKED_DIR:-$HOME/.cache/agent-tools/skills-invoked}"
-touch "${SKILLS_INVOKED_DIR:-$HOME/.cache/agent-tools/skills-invoked}/<skill-name>"
-```
+default `7200`s). The wrapper is `skills-marker-writer` (sibling hook, `pre-skill` point):
+it fires on every Skill-tool invocation and touches the marker for the invoked skill — see
+`agent-hooks/skills-marker-writer/README.md`. In Claude Code this is live once rig registers
+a `Skill` PreToolUse matcher for the bridge (`riglib` `hook_bridge_entries`); Codex/opencode
+are not mapped yet (same gap the `pre-agent` point had before it was wired — see
+`agent-hooks/README.md`'s `pre-skill` section for the current per-harness status).
 
 This is the honest, satisfiable action: invoking the skill writes its marker, which is what
 the gate checks — it is real wiring, not a forge.

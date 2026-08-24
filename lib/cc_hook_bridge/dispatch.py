@@ -51,6 +51,14 @@ _WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 # PreToolUse matcher carrying `cc_hook_bridge PreToolUse`. That is a separate repo; this
 # bridge half (the point mapping + agent_id forwarding) lives here.
 _AGENT_TOOLS = frozenset({"Agent", "Task"})
+# CC's Skill tool (invoking a named skill). A PreToolUse on it maps to `pre-skill`, the point
+# a skill-invocation marker writer uses to satisfy skills-read-gate's freshness check (that
+# gate's marker contract — agent-hooks/skills-read-gate/README.md — needs SOMETHING to touch
+# `~/.cache/agent-tools/skills-invoked/<skill-name>` on every real invocation; before this,
+# nothing did, so the gate could never leave its WARN-forever tier). Same rig-cli follow-up
+# note as `_AGENT_TOOLS` above applies: this half only maps the point, rig-cli's
+# `hook_bridge_entries` must register a `Skill` PreToolUse matcher for it to actually fire.
+_SKILL_TOOLS = frozenset({"Skill"})
 
 
 def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
@@ -64,6 +72,8 @@ def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
             return "pre-write"
         if tool_name in _AGENT_TOOLS:
             return "pre-agent"
+        if tool_name in _SKILL_TOOLS:
+            return "pre-skill"
     if hook_event_name == "PostToolUse" and tool_name in _WRITE_TOOLS:
         # The write already landed on disk → the REACTIVE point (format-on-write,
         # lint-on-write). A post-write hook's exit-10 is FEEDBACK to the model, not

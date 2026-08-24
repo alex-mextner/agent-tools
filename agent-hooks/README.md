@@ -92,10 +92,10 @@ These are the *logical* points; map them to your harness's actual tool-use event
 
 > **Claude Code:** CC does NOT run these descriptors directly — it only runs hooks declared
 > in `settings.json`. The `lib/cc_hook_bridge` dispatcher is the carrier that makes them
-> fire: rig wires it into `settings.json` (PreToolUse for `pre-bash`/`pre-write`, PostToolUse
-> for `post-write`, Stop for `stop`) and translates the exit-10 BLOCK into CC's
-> `permissionDecision: "deny"` / `decision: "block"`. Without that bridge these hooks
-> are inert in CC (agent-tools#18).
+> fire: rig wires it into `settings.json` (PreToolUse for `pre-bash`/`pre-write`/`pre-agent`/
+> `pre-skill`, PostToolUse for `post-write`, Stop for `stop`) and translates the exit-10
+> BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`. Without that bridge
+> these hooks are inert in CC (agent-tools#18).
 
 > **Codex:** Codex also needs a carrier bridge. `lib/codex_hook_bridge` is the first
 > dispatcher for the confirmed Codex hooks contract: TOML hooks call it for `PreToolUse`
@@ -120,6 +120,7 @@ These are the *logical* points; map them to your harness's actual tool-use event
 | `pre-agent` **(live in Claude Code and opencode when rig provisions their bridges; NOT mapped in Codex yet)** | before a subagent dispatch (Agent/Task/opencode task tool) | background-subagent-gate                 |
 | `pre-bash`     | before a shell command runs                  | block-no-verify, block-raw-pr-merge, block-reset-hard, pkill-guard, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash, orchestrator-stays-thin, no-long-inline-process, subagent-no-bg-longproc, no-shell-file-edit, skills-read-gate, visual-proof-gate, decision-request-format |
 | `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env, orchestrator-stays-thin, worktree-only-writes |
+| `pre-skill` **(live in Claude Code when rig provisions the bridge; NOT mapped in Codex/opencode yet)** | before a Skill-tool invocation | skills-marker-writer |
 | `post-write`   | after a file write/edit has landed on disk   | format-on-write, lint-on-write          |
 | `stop`         | when the agent is about to end its turn      | stop-completion-selfcheck               |
 
@@ -133,6 +134,15 @@ subagent) into `args`, so a subagent-exempt gate can tell the orchestrator's dis
 from a worker's. opencode maps its `task` tool to the same logical point, but does not expose
 a trusted subagent identity in the plugin payload, so forged `agent_id` / `agent_type` values
 inside tool args are stripped.
+
+### `pre-skill` — record a skill invocation
+
+`pre-skill` fires before a Skill-tool call runs (CC's `PreToolUse` on the `Skill` tool). It
+exists for exactly one consumer today: `skills-marker-writer`, which touches
+`~/.cache/agent-tools/skills-invoked/<skill-name>` so `skills-read-gate`'s freshness check
+(on `pre-bash`) has something real to read. A `pre-skill` hook should never block — the point
+is a recording tap, not a gate — so hooks here should be `on_error: open` and always emit
+`allow`.
 
 ### `post-write` — react to a *completed* write
 

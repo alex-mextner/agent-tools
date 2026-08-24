@@ -49,6 +49,10 @@ BACKGROUND_SUBAGENT_GATE = (
 # back as PostToolUse feedback.
 FORMAT_ON_WRITE = _REPO / "agent-hooks" / "format-on-write" / "format_on_write.py"
 LINT_ON_WRITE = _REPO / "agent-hooks" / "lint-on-write" / "lint_on_write.py"
+# The pre-skill guard: skills-marker-writer (touches the skills-read-gate freshness marker).
+SKILLS_MARKER_WRITER = (
+    _REPO / "agent-hooks" / "skills-marker-writer" / "skills_marker_writer.py"
+)
 
 
 def _install_descriptor(hooks_dir: Path, *, hook_id: str, point: str, cmd: Path,
@@ -95,6 +99,8 @@ def test_point_for_event_maps_tool_to_logical_point():
     # the subagent-dispatch tools map to the new pre-agent point (CC calls them Agent/Task)
     assert dispatch.point_for_event("PreToolUse", "Agent") == "pre-agent"
     assert dispatch.point_for_event("PreToolUse", "Task") == "pre-agent"
+    # invoking a skill maps to pre-skill (the skills-invoked marker-writer point)
+    assert dispatch.point_for_event("PreToolUse", "Skill") == "pre-skill"
     assert dispatch.point_for_event("Stop", None) == "stop"
     # a COMPLETED write maps to the reactive post-write point (format-on-write, lint-on-write)
     assert dispatch.point_for_event("PostToolUse", "Write") == "post-write"
@@ -433,6 +439,31 @@ def test_forged_tool_input_agent_id_does_not_exempt_clean_room(tmp_path):
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout)
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
+
+
+def test_pre_skill_writes_the_skills_read_gate_marker_clean_room(tmp_path):
+    """End-to-end: a `Skill` PreToolUse event, driven through the REAL bridge subprocess +
+    the REAL skills-marker-writer script (not called in-process), touches the marker
+    skills-read-gate's freshness check reads — proving the whole caller-to-callee path:
+    CC event -> bridge to_v1_event() -> descriptor loading -> subprocess hook ->
+    $HOME/.cache/agent-tools/skills-invoked/<skill>."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="skills-marker-writer", point="pre-skill",
+                        cmd=SKILLS_MARKER_WRITER, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Skill",
+        "tool_input": {"skill": "delegate-work-to-subagents"},
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    if proc.stdout.strip():
+        out = json.loads(proc.stdout)
+        assert out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", out
+    marker = home / ".cache" / "agent-tools" / "skills-invoked" / "delegate-work-to-subagents"
+    assert marker.is_file(), "skills-marker-writer did not touch the freshness marker"
 
 
 def test_unmatched_tool_does_not_run_pre_bash_hook(tmp_path):
