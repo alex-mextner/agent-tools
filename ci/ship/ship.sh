@@ -13,10 +13,15 @@
 #   • The local branch has unpushed/diverged commits, or its worktree is dirty.
 #   • The review-quorum bar (Guard-B of the self-merge-authority program) is not met: the
 #     PR's task code has fewer than SHIP_REVIEW_QUORUM_MIN_ITER PASSED review-cli iterations
-#     across SHIP_REVIEW_QUORUM_MIN_MODELS distinct models among those passed iterations (a
-#     failed/degraded review does not count toward the bar). There is NO self-service override —
-#     a one-time bypass goes through a live Telegram approval to Alex (see the hatch escalation
-#     below), never a reason flag.
+#     covering SHIP_REVIEW_QUORUM_MIN_ROLES distinct board roles (architect/correctness/
+#     security/...) among those passed iterations (a failed/degraded review does not count
+#     toward the bar). ROLE coverage, not raw model-name diversity, is the default counting
+#     mode (matches review-cli's own default since review-cli#246) — this is deliberate: a
+#     single exhausted/rate-limited model must never wedge the gate when other roles were
+#     genuinely covered by other models. Set SHIP_REVIEW_QUORUM_MIN_MODELS to opt back into
+#     (or additionally require, AND'd) the stricter distinct-model-name count. There is NO
+#     self-service override for the bar itself — a one-time bypass goes through a live
+#     Telegram approval to Alex (see the hatch escalation below), never a reason flag.
 #
 # After a successful merge, IF a `task` (task-cli) binary is on PATH and a ticket code can be
 # derived from the branch/PR title/PR body, ship calls `task mark-shipped <code> --pr <url>
@@ -136,7 +141,17 @@
 #   SHIP_REVIEW_QUORUM_MIN_ITER    quorum floor: PASSED review-cli iterations (default 3). CLAMPED
 #                          to a hard minimum of 3 — raise-only, an unset/0/negative/below-3 value
 #                          resolves to 3 (fail-closed #242).
-#   SHIP_REVIEW_QUORUM_MIN_MODELS  quorum floor: distinct models (default 3). Same >=3 clamp.
+#   SHIP_REVIEW_QUORUM_MIN_ROLES   quorum floor: distinct board ROLES covered by the passed
+#                          iterations (default 3). Same >=3 clamp. This is the DEFAULT gate mode
+#                          — role coverage survives a single model running out of quota, since a
+#                          role reused via a different model (or a duplicated-model role-fill,
+#                          review-cli#207) still counts. Unset unless you have a reason to change it.
+#   SHIP_REVIEW_QUORUM_MIN_MODELS  optional ADDITIONAL quorum floor: distinct model-name strings.
+#                          Unset by default (role coverage governs alone). When set, it is AND'd
+#                          with the role floor — both must pass (review-cli#246 semantics) — so
+#                          only set this if you specifically need distinct-model-name diversity,
+#                          not just role coverage; it reintroduces the single-model-exhaustion
+#                          wedge this gate's default mode exists to avoid.
 #   RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM  one-time bypass request for the review-quorum gate:
 #                          set it to a written justification to ask Alex live on Telegram (via
 #                          the shared agenttools_hatch_escalation lib); the gate proceeds ONLY on
@@ -2046,14 +2061,18 @@ _review_quorum_clamp_floor() {
 # Append one audit line to the review-quorum audit log. Best-effort: a logging failure must
 # never block or unblock the ship, so failures here are swallowed (`|| true`).
 # $1=decision(authorized|bypass:approved|bypass:denied|refused) $2=task_code $3=iterations
-# $4=models $5=reason(optional — the hatch verdict for bypass:* decisions)
+# $4=models(distinct model-name count — unchanged meaning, kept for audit-log backward compat)
+# $5=reason(optional — the hatch verdict for bypass:* decisions)
+# $6=roles(optional — distinct board-role count; the count that actually gates by default since
+#          review-cli#246/ship's role-mode fix. Added as a NEW field, never overloaded onto $4,
+#          so existing consumers of the "models" field keep its original meaning.)
 _review_quorum_audit_log() {
-  local decision="$1" code="$2" iterations="${3:-0}" models="${4:-0}" reason="${5:-}"
+  local decision="$1" code="$2" iterations="${3:-0}" models="${4:-0}" reason="${5:-}" roles="${6:-}"
   # Honor the --dry-run contract ("print what would happen; change nothing"): a simulated ship
   # must not create or pollute the real audit record. The gate above still evaluates and prints
   # its authorized/refused verdict — only the persistent write is suppressed here.
   if [ "$DRY_RUN" = "1" ]; then
-    echo "[dry-run] would append review-quorum audit: decision=${decision} task=${code} iter=${iterations} models=${models}" >&2
+    echo "[dry-run] would append review-quorum audit: decision=${decision} task=${code} iter=${iterations} models=${models}${roles:+ roles=${roles}}" >&2
     return 0
   fi
   local file="${SHIP_AUDIT_FILE:-$HOME/.config/agent-tools/ship-audit.jsonl}"
@@ -2062,9 +2081,10 @@ _review_quorum_audit_log() {
   if command -v jq >/dev/null 2>&1; then
     jq -nc --arg ts "$ts" --arg pr "$PR" --arg code "$code" --argjson it "$iterations" \
       --argjson m "$models" --arg dec "$decision" \
-      --arg reason "$reason" \
+      --arg reason "$reason" --arg roles "$roles" \
       '{ts:$ts, pr:$pr, task_code:$code, iterations:$it, models:$m, decision:$dec} +
-       (if $reason == "" then {} else {override_reason:$reason} end)' \
+       (if $reason == "" then {} else {override_reason:$reason} end) +
+       (if $roles == "" then {} else {roles: ($roles|tonumber)} end)' \
       >> "$file" 2>/dev/null || true
   else
     # jq-less fallback so the audit line is never DROPPED just because jq is absent (jq-missing is
@@ -2073,17 +2093,19 @@ _review_quorum_audit_log() {
     # each made JSON-safe: newlines/CR/tab -> space and other control chars stripped (so none can
     # inject a forged extra JSONL line), then backslash + double-quote escaped. `pr` is escaped too
     # — it is a bare CLI arg, so a quote/control char in it must not corrupt the line (the jq path
-    # is already safe via --arg). iterations/models are validated integers; decision is internal.
-    local esc_pr esc_code esc_reason
+    # is already safe via --arg). iterations/models/roles are validated integers; decision internal.
+    local esc_pr esc_code esc_reason roles_frag
     esc_pr=$(printf '%s' "$PR" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
     esc_code=$(printf '%s' "$code" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
     esc_reason=$(printf '%s' "$reason" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    roles_frag=""
+    case "$roles" in ''|*[!0-9]*) : ;; *) roles_frag=",\"roles\":${roles}" ;; esac
     { if [ -n "$reason" ]; then
-        printf '{"ts":"%s","pr":"%s","task_code":"%s","iterations":%s,"models":%s,"decision":"%s","override_reason":"%s"}\n' \
-          "$ts" "$esc_pr" "$esc_code" "${iterations:-0}" "${models:-0}" "$decision" "$esc_reason"
+        printf '{"ts":"%s","pr":"%s","task_code":"%s","iterations":%s,"models":%s,"decision":"%s","override_reason":"%s"%s}\n' \
+          "$ts" "$esc_pr" "$esc_code" "${iterations:-0}" "${models:-0}" "$decision" "$esc_reason" "$roles_frag"
       else
-        printf '{"ts":"%s","pr":"%s","task_code":"%s","iterations":%s,"models":%s,"decision":"%s"}\n' \
-          "$ts" "$esc_pr" "$esc_code" "${iterations:-0}" "${models:-0}" "$decision"
+        printf '{"ts":"%s","pr":"%s","task_code":"%s","iterations":%s,"models":%s,"decision":"%s"%s}\n' \
+          "$ts" "$esc_pr" "$esc_code" "${iterations:-0}" "${models:-0}" "$decision" "$roles_frag"
       fi; } >> "$file" 2>/dev/null || true
   fi
 }
@@ -2132,7 +2154,7 @@ _review_quorum_refuse_or_hatch() {  # $1 = refusal summary
       echo "    RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM=\"<justification>\""
       echo "  which asks Alex live on Telegram and proceeds ONLY on his real-time approval."
       echo "  SHIP_REVIEW_QUORUM=0 disables the gate entirely (ops off-switch)."; } >&2
-    _review_quorum_audit_log refused "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" ""
+    _review_quorum_audit_log refused "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "" "${QROLES_N:-}"
     exit 1
   fi
   # The helper prints a verdict SENTINEL on stdout ("APPROVED <reason>" / "DENIED <reason>") and
@@ -2159,8 +2181,8 @@ _review_quorum_refuse_or_hatch() {  # $1 = refusal summary
   # import-fail, unexpected verdict), the helper did NOT audit, so record the fail-closed
   # bypass:denied here. Never double-write.
   case "$hverdict" in
-    DENIED) [ "$DRY_RUN" = "1" ] && _review_quorum_audit_log "bypass:denied" "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "$hreason" ;;
-    *) _review_quorum_audit_log "bypass:denied" "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "$hreason" ;;
+    DENIED) [ "$DRY_RUN" = "1" ] && _review_quorum_audit_log "bypass:denied" "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "$hreason" "${QROLES_N:-}" ;;
+    *) _review_quorum_audit_log "bypass:denied" "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "$hreason" "${QROLES_N:-}" ;;
   esac
   exit 1
 }
@@ -2261,16 +2283,27 @@ case "${SHIP_REVIEW_QUORUM:-1}" in 0|false|no) QUORUM_ENABLED=0 ;; esac
 if [ "$QUORUM_ENABLED" = "0" ]; then
   echo "[ship] review-quorum gate disabled (SHIP_REVIEW_QUORUM_ENABLED/SHIP_REVIEW_QUORUM=0)."
 else
-  # Hard fail-closed floor: the self-merge bar is >=3 passed iterations across >=3 distinct
-  # models. The floor must NEVER silently resolve to 0 in this subprocess — a 0 floor makes an
-  # empty quorum trivially "pass" (0 >= 0) and defeats the whole gate (#242). So clamp every
-  # unset / non-numeric / <3 value UP to the hard minimum 3; only an explicit, well-formed value
-  # of 3-or-more is honored as-is (an operator may RAISE the bar, never lower it below 3).
+  # Hard fail-closed floor: the self-merge bar is >=3 passed iterations covering >=3 distinct
+  # board ROLES (the default counting mode — matches review-cli's own default since
+  # review-cli#246: a role filled by a duplicated-model pass, or by a DIFFERENT model than an
+  # earlier pass used, still counts, so one exhausted/rate-limited model can never wedge this
+  # gate on its own). The floor must NEVER silently resolve to 0 in this subprocess — a 0 floor
+  # makes an empty quorum trivially "pass" (0 >= 0) and defeats the whole gate (#242). So clamp
+  # every unset / non-numeric / <3 value UP to the hard minimum 3; only an explicit, well-formed
+  # value of 3-or-more is honored as-is (an operator may RAISE a bar, never lower it below 3).
   MIN_ITER=$(_review_quorum_clamp_floor "${SHIP_REVIEW_QUORUM_MIN_ITER:-}" "min-iter")
-  MIN_MODELS=$(_review_quorum_clamp_floor "${SHIP_REVIEW_QUORUM_MIN_MODELS:-}" "min-models")
+  MIN_ROLES=$(_review_quorum_clamp_floor "${SHIP_REVIEW_QUORUM_MIN_ROLES:-}" "min-roles")
+  # --min-models is OPT-IN (unset by default): when an operator explicitly sets
+  # SHIP_REVIEW_QUORUM_MIN_MODELS, it is AND'd on top of the role floor (review-cli#246
+  # semantics — both must pass), reinstating the stricter pre-#246 distinct-model-name count.
+  # Leaving it unset (the default) means role coverage alone governs the gate.
+  MIN_MODELS_EXPLICIT=0
+  [ -n "${SHIP_REVIEW_QUORUM_MIN_MODELS:-}" ] && MIN_MODELS_EXPLICIT=1
+  MIN_MODELS=""
+  [ "$MIN_MODELS_EXPLICIT" = "1" ] && MIN_MODELS=$(_review_quorum_clamp_floor "${SHIP_REVIEW_QUORUM_MIN_MODELS:-}" "min-models")
   # Safe defaults so an early refusal (before the review query) still has these for the audit
   # line and the hatch context.
-  QITER=0; QMODELS_N=0; QMODELS=""; QERR=""; QPASSED=false
+  QITER=0; QROLES_N=0; QROLES=""; QMODELS_N=0; QMODELS=""; QERR=""; QPASSED=false
 
   TASK_CODE="${REVIEW_TASK_CODE:-}"
   [ -n "$TASK_CODE" ] || TASK_CODE=$(_review_quorum_extract_ticket "$BRANCH")
@@ -2289,45 +2322,71 @@ else
     # Prefer --check (the review-cli rename target); fall back to --quorum-check when running
     # against a review-cli build that hasn't picked up the rename yet. In --json mode review-cli
     # always prints JSON to stdout (pass or fail) — only an unsupported-flag argparse error
-    # leaves stdout empty, which is the fallback trigger.
-    QUORUM_JSON=$(review task "$TASK_CODE" --check --min-iter "$MIN_ITER" --min-models "$MIN_MODELS" --json 2>/dev/null) || true
+    # leaves stdout empty, which is the fallback trigger. --min-roles is ALWAYS passed (the
+    # default gate); --min-models is only added when the operator explicitly opted in above —
+    # passing it unconditionally (the pre-fix behavior) silently reproduced the OLD
+    # distinct-model-name-only gate on every ship, even though review-cli itself defaults to
+    # role-based counting since #246, defeating the whole point of role accounting.
+    REVIEW_QARGS=(task "$TASK_CODE" --check --min-iter "$MIN_ITER" --min-roles "$MIN_ROLES")
+    [ "$MIN_MODELS_EXPLICIT" = "1" ] && REVIEW_QARGS+=(--min-models "$MIN_MODELS")
+    QUORUM_JSON=$(review "${REVIEW_QARGS[@]}" --json 2>/dev/null) || true
     if [ -z "$QUORUM_JSON" ]; then
-      QUORUM_JSON=$(review task "$TASK_CODE" --quorum-check --min-iter "$MIN_ITER" --min-models "$MIN_MODELS" --json 2>/dev/null) || true
+      REVIEW_QARGS[2]="--quorum-check"
+      QUORUM_JSON=$(review "${REVIEW_QARGS[@]}" --json 2>/dev/null) || true
     fi
 
     if [ -z "$QUORUM_JSON" ]; then
       _review_quorum_refuse_or_hatch "could not query review-cli (store unreadable / task ${TASK_CODE} unknown)"
     else
-      # review-cli's quorum_check emits `passed_iterations` / `distinct_models_passed` — the
-      # COUNT of PASSED iterations and the distinct models among them. An earlier revision read
-      # `.iterations` / `.distinct_models`, keys review-cli NEVER emits, so both parsed to 0 (the
-      # "0 iterations across 0 models" in the #242 incident log). Read ONLY the real keys — do NOT
-      # fall back to the never-emitted legacy names: a payload carrying only `.iterations` /
-      # `.distinct_models` is not review-cli's output (old build or hostile `review` on PATH), so
-      # it reads as 0/0 and fails closed below, never authorizes via a laxer key.
+      # review-cli's quorum_check emits `passed_iterations` / `distinct_roles_passed` (when
+      # --min-roles is passed, which it always is now) / `distinct_models_passed` (always
+      # present regardless of mode). An earlier revision read `.iterations` / `.distinct_models`,
+      # keys review-cli NEVER emits, so both parsed to 0 (the "0 iterations across 0 models" in
+      # the #242 incident log). Read ONLY the real keys — do NOT fall back to never-emitted
+      # legacy names: a payload missing them is not review-cli's real output (old build or
+      # hostile `review` on PATH), so it reads as 0 and fails closed below, never authorizes via
+      # a laxer key.
       QPASSED=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed // false' 2>/dev/null || echo false)
       QITER=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed_iterations // 0' 2>/dev/null || echo 0)
+      QROLES_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_roles_passed // 0' 2>/dev/null || echo 0)
+      QROLES=$(printf '%s' "$QUORUM_JSON" | jq -r '(.roles // []) | join(", ")' 2>/dev/null || echo "")
       QMODELS_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_models_passed // 0' 2>/dev/null || echo 0)
       QMODELS=$(printf '%s' "$QUORUM_JSON" | jq -r '(.models // []) | join(", ")' 2>/dev/null || echo "")
       QERR=$(printf '%s' "$QUORUM_JSON" | jq -r '.error // empty' 2>/dev/null || echo "")
       # Non-numeric / missing counts collapse to 0 so the arithmetic gate below fails closed
       # (jq can hand back "null" as text if a key holds JSON null).
       case "$QITER" in ''|*[!0-9]*) QITER=0 ;; esac
+      case "$QROLES_N" in ''|*[!0-9]*) QROLES_N=0 ;; esac
       case "$QMODELS_N" in ''|*[!0-9]*) QMODELS_N=0 ;; esac
 
       # FAIL-CLOSED authorization (#242): NEVER authorize on the subprocess's `.passed` boolean
-      # alone. ship re-derives the verdict from the numbers it read and its own hard floor, so a
-      # review-cli that returns `passed:true` with a hollow 0/0 record (an older build without the
-      # min>=1 guard, a task-code miss, or an attacker-controlled `review` on PATH) is refused.
-      # Authorize ONLY when EVERY condition holds: the subprocess agreed (passed==true), there is
-      # NO error key, and BOTH counts are strictly positive AND meet the >=3 floor independently.
+      # alone. ship re-derives the verdict from the numbers it read and its own hard floor(s), so
+      # a review-cli that returns `passed:true` with a hollow 0/0 record (an older build without
+      # the min>=1 guard, a task-code miss, or an attacker-controlled `review` on PATH) is
+      # refused. Authorize ONLY when EVERY condition holds: the subprocess agreed (passed==true),
+      # there is NO error key, the iteration floor is met, the ROLE floor is met (always
+      # required), and — only when the operator explicitly opted in — the MODEL floor is ALSO
+      # met (AND'd, review-cli#246 semantics; never lets one floor silently outvote the other).
+      MODELS_OK=1
+      if [ "$MIN_MODELS_EXPLICIT" = "1" ]; then
+        if [ "$QMODELS_N" -gt 0 ] && [ "$QMODELS_N" -ge "$MIN_MODELS" ]; then
+          MODELS_OK=1
+        else
+          MODELS_OK=0
+        fi
+      fi
       if [ "$QPASSED" = "true" ] && [ -z "$QERR" ] \
-         && [ "$QITER" -gt 0 ] && [ "$QMODELS_N" -gt 0 ] \
-         && [ "$QITER" -ge "$MIN_ITER" ] && [ "$QMODELS_N" -ge "$MIN_MODELS" ]; then
-        echo "[ship] AUTHORITY CONFIRMED — review quorum met: ${QITER} iterations across ${QMODELS_N} models for ${TASK_CODE}. Self-merge authorized by the review-quorum gate."
-        _review_quorum_audit_log authorized "$TASK_CODE" "$QITER" "$QMODELS_N" ""
+         && [ "$QITER" -gt 0 ] && [ "$QITER" -ge "$MIN_ITER" ] \
+         && [ "$QROLES_N" -gt 0 ] && [ "$QROLES_N" -ge "$MIN_ROLES" ] \
+         && [ "$MODELS_OK" = "1" ]; then
+        MODELS_NOTE=""
+        [ "$MIN_MODELS_EXPLICIT" = "1" ] && MODELS_NOTE=" (also ${QMODELS_N}/${MIN_MODELS} distinct models, explicitly required)"
+        echo "[ship] AUTHORITY CONFIRMED — review quorum met: ${QITER} iterations covering ${QROLES_N} distinct roles for ${TASK_CODE}${MODELS_NOTE}. Self-merge authorized by the review-quorum gate."
+        _review_quorum_audit_log authorized "$TASK_CODE" "$QITER" "$QMODELS_N" "" "$QROLES_N"
       else
-        _review_quorum_refuse_or_hatch "bar NOT met for ${TASK_CODE} — ${QITER}/${MIN_ITER} iterations, ${QMODELS_N}/${MIN_MODELS} distinct models${QMODELS:+ (models seen: ${QMODELS})}${QERR:+ (${QERR})}"
+        MODELS_MSG=""
+        [ "$MIN_MODELS_EXPLICIT" = "1" ] && MODELS_MSG=", ${QMODELS_N}/${MIN_MODELS} distinct models (explicitly required)"
+        _review_quorum_refuse_or_hatch "bar NOT met for ${TASK_CODE} — ${QITER}/${MIN_ITER} iterations, ${QROLES_N}/${MIN_ROLES} distinct roles${QROLES:+ (roles seen: ${QROLES})}${MODELS_MSG}${QMODELS:+ (models seen: ${QMODELS})}${QERR:+ (${QERR})}"
       fi
     fi
   fi

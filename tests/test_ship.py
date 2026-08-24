@@ -5279,8 +5279,14 @@ esac
 """
 
 # A fake `review` CLI answering `review task <code> [--check|--quorum-check] --min-iter N
-# --min-models M --json`. Behavior is driven entirely by env vars so each test controls it:
+# [--min-roles R] [--min-models M] --json`. Behavior is driven entirely by env vars so each test
+# controls it:
 #   SHIP_TEST_REVIEW_ITER / SHIP_TEST_REVIEW_MODELS   iteration/model counts to report (default 3/3)
+#   SHIP_TEST_REVIEW_ROLES              distinct-role count to report. Defaults to
+#                                       SHIP_TEST_REVIEW_MODELS (role coverage tracks model
+#                                       coverage 1:1 unless a test deliberately wants them to
+#                                       diverge — e.g. proving role-mode survives a short model
+#                                       count when roles are still fully covered).
 #   SHIP_TEST_REVIEW_SUPPORTS_CHECK=0   reject --check with an argparse-style error (exit 2,
 #                                       empty stdout) so ship.sh must fall back to --quorum-check
 #   SHIP_TEST_REVIEW_BROKEN=1           fail BOTH --check and --quorum-check (simulates an
@@ -5291,13 +5297,17 @@ esac
 #                                       computing it from the counts — lets a test forge a hollow
 #                                       `passed:true` with 0/0 counts (an older/hostile review-cli)
 #                                       to prove ship's independent arithmetic gate fails closed (#242).
-#   SHIP_TEST_REVIEW_MIN_ITER_ECHO      if set, emit THIS as the JSON `min_iter`/`min_models` echo
-#                                       instead of the flag values, so a test can inspect the floor
-#                                       ship actually passed to review-cli.
+#   SHIP_TEST_REVIEW_MIN_ITER_ECHO      if set, emit THIS as the JSON `min_iter`/`min_roles`/
+#                                       `min_models` echo instead of the flag values, so a test
+#                                       can inspect the floor ship actually passed to review-cli.
 #
-# The JSON keys match review-cli's real output: `passed_iterations` / `distinct_models_passed`
-# (NOT `iterations` / `distinct_models`, which review-cli never emitted — that key mismatch was
-# half of the #242 hole; a fake using the wrong keys would validate a fiction).
+# The JSON keys match review-cli's real output: `passed_iterations` / `distinct_models_passed` /
+# `distinct_roles_passed` (NOT `iterations` / `distinct_models`, which review-cli never emitted —
+# that key mismatch was half of the #242 hole; a fake using the wrong keys would validate a
+# fiction). `passed` requires the iteration floor AND the role floor (ship.sh always requests
+# --min-roles, review-cli#246's default gate) AND, only when --min-models was ALSO passed
+# (ship.sh's opt-in explicit-model-floor mode), the model floor too — mirroring review-cli's own
+# AND semantics when both floors are explicitly given.
 _FAKE_REVIEW = """\
 #!/usr/bin/env bash
 sub="${1:-}"; shift || true
@@ -5306,12 +5316,15 @@ code="${1:-}"; shift || true
 flag=""
 minit=3
 minmodels=3
+minroles=3
+models_given=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) flag="check" ;;
     --quorum-check) flag="quorum-check" ;;
     --min-iter) shift; minit="$1" ;;
-    --min-models) shift; minmodels="$1" ;;
+    --min-models) shift; minmodels="$1"; models_given=1 ;;
+    --min-roles) shift; minroles="$1" ;;
   esac
   shift || true
 done
@@ -5326,22 +5339,29 @@ if [ "${SHIP_TEST_REVIEW_BROKEN:-0}" = "1" ]; then
 fi
 iterations="${SHIP_TEST_REVIEW_ITER:-3}"
 models_n="${SHIP_TEST_REVIEW_MODELS:-3}"
+roles_n="${SHIP_TEST_REVIEW_ROLES:-$models_n}"
 if [ -n "${SHIP_TEST_REVIEW_FORCE_PASSED:-}" ]; then
   passed="${SHIP_TEST_REVIEW_FORCE_PASSED}"
 else
   passed="false"
-  if [ "$iterations" -ge "$minit" ] && [ "$models_n" -ge "$minmodels" ]; then passed="true"; fi
+  ok=1
+  [ "$iterations" -ge "$minit" ] || ok=0
+  [ "$roles_n" -ge "$minroles" ] || ok=0
+  if [ "$models_given" = "1" ]; then
+    [ "$models_n" -ge "$minmodels" ] || ok=0
+  fi
+  [ "$ok" = "1" ] && passed="true"
 fi
 echo_min="${SHIP_TEST_REVIEW_MIN_ITER_ECHO:-}"
-[ -n "$echo_min" ] && { minit="$echo_min"; minmodels="$echo_min"; }
+[ -n "$echo_min" ] && { minit="$echo_min"; minmodels="$echo_min"; minroles="$echo_min"; }
 if [ "${SHIP_TEST_REVIEW_LEGACY_KEYS:-0}" = "1" ]; then
   # Emit ONLY the never-emitted legacy key names (`iterations` / `distinct_models`) to prove ship
   # reads the REAL keys and treats a legacy-only payload as 0/0 -> fail-closed refuse (#242).
   printf '{"task_code":"%s","iterations":%s,"distinct_models":%s,"models":["claude","codex","gemini"],"min_iter":%s,"min_models":%s,"passed":%s}\\n' \\
     "$code" "$iterations" "$models_n" "$minit" "$minmodels" "$passed"
 else
-  printf '{"task_code":"%s","passed_iterations":%s,"total_iterations":%s,"distinct_models_passed":%s,"models":["claude","codex","gemini"],"min_iter":%s,"min_models":%s,"passed":%s}\\n' \\
-    "$code" "$iterations" "$iterations" "$models_n" "$minit" "$minmodels" "$passed"
+  printf '{"task_code":"%s","passed_iterations":%s,"total_iterations":%s,"distinct_models_passed":%s,"models":["claude","codex","gemini"],"distinct_roles_passed":%s,"roles":["architect","correctness","security"],"min_iter":%s,"min_models":%s,"min_roles":%s,"passed":%s}\\n' \\
+    "$code" "$iterations" "$iterations" "$models_n" "$roles_n" "$minit" "$minmodels" "$minroles" "$passed"
 fi
 """
 
@@ -5480,6 +5500,56 @@ def test_review_quorum_passes_and_authorizes_when_bar_met(tmp_path):
     assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
     assert "HYP-101" in r.stdout, r.stdout
     assert "merged #1" in r.stdout, r.stdout
+
+
+def test_review_quorum_role_mode_authorizes_despite_model_shortage(tmp_path):
+    """Alex's correction (2026-08): accounting is per-ROLE by default now (review-cli#246), so a
+    SINGLE exhausted/rate-limited model must never wedge the gate on its own when the required
+    roles were still genuinely covered (by other models, or a duplicated-model role-fill,
+    review-cli#207). 3 passed iterations covering 3 distinct roles, but only 1 distinct model
+    name, with NO SHIP_REVIEW_QUORUM_MIN_MODELS override -> still AUTHORIZES."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-999",
+            "SHIP_TEST_REVIEW_ITER": "3",
+            "SHIP_TEST_REVIEW_MODELS": "1",
+            "SHIP_TEST_REVIEW_ROLES": "3",
+        },
+    )
+    assert r.returncode == 0, f"role coverage alone should authorize despite a model shortage\n{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
+    assert "3 distinct roles" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_review_quorum_explicit_min_models_still_enforced_and_anded(tmp_path):
+    """An operator who explicitly sets SHIP_REVIEW_QUORUM_MIN_MODELS opts BACK IN to the
+    stricter distinct-model-name floor, AND'd on top of the (always-on) role floor
+    (review-cli#246 semantics: an explicit floor can never be silently outvoted by the other
+    one). Same 3-iterations/3-roles/1-model record as the test above, but with
+    SHIP_REVIEW_QUORUM_MIN_MODELS=3 set explicitly -> now REFUSES on the model shortage."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-999",
+            "SHIP_REVIEW_QUORUM_MIN_MODELS": "3",
+            "SHIP_TEST_REVIEW_ITER": "3",
+            "SHIP_TEST_REVIEW_MODELS": "1",
+            "SHIP_TEST_REVIEW_ROLES": "3",
+        },
+    )
+    assert r.returncode != 0, f"an explicit min-models floor must still be enforced\n{r.stdout}\n{r.stderr}"
+    assert "bar NOT met" in r.stderr, r.stderr
+    assert "1/3 distinct models" in r.stderr, r.stderr
+    assert "AUTHORITY CONFIRMED" not in r.stdout, r.stdout
+    assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
 
 
 def test_review_quorum_calls_check_flag_by_default(tmp_path):
@@ -5843,8 +5913,9 @@ def test_review_quorum_reads_real_passed_iteration_keys(tmp_path):
     )
     assert r.returncode == 0, f"a real 4×3 record should authorize\n{r.stdout}\n{r.stderr}"
     assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
-    # The confirmed line must show the REAL counts (4 iterations across 3 models), not 0/0.
-    assert "4 iterations across 3 models" in r.stdout, r.stdout
+    # The confirmed line must show the REAL counts (4 iterations, 3 roles — role coverage is
+    # the default gate mode since the review-cli#246 role-based fix), not 0/0.
+    assert "4 iterations covering 3 distinct roles" in r.stdout, r.stdout
     assert "merged #1" in r.stdout, r.stdout
 
 
