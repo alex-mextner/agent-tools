@@ -1,0 +1,9 @@
+{
+  "id": "block-rg-pre",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/block-rg-pre/block_rg_pre.py",
+  "priority": 10,
+  "timeout_ms": 960000,
+  "on_error": "closed",
+  "description": "Blocks a real `rg --pre <COMMAND>` / `--pre=<COMMAND>` flag on a ripgrep invocation, argv-parsed (shlex), not glob/substring-matched — `--pre` runs COMMAND as an arbitrary preprocessor on every matched file, turning the read-only search tool every agent is pre-allowed to run into an unrestricted local code-execution vector. Closes two gaps the coarse per-harness glob deny rules (rig-cli riglib/permissions.py) cannot express: it honors `--` end-of-options (`rg -- --pre .` is a literal, harmless search and is allowed) and distinguishes `--pre` used as a flag from `--pre` appearing as the VALUE of a different flag (`rg -e --pre .` searches for the literal text \"--pre\" via `-e`/`--regexp` and is allowed). `--pre-glob=<GLOB>` alone is a separate, non-dangerous flag (no effect without `--pre`) and is never gated. Deny-by-default: no self-service bypass; RIG_HATCH_REQUEST_BLOCK_RG_PRE with a written justification asks Telegram via the shared hatch-escalation helper, auto-recorded in overrides.log (G-8). on_error=closed: if the check itself fails, deny rather than let a `--pre` arbitrary-command-execution vector through."
+}
