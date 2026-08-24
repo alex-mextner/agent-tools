@@ -69,6 +69,7 @@ cp ci/ship/ship.sh ~/bin/ship && chmod +x ~/bin/ship    # or wherever your PATH 
 ship 123                                                # merge PR #123 when green
 ship 123 --dry-run                                      # show what it would do
 ship 123 --screenshot ./after.png "new dialog"          # attach + post visual proof
+ship 123 --repo owner/repo                              # ship a PR in a DIFFERENT repo (no cd)
 ```
 
 Wire it as a `gh` alias if you like:
@@ -123,6 +124,12 @@ Nothing org-/tracker-/layout-specific is hard-coded. Configure via env:
 
 ## Flags
 
+- `--repo <owner/repo>` (or `-R`, `--repo=<owner/repo>`, `-R=<owner/repo>`, `-R<owner/repo>`) —
+  ship a PR that lives in a **different repo** than the current checkout: pins every `gh` call
+  (view/checks/merge) to `owner/repo` via `GH_REPO`. This is the way to ship cross-repo — **never**
+  `cd <repo> && gh ship <N>` (that's chaining two commands); instead run, unchained, from anywhere:
+  `gh ship <N> --repo <owner/repo>`. When the target isn't this checkout's own origin, remote-branch
+  deletion after merge is skipped so the wrong remote is never touched.
 - `--skip-ci` — admin-merge bypassing the green-CI gate (+ branch protection); the other
   preflights still run. **Deny-by-default**: it proceeds ONLY on a one-time live Telegram approval
   requested via `RIG_HATCH_REQUEST_SHIP_SKIP_CI="<justification>"` (same shared hatch lib as the

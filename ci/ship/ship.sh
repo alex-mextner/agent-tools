@@ -35,6 +35,11 @@
 #   ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run]
 #           [--no-screenshot-ok <reason>] [--resolve-addressed-threads]
 #           [--screenshot <path> [desc]]...
+#   ship.sh -h | --help             print usage and exit
+#
+# For a PR in a DIFFERENT repo than the current checkout:
+#   gh ship <PR-number> --repo <owner/repo>
+# Never chain it (no `cd <repo> && gh ship ...`) — pass --repo instead; it works from any cwd.
 #
 # Flags:
 #   --repo <owner/repo>    ship a PR that lives in a DIFFERENT repo than the current checkout:
@@ -211,7 +216,9 @@ KF_AUDIT_PENDING=""
 # current thread is never touched (see the gate below).
 RESOLVE_THREADS=0
 case "${SHIP_RESOLVE_ADDRESSED_THREADS:-}" in 1|true|yes) RESOLVE_THREADS=1 ;; esac
-USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--resolve-addressed-threads] [--screenshot <path> [desc]]... [--known-flake <check-name>]...'
+USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--resolve-addressed-threads] [--screenshot <path> [desc]]... [--known-flake <check-name>]...
+For a PR in a DIFFERENT repo than the current checkout: gh ship <PR-number> --repo <owner/repo>
+Never chain it (no `cd <repo> && gh ship ...`) — pass --repo instead; it works from any cwd.'
 
 # Path to the review-quorum gate's hatch-escalation helper (ci/ship/review_quorum_hatch.py),
 # derived ONLY from this script's own location. That helper imports the shared
@@ -235,6 +242,7 @@ args=("$@"); i=0; n=${#args[@]}
 while [ "$i" -lt "$n" ]; do
   a=${args[$i]}
   case "$a" in
+    -h|--help) echo "$USAGE"; exit 0 ;;
     --skip-ci) SKIP_CI=1 ;;
     --dry-run) DRY_RUN=1 ;;
     --resolve-addressed-threads) RESOLVE_THREADS=1 ;;
