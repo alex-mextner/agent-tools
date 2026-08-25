@@ -5540,6 +5540,10 @@ def _run_ship_quorum(main, gh_bindir, review_bindir, *, branch="feat", extra_arg
     # into an "explicit model floor" one. Tests that want it explicit set it via env_extra AFTER
     # this pop.
     env.pop("SHIP_REVIEW_QUORUM_MIN_MODELS", None)
+    # Same hygiene for the role-floor: an operator/CI environment with a raised
+    # SHIP_REVIEW_QUORUM_MIN_ROLES would otherwise leak in and silently change what
+    # a "default 3-role floor" test actually asserts (codex review, PR #416).
+    env.pop("SHIP_REVIEW_QUORUM_MIN_ROLES", None)
     if env_extra:
         env.update(env_extra)
     return _sh(
