@@ -200,12 +200,17 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   ALL-CAPS/hyphenated code (`SME-ROADMAP-WORKTREE-NOTE`-shaped, 3+ segments, no digits) — all
   tried against the branch name or PR
   body) has ≥ `SHIP_REVIEW_QUORUM_MIN_ITER` PASSED review-cli iterations across ≥
-  `SHIP_REVIEW_QUORUM_MIN_MODELS` distinct models (`review task <code> --check`). Both floors are
-  **clamped to a hard minimum of 3** — the env knobs can only RAISE the bar, never lower it (a
-  `0`/negative/below-3 value resolves to 3). This is the gate that makes self-merge *strictly
-  controlled*; it **fails closed** (a missing task code / `review` CLI / unreadable store, OR a
-  quorum reading 0 iterations / 0 distinct models, all refuse — ship re-derives the verdict from
-  the counts, never trusts the subprocess's `passed` boolean alone, #242). There is **NO self-service override flag** — a one-time bypass
+  `SHIP_REVIEW_QUORUM_MIN_ROLES` distinct BOARD ROLES (`review task <code> --check`) — this is
+  the DEFAULT check and is always enforced, matching review-cli's own role-based coverage
+  (review-cli#246). `SHIP_REVIEW_QUORUM_MIN_MODELS` is an OPT-IN extra: unset by default (no
+  model floor), and if an operator sets it, both the role floor AND the model floor apply
+  together. Both floors, when in force, are **clamped to a hard minimum of 3** — the env knobs
+  can only RAISE the bar, never lower it (a `0`/negative/below-3 value resolves to 3). This is
+  the gate that makes self-merge *strictly controlled*; it **fails closed** (a missing task
+  code / `review` CLI / unreadable store, OR a quorum reading 0 iterations / 0 distinct roles,
+  all refuse — ship re-derives the verdict from the counts, never trusts the subprocess's
+  `passed` boolean alone, #242). An installed `review-cli` too old to report roles gets an
+  explicit "upgrade review-cli" refusal instead of a generic error. There is **NO self-service override flag** — a one-time bypass
   is requested via `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>"`, which asks Alex live
   on Telegram (shared `agenttools_hatch_escalation` lib) and proceeds ONLY on his real-time
   approval. Disable the whole gate with `SHIP_REVIEW_QUORUM=0`. Every non-dry-run gated ship is
