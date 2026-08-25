@@ -18,6 +18,40 @@ standalone third-party CLI ([vercel-labs/agent-browser](https://github.com/verce
 installed separately — `npm i -g agent-browser && agent-browser install` (or
 `cargo install agent-browser && agent-browser install`).
 
+> **Read `agent-browser-concurrency` too, before running any command below.**
+> You can't tell whether another agent or a human is also using
+> `agent-browser` on this machine, so plain `agent-browser open` (the shared
+> `default` session) risks colliding with them — including another agent
+> reading a different page at the same time. Run this at the start of
+> **every** command for this read (identical whether it's your first call or
+> a later one — it reuses the session it already created, or creates one if
+> this is the first call). Replace `<your-task-label>` in both places with
+> something that distinguishes this read from a sibling task's, in case one
+> happens to run alongside it in the same worktree:
+>
+> ```bash
+> f="$(git rev-parse --absolute-git-dir 2>/dev/null || echo "${TMPDIR:-/tmp}")/agent-browser-session.<your-task-label>"
+> [ -s "$f" ] || echo "<your-task-label>-$(date +%s)-$RANDOM-$$" > "$f"
+> export AGENT_BROWSER_SESSION="$(cat "$f")"
+> ```
+>
+> Every plain `agent-browser` command below then uses it automatically — no
+> per-command flag needed, including in the examples that follow, exactly as
+> written. **Close when you're done reading** with the same snippet first
+> (never a bare `agent-browser close` on its own — in a fresh call with
+> nothing exported yet, that hits the shared `default` session instead), then
+> remove the state file:
+>
+> ```bash
+> f="$(git rev-parse --absolute-git-dir 2>/dev/null || echo "${TMPDIR:-/tmp}")/agent-browser-session.<your-task-label>"
+> [ -s "$f" ] || echo "<your-task-label>-$(date +%s)-$RANDOM-$$" > "$f"
+> export AGENT_BROWSER_SESSION="$(cat "$f")"
+> agent-browser close && rm -f "$f"
+> ```
+>
+> See `agent-browser-concurrency` for the full contract (why a file instead
+> of remembering a value, older CLI versions, retrying after a crash).
+
 ## Rule
 
 - **Reading a web page / docs / API reference → reach for `agent-browser`,** not
@@ -94,6 +128,12 @@ installed separately — `npm i -g agent-browser && agent-browser install` (or
 
 - **A fetch-and-summarize tool is still fine** for a short, static page or a raw
   JSON/text endpoint where truncation and JS-rendering aren't a concern.
+
+- **Close the session when your read is done**, using the full close snippet
+  near the top of this skill (setup lines included, not just the bare
+  `close`). Skipping this leaves a Chrome process tree running — see
+  `agent-browser-concurrency` Rule 2 for how long it lingers before an idle
+  timeout reclaims it.
 
 ## Learn it properly before using it
 
