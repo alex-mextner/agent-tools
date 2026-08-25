@@ -2,10 +2,6 @@
 .cache/
 *.done
 
-# Local git worktrees used by parallel agents; never committed.
-# Remove with `git worktree remove`, not by deleting source files.
-.worktrees/
-
 # OS / editor noise
 .DS_Store
 *.swp
@@ -24,3 +20,7 @@ dist/
 # Visual proof screenshots / PDFs from agent work — local artifacts, not committed.
 *.png
 *.pdf
+
+# JS/TS package installs (e.g. pi-extensions/*/node_modules) — never committed.
+node_modules/
+.test-repos/

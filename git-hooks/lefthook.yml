@@ -1,34 +1,62 @@
 # lefthook.yml — example git-hook config for the lefthook runner.
 #
 # Pick the block matching your stack (bun/node, python-uv, or go) and delete the others,
-# or merge them — lefthook only runs commands whose tools exist. `lefthook install` wires
-# these into the repo's git hooks; the config is committed, so every clone gets the same
-# gates. See README.md.
-#
-# These mirror the standalone hooks in this directory. Run fast/scoped checks on
-# pre-commit and the full suite on pre-push (see the pre-commit-gate skill).
+# or merge them. For JS/TS the standard toolchain is Oxc: Oxlint + Oxfmt.
 
 pre-commit:
   parallel: true
   commands:
-    # ---- global git-hook dispatcher (runs secret-scan + every future global hook) ---
-    # This ONE command wires the repo into ~/.config/git/global-hooks.d/ so any hook
-    # dropped there runs here too, with no further per-repo edits. The run: value MUST
-    # be a single-quoted YAML scalar. See global-dispatcher/README.md and the
-    # global-git-hooks skill. The dispatcher's `10-secret-scan` supersedes the standalone
-    # `no-secrets` command below — keep that one commented to avoid running gitleaks twice
-    # (the dispatcher's DEDUP / `.githooks-skip` is the documented way to reconcile both).
     global-git-hooks-dispatcher:
       run: '"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" pre-commit'
-    # ---- bun / node ----------------------------------------------------------------
-    lint:
-      glob: "*.{ts,tsx,js,jsx}"
-      run: node_modules/.bin/biome check --no-errors-on-unmatched {staged_files}
-      fail_text: "lint failed — fix before committing (no --no-verify)"
+
+    # ---- JavaScript / TypeScript: Oxc ---------------------------------------------
+    # Direct Lefthook installs distinguish "not adopted" from "adopted but unavailable":
+    # only the former skips. If ANY tracked package.json declares the tool, failure to execute it
+    # blocks the commit so a stale install / PnP / workspace layout can never silently bypass a gate.
+    oxlint:
+      glob: "*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"
+      run: >-
+        if ! command -v node >/dev/null 2>&1; then
+          echo "Node.js is required to evaluate the JS/TS Oxlint gate" >&2; exit 127;
+        elif node -e 'const fs=require("fs"),cp=require("child_process");const tool=process.argv[1];const files=cp.execFileSync("git",["ls-files","*package.json"],{encoding:"utf8"}).trim().split(/\r?\n/).filter(Boolean);for(const f of files){try{const p=JSON.parse(fs.readFileSync(f,"utf8"));for(const k of ["dependencies","devDependencies","peerDependencies","optionalDependencies"]){if(p[k]&&Object.prototype.hasOwnProperty.call(p[k],tool))process.exit(0)}}catch{}}process.exit(1)' oxlint; then
+          if [ -x node_modules/.bin/oxlint ]; then node_modules/.bin/oxlint --type-aware {staged_files};
+          elif [ -f pnpm-lock.yaml ] && command -v pnpm >/dev/null 2>&1; then pnpm exec oxlint --type-aware {staged_files};
+          elif [ -f yarn.lock ] && command -v yarn >/dev/null 2>&1; then yarn oxlint --type-aware {staged_files};
+          elif command -v npx >/dev/null 2>&1; then npx --no-install oxlint --type-aware {staged_files};
+          else echo "Oxlint is declared in this repository but cannot be executed; install dependencies or configure the workspace invocation" >&2; exit 127; fi;
+        else
+          echo "Oxlint is not declared in tracked package manifests — Oxc lint gate not applicable";
+        fi
+      fail_text: "Oxlint / anti-slop policy failed"
+    oxfmt:
+      glob: "*.{ts,tsx,js,jsx,mts,cts,mjs,cjs,json,jsonc}"
+      run: >-
+        if ! command -v node >/dev/null 2>&1; then
+          echo "Node.js is required to evaluate the JS/TS Oxfmt gate" >&2; exit 127;
+        elif node -e 'const fs=require("fs"),cp=require("child_process");const tool=process.argv[1];const files=cp.execFileSync("git",["ls-files","*package.json"],{encoding:"utf8"}).trim().split(/\r?\n/).filter(Boolean);for(const f of files){try{const p=JSON.parse(fs.readFileSync(f,"utf8"));for(const k of ["dependencies","devDependencies","peerDependencies","optionalDependencies"]){if(p[k]&&Object.prototype.hasOwnProperty.call(p[k],tool))process.exit(0)}}catch{}}process.exit(1)' oxfmt; then
+          if [ -x node_modules/.bin/oxfmt ]; then node_modules/.bin/oxfmt --check {staged_files};
+          elif [ -f pnpm-lock.yaml ] && command -v pnpm >/dev/null 2>&1; then pnpm exec oxfmt --check {staged_files};
+          elif [ -f yarn.lock ] && command -v yarn >/dev/null 2>&1; then yarn oxfmt --check {staged_files};
+          elif command -v npx >/dev/null 2>&1; then npx --no-install oxfmt --check {staged_files};
+          else echo "Oxfmt is declared in this repository but cannot be executed; install dependencies or configure the workspace invocation" >&2; exit 127; fi;
+        else
+          echo "Oxfmt is not declared in tracked package manifests — Oxc format gate not applicable";
+        fi
+      fail_text: "Oxfmt check failed"
+
     typecheck:
-      glob: "*.{ts,tsx}"
+      glob: "*.{ts,tsx,mts,cts}"
       run: node_modules/.bin/tsc --noEmit
       fail_text: "typecheck failed"
+
+    # The old regex `as any` / `as unknown as` / @ts-ignore gate is intentionally gone.
+    # AST + type-aware policy is stronger:
+    #   anti-slop/*
+    #   typescript/no-unsafe-type-assertion
+    #   typescript/no-unnecessary-type-assertion
+    #   typescript/no-non-null-assertion
+    #   typescript/ban-ts-comment
+
     # ---- python (uv) ---------------------------------------------------------------
     # ruff:
     #   glob: "*.py"
@@ -36,6 +64,7 @@ pre-commit:
     # mypy:
     #   glob: "*.py"
     #   run: uv run mypy .
+
     # ---- go ------------------------------------------------------------------------
     # gofmt:
     #   glob: "*.go"
@@ -43,29 +72,6 @@ pre-commit:
     # golangci:
     #   glob: "*.go"
     #   run: golangci-lint run ./...
-    # ---- universal: no type escape hatches (see no-type-escape-hatches skill) -------
-    no-type-escape-hatches:
-      glob: "*.{ts,tsx}"
-      # Flag unjustified casts/ignores in staged TS. A justified @ts-expect-error with
-      # an explanatory comment on the SAME line is allowed; bare ones are not.
-      run: |
-        if grep -nE '\bas any\b|\bas unknown as\b' {staged_files}; then
-          echo "no-type-escape-hatches: remove 'as any' / 'as unknown as' (see the skill)"; exit 1
-        fi
-        if grep -nE '@ts-ignore' {staged_files}; then
-          echo "no-type-escape-hatches: use @ts-expect-error with a justification, not @ts-ignore"; exit 1
-        fi
-      fail_text: "type escape hatch found"
-    # ---- universal: secret scan -----------------------------------------------------
-    # The dispatcher's `10-secret-scan` already covers this when the dispatcher line
-    # above is present, so a separate local secret scan is redundant — keeping BOTH runs
-    # gitleaks TWICE. Leave it commented if you use the dispatcher. If you DO want a
-    # local one (e.g. a repo not wired to the dispatcher), uncomment it AND add a tracked
-    # `.githooks-skip` with a `secret-scan` line so the dispatcher skips its global copy
-    # (run-global-hooks DEDUP — install-local-hooks.sh writes that file automatically).
-    # no-secrets:
-    #   run: ./git-hooks/no-secrets-scan
-    #   fail_text: "secret detected in staged changes"
 
 commit-msg:
   commands:
@@ -81,6 +87,5 @@ pre-push:
     global-git-hooks-dispatcher:
       run: '"${XDG_CONFIG_HOME:-$HOME/.config}/git/run-global-hooks" pre-push'
     test:
-      # bun/node — swap for `uv run pytest` or `go test ./...` per stack.
       run: npm test
       fail_text: "tests failed — not pushing red"

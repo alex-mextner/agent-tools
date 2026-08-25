@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -337,6 +338,7 @@ _AGENT_HOOKS_DIR = Path(__file__).resolve().parents[1] / "agent-hooks"
         _AGENT_HOOKS_DIR / "block-reset-hard" / "block-reset-hard.pre-bash.json",
         _AGENT_HOOKS_DIR / "pin-primary-worktree" / "pin-primary-worktree.pre-bash.json",
         _AGENT_HOOKS_DIR / "block-raw-pr-merge" / "block-raw-pr-merge.pre-bash.json",
+        _AGENT_HOOKS_DIR / "pkill-guard" / "pkill-guard.pre-bash.json",
         _AGENT_HOOKS_DIR / "require-review-before-commit"
         / "require-review-before-commit.pre-bash.json",
         _AGENT_HOOKS_DIR / "decision-request-format" / "decision-request-format.pre-bash.json",
@@ -892,3 +894,320 @@ def test_home_rig_lookup_does_not_walk_up_to_parent(tmp_path, monkeypatch):
     assert result.approved is False
     assert not evil_marker.exists()  # the parent-dir override was NEVER honored
     assert "not available" in result.reason
+
+
+# ── Escape-hatch audit sink (overrides.log, G-8 / retrospective 5.2.3 item 3) ────────────────
+
+
+def _read_overrides_log(log_path: Path) -> list[dict]:
+    return [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+
+
+def test_unset_env_never_touches_overrides_log(tmp_path):
+    """An env var that was never set is not a hatch USE — nothing should be logged, and neither
+    the tier-3 `resolve_home()` default NOR the ACTUAL sink this test would write to (tier 2, the
+    `AGENT_TOOLS_OVERRIDES_LOG` path the repo-wide conftest fixture exports for every test) may be
+    created. Asserting only the tier-3 path would miss a regression that moved the audit-log call
+    ahead of the `raw is None` early-return — that stray write would land in the tier-2 path, which
+    wins precedence, leaving the tier-3 assertion trivially (and misleadingly) green."""
+    repo = _repo_with_tg_ctl(tmp_path)
+    default_log = tmp_path / "_clean_home" / ".config" / "agent-tools" / "overrides.log"
+    actual_sink = Path(os.environ["AGENT_TOOLS_OVERRIDES_LOG"])  # the tier that would really fire
+
+    result = request_hatch_approval(
+        "block-reset-hard",
+        {"command": "git clean -fd"},
+        cwd=str(repo),
+        env={},
+        tg_ctl_candidates=[tmp_path / "missing" / "tg-ctl"],
+    )
+
+    assert result.env_present is False
+    assert not default_log.exists()
+    assert not actual_sink.exists()
+
+
+def test_approved_hatch_use_is_logged_with_expected_fields(tmp_path):
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", 'printf "approved by Alex\\n"\nexit 0\n')
+    repo = _repo_with_tg_ctl(tmp_path)
+    log_path = tmp_path / "overrides.log"
+    env_var = hatch_env_var("visual-proof-gate")
+
+    result = request_hatch_approval(
+        "visual-proof-gate",
+        {"session_id": "sess-42", "command": "git commit -m x"},
+        cwd=str(repo),
+        env={env_var: "Deleting a dead component, nothing to render."},
+        command="git commit -m x",
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=2,
+        overrides_log_path=log_path,
+    )
+
+    assert result.approved is True
+    entries = _read_overrides_log(log_path)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["hatch"] == "visual-proof-gate"
+    assert entry["env_var"] == env_var
+    assert entry["session"] == "sess-42"
+    assert entry["command"] == "git commit -m x"
+    assert entry["reason"] == "Deleting a dead component, nothing to render."
+    assert entry["decision"] == "approved"
+    assert entry["cwd"] == str(repo)
+    assert entry["ts"].endswith("Z")
+
+
+def test_logged_command_falls_back_to_context_when_kwarg_omitted(tmp_path):
+    """A caller that threads the command only through `context` (not the `command=` kwarg)
+    must not ship a blank audit `command` field — most real hook call sites pass both
+    redundantly, but the fallback covers any that only pass one."""
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", "exit 1\n")
+    repo = _repo_with_tg_ctl(tmp_path)
+    log_path = tmp_path / "overrides.log"
+    env_var = hatch_env_var("block-reset-hard")
+
+    request_hatch_approval(
+        "block-reset-hard",
+        {"command": "git reset --hard"},
+        cwd=str(repo),
+        env={env_var: "Recovering from a bad merge."},
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=2,
+        overrides_log_path=log_path,
+    )
+
+    entries = _read_overrides_log(log_path)
+    assert len(entries) == 1
+    assert entries[0]["command"] == "git reset --hard"
+
+
+def test_denied_hatch_use_is_still_logged(tmp_path):
+    """A denied bypass is exactly the kind of pressure an unaudited hatch would hide — it must be
+    logged just like an approved one, with decision=denied and the tg-ctl verdict in `detail`."""
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", "exit 1\n")
+    repo = _repo_with_tg_ctl(tmp_path)
+    log_path = tmp_path / "overrides.log"
+    env_var = hatch_env_var("block-reset-hard")
+
+    result = request_hatch_approval(
+        "block-reset-hard",
+        {"command": "git reset --hard"},
+        cwd=str(repo),
+        env={env_var: "Need to discard a disposable failed experiment."},
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=1,
+        overrides_log_path=log_path,
+    )
+
+    assert result.approved is False
+    entries = _read_overrides_log(log_path)
+    assert len(entries) == 1
+    assert entries[0]["decision"] == "denied"
+    assert "denied" in entries[0]["detail"]
+
+
+def test_blank_and_bare_hatch_attempts_are_logged(tmp_path):
+    """Blank/bare-flag values never contact tg-ctl but are still a hatch USE attempt worth
+    auditing (they are exactly the self-service-without-a-reason shape G-8 exists to surface)."""
+    repo = _repo_with_tg_ctl(tmp_path)
+    log_path = tmp_path / "overrides.log"
+    env_var = hatch_env_var("block-reset-hard")
+
+    request_hatch_approval(
+        "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
+        env={env_var: "   "}, overrides_log_path=log_path,
+    )
+    request_hatch_approval(
+        "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
+        env={env_var: "1"}, overrides_log_path=log_path,
+    )
+
+    entries = _read_overrides_log(log_path)
+    assert len(entries) == 2
+    assert all(e["decision"] == "denied" for e in entries)
+
+
+def test_session_id_resolution_order(tmp_path):
+    """context session_id wins over env vars, which win over the pid fallback.
+
+    All three calls pass a deliberately-missing `tg_ctl_candidates` (matching every other
+    test in this file) rather than leaving it at its default `None`. A `None` candidates list
+    falls through to `_TRUSTED_TG_CTL_PATHS` (real, hardcoded system paths like
+    `/Users/ultra/.files/bin/tg-ctl`) — on a dev machine that actually has tg-ctl installed
+    there (as opposed to a CI runner, where the path is absent), this would resolve to the
+    REAL tg-ctl and attempt a real `ask` round trip against the real Telegram bot for each of
+    the three "reason one/two/three" justifications, each blocking up to
+    DEFAULT_TG_CTL_TIMEOUT_S. This is exactly the class of test-isolation leak this PR's own
+    audit-log fix addresses elsewhere — don't reintroduce it here.
+    """
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("block-reset-hard")
+    missing_tg_ctl = [tmp_path / "missing" / "tg-ctl"]
+
+    log_path = tmp_path / "ctx-wins.log"
+    request_hatch_approval(
+        "block-reset-hard", {"session_id": "from-context"}, cwd=str(repo),
+        env={env_var: "reason one"}, overrides_log_path=log_path,
+        tg_ctl_candidates=missing_tg_ctl,
+    )
+    assert _read_overrides_log(log_path)[0]["session"] == "from-context"
+
+    log_path = tmp_path / "env-wins.log"
+    request_hatch_approval(
+        "block-reset-hard", {}, cwd=str(repo),
+        env={env_var: "reason two", "CLAUDE_SESSION_ID": "from-env"},
+        overrides_log_path=log_path,
+        tg_ctl_candidates=missing_tg_ctl,
+    )
+    assert _read_overrides_log(log_path)[0]["session"] == "from-env"
+
+    log_path = tmp_path / "pid-fallback.log"
+    request_hatch_approval(
+        "block-reset-hard", {}, cwd=str(repo),
+        env={env_var: "reason three"}, overrides_log_path=log_path,
+        tg_ctl_candidates=missing_tg_ctl,
+    )
+    assert _read_overrides_log(log_path)[0]["session"] == f"pid:{os.getpid()}"
+
+
+def test_multiple_uses_append_rather_than_overwrite(tmp_path):
+    repo = _repo_with_tg_ctl(tmp_path)
+    log_path = tmp_path / "overrides.log"
+    env_var = hatch_env_var("block-reset-hard")
+
+    for _ in range(3):
+        request_hatch_approval(
+            "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
+            env={env_var: "1"}, overrides_log_path=log_path,
+        )
+
+    assert len(_read_overrides_log(log_path)) == 3
+
+
+def test_default_overrides_log_path_is_rooted_at_resolve_home(tmp_path, monkeypatch):
+    """No explicit `overrides_log_path` AND no `AGENT_TOOLS_OVERRIDES_LOG` override -> the sink
+    lands under the (test-monkeypatched) `resolve_home()`, exactly where
+    `default_overrides_log_path()` reports it — never under a doctored `$HOME` or the
+    agent-controlled `cwd`/repo. The repo-wide `tests/conftest.py` fixture exports
+    `AGENT_TOOLS_OVERRIDES_LOG` for every test (subprocess hermeticity) — that tier is deliberately
+    cleared here so this test proves the tier-3 fallback specifically."""
+    monkeypatch.delenv("AGENT_TOOLS_OVERRIDES_LOG", raising=False)
+    attacker_home = tmp_path / "attacker-home"
+    attacker_home.mkdir()
+    monkeypatch.setenv("HOME", str(attacker_home))
+    real_home = tmp_path / "_clean_home"  # set up by the autouse _hermetic_home fixture
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("block-reset-hard")
+
+    request_hatch_approval(
+        "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
+        env={env_var: "1"},
+    )
+
+    assert not (attacker_home / ".config" / "agent-tools" / "overrides.log").exists()
+    expected = real_home / ".config" / "agent-tools" / "overrides.log"
+    assert expected.exists()
+    assert agenttools_hatch_escalation.default_overrides_log_path() == expected
+
+
+def test_overrides_log_env_override_takes_precedence_over_resolve_home(tmp_path, monkeypatch):
+    """`AGENT_TOOLS_OVERRIDES_LOG` (tier 2) wins over the `resolve_home()`-rooted default (tier 3)
+    — this is the subprocess-reachable override `tests/conftest.py` relies on for hermeticity, and
+    an explicit `overrides_log_path=` kwarg (tier 1, exercised by every other test in this section)
+    would win over it in turn."""
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_log = tmp_path / "env-override" / "overrides.log"
+    monkeypatch.setenv("AGENT_TOOLS_OVERRIDES_LOG", str(env_log))
+    env_var = hatch_env_var("block-reset-hard")
+
+    request_hatch_approval(
+        "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
+        env={env_var: "1"},
+    )
+
+    entries = _read_overrides_log(env_log)
+    assert len(entries) == 1
+    real_home_default = tmp_path / "_clean_home" / ".config" / "agent-tools" / "overrides.log"
+    assert not real_home_default.exists()
+
+
+def test_overrides_log_write_failure_never_raises_or_blocks_hatch(tmp_path):
+    """Audit logging is best-effort: if the log's parent path cannot be created (here, a FILE
+    already occupies the would-be parent directory's name), the hatch flow must proceed normally
+    rather than raising out of `request_hatch_approval`."""
+    repo = _repo_with_tg_ctl(tmp_path)
+    blocked = tmp_path / "not-a-dir"
+    blocked.write_text("occupied")
+    log_path = blocked / "overrides.log"  # blocked's parent mkdir will fail: it's a file, not a dir
+    env_var = hatch_env_var("block-reset-hard")
+
+    result = request_hatch_approval(
+        "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
+        env={env_var: "1"}, overrides_log_path=log_path,
+    )
+
+    assert result.approved is False  # the hatch itself still resolved normally
+    assert not log_path.exists()
+
+
+def test_overrides_log_is_created_with_0600_permissions(tmp_path):
+    """The audit line can carry a free-text justification and a full shell command — it must be
+    owner-only readable from the moment the file is created, not just by convention."""
+    repo = _repo_with_tg_ctl(tmp_path)
+    log_path = tmp_path / "overrides.log"
+    env_var = hatch_env_var("block-reset-hard")
+
+    request_hatch_approval(
+        "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
+        env={env_var: "1"}, overrides_log_path=log_path,
+    )
+
+    mode = stat.S_IMODE(log_path.stat().st_mode)
+    assert mode == 0o600, oct(mode)
+
+
+def test_overrides_log_permissions_are_tightened_on_a_preexisting_loose_file(tmp_path):
+    """A pre-existing log file with looser permissions (e.g. created before this feature shipped,
+    or by a misconfigured umask) must be tightened to 0600 on the very next append, not left as
+    a lingering world/group-readable file forever."""
+    repo = _repo_with_tg_ctl(tmp_path)
+    log_path = tmp_path / "overrides.log"
+    log_path.write_text("")
+    log_path.chmod(0o644)
+    env_var = hatch_env_var("block-reset-hard")
+
+    request_hatch_approval(
+        "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
+        env={env_var: "1"}, overrides_log_path=log_path,
+    )
+
+    mode = stat.S_IMODE(log_path.stat().st_mode)
+    assert mode == 0o600, oct(mode)
+
+
+def test_internal_exception_is_still_logged_as_denied(tmp_path, monkeypatch):
+    """`_append_overrides_log`'s docstring promises EVERY env-present attempt is audited,
+    including the `except Exception` branch in `request_hatch_approval` (a crash inside
+    `_request_present_hatch_approval` itself, e.g. `_find_tg_ctl` raising unexpectedly) — not just
+    the approved/denied/blank/bare outcomes reached via the normal tg-ctl round trip."""
+    repo = _repo_with_tg_ctl(tmp_path)
+    log_path = tmp_path / "overrides.log"
+    env_var = hatch_env_var("block-reset-hard")
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated internal failure")
+
+    monkeypatch.setattr(agenttools_hatch_escalation, "_find_tg_ctl", _boom)
+
+    result = request_hatch_approval(
+        "block-reset-hard", {"command": "git clean -fd"}, cwd=str(repo),
+        env={env_var: "a real written justification"}, overrides_log_path=log_path,
+    )
+
+    assert result.approved is False
+    assert "errored" in result.reason
+    entries = _read_overrides_log(log_path)
+    assert len(entries) == 1
+    assert entries[0]["decision"] == "denied"
+    assert "simulated internal failure" in entries[0]["detail"]

@@ -1,0 +1,9 @@
+{
+  "id": "pkill-guard",
+  "point": "pre-bash",
+  "cmd": "/ABSOLUTE/PATH/TO/agent-hooks/pkill-guard/pkill_guard.py",
+  "priority": 10,
+  "timeout_ms": 960000,
+  "on_error": "closed",
+  "description": "Blocks a pattern-based kill (`pkill -f <name>`, `killall <name>`, `kill $(pgrep <name>)`, `kill $(pidof <name>)`, `pgrep <name> | xargs kill`, `pidof <name> | xargs kill`) of a SHARED/ambiguous tool or process name (node, codex, claude, review diff, playwright, ...) — pkill/killall/pgrep/pidof match against EVERY process on the machine whose command line (or exact name, for pidof) contains the pattern, not just the caller's own, and this has already killed a different session's in-flight work twice (a code review, an e2e matrix run — 2026-07-01 agent-ecosystem retrospective, gap G-5). Allows `kill <pid>` (always PID-targeted), a pattern carrying a session-scoping signal (a path, a worktree/harness isolation token, a hex/uuid-looking run, or a 5+ digit run — a bare 4-digit dev port like 9222 does NOT count, since it's shared by every concurrent session on that default port) even if it also names a shared tool, and any pattern not on the denylist (fails open on unknowns — this hook gates KNOWN-ambiguous names, not every kill invocation). Deny-by-default: no self-service bypass; RIG_HATCH_REQUEST_PKILL_GUARD with a written justification asks Telegram via the shared hatch-escalation helper, auto-recorded in overrides.log (G-8). on_error=closed: if the check itself fails, deny rather than let a collateral pattern-kill through."
+}

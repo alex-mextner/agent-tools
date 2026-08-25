@@ -12,16 +12,27 @@
 #   • A UI-touching PR has no embedded screenshot (see ci/screenshots/) — unless overridden.
 #   • The local branch has unpushed/diverged commits, or its worktree is dirty.
 #   • The review-quorum bar (Guard-B of the self-merge-authority program) is not met: the
-#     PR's task code has fewer than SHIP_REVIEW_QUORUM_MIN_ITER PASSED review-cli iterations
-#     across SHIP_REVIEW_QUORUM_MIN_MODELS distinct models among those passed iterations (a
-#     failed/degraded review does not count toward the bar). There is NO self-service override —
-#     a one-time bypass goes through a live Telegram approval to Alex (see the hatch escalation
-#     below), never a reason flag.
+#     PR's task code has fewer than SHIP_REVIEW_QUORUM_MIN_ITER PASSED review-cli iterations,
+#     across SHIP_REVIEW_QUORUM_MIN_ROLES distinct BOARD ROLES among those passed iterations —
+#     role-based coverage is the PRIMARY/default check now (matching review-cli's own default,
+#     review-cli#246). An explicit SHIP_REVIEW_QUORUM_MIN_MODELS additionally requires that many
+#     distinct MODELS too (AND logic — both floors must be met); there is no default model floor
+#     any more. A failed/degraded review never counts toward either floor. There is NO
+#     self-service override — a one-time bypass goes through a live Telegram approval to Alex
+#     (see the hatch escalation below), never a reason flag.
+#
+# After a successful merge, IF a `task` (task-cli) binary is on PATH and a ticket code can be
+# derived from the branch/PR title/PR body, ship calls `task mark-shipped <code> --pr <url>
+# [--commit <sha>]` so the ticket records the merge and prints its own acceptance instructions
+# — this NEVER closes the ticket (only proof-backed acceptance does that) and NEVER blocks or
+# fails the ship (best-effort: task-cli absent, an undetectable ticket code, or a task-cli
+# error are all logged and skipped, not fatal). See "task-cli notify" below the merge step.
 #
 # All project-specific coupling is OPTIONAL and configured by env/flags — no issue-tracker,
 # no path layout, no org is hard-coded.
 #
 # Requires: gh (authenticated), git. jq strongly recommended (required-checks-only gating).
+# task-cli (the `task` binary) is optional — its absence only skips the post-merge ticket notify.
 #
 # Usage:
 #   ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run]
@@ -57,6 +68,28 @@
 #                          comments is fail-closed (never auto-resolved).
 #   --screenshot P [D]     attach a local screenshot P (desc D) via SHIP_IMAGE_UPLOAD_CMD,
 #                          then post it as a PR comment. Repeatable.
+#   --known-flake NAME     assert that the FAILED check named NAME (as printed by the green-CI
+#                          gate's own "x <name> -> <conclusion>" refusal lines) is a pre-existing
+#                          failure unrelated to this diff — a confirmed CI flake, not the "CI is
+#                          structurally down" case ci_appears_structurally_down() already covers
+#                          (that one needs ~80% of ALL checks failing; this is for the common
+#                          shape where ONE check is flaky and everything else is green). NOT a
+#                          blind trust-me flag: ship independently VERIFIES the assertion before
+#                          it does anything — it queries the last SHIP_FLAKE_LOOKBACK_RUNS
+#                          completed runs of the SAME workflow on the PR's BASE branch and
+#                          requires that this exact check name also FAILED on at least one of
+#                          them (see _known_flake_confirmed). An assertion that cannot be
+#                          verified this way is REFUSED, same as not passing the flag at all — so
+#                          this closes, rather than reopens, the exact escalate-to-Alex-for-a-
+#                          confirmed-unrelated-flake gap this flag exists to remove (see the
+#                          AGENTS.md "CI billing-block" note in the repos that document it).
+#                          Repeatable — every check currently FAILED in the rollup must be
+#                          covered by a verified --known-flake or the gate still hard-refuses
+#                          (an unaccounted-for failure is never silently waved through). On
+#                          success this runs the SAME local fallback gate as the CI-down path
+#                          (run_local_ci_gate) and merges only if it passes — a known flake still
+#                          gets a real local verification pass, it does not skip testing
+#                          entirely. Logged to SHIP_AUDIT_FILE like every other gate decision.
 #
 # NOTE: the review-quorum gate (Guard-B) has NO override FLAG. When its bar is not met and you
 # genuinely need to proceed, request a one-time bypass by setting the env var
@@ -99,10 +132,23 @@
 #                          gate refuses (fail-closed) with guidance.
 #   SHIP_REVIEW_QUORUM_ENABLED / SHIP_REVIEW_QUORUM  set either to 0 to disable the
 #                          review-quorum gate entirely (default: enabled).
+#   SHIP_TASK_NOTIFY_ENABLED  set to 0/false/no to disable the post-merge task-cli notify step
+#                          (default: enabled). Best-effort and never blocks the merge either
+#                          way — this only controls whether `task mark-shipped` gets called at
+#                          all. See "task-cli notify" below the merge step for the full story.
 #   SHIP_REVIEW_QUORUM_MIN_ITER    quorum floor: PASSED review-cli iterations (default 3). CLAMPED
 #                          to a hard minimum of 3 — raise-only, an unset/0/negative/below-3 value
 #                          resolves to 3 (fail-closed #242).
+#   SHIP_REVIEW_QUORUM_MIN_ROLES   quorum floor: distinct BOARD ROLES among the passed iterations
+#                          (default 3). Same >=3 clamp. This is now the PRIMARY/default gate
+#                          mechanism and is ALWAYS enforced, matching review-cli's own default
+#                          (review-cli#246).
 #   SHIP_REVIEW_QUORUM_MIN_MODELS  quorum floor: distinct models (default 3). Same >=3 clamp.
+#                          Enforced ONLY when this env var is explicitly set by the operator —
+#                          there is no default model floor any more (role-based coverage is the
+#                          default). When set, ship also passes --min-models to review-cli, so
+#                          BOTH floors are required (mirrors review-cli's own explicit-vs-default
+#                          AND logic, review-cli#246).
 #   RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM  one-time bypass request for the review-quorum gate:
 #                          set it to a written justification to ask Alex live on Telegram (via
 #                          the shared agenttools_hatch_escalation lib); the gate proceeds ONLY on
@@ -120,11 +166,56 @@
 #                          --skip-ci gate decisions: skipci:bypass:approved / skipci:bypass:denied
 #                          / skipci:refused (has a `gate":"skip-ci"` field). --dry-run prints the
 #                          would-be audit instead of writing.
+#
+# Knobs (file):
+#   .ship-config           optional, committed at the repo root — an AUDITED, per-repo override
+#                          for the CI-down local test fallback gate (see "CI-down detection and
+#                          local fallback gate" below). Unlike SHIP_LOCAL_TEST_CMD (an env var,
+#                          test-only, never meant for production use — see that knob above),
+#                          this file is checked into the repo itself, so it is reviewed exactly
+#                          like rig.yaml/package.json already are — it does NOT introduce a new
+#                          trust boundary, it is a production-safe, auditable way to tell the
+#                          local gate where and how to run tests when auto-detection can't guess
+#                          correctly (e.g. a monorepo-of-fixtures whose real suite lives in a
+#                          subdirectory). The file is read from the last COMMITTED content at
+#                          HEAD (`git show HEAD:.ship-config`), never the working tree — an
+#                          uncommitted/staged-only .ship-config is ignored with a warning —
+#                          the "audited, committed" claim above is an enforced property, not
+#                          just documentation. Simple `KEY=value` lines, no quote-stripping
+#                          (don't wrap values in quotes — `KEY="val"` means the literal value
+#                          `"val"`, not `val`); `#`-only-prefixed lines and blank lines are
+#                          ignored. Two whitelisted keys, nothing else is read or evaluated
+#                          from the file:
+#                            SHIP_LOCAL_TEST_DIR=<path>   directory (relative to repo root) to run
+#                                                  the test command from, or to scope
+#                                                  auto-detection to when SHIP_LOCAL_TEST_CMD is
+#                                                  not also set.
+#                            SHIP_LOCAL_TEST_CMD=<cmd>    command line to eval for the local gate
+#                                                  (same eval mechanism as the env var of the same
+#                                                  name — this is just a committed, per-repo
+#                                                  source for it instead of a per-invocation one).
+#                          Precedence (highest first): SHIP_LOCAL_TEST_CMD env var (test-only) >
+#                          .ship-config file > rig.yaml + `dev` CLI (root-only) > root auto-detect
+#                          (pyproject.toml/package.json/Cargo.toml at repo root) > e2e/ subdirectory
+#                          auto-detect (same three manifests, one level deep, e2e/ ONLY — test/ and
+#                          tests/ are deliberately NOT auto-probed, see the priority-5 comment in
+#                          _local_test_runner; use .ship-config for those) > fail closed. A
+#                          present-but-empty/malformed .ship-config (neither key set, not committed
+#                          at HEAD, or an unrecognized/unsafe SHIP_LOCAL_TEST_DIR — absolute,
+#                          containing `..`, or resolving to the repo root itself — which invalidates
+#                          the WHOLE file, not just the dir) is ignored (with a logged warning) and
+#                          detection proceeds as if the file didn't exist.
 set -euo pipefail
 
 ORIG_PWD=$(pwd -P)
 PR=""; SKIP_CI=0; DRY_RUN=0; NO_SHOT_OK=""; NO_VBUMP_OK=""; NO_DWELL_OK=""; REPO_FLAG=""
 SHOT_PATHS=(); SHOT_DESCS=()
+# --known-flake NAME, repeatable — see the "known-flake gate" block below _ci_github_status_indicator.
+KNOWN_FLAKES=()
+# Set by the known-flake gate once its local test pass succeeds; consumed at the merge section
+# below to log the "confirmed" audit line only once `gh pr merge` has actually succeeded — see
+# that gate's own comment for why the audit must wait for the true terminal event.
+KF_AUDIT_PENDING=""
 # Auto-resolve addressed bot-nit review threads before the unresolved-threads gate (opt-in, #268).
 # Enabled by --resolve-addressed-threads or SHIP_RESOLVE_ADDRESSED_THREADS=1; only ever closes a
 # thread that is unresolved, OUTDATED (its code changed), authored ENTIRELY by bots, and has no
@@ -132,7 +223,7 @@ SHOT_PATHS=(); SHOT_DESCS=()
 # current thread is never touched (see the gate below).
 RESOLVE_THREADS=0
 case "${SHIP_RESOLVE_ADDRESSED_THREADS:-}" in 1|true|yes) RESOLVE_THREADS=1 ;; esac
-USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--resolve-addressed-threads] [--screenshot <path> [desc]]...'
+USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--resolve-addressed-threads] [--screenshot <path> [desc]]... [--known-flake <check-name>]...'
 
 # Path to the review-quorum gate's hatch-escalation helper (ci/ship/review_quorum_hatch.py),
 # derived ONLY from this script's own location. That helper imports the shared
@@ -168,6 +259,10 @@ while [ "$i" -lt "$n" ]; do
     --no-review-dwell-ok)
       i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "--no-review-dwell-ok needs a <reason>." >&2; exit 1; }
       NO_DWELL_OK=${args[$i]}; [ -n "$NO_DWELL_OK" ] || { echo "--no-review-dwell-ok reason empty." >&2; exit 1; } ;;
+    --known-flake)
+      i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "--known-flake needs a <check-name>." >&2; exit 1; }
+      [ -n "${args[$i]}" ] || { echo "--known-flake check-name empty." >&2; exit 1; }
+      KNOWN_FLAKES+=("${args[$i]}") ;;
     --screenshot|--shot)
       i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "$a needs a <path>." >&2; exit 1; }
       p=${args[$i]}; case "$p" in /*) : ;; *) p="$ORIG_PWD/$p" ;; esac
@@ -421,6 +516,120 @@ fi
 #   SHIP_TEST_CI_DOWN    Set to "1" to force-trigger the CI-down path (test-only shortcut,
 #                        bypasses the detection heuristics). Never set in production.
 #   SHIP_LOCAL_TEST_CMD  Override the local test command (test-only; default: auto-detect).
+#
+# Local test auto-detection order (see _local_test_runner): SHIP_LOCAL_TEST_CMD env var (if
+# set) > $root/.ship-config file (see "Knobs (file)" above) > rig.yaml + `dev` CLI (root-only)
+# > root-level pyproject.toml/package.json/Cargo.toml > the same three manifests in e2e/ ONLY,
+# one level down (bounded — no deeper recursion, no arbitrary directory scan, and deliberately
+# NOT test/tests/ — see the priority-5 comment in _local_test_runner) > fail closed with
+# "no recognized test runner found". The config file
+# outranks rig.yaml deliberately: it exists precisely to override a heuristic that guessed
+# wrong, so it must win over the OTHER heuristic (rig.yaml/dev) too, not just auto-detect.
+# Residual caveat (same trust boundary as rig.yaml/package.json, not a new one — see
+# _ship_config_load below): a PR can add/edit .ship-config in the same commit that needs
+# verifying, same as it could already add a stub `"test": "true"` script to package.json —
+# this file does not change what a malicious PR could already get away with, review still
+# has to look at test-affecting changes either way.
+
+# --- known-flake gate (--known-flake NAME) --------------------------------------------
+# A NARROWER sibling of the CI-down path above: ci_appears_structurally_down() only fires when
+# ~80% of ALL checks fail (a whole-infrastructure outage). The far more common real shape is
+# "one specific check is a flaky, already-broken-on-main test and every other check is green" —
+# that does not look like an outage at all, so the CI-down path never triggers for it, and
+# without this gate the only way through was a human escalation for something a quick check of
+# the base branch's own recent CI history already answers (this repeated, avoidable escalation
+# is exactly what this gate exists to close — see AGENTS.md's "CI billing-block" note in repos
+# that document that history).
+#
+# $1 = check NAME as it appears in the rollup (.name // .context — the same string the green-CI
+# gate's own refusal already prints). $2 = that check's workflowName (may be empty for a
+# StatusContext, which has none), used to scope the base-branch lookup to the SAME workflow so a
+# same-named check from an unrelated workflow can't manufacture a false match. $3 = the PR's
+# ACTUAL base branch (baseRefName), resolved ONCE by the caller (see the call site) — NOT
+# re-derived per check. Two reasons this is a required argument, not an internal lookup: (a) a
+# `gh pr view` failure inside a per-check helper is easy to silently paper over with a
+# same-shaped fallback (a real prior version of this function did exactly that — see the caller
+# for why that direction is wrong for THIS gate specifically), and (b) it avoids re-querying the
+# identical answer once per failing check.
+#
+# Evidence, not trust: queries the last SHIP_FLAKE_LOOKBACK_RUNS (default 5) COMPLETED runs of
+# that workflow on $3 and requires a job of the SAME name to have FAILED in at least one of
+# them. A flake does not have to fail every run — that is what makes it a flake rather than a
+# hard break — so ANY match in the window is sufficient; the absence of any match is what
+# refuses the claim. Fail-closed throughout: a gh/jq read failure, an empty run list, or no
+# matching failure anywhere in the window all return 1 (NOT confirmed) — the caller then treats
+# the check as a genuine, blocking failure exactly as if --known-flake had never been passed
+# for it.
+#
+# Scope, stated plainly: this confirms "this check NAME has also failed recently on the base
+# branch, independent of this PR" — job-name granularity, not a guarantee that the SAME
+# sub-test/assertion failed both times (a job that bundles a large suite, like this repo's own
+# monorepo-wide "Tests" check, could in principle fail for two DIFFERENT reasons on two
+# different runs and still match here). That is a real, accepted limitation, not an oversight —
+# a shipper should still glance at the failure output before asserting the flag (the refusal
+# message this gate's caller prints tells them exactly what failed), and the base-branch match
+# is logged to SHIP_AUDIT_FILE precisely so an asserted-but-wrong claim is reviewable after the
+# fact, same as the review-quorum and skip-ci gates already are.
+_known_flake_confirmed() {
+  local check_name="$1" wf_name="$2" base="$3" runs_json rid concl jobs_json match found=0 n
+  [ -n "$base" ] || return 1
+  n="${SHIP_FLAKE_LOOKBACK_RUNS:-5}"
+  case "$n" in ''|*[!0-9]*) n=5 ;; esac
+  [ "$n" -gt 0 ] || n=5
+  # Clamped upper bound: an unbounded SHIP_FLAKE_LOOKBACK_RUNS turns the refusal path (every
+  # candidate run inspected, none matching) into dozens-to-hundreds of sequential `gh run view`
+  # calls — minutes of wall time before ship even gets to refuse. 25 is generous for "how many
+  # recent runs could plausibly contain the same flake" while keeping the worst case bounded.
+  [ "$n" -le 25 ] || n=25
+  if [ -n "$wf_name" ]; then
+    runs_json=$(gh run list --branch "$base" --workflow "$wf_name" --status completed --limit "$n" \
+      --json databaseId,conclusion 2>/dev/null) || return 1
+  else
+    runs_json=$(gh run list --branch "$base" --status completed --limit "$n" \
+      --json databaseId,conclusion 2>/dev/null) || return 1
+  fi
+  [ -n "$runs_json" ] && [ "$runs_json" != "null" ] || return 1
+  while IFS=$'\t' read -r rid concl; do
+    [ -n "$rid" ] || continue
+    # A fully green run cannot contain a failing job with this name — cheap skip before the
+    # extra `gh run view` call that would otherwise be needed for every recent run.
+    case "$concl" in failure|cancelled|timed_out|action_required) : ;; *) continue ;; esac
+    jobs_json=$(gh run view "$rid" --json jobs -q '.jobs' 2>/dev/null) || continue
+    match=$(printf '%s' "$jobs_json" | jq -r --arg n "$check_name" \
+      '(. // [])[] | select(.name == $n) | .conclusion' 2>/dev/null)
+    if printf '%s\n' "$match" | grep -qx "failure"; then
+      found=1
+      echo "[ship] known-flake evidence: '$check_name' also FAILED on ${base} run ${rid} (recent, same workflow) — treating as pre-existing, not introduced by this PR." >&2
+      break
+    fi
+  done < <(printf '%s' "$runs_json" | jq -r '(. // [])[] | [(.databaseId|tostring), .conclusion] | @tsv' 2>/dev/null)
+  [ "$found" = "1" ]
+}
+
+# One known-flake audit line -> SHIP_AUDIT_FILE, mirroring _skip_ci_audit_log's shape/dry-run
+# contract. $1 = decision (confirmed | refused), $2 = space-joined check names asserted.
+_known_flake_audit_log() {
+  local decision="$1" checks="$2"
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "[dry-run] would append known-flake audit: decision=${decision} checks=${checks}" >&2
+    return 0
+  fi
+  local file="${SHIP_AUDIT_FILE:-$HOME/.config/agent-tools/ship-audit.jsonl}"
+  mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
+  local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if command -v jq >/dev/null 2>&1; then
+    jq -nc --arg ts "$ts" --arg pr "$PR" --arg dec "$decision" --arg gate "known-flake" \
+      --arg checks "$checks" \
+      '{ts:$ts, pr:$pr, gate:$gate, decision:$dec, checks:$checks}' \
+      >> "$file" 2>/dev/null || true
+  else
+    local esc_pr esc_checks
+    esc_pr=$(printf '%s' "$PR" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    esc_checks=$(printf '%s' "$checks" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    printf '{"ts":"%s","pr":"%s","gate":"known-flake","decision":"%s","checks":"%s"}\n' \
+      "$ts" "$esc_pr" "$decision" "$esc_checks" >> "$file" 2>/dev/null || true
+  fi
+}
 
 # Query the GitHub status page for Actions component health.
 # Stdout: "degraded" if Actions is not fully operational, "ok" if fine, "unknown" on error.
@@ -483,13 +692,261 @@ ci_appears_structurally_down() {
   return 0
 }
 
+# Parse the audited per-repo config file $root/.ship-config, if present. Sets two globals
+# for the caller: SHIP_CFG_DIR and SHIP_CFG_CMD (each "" when unset/absent/rejected). Only
+# whole-line `#` comments and the two whitelisted `KEY=value` keys are recognized — the file
+# is never eval'd itself. Any non-blank, non-comment line that doesn't match one of the two
+# keys is logged and ignored (not silently dropped) so a typo doesn't silently downgrade the
+# gate to auto-detection.
+#
+# The file is read from the last COMMITTED content at HEAD (`git show HEAD:.ship-config`),
+# never the working tree — the "audited, committed" trust story in the header doc is an
+# enforced property, not just a claim. Reading the worktree copy would let a tracked-but-
+# locally-modified file (or a staged-but-never-committed one) take effect with no audit
+# trail; reading HEAD means only content that has actually landed in history — reviewed
+# like any other committed change — can ever run. A file present in the working tree but
+# absent/uncommitted at HEAD is ignored with a warning, exactly as if it didn't exist.
+#
+# SHIP_LOCAL_TEST_DIR is rejected (logged) if it is an absolute path, contains a `..`
+# component, or resolves to the repo root itself (`.`, `./`, or any all-`.`-segments path).
+# Rejection invalidates the WHOLE file (both keys cleared), not just the DIR — a rejected
+# dir alongside a still-present SHIP_LOCAL_TEST_CMD must not silently relocate that command
+# to run from the repo root instead of the (rejected) directory the author asked for; that
+# would verify a different suite than intended. Detection then proceeds exactly as if the
+# file didn't exist, per the header doc.
+#
+# Threat model: $root/.ship-config's committed content is under the SAME trust boundary as
+# rig.yaml/package.json (both already dictate what the gate runs) — a PR that edits it is
+# reviewed like any other change, this does not add a new attack surface (see the
+# header-doc caveat above). The DIR safety check is accident-prevention (a typo'd
+# absolute/traversal/root path), not a security boundary — SHIP_LOCAL_TEST_CMD is arbitrary
+# eval'd shell regardless of DIR.
+_ship_config_load() {
+  local root="$1" content line key val
+  SHIP_CFG_DIR=""
+  SHIP_CFG_CMD=""
+  if ! (cd "$root" && git show HEAD:.ship-config) >/dev/null 2>&1; then
+    [ -f "$root/.ship-config" ] && \
+      echo "[ship] local gate: .ship-config exists in the working tree but is not committed at HEAD — ignoring (uncommitted config is not audited)." >&2
+    return 0
+  fi
+  # HEAD:.ship-config must be a REGULAR FILE — mode 100644/100755, checked via `git ls-tree`,
+  # not merely `git cat-file -t` == blob. Two non-regular tree entries are ALSO type `blob`
+  # and would slip past a bare type check:
+  #   - A TREE (someone committed a `.ship-config/` directory): `git show`/`git cat-file -s`
+  #     both succeed on it and print a tree listing — tree entry names are plain filenames
+  #     that can legally contain `=` and spaces, so an entry literally named
+  #     `SHIP_LOCAL_TEST_CMD=<cmd>` would otherwise flow into the KEY=value parser below as
+  #     if it were committed file CONTENT.
+  #   - A SYMLINK (git mode 120000, e.g. `.ship-config -> /some/attacker/path`): its blob
+  #     content is the link TARGET STRING, not test-runner config — `git cat-file -t` reports
+  #     `blob` for symlinks too, so a type-only check would parse a target path as if it were
+  #     a committed KEY=value line.
+  # `git ls-tree` reports the tree ENTRY's mode (unlike `cat-file -t`, which resolves to the
+  # blob's own type and can't distinguish a symlink's blob from a regular file's blob).
+  local head_mode
+  head_mode=$(cd "$root" && git ls-tree HEAD -- .ship-config 2>/dev/null | awk '{print $1}')
+  case "$head_mode" in
+    100644|100755) ;;
+    *)
+      echo "[ship] local gate: .ship-config at HEAD is not a regular file (mode ${head_mode:-unknown}, not 100644/100755) — ignoring." >&2
+      return 0
+      ;;
+  esac
+  # NUL-byte guard: bash silently STRIPS NUL bytes when a command substitution's output
+  # becomes a variable's value (below), which could turn a byte sequence that never spells
+  # a whitelisted key in the actual committed bytes (e.g. `SHIP_LOCAL_TEST_C<NUL>MD=...`)
+  # into one that does once assigned to $content. Check the RAW git-show output (piped
+  # straight to grep, never touching a bash variable) for a NUL byte first and refuse to
+  # parse at all if found — a legitimate KEY=value text config never contains one. `grep -I`
+  # (without `-a`) treats a NUL-containing input as binary and reports NO match even against
+  # the empty pattern, while a plain-text input matches the (vacuously true) empty pattern —
+  # note this is NOT `grep -a $'\0'`: bash's ANSI-C quoting truncates at the first NUL, so
+  # that pattern silently becomes an EMPTY string and would match (and thus "reject") every
+  # normal file — a bug caught by this diff's own test suite before it shipped. A genuinely
+  # empty (0-byte) file ALSO fails `grep -I ''` (no lines to match at all) despite having no
+  # NUL byte, so that case is excluded via a blob-size check first. Deliberately NOT `-q`:
+  # under this script's `set -o pipefail`, `grep -q` can exit (and close its stdin pipe) as
+  # soon as it sees a match, which for a config larger than the OS pipe buffer would SIGPIPE
+  # the upstream `git show` and misreport a perfectly valid large text file as "binary" —
+  # without `-q`, grep must read every line to emit them all, so `git show` always completes.
+  local blob_size
+  blob_size=$(cd "$root" && git cat-file -s HEAD:.ship-config 2>/dev/null) || blob_size=0
+  if [ "$blob_size" -gt 0 ] && ! (cd "$root" && git show HEAD:.ship-config 2>/dev/null) | grep -I '' >/dev/null; then
+    echo "[ship] local gate: .ship-config committed content contains a NUL byte (binary/corrupt) — refusing to parse, ignoring." >&2
+    return 0
+  fi
+  content=$(cd "$root" && git show HEAD:.ship-config 2>/dev/null)
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    case "$line" in
+      ''|'#'*) continue ;;
+      SHIP_LOCAL_TEST_DIR=*|SHIP_LOCAL_TEST_CMD=*)
+        key="${line%%=*}"
+        val="${line#*=}"
+        val="$(printf '%s' "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [ "$key" = "SHIP_LOCAL_TEST_DIR" ] && SHIP_CFG_DIR="$val" || SHIP_CFG_CMD="$val"
+        ;;
+      *)
+        echo "[ship] local gate: .ship-config: ignoring unrecognized line: $line" >&2 ;;
+    esac
+  done <<< "$content"
+  if [ -n "$SHIP_CFG_DIR" ] && ! _ship_config_dir_is_safe "$SHIP_CFG_DIR"; then
+    echo "[ship] local gate: .ship-config: SHIP_LOCAL_TEST_DIR '$SHIP_CFG_DIR' is not a safe repo-relative subdirectory (absolute, a '..' path component, or '.'/repo root itself — omit the key to mean root) — ignoring the whole file." >&2
+    SHIP_CFG_DIR=""
+    SHIP_CFG_CMD=""
+  fi
+}
+
+# True (exit 0) if $1 is a safe repo-relative subdirectory reference: not absolute, no `..`
+# PATH COMPONENT (a component match, not a substring match — a dir legitimately named
+# `v1..2` or `foo..bar` must NOT be rejected), and does not resolve to "the repo root
+# itself" — every path component being `.` (or empty, from a trailing/duplicate slash),
+# e.g. `.`, `./`, `././.` — which would defeat the `mode="root"` pytest-args guarantee in
+# _local_test_try_dir if silently routed through non-root auto-detect. Omit the key
+# instead to scope to root.
+_ship_config_dir_is_safe() {
+  local p="$1" seg all_dot=1
+  local -a _ship_cfg_dir_segs
+  case "$p" in /*) return 1 ;; esac
+  IFS='/' read -ra _ship_cfg_dir_segs <<< "$p"
+  for seg in "${_ship_cfg_dir_segs[@]}"; do
+    [ "$seg" = ".." ] && return 1
+    [ "$seg" != "." ] && [ -n "$seg" ] && all_dot=0
+  done
+  [ "$all_dot" -eq 1 ] && return 1
+  return 0
+}
+
+# True (exit 0) if $2 (a real, existing directory) is a STRICT physical descendant of $1
+# (root) — i.e. inside it, but not equal to it — resolving symlinks on BOTH sides via
+# `cd ... && pwd -P`. _ship_config_dir_is_safe only checks the CONFIGURED string lexically
+# (absolute/`..`/root-equivalent); this additionally catches a directory — or any path
+# component on the way to it — being a symlink that resolves OUTSIDE the repo, or a symlink
+# that resolves to the root itself (`SHIP_LOCAL_TEST_DIR=suite` with `suite -> .`, which
+# would otherwise bypass the lexical root-equivalence rejection). NOTE — scope: this check
+# only defends the repo-boundary case; it does NOT and cannot generally prevent a symlink
+# that redirects a candidate to a DIFFERENT directory that is still inside the repo (e.g.
+# `e2e -> tests/fixture`) — a committed symlink like that is visible in the PR diff under
+# the same review trust boundary as any other change here, not a new attack surface this
+# helper is meant to close. Call this on every directory actually about to be `cd`'d into
+# for testing (both the .ship-config-scoped dir and the priority-5 e2e/ candidate).
+_dir_is_real_descendant_of_root() {
+  local root="$1" dir="$2" real_root real_dir
+  real_root=$(cd "$root" 2>/dev/null && pwd -P) || return 1
+  real_dir=$(cd "$dir" 2>/dev/null && pwd -P) || return 1
+  case "$real_dir" in
+    "$real_root") return 1 ;;
+    "$real_root"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Try auto-detecting a test manifest in directory $1 and run its matching command from
+# there. $2 (optional) = "root" to force the classic unconditional `pytest tests/ -q`
+# invocation (byte-for-byte the pre-existing root behavior — never loosened to a bare
+# `pytest -q` repo-wide-discovery run just because this helper now also serves
+# subdirectories); any other value (or omitted) auto-detects whether `$dir/tests` exists,
+# which is only correct for a non-root $dir where the manifest's own directory IS the suite.
+#
+# Sets the global _LOCAL_TEST_MATCHED to 1 if a manifest was found (regardless of whether
+# the test command itself passed or failed), or 0 if $1 has none of the three recognized
+# manifests. Callers MUST branch on _LOCAL_TEST_MATCHED, never on this function's own return
+# code, to decide whether to keep probing other candidates: the wrapped test command's exit
+# status is returned as-is (e.g. pytest can legitimately exit 2 on a usage error/
+# interruption), so overloading "no manifest here" onto a specific exit code would collide
+# with a real test failure and risk running a DIFFERENT suite that happens to pass.
+_local_test_try_dir() {
+  local dir="$1" mode="${2:-auto}"
+  _LOCAL_TEST_MATCHED=0
+  if [ -f "$dir/pyproject.toml" ]; then
+    _LOCAL_TEST_MATCHED=1
+    echo "[ship] local gate: running pytest ($dir/pyproject.toml detected) ..."
+    local -a pytest_args=(tests/ -q)
+    if [ "$mode" != "root" ] && [ ! -d "$dir/tests" ]; then
+      pytest_args=(-q)
+    fi
+    if command -v uv >/dev/null 2>&1; then
+      (cd "$dir" && uv run --with pytest pytest "${pytest_args[@]}") 2>&1; return $?
+    else
+      (cd "$dir" && python3 -m pytest "${pytest_args[@]}") 2>&1; return $?
+    fi
+  fi
+  if [ -f "$dir/package.json" ]; then
+    _LOCAL_TEST_MATCHED=1
+    echo "[ship] local gate: running npm test ($dir/package.json detected) ..."
+    (cd "$dir" && npm test) 2>&1; return $?
+  fi
+  if [ -f "$dir/Cargo.toml" ]; then
+    _LOCAL_TEST_MATCHED=1
+    echo "[ship] local gate: running cargo test ($dir/Cargo.toml detected) ..."
+    (cd "$dir" && cargo test) 2>&1; return $?
+  fi
+  return 0
+}
+
+# Execute the audited $root/.ship-config override (see "Knobs (file)" in the header doc and
+# _ship_config_load's docstring). Sets the global _SHIP_CFG_ACTED to 1 if there was a config
+# to act on (regardless of whether the resulting command/detection passed or failed), or 0 if
+# neither key was set (no file / not committed at HEAD / rejected). Callers MUST branch on
+# _SHIP_CFG_ACTED, never on this function's own return code, for the exact same reason
+# _local_test_try_dir uses _LOCAL_TEST_MATCHED instead of its return code: the configured
+# command can legitimately exit 2 (pytest usage error, an arbitrary script's own exit 2), which
+# would collide with a return-code sentinel for "nothing configured" and risk silently falling
+# through to a DIFFERENT, passing heuristic even though the audited, explicitly-configured
+# suite actually failed — exactly the failure mode this whole file exists to avoid. The
+# SHIP_LOCAL_TEST_DIR existence check lives in exactly ONE place here (both the DIR+CMD and
+# DIR-only paths need it).
+_ship_config_run() {
+  local root="$1" status
+  _ship_config_load "$root"
+  _SHIP_CFG_ACTED=0
+  if [ -z "$SHIP_CFG_CMD" ] && [ -z "$SHIP_CFG_DIR" ]; then
+    return 0
+  fi
+  _SHIP_CFG_ACTED=1
+  if [ -n "$SHIP_CFG_DIR" ]; then
+    if [ ! -d "$root/$SHIP_CFG_DIR" ]; then
+      echo "[ship] local gate: FAILED — SHIP_LOCAL_TEST_DIR '$SHIP_CFG_DIR' does not exist under $root." >&2
+      return 1
+    fi
+    if ! _dir_is_real_descendant_of_root "$root" "$root/$SHIP_CFG_DIR"; then
+      echo "[ship] local gate: FAILED — SHIP_LOCAL_TEST_DIR '$SHIP_CFG_DIR' resolves (via a symlink) outside the repo root." >&2
+      return 1
+    fi
+  fi
+  if [ -n "$SHIP_CFG_CMD" ]; then
+    if [ -n "$SHIP_CFG_DIR" ]; then
+      echo "[ship] local gate: .ship-config: running in $SHIP_CFG_DIR: $SHIP_CFG_CMD"
+      (cd "$root/$SHIP_CFG_DIR" && eval "$SHIP_CFG_CMD") 2>&1; return $?
+    fi
+    echo "[ship] local gate: .ship-config: running: $SHIP_CFG_CMD"
+    (cd "$root" && eval "$SHIP_CFG_CMD") 2>&1; return $?
+  fi
+  echo "[ship] local gate: .ship-config: scoping auto-detect to $SHIP_CFG_DIR"
+  _local_test_try_dir "$root/$SHIP_CFG_DIR"; status=$?
+  [ "$_LOCAL_TEST_MATCHED" -eq 1 ] && return "$status"
+  echo "[ship] local gate: FAILED — no recognized test runner found in $SHIP_CFG_DIR (no pyproject.toml/package.json/Cargo.toml)." >&2
+  return 1
+}
+
 _local_test_runner() {
-  local root="$1" cmd dev_status
-  # Allow a test-only override to avoid real test execution in hermetic tests.
+  local root="$1" dev_status status
+
+  # Priority 1: test-only env override — never set in production (see header doc).
   if [ -n "${SHIP_LOCAL_TEST_CMD:-}" ]; then
     echo "[ship] local gate: running test command: $SHIP_LOCAL_TEST_CMD"
     eval "$SHIP_LOCAL_TEST_CMD" 2>&1; return $?
   fi
+
+  # Priority 2: audited per-repo $root/.ship-config (see "Knobs (file)" in the header doc).
+  # An explicit, committed override outranks every heuristic below it, INCLUDING rig.yaml —
+  # it exists precisely to correct a case where a heuristic (auto-detect OR rig.yaml) guesses
+  # wrong, so it must win over both, not just auto-detect.
+  _ship_config_run "$root"; status=$?
+  [ "$_SHIP_CFG_ACTED" -eq 1 ] && return "$status"
+
+  # Priority 3: rig.yaml + `dev` CLI probe — root-only, unchanged from prior behavior.
   if [ -f "$root/rig.yaml" ] && command -v dev >/dev/null 2>&1 && dev --agenttools-dev-probe >/dev/null 2>&1; then
     if (cd "$root" && dev has-script --repo-only test >/dev/null 2>&1); then
       dev_status=0
@@ -505,29 +962,109 @@ _local_test_runner() {
       return 1
     fi
   fi
-  if [ -f "$root/pyproject.toml" ]; then
-    echo "[ship] local gate: running pytest (pyproject.toml detected) ..."
-    if command -v uv >/dev/null 2>&1; then
-      uv run --with pytest pytest tests/ -q 2>&1; return $?
+
+  # Priority 4: root-level auto-detect (existing behavior, unchanged — "root" mode keeps
+  # the classic unconditional `pytest tests/ -q`, byte-for-byte the pre-existing behavior).
+  _local_test_try_dir "$root" root; status=$?
+  [ "$_LOCAL_TEST_MATCHED" -eq 1 ] && return "$status"
+
+  # Priority 5: bounded subdirectory auto-detect, ONE candidate only (e2e/), one level deep.
+  # Handles the concrete monorepo-of-fixtures shape this feature targets (e.g. hyper-ext-e2e's
+  # e2e/package.json) where the root has no manifest but e2e/ does. Deliberately narrow: an
+  # earlier version of this also guessed test/ and tests/, but review flagged (repeatedly,
+  # across independent rounds) that those two names are exactly where repos most often keep
+  # FIXTURE manifests (a package.json/Cargo.toml with a trivially-passing test used for
+  # something else entirely) — auto-running one would silently convert a conservative
+  # fail-closed block into a false "verified" pass. e2e/ is kept because it is the concrete,
+  # unambiguous case that motivated this feature (#309); any other/ambiguous subdirectory
+  # name is exactly what .ship-config (priority 2) exists for — use it instead of growing
+  # this list, do not recurse further or scan arbitrary directories.
+  if [ -d "$root/e2e" ]; then
+    if _dir_is_real_descendant_of_root "$root" "$root/e2e"; then
+      _local_test_try_dir "$root/e2e"; status=$?
+      [ "$_LOCAL_TEST_MATCHED" -eq 1 ] && return "$status"
     else
-      python3 -m pytest tests/ -q 2>&1; return $?
+      echo "[ship] local gate: e2e/ resolves (via a symlink) outside the repo root — skipping the priority-5 candidate (same guard as SHIP_LOCAL_TEST_DIR; use .ship-config for an intentional alias)." >&2
     fi
   fi
-  if [ -f "$root/package.json" ]; then
-    echo "[ship] local gate: running npm test (package.json detected) ..."
-    npm test 2>&1; return $?
-  fi
-  if [ -f "$root/Cargo.toml" ]; then
-    echo "[ship] local gate: running cargo test (Cargo.toml detected) ..."
-    cargo test 2>&1; return $?
-  fi
-  echo "[ship] local gate: FAILED — no recognized test runner found (no pyproject.toml/package.json/Cargo.toml)." >&2
+
+  echo "[ship] local gate: FAILED — no recognized test runner found (no pyproject.toml/package.json/Cargo.toml at root or in e2e/)." >&2
   echo "[ship]   CI is down but tests cannot be verified locally — blocking conservatively." >&2
   return 1
 }
 
-# Scan the PR diff additions for leftover markers (TODO/FIXME/HACK/XXX).
+# Scan the PR diff additions for leftover markers: an unfinished-work marker
+# ("[T]ODO"/"[F]IXME"/"[H]ACK") or a standalone "[X]XX" marker.
 # Returns 0 if clean, 1 if markers found or diff cannot be read.
+#
+# Bracket-expression trick on the FIRST letter of each marker (`[T]ODO` instead of
+# spelling it bare): functionally IDENTICAL to the plain literal in an ERE — a
+# single-character bracket class matches exactly that one character, same as writing
+# it bare — but it means this file's own source (this line, and every comment/fixture
+# that needs to spell an example) never contains any marker as ONE contiguous token.
+# This is the standard "grep must not match its own pattern" idiom (the same trick as
+# `ps aux | grep '[f]oo'` to exclude the grep process itself from its own output).
+#
+# Why this matters here specifically: this exact regex line, its own explanatory
+# comments, and the fixtures in tests/test_ship.py that exercise it ALL legitimately
+# need to spell these marker strings as literal example/test data. Without the
+# bracket-expression split, ANY PR editing this gate's own implementation or tests
+# would self-trigger the CI-outage fallback, regardless of whether it added a REAL
+# leftover marker (agent-tools#318, found reviewing #317).
+#
+# Two designs were tried and rejected before this one (both add an exemption
+# mechanism instead of removing the self-match at the source):
+#   - An inline sentinel comment marking "ignore from here to here" inside the diff
+#     content itself — rejected: the diff being scanned IS the untrusted PR content,
+#     so an unclosed or duplicated sentinel written by the PR author would silently
+#     blind the scanner to every file after it in the whole diff.
+#   - A file-path exemption (skip any hunk whose diff header names this file or its
+#     test file) — works and has no injection surface if hunk-boundary-aware, but
+#     blanket-exempts ALL additions to those 2 files from this LOCAL FALLBACK gate,
+#     opening a blind window exactly where a motivated author would most want it
+#     closed: CI down + editing the gate itself + a genuine forgotten marker.
+# The bracket-expression split has neither downside: no new mechanism, no exemption,
+# no blind window — this file's own source simply never contains a literal match, so
+# there's nothing to exempt. Unlike the file-path-exemption design, it needs no
+# coordination with the CI-up ci/leftover-grep/leftover-grep.sh gate to stay
+# consistent: this scanner just doesn't have a self-reference problem to solve.
+# (leftover-grep.sh's OWN detector line has the identical literal-marker self-match
+# exposure for a PR that edits leftover-grep.sh itself — not fixed here, since it's a
+# separate file/gate outside agent-tools#318's scope; tracked as agent-tools#330. A
+# related pre-existing diff-header-parsing false negative in both gates — a real
+# added line that itself starts with "++" collides with the diff's own "+++ b/path"
+# header prefix — is tracked as agent-tools#329.)
+#
+# The [X]XX marker alone gets an additional run-length guard —
+# `(^|[^X])[X]XX($|[^X])`, a portable "no word-boundary regex, no grep -w" idiom in
+# the same style this repo already uses in ci/leftover-grep/leftover-grep.sh's
+# focused-test check — because a plain substring match collides with bash's
+# conventional mktemp template suffix (`mktemp -d "/tmp/foo.XXXXXX"`), a common and
+# legitimate pattern (agent-tools#316). This only excludes a marker inside a longer
+# run of X's (4+), so it deliberately still catches one embedded in an identifier,
+# e.g. an [X]XX-prefixed sentinel like `[X]XX_REMOVE_BEFORE_MERGE` or
+# `foo[X]XX_debug()` — unlike a full word-boundary fix, which would also let those
+# slip through (checked against neighboring X vs non-X only, not against "is this a
+# word character"). Residual limitation, accepted as-is: a 3-character mktemp
+# template (`foo.[X]XX`) is indistinguishable from a real standalone marker and still
+# blocks; this is rare/weak enough (bash's own docs recommend 6+ X's) not to warrant
+# a smarter check.
+#
+# The other three markers deliberately keep plain substring matching (unlike [X]XX).
+# For [T]ODO/[F]IXME this local fallback gate must stay at least as strict as
+# ci/leftover-grep/leftover-grep.sh's untracked-marker check (that gate greps for
+# `[T]ODO|[F]IXME`, also substring, so it catches sentinel identifiers like
+# `[T]ODO_REMOVE_BEFORE_MERGE`): loosening these two to whole-word would let such
+# genuine leftovers slip through the CI-outage fallback while the normal CI-up gate
+# still catches them — a fail-open divergence between the two gates. [H]ACK has no
+# such parity requirement — ci/leftover-grep/leftover-grep.sh does NOT check for it at
+# all, so this fallback gate is deliberately STRICTER than the CI-up gate on [H]ACK,
+# not matched to it (a PR-time [H]ACK passes normal CI but blocks under this
+# CI-outage-only fallback; accepted, since a stricter fallback is a safe direction to
+# diverge in). There's no known real-world false positive for these three that would
+# justify loosening any of them (mktemp templates are an [X]XX-specific nuisance; a
+# project name or filename that happens to contain one of these four
+# letter-sequences as a substring is a much rarer nuisance than a missed marker).
 _local_leftover_check() {
   local pr="$1" diff_out
   echo "[ship] local gate: scanning PR diff for leftover markers ..."
@@ -536,7 +1073,7 @@ _local_leftover_check() {
   local hits
   hits=$(printf '%s\n' "$diff_out" \
     | grep -E '^\+' | grep -vE '^\+\+\+' \
-    | grep -E '(TODO|FIXME|HACK|XXX)' || true)
+    | grep -E '([T]ODO|[F]IXME|[H]ACK)|(^|[^X])[X]XX($|[^X])' || true)
   if [ -n "$hits" ]; then
     echo "[ship] local gate: FAILED — leftover markers in PR additions:" >&2
     printf '%s\n' "$hits" >&2
@@ -587,15 +1124,16 @@ _local_review_threads_check() {
 
 # Orchestrate all local CI fallback gates. Called when CI infra appears structurally down.
 # Returns 0 if ALL gates pass, 1 if any fail (conservative: block unless everything is clean).
-run_local_ci_gate() {
-  echo "[ship] === Running local CI fallback gates (CI infrastructure appears down) ==="
+run_local_ci_gate() {  # $1 (optional) = why this is running, for the banner (default: CI-down wording)
+  local why="${1:-CI infrastructure appears down}"
+  echo "[ship] === Running local CI fallback gates (${why}) ==="
   local gate_failed=0
   _local_test_runner "$ROOT"       || gate_failed=1
   _local_leftover_check "$PR"      || gate_failed=1
   _local_pr_checklist_check "$PR"  || gate_failed=1
   _local_review_threads_check "$PR" || gate_failed=1
   if [ "$gate_failed" = "0" ]; then
-    echo "[ship] === Local CI fallback: ALL gates passed — safe to merge despite CI outage. ==="
+    echo "[ship] === Local CI fallback: ALL gates passed — safe to merge. ==="
     return 0
   fi
   echo "[ship] === Local CI fallback: FAILED — see above; not safe to merge. ===" >&2
@@ -882,10 +1420,135 @@ if [ "$SKIP_CI" = "0" ]; then
         exit 1
       fi
     else
-      echo "Refusing: PR #$PR has $FAILED check(s) not passing:" >&2
-      printf '%s' "$ROLLUP" | jq -r ".[] | select($SUCCESS_FILTER | not) | \"  x \(.name // .context) -> \(.conclusion // .state)\"" >&2 2>/dev/null || true
-      echo "  Fix CI, then re-run. If CI is genuinely billing-blocked/down, re-run WITHOUT --skip-ci — the normal path auto-detects a real outage and merges after its own local checks. (--skip-ci is now a deny-by-default hatch-gated admin bypass, NOT the billing path.)" >&2
-      exit 1
+      # known-flake gate (--known-flake NAME, repeatable) — narrower than the CI-down path
+      # above: that one needs ~80% of ALL checks failing (a whole-infra outage); this covers
+      # "one specific check is a confirmed pre-existing flake and everything else is green",
+      # the far more common shape a human used to get pinged for. Only consulted when at
+      # least one --known-flake was passed; EVERY currently-failed check must be BOTH
+      # asserted via --known-flake AND independently CONFIRMED by _known_flake_confirmed
+      # against the base branch's own recent CI history (see that function's doc comment for
+      # what "confirmed" means and its scope) — one uncovered or unconfirmed failure still
+      # hard-refuses the whole gate; there is no partial credit.
+      #
+      # CAVEAT (review finding, not yet closed): this gate confirms the CLAIM and runs a real
+      # local test pass, then falls through to the SAME plain, non-admin `gh pr merge` every
+      # other success path here uses. If the flaky check is also a REQUIRED status check under
+      # branch protection, GitHub still refuses that merge — a required check FAILING (not
+      # merely absent, unlike the empty-rollup outage case above) blocks the merge regardless
+      # of what ship itself has already verified. In that shape a shipper still ends up at the
+      # `--skip-ci` hatch after doing all the extra work this flag exists to avoid. This is not
+      # silently unsafe (ship never bypasses branch protection here), just an unresolved UX
+      # gap — tracked as a follow-up rather than fixed in this change.
+      #
+      # KNOWN_FLAKE_GATE_OK is POSITIVE confirmation, not "innocent until proven guilty": it
+      # starts at 0 and is set to 1 ONLY after the loop has actually run over every failing
+      # check and every single one confirmed. An earlier version of this gate started
+      # optimistic (=1, flipped to 0 only inside the loop) — if the jq extraction of failing
+      # check names ever came back EMPTY while $FAILED was still nonzero (a jq hiccup, or any
+      # drift between how $FAILED was counted and this independent re-extraction from
+      # $ROLLUP), the loop would run ZERO iterations, nothing would flip the flag off, and the
+      # gate would silently PASS with no check ever actually confirmed — a fail-OPEN past red
+      # CI (review finding). CHECKED_COUNT below makes the pass condition "every failing check
+      # was individually confirmed", verified by counting, not by absence-of-a-negative-signal.
+      KNOWN_FLAKE_GATE_OK=0
+      if [ "${#KNOWN_FLAKES[@]}" -gt 0 ]; then
+        # Resolve the PR's ACTUAL base branch ONCE (not per failing check — avoids redundant
+        # gh calls) and FAIL CLOSED if it can't be read. This gate is evidence-gated by
+        # design: an unreadable base isn't "assume main and proceed", it's "cannot verify the
+        # claim" — same fail-closed posture the review-threads and dwell gates already use for
+        # their own unreadable-data cases (review finding: an earlier version silently
+        # defaulted to $DEFAULT_BRANCH here, which could verify a stacked PR's flake against
+        # the WRONG branch's history on a transient gh failure, or on any base other than
+        # $DEFAULT_BRANCH).
+        KF_BASE=""
+        if [ "${_FOREIGN_REPO_INVOKE:-0}" != "1" ]; then
+          KF_BASE=$(gh pr view "$PR" --json baseRefName -q '.baseRefName' 2>/dev/null) || KF_BASE=""
+          case "$KF_BASE" in ''|-*|*[!A-Za-z0-9._/-]*) KF_BASE="" ;; esac
+        fi
+        if [ -z "$KF_BASE" ]; then
+          if [ "${_FOREIGN_REPO_INVOKE:-0}" = "1" ]; then
+            # Same #166 hole the empty-rollup CI-down path already guards against: with a
+            # foreign --repo/GH_SHIP_REPO target, run_local_ci_gate below would verify against
+            # THIS (ambient) checkout's tests, not the target repo's — never let the
+            # known-flake gate paper over that by "confirming" evidence for the right repo and
+            # then testing the wrong one.
+            echo "[ship] known-flake: refusing for a foreign --repo/GH_SHIP_REPO target — the local fallback gate below verifies THIS checkout, not the target repo (same #166 class the CI-down path guards against)." >&2
+          else
+            echo "[ship] known-flake: could not read this PR's base branch (gh pr view failed or returned an unsafe value) — refusing rather than guessing which branch's history to verify against." >&2
+          fi
+        else
+          FAILED_NAMES_TSV=$(printf '%s' "$ROLLUP" | jq -r ".[] | select($SUCCESS_FILTER | not) | [(.name // .context), (.workflowName // \"\")] | @tsv" 2>/dev/null)
+          KF_FAILED_COUNT=0
+          KF_CONFIRMED_COUNT=0
+          KF_ALREADY_LOST=0
+          while IFS=$'\t' read -r fname fwf; do
+            # Count EVERY row from this loop, including one whose name/context both render
+            # empty — it still counted toward the earlier $FAILED total, so treating it as
+            # "nothing to check" here (the previous `[ -n "$fname" ] || continue` skipped the
+            # counter too) would let a genuinely-failing-but-unnamed row escape the "every
+            # failure confirmed" requirement entirely (review finding). An empty $fname can
+            # never match a --known-flake assertion anyway, so it falls straight to "not
+            # asserted" below and correctly blocks.
+            KF_FAILED_COUNT=$((KF_FAILED_COUNT + 1))
+            if [ "$KF_ALREADY_LOST" = "1" ]; then
+              # The gate has already failed on an earlier row this pass — the outcome is
+              # decided (refuse). Skip the remaining gh-API evidence lookups entirely: they
+              # cannot change the verdict, only cost latency (review finding, perf).
+              echo "[ship] known-flake: '${fname:-<unnamed check>}' not evaluated — an earlier failing check already sank this gate." >&2
+              continue
+            fi
+            asserted=0
+            for kf in "${KNOWN_FLAKES[@]}"; do
+              [ -n "$fname" ] && [ "$kf" = "$fname" ] && { asserted=1; break; }
+            done
+            if [ "$asserted" = "1" ] && _known_flake_confirmed "$fname" "$fwf" "$KF_BASE"; then
+              KF_CONFIRMED_COUNT=$((KF_CONFIRMED_COUNT + 1))
+              echo "[ship] known-flake: '$fname' asserted via --known-flake and CONFIRMED against ${KF_BASE}'s recent CI history." >&2
+            elif [ "$asserted" = "1" ]; then
+              echo "[ship] known-flake: '$fname' was asserted via --known-flake but could NOT be confirmed as a pre-existing failure on ${KF_BASE} — this alone blocks the merge." >&2
+              KF_ALREADY_LOST=1
+            else
+              echo "[ship] known-flake: '${fname:-<unnamed check>}' is FAILED and was not asserted via --known-flake — this alone blocks the merge." >&2
+              KF_ALREADY_LOST=1
+            fi
+          done <<< "$FAILED_NAMES_TSV"
+          # Pass ONLY when every failing row (by count, matching $FAILED — not merely
+          # "nonzero", closing the partial-undercount gap review flagged) was individually
+          # confirmed, with no earlier-loss short-circuit having fired.
+          [ "$KF_ALREADY_LOST" = "0" ] && [ "$KF_FAILED_COUNT" -gt 0 ] \
+            && [ "$KF_FAILED_COUNT" -eq "$FAILED" ] && [ "$KF_CONFIRMED_COUNT" -eq "$KF_FAILED_COUNT" ] \
+            && KNOWN_FLAKE_GATE_OK=1
+        fi
+      fi
+      if [ "$KNOWN_FLAKE_GATE_OK" = "1" ]; then
+        echo "[ship] known-flake gate PASSED — every failing check is a confirmed pre-existing flake on ${KF_BASE}, not something this PR introduced. Running local fallback gates instead of blocking on CI." >&2
+        # Audit AFTER the terminal outcome, not before: a "confirmed" line means this ship
+        # actually proceeded to merge, not merely that the base-branch evidence checked out —
+        # SHIP_AUDIT_FILE is "one line per gated ship", so a reader must never see `confirmed`
+        # for a run that in fact refused later (review finding, round 2: the FIRST fix only
+        # deferred past run_local_ci_gate — every gate BELOW this one in the script
+        # (unresolved-threads, review-dwell, branch sanity, version-bump, screenshot,
+        # review-quorum) and the actual `gh pr merge` call can still refuse afterward, so the
+        # audit line has to wait for the REAL terminal event, not just this gate's own local
+        # check). KF_AUDIT_PENDING carries the asserted names to the merge section below,
+        # which logs `confirmed` only once `gh pr merge` has actually succeeded — see "merge".
+        if run_local_ci_gate "a confirmed pre-existing flake on ${KF_BASE}, not a CI outage"; then
+          KF_AUDIT_PENDING="${KNOWN_FLAKES[*]}"
+          echo "[ship] known-flake local gate PASSED — proceeding with merge."
+          # Do not exit 1 — fall through to the merge below.
+        else
+          _known_flake_audit_log confirmed-local-gate-failed "${KNOWN_FLAKES[*]}"
+          echo "Refusing: known-flake confirmed, but local fallback gates also failed — not safe to merge." >&2
+          exit 1
+        fi
+      else
+        [ "${#KNOWN_FLAKES[@]}" -gt 0 ] && _known_flake_audit_log refused "${KNOWN_FLAKES[*]}"
+        echo "Refusing: PR #$PR has $FAILED check(s) not passing:" >&2
+        printf '%s' "$ROLLUP" | jq -r ".[] | select($SUCCESS_FILTER | not) | \"  x \(.name // .context) -> \(.conclusion // .state)\"" >&2 2>/dev/null || true
+        echo "  Fix CI, then re-run. If CI is genuinely billing-blocked/down, re-run WITHOUT --skip-ci — the normal path auto-detects a real outage and merges after its own local checks. (--skip-ci is now a deny-by-default hatch-gated admin bypass, NOT the billing path.)" >&2
+        echo "  If a failing check looks UNRELATED to this diff, check whether it ALSO fails on this PR's BASE branch (e.g. \`gh run list --branch <base>\`, or re-run the same test locally against the base branch's HEAD — note this may not be ${DEFAULT_BRANCH} for a stacked PR). A CONFIRMED pre-existing flake does NOT need human escalation: re-run with \`--known-flake <check-name>\` (repeatable, one per failing check) — ship independently VERIFIES the claim against the PR's actual base branch's recent CI history before doing anything with it (see --known-flake in this script's own header comment); it refuses the same as now if the claim doesn't hold up. Escalate to a human only for a genuine billing-block or a failure that is actually related to this diff." >&2
+        exit 1
+      fi
     fi
   fi
 fi
@@ -1062,6 +1725,14 @@ is_nonshippable_path() {  # $1 = path -> rc 0 if non-shippable (docs/test/CI), 1
     appveyor.yml|appveyor.yaml|.appveyor.yml|Jenkinsfile|.drone.yml|bitbucket-pipelines.yml|cloudbuild.yaml|cloudbuild.yml) return 0 ;;
   esac
   case "$1" in
+    # ship's own CI/merge-gate metadata, not product code — a repo adding/editing the
+    # REPO-ROOT .ship-config to fix its local-fallback test detection is not a release.
+    # Exact path match (not basename): only the root file is ever read by
+    # _ship_config_load, so a nested same-named file (e.g. src/.ship-config, which ship
+    # never consumes) must NOT be swept into this exemption.
+    .ship-config) return 0 ;;
+  esac
+  case "$1" in
     # tests (common conventions across languages)
     test/*|*/test/*|tests/*|*/tests/*|__tests__/*|*/__tests__/*) return 0 ;;
     test_*.py|*/test_*.py|*_test.py|*/*_test.py) return 0 ;;
@@ -1163,16 +1834,88 @@ else
 fi
 
 # --- screenshot gate (optional uploader + UI-touching check) ---------------------------
+# Compose the SHIP_IMAGE_UPLOAD_CMD template with `replacement` spliced in wherever `{FILE}`
+# appears — bare (`{FILE}`) or wrapped in its OWN dedicated matching quotes (`"{FILE}"` /
+# `'{FILE}'`, replaced WHOLE, quotes included: the caller's `replacement` already supplies its
+# own quoting via `%q`, so nesting it inside the operator's quotes would corrupt it — see
+# upload_png). A SINGLE left-to-right pass over the ORIGINAL `haystack` finds, at each point,
+# whichever of the three forms starts EARLIEST (ties broken toward the quoted forms, since a
+# bare `{FILE}` match is always a substring of a quoted one at the same position — `%%pat*`'s
+# "not found" case is used AS its own sentinel: an unmatched candidate's prefix equals the
+# full remaining haystack length, which is never shorter than a real match's prefix, so it
+# can never incorrectly win). Never rescans `out`/`replacement` for a later pass to find
+# another `{FILE}` in already-emitted text — REQUIRED, not cosmetic: `replacement` is a %q
+# escaped path, and `%q` does not escape `{`/`}`, so a screenshot path containing the literal
+# substring `{FILE}` would otherwise get corrupted by a later pass re-matching text this same
+# call already emitted (regression pinned in tests). `%%"$needle"*` / `#*"$needle"` are
+# pattern-REMOVAL operators (needle is quoted = literal, no glob), not `${var//pat/rep}`
+# replacement, so `replacement`'s own content (which may contain `&`/`\`) is never reinterpreted
+# by patsub_replacement (default-on since bash 5.2 for the two-argument replace form).
+_upload_png_compose_cmd() {  # $1=template $2=replacement -> stdout composed command
+  local haystack="$1" replacement="$2" out=""
+  local dq='"{FILE}"' sq="'{FILE}'" bare='{FILE}'
+  local prefix_dq prefix_sq prefix_bare best_prefix needle
+  while :; do
+    case "$haystack" in
+      *"$bare"*) : ;;
+      *) out+="$haystack"; break ;;
+    esac
+    prefix_dq="$haystack"; case "$haystack" in *"$dq"*) prefix_dq="${haystack%%"$dq"*}" ;; esac
+    prefix_sq="$haystack"; case "$haystack" in *"$sq"*) prefix_sq="${haystack%%"$sq"*}" ;; esac
+    prefix_bare="${haystack%%"$bare"*}"
+    best_prefix="$prefix_dq"; needle="$dq"
+    if [ "${#prefix_sq}" -lt "${#best_prefix}" ]; then best_prefix="$prefix_sq"; needle="$sq"; fi
+    if [ "${#prefix_bare}" -lt "${#best_prefix}" ]; then best_prefix="$prefix_bare"; needle="$bare"; fi
+    out+="$best_prefix$replacement"
+    haystack="${haystack#*"$needle"}"
+  done
+  printf '%s' "$out"
+}
+# upload_png (HYP-1260): the untrusted screenshot PATH must never be interpolated into
+# SHIP_IMAGE_UPLOAD_CMD as raw text before `eval` — a `"`/`;`/`$(...)`/backtick in the path
+# would otherwise break out of the template's quoting and inject arbitrary shell syntax (the
+# pre-fix code did exactly that: `eval "$SHIP_IMAGE_UPLOAD_CMD \"$png\""`).
+#
+# Fix: shell-quote the path via `printf %q` into a single, syntactically-inert token, splice
+# THAT into the (trusted) template via `_upload_png_compose_cmd`, then eval the composed
+# string exactly as before. A %q-quoted token always re-parses back to precisely the original
+# string as one shell word, so the untrusted content can never break out of its own quoting —
+# while the template keeps its full shell semantics (pipes, redirects, `&&`, an env-var prefix
+# all still work, unlike an argv-array split of the template, which loses them).
+#
+# NOT supported: `{FILE}` embedded inside a larger quoted word alongside other text (e.g.
+# `"file=@{FILE}"` — the quote isn't adjacent to the placeholder, so it doesn't match a
+# recognized form and the bare substitution fires instead, landing the %q token inside the
+# operator's quotes) — give `{FILE}` its OWN dedicated quotes instead, or use `--data=@{FILE}`
+# unquoted (%q's own escaping handles a space-containing path there too).
 upload_png() {
   local png="$1"
   [ -n "${SHIP_IMAGE_UPLOAD_CMD:-}" ] || return 1
   if [ "$DRY_RUN" = "1" ]; then printf 'https://example.invalid/dry-run/%s' "$(basename "$png")"; return 0; fi
-  local out
-  if printf '%s' "$SHIP_IMAGE_UPLOAD_CMD" | grep -q '{FILE}'; then
-    out=$(eval "${SHIP_IMAGE_UPLOAD_CMD//\{FILE\}/$png}" 2>/dev/null)
-  else
-    out=$(eval "$SHIP_IMAGE_UPLOAD_CMD \"$png\"" 2>/dev/null)
-  fi
+  local out quoted_png cmd tmpl="$SHIP_IMAGE_UPLOAD_CMD"
+  printf -v quoted_png '%q' "$png"
+  # Strip trailing newline(s) from the template before doing anything else: a config value
+  # that picked up a stray trailing newline (e.g. from an unguarded `$(cat file)`, or a
+  # heredoc) is never semantically meaningful as "extra command syntax" here, but if left in
+  # place it becomes an EMBEDDED newline once the path is appended below — and `eval` treats a
+  # raw newline as a statement separator, silently splitting the composed command into two
+  # garbled statements (verified via test: the uploader then runs with zero real args).
+  while :; do
+    case "$tmpl" in
+      *$'\n') tmpl="${tmpl%$'\n'}" ;;
+      *) break ;;
+    esac
+  done
+  # Detect "no {FILE} placeholder at all -> append the path" from the (now newline-stripped)
+  # TEMPLATE itself (matches the pre-fix `grep -q '{FILE}'` check), not by comparing composed
+  # output back to the template: a path whose value happens to be the literal string `{FILE}`
+  # would slip past an output-equality check (compose-then-compare is not a substitute for
+  # asking the template directly).
+  case "$tmpl" in
+    *'{FILE}'*) cmd=$(_upload_png_compose_cmd "$tmpl" "$quoted_png") ;;
+    *)          cmd="$tmpl $quoted_png" ;;
+  esac
+  out=$(eval "$cmd" 2>/dev/null)
   out=$(printf '%s' "$out" | grep -oE 'https?://[^ ]+' | tail -1)
   [ -n "$out" ] || return 1; printf '%s' "$out"
 }
@@ -1247,21 +1990,55 @@ fi
 # Prints the first ticket-like token found in $1, or nothing. Tries the repo's own HYP-<n>
 # convention first (case-insensitive, normalized to uppercase), then a generic
 # UPPERCASE-PREFIX-<n> ticket token (2+ uppercase letters, a hyphen, digits) so other repos'
-# conventions (JIRA-style PROJ-123, etc.) are also picked up. The generic pattern is
-# deliberately uppercase-only so it doesn't false-match ordinary prose like "utf-8" or "step-2".
+# conventions (JIRA-style PROJ-123, etc.) are also picked up, then a purely descriptive
+# review-cli task code (2+ uppercase letters, then 2-OR-MORE hyphen-joined 2+-letter uppercase
+# segments -- 3+ segments total, no digits) so hand-picked codes like `SME-ROADMAP-WORKTREE-NOTE`
+# or `WT-GITIGNORE-EXCLUDE` -- real task codes review-cli's own run-stats log records fine, just
+# without a numeric suffix -- are also auto-derived (#384). `LC_ALL=C` on every grep here: outside
+# the C locale, `[A-Z]` bracket ranges are collation-dependent (glibc's en_US.UTF-8 can interleave
+# case), which would make the "uppercase-only" guarantee below hold only by luck of the ambient
+# locale -- same fix idiom the `tr` calls elsewhere in this file already use.
+#
+# The descriptive arm is extracted in two stages: first the FULL boundary-delimited token
+# (letters/digits/hyphens, stops at the first char outside that set), then an exact whole-token
+# match against the letters-only shape, evaluated per CANDIDATE (not the whole text), so one
+# rejected candidate never shadows a clean one appearing later. That order matters: a token with
+# a stray digit buried inside a segment (`SME-ROADMAP-V2-NOTE`) is rejected outright instead of
+# silently grep -o'ing a truncated prefix (`SME-ROADMAP-V`) as if it were the real code.
+#
+# The 3-segment floor (each segment 2+ letters) is a deliberate, documented trade-off: it rules
+# out the common TWO-word hyphenated English that would otherwise false-positive on ordinary
+# PR-body prose -- "READ-ONLY", "CI-CD", "PRE-COMMIT", "API-KEY", "OPT-IN" are all 2 segments and
+# do NOT match. Two known, ACCEPTED residuals remain, same class of imprecision the numeric
+# pattern above already tolerates for stray "AB-12"-shaped text, and both fail CLOSED regardless
+# -- review-cli has no record for a wrongly-derived code, so ship still refuses, just with a less
+# friendly message than "could not derive a task code" (#384 review notes):
+#   - a rarer three-word phrase ("END-TO-END", "DO-NOT-MERGE") can still slip through uncaught;
+#   - a digit fused directly onto (or hyphen-separated immediately before) the token's OWN first
+#     segment ("2FA-SETUP-FLOW", "123-ABC-DEF-GHI") isn't caught by the boundary-free `[A-Z]`
+#     start -- POSIX ERE has no lookbehind to assert "not preceded by a digit/letter" here;
+#   - the numeric arm above runs FIRST and returns on its first match anywhere in the text, so an
+#     incidental uppercase-acronym-plus-digit token that has nothing to do with the real ticket
+#     ("UTF-8", "SHA-256", "RFC-2119", "ISO-8601" all match `[A-Z][A-Z]+-[0-9]+`) can shadow a
+#     valid descriptive code appearing later in the same PR body -- the descriptive arm below then
+#     never even runs. Same fail-closed trade-off: review-cli has no record for "UTF-8" either, so
+#     ship still refuses, just without ever trying the real code (#384 review round 3).
 _review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing; ALWAYS exits 0
   local text="$1" m
-  m=$(printf '%s\n' "$text" | grep -oiE 'HYP-[0-9]+' | head -1 || true)
-  if [ -n "$m" ]; then printf '%s' "$m" | tr '[:lower:]' '[:upper:]'; return 0; fi
-  m=$(printf '%s\n' "$text" | grep -oE '[A-Z][A-Z]+-[0-9]+' | head -1 || true)
+  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE 'HYP-[0-9]+' | head -1 || true)
+  if [ -n "$m" ]; then printf '%s' "$m" | LC_ALL=C tr '[:lower:]' '[:upper:]'; return 0; fi
+  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z]+-[0-9]+' | head -1 || true)
+  if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
+  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z0-9]*(-[A-Z0-9]+)*' \
+        | LC_ALL=C grep -xE '[A-Z][A-Z]+(-[A-Z][A-Z]+){2,}' | head -1 || true)
   printf '%s' "$m"
   return 0
 }
 
 # Clamp a quorum floor value to the hard minimum (3). Fail-closed: an unset, non-numeric,
 # zero, negative, or below-floor value is raised to 3; only a well-formed integer >= 3 passes
-# through unchanged (an operator may RAISE the bar via SHIP_REVIEW_QUORUM_MIN_ITER/MODELS, never
-# lower it below 3). A 0 floor would let an empty record satisfy the gate via `0 >= 0` (#242).
+# through unchanged (an operator may RAISE the bar via SHIP_REVIEW_QUORUM_MIN_ITER/MODELS/ROLES,
+# never lower it below 3). A 0 floor would let an empty record satisfy the gate via `0 >= 0` (#242).
 # $1 = raw value, $2 = label (for the warning); prints the clamped integer, ALWAYS exits 0.
 _review_quorum_clamp_floor() {
   local raw="$1" label="$2" floor=3
@@ -1281,14 +2058,22 @@ _review_quorum_clamp_floor() {
 # Append one audit line to the review-quorum audit log. Best-effort: a logging failure must
 # never block or unblock the ship, so failures here are swallowed (`|| true`).
 # $1=decision(authorized|bypass:approved|bypass:denied|refused) $2=task_code $3=iterations
-# $4=models $5=reason(optional — the hatch verdict for bypass:* decisions)
+# $4=models $5=reason(optional — the hatch verdict for bypass:* decisions) $6=roles(optional —
+# distinct BOARD ROLES actually achieved) $7=min_roles(optional — the role floor enforced for
+# this decision, review-cli#246: role-based coverage is now the primary/default gate mechanism,
+# so the audit trail must show what actually gated it, not just the model count) $8=min_models
+# (optional — 0 means the model floor was NOT enforced for this decision; a genuinely ENFORCED
+# floor is always clamped to >=3 by _review_quorum_clamp_floor and can therefore never itself be
+# 0, so 0 is an unambiguous "not enforced" sentinel — without this an `authorized` line reading
+# `models:1` alone can't tell an auditor whether an explicit model floor was even in force)
 _review_quorum_audit_log() {
-  local decision="$1" code="$2" iterations="${3:-0}" models="${4:-0}" reason="${5:-}"
+  local decision="$1" code="$2" iterations="${3:-0}" models="${4:-0}" reason="${5:-}" \
+        roles="${6:-0}" min_roles="${7:-0}" min_models="${8:-0}"
   # Honor the --dry-run contract ("print what would happen; change nothing"): a simulated ship
   # must not create or pollute the real audit record. The gate above still evaluates and prints
   # its authorized/refused verdict — only the persistent write is suppressed here.
   if [ "$DRY_RUN" = "1" ]; then
-    echo "[dry-run] would append review-quorum audit: decision=${decision} task=${code} iter=${iterations} models=${models}" >&2
+    echo "[dry-run] would append review-quorum audit: decision=${decision} task=${code} iter=${iterations} models=${models} (floor ${min_models}) roles=${roles}/${min_roles}" >&2
     return 0
   fi
   local file="${SHIP_AUDIT_FILE:-$HOME/.config/agent-tools/ship-audit.jsonl}"
@@ -1296,9 +2081,10 @@ _review_quorum_audit_log() {
   local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   if command -v jq >/dev/null 2>&1; then
     jq -nc --arg ts "$ts" --arg pr "$PR" --arg code "$code" --argjson it "$iterations" \
-      --argjson m "$models" --arg dec "$decision" \
+      --argjson m "$models" --argjson rl "$roles" --argjson mrl "$min_roles" \
+      --argjson mm "$min_models" --arg dec "$decision" \
       --arg reason "$reason" \
-      '{ts:$ts, pr:$pr, task_code:$code, iterations:$it, models:$m, decision:$dec} +
+      '{ts:$ts, pr:$pr, task_code:$code, iterations:$it, models:$m, min_models:$mm, roles:$rl, min_roles:$mrl, decision:$dec} +
        (if $reason == "" then {} else {override_reason:$reason} end)' \
       >> "$file" 2>/dev/null || true
   else
@@ -1308,17 +2094,18 @@ _review_quorum_audit_log() {
     # each made JSON-safe: newlines/CR/tab -> space and other control chars stripped (so none can
     # inject a forged extra JSONL line), then backslash + double-quote escaped. `pr` is escaped too
     # — it is a bare CLI arg, so a quote/control char in it must not corrupt the line (the jq path
-    # is already safe via --arg). iterations/models are validated integers; decision is internal.
+    # is already safe via --arg). iterations/models/roles/min_roles/min_models are validated
+    # integers; decision is internal.
     local esc_pr esc_code esc_reason
     esc_pr=$(printf '%s' "$PR" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
     esc_code=$(printf '%s' "$code" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
     esc_reason=$(printf '%s' "$reason" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
     { if [ -n "$reason" ]; then
-        printf '{"ts":"%s","pr":"%s","task_code":"%s","iterations":%s,"models":%s,"decision":"%s","override_reason":"%s"}\n' \
-          "$ts" "$esc_pr" "$esc_code" "${iterations:-0}" "${models:-0}" "$decision" "$esc_reason"
+        printf '{"ts":"%s","pr":"%s","task_code":"%s","iterations":%s,"models":%s,"min_models":%s,"roles":%s,"min_roles":%s,"decision":"%s","override_reason":"%s"}\n' \
+          "$ts" "$esc_pr" "$esc_code" "${iterations:-0}" "${models:-0}" "${min_models:-0}" "${roles:-0}" "${min_roles:-0}" "$decision" "$esc_reason"
       else
-        printf '{"ts":"%s","pr":"%s","task_code":"%s","iterations":%s,"models":%s,"decision":"%s"}\n' \
-          "$ts" "$esc_pr" "$esc_code" "${iterations:-0}" "${models:-0}" "$decision"
+        printf '{"ts":"%s","pr":"%s","task_code":"%s","iterations":%s,"models":%s,"min_models":%s,"roles":%s,"min_roles":%s,"decision":"%s"}\n' \
+          "$ts" "$esc_pr" "$esc_code" "${iterations:-0}" "${models:-0}" "${min_models:-0}" "${roles:-0}" "${min_roles:-0}" "$decision"
       fi; } >> "$file" 2>/dev/null || true
   fi
 }
@@ -1367,7 +2154,7 @@ _review_quorum_refuse_or_hatch() {  # $1 = refusal summary
       echo "    RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM=\"<justification>\""
       echo "  which asks Alex live on Telegram and proceeds ONLY on his real-time approval."
       echo "  SHIP_REVIEW_QUORUM=0 disables the gate entirely (ops off-switch)."; } >&2
-    _review_quorum_audit_log refused "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" ""
+    _review_quorum_audit_log refused "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "" "${QROLES_N:-0}" "${MIN_ROLES:-0}" "${AUDIT_MIN_MODELS:-0}"
     exit 1
   fi
   # The helper prints a verdict SENTINEL on stdout ("APPROVED <reason>" / "DENIED <reason>") and
@@ -1393,9 +2180,15 @@ _review_quorum_refuse_or_hatch() {  # $1 = refusal summary
   # print the would-be audit line. In every other non-DENIED case (fake/broken/absent interpreter,
   # import-fail, unexpected verdict), the helper did NOT audit, so record the fail-closed
   # bypass:denied here. Never double-write.
+  #
+  # SCHEMA NOTE: the shell-written bypass:denied line below (and refused/authorized elsewhere in
+  # this file) now carries roles/min_roles/min_models. The bypass:APPROVED line, in contrast, is
+  # written entirely by the separate lib/agenttools_hatch_escalation lib (invoked from
+  # _review_quorum_hatch_check above) and does NOT yet carry these fields — this diff only widened
+  # the shell-side call sites, not that lib's own audit call. Tracked: agent-tools#414.
   case "$hverdict" in
-    DENIED) [ "$DRY_RUN" = "1" ] && _review_quorum_audit_log "bypass:denied" "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "$hreason" ;;
-    *) _review_quorum_audit_log "bypass:denied" "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "$hreason" ;;
+    DENIED) [ "$DRY_RUN" = "1" ] && _review_quorum_audit_log "bypass:denied" "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "$hreason" "${QROLES_N:-0}" "${MIN_ROLES:-0}" "${AUDIT_MIN_MODELS:-0}" ;;
+    *) _review_quorum_audit_log "bypass:denied" "${TASK_CODE:-}" "${QITER:-0}" "${QMODELS_N:-0}" "$hreason" "${QROLES_N:-0}" "${MIN_ROLES:-0}" "${AUDIT_MIN_MODELS:-0}" ;;
   esac
   exit 1
 }
@@ -1497,15 +2290,28 @@ if [ "$QUORUM_ENABLED" = "0" ]; then
   echo "[ship] review-quorum gate disabled (SHIP_REVIEW_QUORUM_ENABLED/SHIP_REVIEW_QUORUM=0)."
 else
   # Hard fail-closed floor: the self-merge bar is >=3 passed iterations across >=3 distinct
-  # models. The floor must NEVER silently resolve to 0 in this subprocess — a 0 floor makes an
+  # BOARD ROLES (the primary/default mechanism — review-cli#246) and, ONLY when the operator
+  # explicitly opts in via SHIP_REVIEW_QUORUM_MIN_MODELS, ADDITIONALLY across >=3 distinct
+  # models. Floors must NEVER silently resolve to 0 in this subprocess — a 0 floor makes an
   # empty quorum trivially "pass" (0 >= 0) and defeats the whole gate (#242). So clamp every
   # unset / non-numeric / <3 value UP to the hard minimum 3; only an explicit, well-formed value
   # of 3-or-more is honored as-is (an operator may RAISE the bar, never lower it below 3).
   MIN_ITER=$(_review_quorum_clamp_floor "${SHIP_REVIEW_QUORUM_MIN_ITER:-}" "min-iter")
   MIN_MODELS=$(_review_quorum_clamp_floor "${SHIP_REVIEW_QUORUM_MIN_MODELS:-}" "min-models")
+  MIN_ROLES=$(_review_quorum_clamp_floor "${SHIP_REVIEW_QUORUM_MIN_ROLES:-}" "min-roles")
+  # Explicitness (not the resolved value) decides whether the model floor governs — mirroring
+  # review-cli's own explicit-vs-default distinction (review-cli#246): `${VAR+x}` is empty only
+  # when the var is genuinely unset, so an operator who sets SHIP_REVIEW_QUORUM_MIN_MODELS to a
+  # bad value is still "explicit" here (the clamp above still raises it to the hard floor).
+  MIN_MODELS_EXPLICIT=0
+  [ -n "${SHIP_REVIEW_QUORUM_MIN_MODELS+x}" ] && MIN_MODELS_EXPLICIT=1
+  # The min_models value recorded in the audit log: 0 (an unambiguous "not enforced" sentinel,
+  # since a genuinely enforced floor is always clamped to >=3) unless the operator opted in.
+  AUDIT_MIN_MODELS=0
+  [ "$MIN_MODELS_EXPLICIT" = "1" ] && AUDIT_MIN_MODELS="$MIN_MODELS"
   # Safe defaults so an early refusal (before the review query) still has these for the audit
   # line and the hatch context.
-  QITER=0; QMODELS_N=0; QMODELS=""; QERR=""; QPASSED=false
+  QITER=0; QMODELS_N=0; QMODELS=""; QROLES_N=0; QROLES=""; QERR=""; QPASSED=false
 
   TASK_CODE="${REVIEW_TASK_CODE:-}"
   [ -n "$TASK_CODE" ] || TASK_CODE=$(_review_quorum_extract_ticket "$BRANCH")
@@ -1521,48 +2327,133 @@ else
   elif ! command -v jq >/dev/null 2>&1; then
     _review_quorum_refuse_or_hatch "jq not found — cannot evaluate the gate for ${TASK_CODE} (install jq)"
   else
-    # Prefer --check (the review-cli rename target); fall back to --quorum-check when running
-    # against a review-cli build that hasn't picked up the rename yet. In --json mode review-cli
-    # always prints JSON to stdout (pass or fail) — only an unsupported-flag argparse error
-    # leaves stdout empty, which is the fallback trigger.
-    QUORUM_JSON=$(review task "$TASK_CODE" --check --min-iter "$MIN_ITER" --min-models "$MIN_MODELS" --json 2>/dev/null) || true
+    # Role-based coverage (--min-roles) is ALWAYS requested — it is the primary/default gate now
+    # (review-cli#246). --min-models is passed ONLY when the operator explicitly set
+    # SHIP_REVIEW_QUORUM_MIN_MODELS: passing it unconditionally would make review-cli treat the
+    # model floor as EXPLICITLY requested too (a subprocess CLI flag can't carry "this is just
+    # ship's internal default"), which would silently reinstate a default model floor via
+    # review-cli's own AND logic (review-cli#246) — exactly what this change removes.
+    #
+    # Three-tier query, oldest-compatible-flag-set-last, because review-cli's own history proves
+    # --min-roles and --quorum-check were NEVER both supported by the same build: --quorum-check
+    # was renamed to --check on 2026-07-09 (review-cli#135), a full six weeks before --min-roles
+    # existed at all (added 2026-08-21, review-cli#246). So sending --min-roles on a --quorum-check
+    # attempt can never succeed against any real build — it would only misdiagnose "review-cli is
+    # too old for role checking" as "could not query review-cli" (a real finding from review, since
+    # a --check-supporting-but-pre-#246 build, built in that six-week window, would otherwise fail
+    # BOTH the --check-with-roles attempt and the --quorum-check-with-roles fallback, landing on
+    # the wrong, confusing refusal message):
+    #   1. --check WITH --min-roles (+ --min-models if explicit) — the current/target shape.
+    #   2. --check WITHOUT --min-roles (+ --min-models if explicit) — a build that has the --check
+    #      rename but predates role support; succeeds with real iter/model data and NO role keys
+    #      (review-cli only emits distinct_roles_passed/roles when --min-roles was actually asked),
+    #      so the gate below reads 0 roles and refuses with an honest "0/N distinct roles" instead
+    #      of a hollow "could not query" — accurate, still fail-closed (role coverage is mandatory
+    #      now, so an old review-cli genuinely cannot satisfy this gate until upgraded).
+    #   3. --quorum-check WITHOUT --min-roles (+ --min-models if explicit) — genuinely ancient,
+    #      pre-rename builds; same honest 0-roles refusal as tier 2 if it succeeds.
+    # In --json mode review-cli always prints JSON to stdout (pass or fail) — only an
+    # unsupported-flag argparse error leaves stdout empty, which is each tier's trigger.
+    REVIEW_CHECK_ARGS_NOROLES=(--min-iter "$MIN_ITER")
+    [ "$MIN_MODELS_EXPLICIT" = "1" ] && REVIEW_CHECK_ARGS_NOROLES+=(--min-models "$MIN_MODELS")
+    REVIEW_CHECK_ARGS=("${REVIEW_CHECK_ARGS_NOROLES[@]}" --min-roles "$MIN_ROLES")
+
+    # QUORUM_ROLES_REQUESTED tracks whether the tier that actually produced QUORUM_JSON included
+    # --min-roles, so a genuine "0 distinct roles" (tier 1: review-cli understood the request and
+    # simply found no role-tagged history) can be told apart, below, from "this review-cli cannot
+    # report roles at all" (tier 2/3: the request never even asked) — the two have different
+    # remedies (re-review with roles vs. upgrade review-cli).
+    QUORUM_ROLES_REQUESTED=1
+    QUORUM_JSON=$(review task "$TASK_CODE" --check "${REVIEW_CHECK_ARGS[@]}" --json 2>/dev/null) || true
     if [ -z "$QUORUM_JSON" ]; then
-      QUORUM_JSON=$(review task "$TASK_CODE" --quorum-check --min-iter "$MIN_ITER" --min-models "$MIN_MODELS" --json 2>/dev/null) || true
+      QUORUM_ROLES_REQUESTED=0
+      QUORUM_JSON=$(review task "$TASK_CODE" --check "${REVIEW_CHECK_ARGS_NOROLES[@]}" --json 2>/dev/null) || true
+    fi
+    if [ -z "$QUORUM_JSON" ]; then
+      QUORUM_JSON=$(review task "$TASK_CODE" --quorum-check "${REVIEW_CHECK_ARGS_NOROLES[@]}" --json 2>/dev/null) || true
     fi
 
     if [ -z "$QUORUM_JSON" ]; then
       _review_quorum_refuse_or_hatch "could not query review-cli (store unreadable / task ${TASK_CODE} unknown)"
     else
-      # review-cli's quorum_check emits `passed_iterations` / `distinct_models_passed` — the
-      # COUNT of PASSED iterations and the distinct models among them. An earlier revision read
-      # `.iterations` / `.distinct_models`, keys review-cli NEVER emits, so both parsed to 0 (the
-      # "0 iterations across 0 models" in the #242 incident log). Read ONLY the real keys — do NOT
-      # fall back to the never-emitted legacy names: a payload carrying only `.iterations` /
-      # `.distinct_models` is not review-cli's output (old build or hostile `review` on PATH), so
-      # it reads as 0/0 and fails closed below, never authorizes via a laxer key.
+      # review-cli's quorum_check emits `passed_iterations` / `distinct_models_passed` /
+      # `distinct_roles_passed` — the COUNT of PASSED iterations and the distinct models / BOARD
+      # ROLES among them. An earlier revision read `.iterations` / `.distinct_models`, keys
+      # review-cli NEVER emits, so both parsed to 0 (the "0 iterations across 0 models" in the
+      # #242 incident log). Read ONLY the real keys — do NOT fall back to the never-emitted
+      # legacy names: a payload carrying only `.iterations` / `.distinct_models` is not
+      # review-cli's output (old build or hostile `review` on PATH), so it reads as 0/0 and fails
+      # closed below, never authorizes via a laxer key.
       QPASSED=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed // false' 2>/dev/null || echo false)
       QITER=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed_iterations // 0' 2>/dev/null || echo 0)
       QMODELS_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_models_passed // 0' 2>/dev/null || echo 0)
       QMODELS=$(printf '%s' "$QUORUM_JSON" | jq -r '(.models // []) | join(", ")' 2>/dev/null || echo "")
+      QROLES_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_roles_passed // 0' 2>/dev/null || echo 0)
+      QROLES=$(printf '%s' "$QUORUM_JSON" | jq -r '(.roles // []) | join(", ")' 2>/dev/null || echo "")
       QERR=$(printf '%s' "$QUORUM_JSON" | jq -r '.error // empty' 2>/dev/null || echo "")
+      # Whether the ANSWER (not just what ship sent) actually carried role data — read from the
+      # payload's own shape (does it have the key at all?), not from QUORUM_ROLES_REQUESTED. A
+      # review-cli that tolerates an unrecognized --min-roles (e.g. argparse's parse_known_args,
+      # or a shim) could "succeed" on the roles-requesting tier while silently ignoring the flag —
+      # QUORUM_ROLES_REQUESTED would then be wrong (it only tracks what ship attempted), but the
+      # payload shape is still honest. Used ONLY for the disambiguating hint below; the authorize
+      # gate keeps requiring QUORUM_ROLES_REQUESTED independently (defense-in-depth, not replaced).
+      QUORUM_HAS_ROLE_KEY=$(printf '%s' "$QUORUM_JSON" | jq -r 'has("distinct_roles_passed")' 2>/dev/null || echo false)
       # Non-numeric / missing counts collapse to 0 so the arithmetic gate below fails closed
       # (jq can hand back "null" as text if a key holds JSON null).
       case "$QITER" in ''|*[!0-9]*) QITER=0 ;; esac
       case "$QMODELS_N" in ''|*[!0-9]*) QMODELS_N=0 ;; esac
+      case "$QROLES_N" in ''|*[!0-9]*) QROLES_N=0 ;; esac
+
+      # The model floor gates ONLY when the operator explicitly asked for it — vacuously
+      # satisfied otherwise, mirroring review-cli's own explicit-vs-default AND logic
+      # (review-cli#246): an explicit request is always honored, but there is no default model
+      # floor any more now that role-based coverage is the primary/default mechanism.
+      MODELS_GATE_OK=1
+      if [ "$MIN_MODELS_EXPLICIT" = "1" ]; then
+        MODELS_GATE_OK=0
+        [ "$QMODELS_N" -gt 0 ] && [ "$QMODELS_N" -ge "$MIN_MODELS" ] && MODELS_GATE_OK=1
+      fi
 
       # FAIL-CLOSED authorization (#242): NEVER authorize on the subprocess's `.passed` boolean
-      # alone. ship re-derives the verdict from the numbers it read and its own hard floor, so a
+      # alone. ship re-derives the verdict from the numbers it read and its own hard floors, so a
       # review-cli that returns `passed:true` with a hollow 0/0 record (an older build without the
       # min>=1 guard, a task-code miss, or an attacker-controlled `review` on PATH) is refused.
       # Authorize ONLY when EVERY condition holds: the subprocess agreed (passed==true), there is
-      # NO error key, and BOTH counts are strictly positive AND meet the >=3 floor independently.
+      # NO error key, ship itself actually ASKED for role coverage on the query that answered
+      # (QUORUM_ROLES_REQUESTED — never trust an external contract that review-cli only emits
+      # role keys when asked; re-derive that independently too, same #242 philosophy), the
+      # iteration and role counts are strictly positive and independently meet their >=3 floors,
+      # a genuine record always carries at least one model (QMODELS_N -gt 0 is a hollow-payload
+      # sanity check, not a diversity floor — kept unconditionally, same as the pre-existing #242
+      # guard, independent of whether an explicit model floor is even in play), and (only when
+      # explicitly requested) the model floor is met too.
       if [ "$QPASSED" = "true" ] && [ -z "$QERR" ] \
-         && [ "$QITER" -gt 0 ] && [ "$QMODELS_N" -gt 0 ] \
-         && [ "$QITER" -ge "$MIN_ITER" ] && [ "$QMODELS_N" -ge "$MIN_MODELS" ]; then
-        echo "[ship] AUTHORITY CONFIRMED — review quorum met: ${QITER} iterations across ${QMODELS_N} models for ${TASK_CODE}. Self-merge authorized by the review-quorum gate."
-        _review_quorum_audit_log authorized "$TASK_CODE" "$QITER" "$QMODELS_N" ""
+         && [ "$QUORUM_ROLES_REQUESTED" = "1" ] \
+         && [ "$QITER" -gt 0 ] && [ "$QROLES_N" -gt 0 ] && [ "$QMODELS_N" -gt 0 ] \
+         && [ "$QITER" -ge "$MIN_ITER" ] && [ "$QROLES_N" -ge "$MIN_ROLES" ] \
+         && [ "$MODELS_GATE_OK" = "1" ]; then
+        if [ "$MIN_MODELS_EXPLICIT" = "1" ]; then
+          echo "[ship] AUTHORITY CONFIRMED — review quorum met: ${QITER} iterations across ${QROLES_N} roles and ${QMODELS_N} models for ${TASK_CODE}. Self-merge authorized by the review-quorum gate."
+        else
+          echo "[ship] AUTHORITY CONFIRMED — review quorum met: ${QITER} iterations across ${QROLES_N} roles for ${TASK_CODE}. Self-merge authorized by the review-quorum gate."
+        fi
+        _review_quorum_audit_log authorized "$TASK_CODE" "$QITER" "$QMODELS_N" "" "$QROLES_N" "$MIN_ROLES" "$AUDIT_MIN_MODELS"
       else
-        _review_quorum_refuse_or_hatch "bar NOT met for ${TASK_CODE} — ${QITER}/${MIN_ITER} iterations, ${QMODELS_N}/${MIN_MODELS} distinct models${QMODELS:+ (models seen: ${QMODELS})}${QERR:+ (${QERR})}"
+        MODELS_SUMMARY=""
+        [ "$MIN_MODELS_EXPLICIT" = "1" ] && MODELS_SUMMARY=", ${QMODELS_N}/${MIN_MODELS} distinct models${QMODELS:+ (models seen: ${QMODELS})}"
+        # A response whose OWN shape carries no role key at all means this review-cli build
+        # cannot report role coverage — a version problem, not "reviews genuinely carry no role
+        # labels" (a modern build that WAS asked always echoes the key, even as 0). Driven off
+        # the payload shape (QUORUM_HAS_ROLE_KEY), not off what ship merely attempted
+        # (QUORUM_ROLES_REQUESTED) — a build that silently tolerates an unrecognized --min-roles
+        # would otherwise "succeed" on the roles-requesting tier while still omitting the key,
+        # which QUORUM_HAS_ROLE_KEY catches and QUORUM_ROLES_REQUESTED alone would miss.
+        ROLES_UNAVAILABLE_HINT=""
+        if [ "$QUORUM_HAS_ROLE_KEY" != "true" ]; then
+          ROLES_UNAVAILABLE_HINT=" — the installed review-cli does not support --min-roles (predates review-cli#246); upgrade it to restore role-based coverage"
+        fi
+        _review_quorum_refuse_or_hatch "bar NOT met for ${TASK_CODE} — ${QITER}/${MIN_ITER} iterations, ${QROLES_N}/${MIN_ROLES} distinct roles${QROLES:+ (roles seen: ${QROLES})}${MODELS_SUMMARY}${QERR:+ (${QERR})}${ROLES_UNAVAILABLE_HINT}"
       fi
     fi
   fi
@@ -1578,6 +2469,144 @@ if [ "$SKIP_CI" = "1" ]; then
 else
   echo "[ship] preflight clean — merging PR #${PR} (${BRANCH}) --${MERGE_METHOD} ..."
   run gh pr merge "$PR" "--$MERGE_METHOD"
+fi
+# `run gh pr merge` above runs under `set -e` — a merge failure would have already aborted the
+# script, so reaching here means the merge (or its --dry-run stand-in) succeeded. ONLY now is it
+# true that a known-flake claim was "confirmed" in the sense the audit trail promises (an
+# actual merge happened, not merely a passed local check that a LATER gate then refused).
+if [ -n "$KF_AUDIT_PENDING" ]; then
+  _known_flake_audit_log confirmed "$KF_AUDIT_PENDING"
+fi
+
+# --- task-cli notify (best-effort; never blocks or fails the ship) --------------------
+# The merge above already succeeded. Tell task-cli about it so the ticket TRACKS the merge
+# instead of drifting out of sync (the class of bug behind a real 13-ticket status-divergence
+# cleanup) — and so the ticket surfaces its acceptance instructions (what proof is still
+# needed) instead of silently going quiet. This is pure notification: `task mark-shipped`
+# (task-cli) never closes the ticket itself, only PROPER acceptance does that — see its own
+# docstring. A failure anywhere in this step is a WARNING, never a ship failure: the merge is
+# already durable, this is best-effort bookkeeping on top of it.
+#
+# SHIP_TASK_NOTIFY_ENABLED=0 disables the whole step (ops off-switch, same shape as
+# SHIP_REVIEW_QUORUM_ENABLED above) — the test harness's shared fixtures (tests/test_ship.py)
+# default it off process-wide (review finding: those ~30 pre-existing fixtures never stub a
+# fake `task`, so leaving this on-by-default there would invoke whatever REAL task-cli happens
+# to be on the developer's PATH, against a fake PR carrying garbage `--pr`/`--commit` values —
+# a real, unintended mutation of a real ticket store during a test run).
+#
+# Task-code derivation reuses _review_quorum_extract_ticket (the same matcher the review-quorum
+# gate above uses) but tries MORE sources, each validated independently, falling through to the
+# next on rejection: the gate's own $TASK_CODE (if it already ran and found one — avoids a
+# redundant `gh pr view` on the common path) → branch → PR TITLE → PR body. The title is a
+# deliberate gap-fix over the quorum gate (which only ever tries branch → body): a PR whose
+# ticket code lives only in its title (a common shape — "HYP-931: fix the thing") would
+# otherwise never be found here even though a human reads it immediately.
+#
+# EACH candidate — including a reused $TASK_CODE — is validated (must contain a DIGIT) before
+# being accepted; a rejected one falls through to try the NEXT source rather than giving up
+# (review finding — an earlier version validated only the FINAL chosen source, so a digit-free
+# $TASK_CODE reuse — e.g. an explicit REVIEW_TASK_CODE=SME-ROADMAP-NOTE, or the branch matching
+# the matcher's descriptive arm — short-circuited past a title/body that DID carry a real,
+# numeric ticket id). The digit requirement itself: the matcher's third arm is a
+# purely-descriptive, digit-free pattern (`SME-ROADMAP-NOTE`) meant for review-cli's own
+# hand-picked task codes — safe for the quorum gate (an unknown code just fails closed, refusing
+# the merge) but NOT safe here, where a false positive gets executed as a real `task
+# mark-shipped <code>` call: a generic PR title like "Fix UTF-8 decoding" would derive `UTF-8`
+# and could silently mark an unrelated ticket "shipped" if that code happens to exist — exactly
+# the status-divergence class this feature exists to prevent, not cause. Every genuine ticket id
+# this project uses (HYP-931, PROJ-12, …) carries a numeric suffix, so this costs nothing on the
+# real path.
+_ship_looks_like_a_ticket_id() {  # $1 = candidate code; true (exit 0) iff it contains a digit
+  case "$1" in *[0-9]*) return 0 ;; *) return 1 ;; esac
+}
+_ship_derive_task_code_for_notify() {
+  local candidate
+
+  candidate="${TASK_CODE:-}"
+  [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
+
+  candidate=$(_review_quorum_extract_ticket "$BRANCH")
+  [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
+
+  local pr_title pr_body_local
+  # One combined query for title+body (2 round trips instead of 2 separate `gh pr view` calls).
+  #
+  # IFS=$'\t' (review finding): a bare `read -r a b` splits on DEFAULT IFS (space/tab/newline),
+  # not just the `@tsv` separator — a real title/body is virtually never a single word, so the
+  # default-IFS form silently truncated `pr_title` to its first word and dumped the rest into
+  # `pr_body_local`. Concretely: "Fix the thing (HYP-931)" read as `pr_title="Fix"` (no match)
+  # instead of finding HYP-931 — the exact wrong-ticket hazard the digit check above exists to
+  # catch, reachable because the RIGHT code got mis-parsed away before the check ever saw it.
+  # jq's `@tsv` escapes any literal tab in a value, so splitting on tab alone is the correct,
+  # unambiguous delimiter (title/body may freely contain spaces and newlines — the `gsub` above
+  # only strips newlines so a MULTI-LINE body still round-trips as ONE tsv line).
+  IFS=$'\t' read -r pr_title pr_body_local < <(gh pr view "$PR" --json title,body \
+    -q '[(.title // ""), (.body // "")] | map(gsub("\n";" ")) | @tsv' 2>/dev/null) \
+    || { pr_title=""; pr_body_local=""; }
+
+  candidate=$(_review_quorum_extract_ticket "$pr_title")
+  [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
+
+  candidate=$(_review_quorum_extract_ticket "$pr_body_local")
+  [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
+
+  return 0
+}
+
+# Call `task mark-shipped <code> --pr <url> [--commit <sha>]` for the just-merged PR. Skipped
+# (with a logged reason, never an error) when: the feature is disabled (SHIP_TASK_NOTIFY_ENABLED=0);
+# `task` isn't on PATH (task-cli not installed — ship must work in a repo that never adopted it);
+# the invocation targets a foreign --repo (any local `task` here would write into the WRONG
+# project, same guard cleanup() already applies to git ops); or no task code can be derived (the
+# PR simply isn't tied to a ticket task-cli tracks — not every PR is, e.g. a dependency bump).
+_ship_notify_task_cli() {
+  case "${SHIP_TASK_NOTIFY_ENABLED:-1}" in
+    0|false|no) echo "[ship] task-cli notify disabled (SHIP_TASK_NOTIFY_ENABLED=${SHIP_TASK_NOTIFY_ENABLED})." >&2; return 0 ;;
+  esac
+  command -v task >/dev/null 2>&1 || { echo "[ship] task-cli not on PATH — skipping ticket notify." >&2; return 0; }
+  if [ "${_FOREIGN_REPO_INVOKE:-0}" = "1" ]; then
+    echo "[ship] --repo targets a foreign remote — skipping ticket notify (a local 'task' here would write into the wrong project)." >&2
+    return 0
+  fi
+  local code; code=$(_ship_derive_task_code_for_notify)
+  if [ -z "$code" ]; then
+    echo "[ship] could not derive a task code for #$PR — skipping ticket notify (not every PR is tied to a tracked ticket; update it manually if this one is)." >&2
+    return 0
+  fi
+  # One combined query for url+mergeCommit (review finding: 2 round trips instead of 2 separate
+  # `gh pr view` calls). IFS=$'\t' for the same reason as the title/body read above — url and
+  # a commit SHA never legitimately contain whitespace so default-IFS `read` was not actually
+  # broken here, but splitting on the SAME unambiguous delimiter everywhere this pattern is
+  # used is worth the one extra token (consistency; review finding).
+  local pr_url merge_sha
+  IFS=$'\t' read -r pr_url merge_sha < <(gh pr view "$PR" --json url,mergeCommit \
+    -q '[(.url // ""), (.mergeCommit.oid // "")] | @tsv' 2>/dev/null) || { pr_url=""; merge_sha=""; }
+  if [ -z "$pr_url" ]; then
+    echo "[ship] could not resolve PR #$PR's URL — skipping ticket notify." >&2
+    return 0
+  fi
+  echo "[ship] notifying task-cli: ${code} shipped via ${pr_url} ..."
+  # Run task-cli FROM "$ROOT" (a subshell `cd`, scoped to this call only) rather than passing
+  # `-C "$ROOT"` as an argument: task-cli's `-C`/`--cwd` is a PER-SUBCOMMAND flag and must
+  # follow the subcommand name — `task -C <dir> mark-shipped ...` fails with "invalid choice:
+  # '<dir>'" (a bug that shipped live and failed silently on its own merge). Running from the
+  # target directory sidesteps the ordering question entirely (task-cli's own `-C` default is
+  # `.`). `run` is a stateless passthrough (see its definition above) with no parent-shell side
+  # effects, so scoping the `cd` around it too is safe.
+  local -a mark_args=(mark-shipped "$code" --pr "$pr_url")
+  [ -n "$merge_sha" ] && mark_args+=(--commit "$merge_sha")
+  if ! (cd "$ROOT" || { echo "[ship] WARNING: could not cd to $ROOT for task-cli notify." >&2; exit 1; }; run task "${mark_args[@]}"); then
+    echo "[ship] WARNING: 'task mark-shipped ${code}' failed — the ticket may be out of sync with this merge. Update it manually: task read ${code}" >&2
+  fi
+}
+if [ "$DRY_RUN" = "1" ]; then
+  echo "[ship] [dry-run] would notify task-cli of the merge."
+else
+  # `_ship_notify_task_cli` already returns 0 on every path (each failure mode is caught and
+  # logged internally) — the `|| echo` here is defence-in-depth matching the `cleanup ||`
+  # guard below: a best-effort post-merge step must NEVER be able to abort the script and
+  # mask an already-successful merge, even if a future edit adds a path that returns non-zero.
+  _ship_notify_task_cli || echo "[ship] WARNING: task-cli notify step hit an unexpected error — #$PR IS merged; check/update the ticket manually." >&2
 fi
 
 # --- cleanup --------------------------------------------------------------------------

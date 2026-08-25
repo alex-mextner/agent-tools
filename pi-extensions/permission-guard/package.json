@@ -1,0 +1,16 @@
+{
+  "name": "@agent-tools/pi-permission-guard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "pi coding-agent extension: enforce command permissions (deny-dangerous / ask-risky) on the bash tool, from a rig-written policy file.",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "test": "tsx --test policy.test.ts index.test.ts loader.test.ts"
+  },
+  "keywords": ["pi", "coding-agent", "extension", "permissions", "rig"],
+  "license": "MIT",
+  "devDependencies": {
+    "tsx": "^4.19.0"
+  }
+}

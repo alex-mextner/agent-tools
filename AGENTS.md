@@ -118,9 +118,10 @@ The shipped hooks and their points:
 
 | Point | Hooks |
 | --- | --- |
-| `pre-agent` **(bridge-ready; NOT yet live in CC — needs the rig-cli `Agent\|Task` matcher; NOT mapped in Codex yet)** | `background-subagent-gate` (orchestration doctrine: block a non-trivial FOREGROUND subagent dispatch; subagent-exempt) |
-| `pre-bash` | `block-no-verify` (fail-closed), `block-raw-pr-merge`, `block-reset-hard` (fail-closed: blocks `git reset --hard` and `git clean -f...`/`-fd`/`-fdx` — irreversible working-tree wipes with no undo; deny-by-default, no self-service bypass — an optional repo-owner `agent_hooks.approval_cmd` in rig.yaml is the only override, Alex tg#6554), `require-review-before-commit`, `require-ticket-before-commit`, `enforce-timeout-on-bash`, `orchestrator-stays-thin` (impl-bash, warn→block, subagent-exempt), `no-long-inline-process` (review/--watch/build-test/long-sleep, subagent-exempt), `subagent-no-bg-longproc` (the INVERSE: block a SUBAGENT from BACKGROUNDING a long process — `run_in_background:true`/`&`/`setsid` on review/--watch/build-test/long-sleep — since a subagent is never re-invoked by a background-completion notification and would wedge forever; subagent-ONLY), `no-shell-file-edit` (block `sed -i`/`perl -i`/`gawk -i inplace` or a `> file` redirect editing a tracked source file; parsed not raw-matched; NOT subagent-exempt), `skills-read-gate` (mandatory skills before work, warn→block), `visual-proof-gate` (block a UI commit with no looked-at screenshot), `decision-request-format` (ADVISORY, never blocks: on a `tg --tag decision` send, self-check the body for Context/Options/Recommendation per the `decision-request-discipline` skill; parsed not raw-matched; NOT subagent-exempt) |
+| `pre-agent` **(live in CC and opencode once rig registers their matchers; NOT mapped in Codex yet)** | `background-subagent-gate` (orchestration doctrine: block a non-trivial FOREGROUND subagent dispatch; subagent-exempt) |
+| `pre-bash` | `block-no-verify` (fail-closed), `block-raw-pr-merge`, `block-reset-hard` (fail-closed: blocks `git reset --hard` and `git clean -f...`/`-fd`/`-fdx` — irreversible working-tree wipes with no undo; deny-by-default, no self-service bypass — an optional repo-owner `agent_hooks.approval_cmd` in rig.yaml is the only override, Alex tg#6554), `pkill-guard` (fail-closed: blocks a PATTERN-based kill — `pkill -f`/`killall`/`kill $(pgrep ...)`/`pgrep | xargs kill` — of a shared/ambiguous process name like `node`/`codex`/`review diff`; allows `kill <pid>` and any session-scoped pattern; deny-by-default, `RIG_HATCH_REQUEST_PKILL_GUARD` Telegram hatch only; retrospective gap G-5), `require-review-before-commit`, `require-ticket-before-commit`, `enforce-timeout-on-bash`, `orchestrator-stays-thin` (impl-bash, warn→block, subagent-exempt), `no-long-inline-process` (review/--watch/build-test/long-sleep, subagent-exempt), `subagent-no-bg-longproc` (the INVERSE: block a SUBAGENT from BACKGROUNDING a long process — `run_in_background:true`/`&`/`setsid` on review/--watch/build-test/long-sleep — since a subagent is never re-invoked by a background-completion notification and would wedge forever; subagent-ONLY), `no-shell-file-edit` (block `sed -i`/`perl -i`/`gawk -i inplace` or a `> file` redirect editing a tracked source file; parsed not raw-matched; NOT subagent-exempt), `skills-read-gate` (mandatory skills before work, warn→block), `visual-proof-gate` (block a UI commit with no looked-at screenshot), `decision-request-format` (ADVISORY, never blocks: on a `tg --tag decision` send, self-check the body for Context/Options/Recommendation per the `decision-request-discipline` skill; parsed not raw-matched; NOT subagent-exempt) |
 | `pre-write` | `block-secrets-write`, `block-raw-process-env`, `orchestrator-stays-thin` (non-docs code Edit/Write, warn→block, subagent-exempt) |
+| `pre-skill` **(live in CC once rig registers the `Skill` matcher; NOT mapped in Codex/opencode yet)** | `skills-marker-writer` (touches the freshness marker `skills-read-gate` reads — ADVISORY, never blocks) |
 | `post-write` | `format-on-write`, `lint-on-write` (react to the completed write; exit-10 is feedback because the write already landed) |
 | `stop` | `stop-completion-selfcheck` |
 
@@ -131,15 +132,17 @@ fail-**open** at the top level (a broken bridge must never wedge every tool call
 individual fail-closed hook still blocks through the shared `agents-hooks/v1` runner.
 
 **Claude Code:** `lib/cc_hook_bridge` is wired by `rig` into `settings.json`. It maps
-`PreToolUse` → `pre-bash`/`pre-write`/`pre-agent` (the last for the `Agent`/`Task` subagent
-tools), `PostToolUse` file-edit tools → `post-write`, and `Stop` → `stop`; it translates
-exit-10 BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`. The bridge also
-forwards CC's `agent_id`/`agent_type` (present only inside a dispatched subagent) into the v1
-event, so a subagent-exempt gate can tell a subagent's own tool use apart from the
-orchestrator's. **rig-cli follow-up:** for CC to actually *fire* `pre-agent`, rig-cli must
-add an `Agent|Task` PreToolUse matcher to `settings.json` (`hook_bridge_entries`) — that
-wiring lives in the separate rig-cli repo; the bridge half (point mapping + signal forwarding)
-lives here.
+`PreToolUse` → `pre-bash`/`pre-write`/`pre-agent`/`pre-skill` (the third for the `Agent`/
+`Task` subagent tools, the fourth for the `Skill` tool), `PostToolUse` file-edit tools →
+`post-write`, and `Stop` → `stop`; it translates exit-10 BLOCK into CC's
+`permissionDecision: "deny"` / `decision: "block"`. The bridge also forwards CC's
+`agent_id`/`agent_type` (present only inside a dispatched subagent) into the v1 event, so a
+subagent-exempt gate can tell a subagent's own tool use apart from the orchestrator's.
+**Two-repo split, both halves required:** the point mapping (which CC `(event, tool)` maps
+to which logical point) lives here; the matcher that makes CC actually *fire* that event —
+an `Agent|Task` or `Skill` `PreToolUse` matcher in `settings.json`'s `hook_bridge_entries` —
+is registered by the separate rig-cli repo. Either half alone is inert; `pre-agent` and
+`pre-skill` are both live only once BOTH sides have shipped and `rig apply` has run.
 
 **Codex:** `lib/codex_hook_bridge` is the first bridge for the confirmed Codex hooks
 contract. Codex TOML hooks call it for `PreToolUse` `Bash` (`pre-bash`), `PreToolUse`
@@ -193,18 +196,40 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   literal (skill: `bump-version-on-release`); override a genuine no-release ship with
   `--no-version-bump-ok <reason>` or `SHIP_SKIP_VERSION_BUMP=1`;
 - the **review-quorum bar is met** (Guard-B of the self-merge-authority program) — the PR's task
-  code (`$REVIEW_TASK_CODE`, else a `HYP-<n>`/uppercase ticket token from the branch name or PR
+  code (`$REVIEW_TASK_CODE`, else a `HYP-<n>`/uppercase ticket token, else a purely descriptive
+  ALL-CAPS/hyphenated code (`SME-ROADMAP-WORKTREE-NOTE`-shaped, 3+ segments, no digits) — all
+  tried against the branch name or PR
   body) has ≥ `SHIP_REVIEW_QUORUM_MIN_ITER` PASSED review-cli iterations across ≥
-  `SHIP_REVIEW_QUORUM_MIN_MODELS` distinct models (`review task <code> --check`). Both floors are
-  **clamped to a hard minimum of 3** — the env knobs can only RAISE the bar, never lower it (a
-  `0`/negative/below-3 value resolves to 3). This is the gate that makes self-merge *strictly
-  controlled*; it **fails closed** (a missing task code / `review` CLI / unreadable store, OR a
-  quorum reading 0 iterations / 0 distinct models, all refuse — ship re-derives the verdict from
-  the counts, never trusts the subprocess's `passed` boolean alone, #242). There is **NO self-service override flag** — a one-time bypass
+  `SHIP_REVIEW_QUORUM_MIN_ROLES` distinct BOARD ROLES (`review task <code> --check`) — this is
+  the DEFAULT check and is always enforced, matching review-cli's own role-based coverage
+  (review-cli#246). `SHIP_REVIEW_QUORUM_MIN_MODELS` is an OPT-IN extra: unset by default (no
+  model floor), and if an operator sets it, both the role floor AND the model floor apply
+  together. Both floors, when in force, are **clamped to a hard minimum of 3** — the env knobs
+  can only RAISE the bar, never lower it (a `0`/negative/below-3 value resolves to 3). This is
+  the gate that makes self-merge *strictly controlled*; it **fails closed** (a missing task
+  code / `review` CLI / unreadable store, OR a quorum reading 0 iterations / 0 distinct roles,
+  all refuse — ship re-derives the verdict from the counts, never trusts the subprocess's
+  `passed` boolean alone, #242). An installed `review-cli` too old to report roles gets an
+  explicit "upgrade review-cli" refusal instead of a generic error. There is **NO self-service override flag** — a one-time bypass
   is requested via `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>"`, which asks Alex live
   on Telegram (shared `agenttools_hatch_escalation` lib) and proceeds ONLY on his real-time
   approval. Disable the whole gate with `SHIP_REVIEW_QUORUM=0`. Every non-dry-run gated ship is
-  audited to `SHIP_AUDIT_FILE`; dry-runs print the would-be audit without writing it;
+  audited to `SHIP_AUDIT_FILE`; dry-runs print the would-be audit without writing it. **Every
+  `RIG_HATCH_REQUEST_*` hatch across every agent-hook** (not just ship's own two) is separately
+  audited by the shared lib itself: any attempt that REACHES `request_hatch_approval` with the env
+  var carrying a value — blank, bare-flag, denied, or approved — appends one JSON line to
+  `overrides.log` (default `<real-home>/.config/agent-tools/overrides.log`,
+  `default_overrides_log_path()`), closing gap G-8 from the 2026-07-01 agent-ecosystem retrospective
+  (`docs/specs/…` in hyperide, section 5.2.3 item 3: "escape hatches have no audit sink"). One
+  pre-existing exception: `ci/ship/skip_ci_hatch.py` denies a blank/bare
+  `RIG_HATCH_REQUEST_SHIP_SKIP_CI` LOCALLY (a deliberate, lib-version-independent guard, unrelated
+  to this feature) before ever calling the shared lib, so that specific blank/bare case is recorded
+  only in `SHIP_AUDIT_FILE` on the non-dry-run path — and in NEITHER file on `--dry-run` (its local
+  guard denies without calling `_audit`, and `ship.sh`'s own dry-run audit helper prints the
+  would-be line without writing it). Every other outcome (denied/approved, and the review-quorum
+  hatch's own blank/bare case) routes through the lib as described above. A `rig
+  status` "overrides this week" section and a weekly tg digest reading this file are tracked as
+  follow-up work, not yet built;
 - the local branch has **no unpushed/diverged commits** and a **clean worktree**.
 
 Then it squash-merges, deletes the remote branch, removes the local worktree + branch (unless
@@ -314,6 +339,34 @@ them to *every* project and user. If you want the catalog of always-apply behavi
 - **Fresh worktrees, off the origin default branch.** Don't work in the primary checkout (another
   agent may hold it). A fresh worktree bases on `origin/<default branch>`, not your current HEAD —
   verify the base before you start if your work is stacked on unmerged branches.
+- **Create worktrees with `rig worktree create <name> --from origin/main`** (rig-cli — the
+  explicit `--from` matters: the command defaults to branching off your current `HEAD`, which
+  contradicts the "off the origin default branch" rule above if you run it from inside an
+  existing feature worktree). It lands the tree at the standardized `<repo>/.worktrees/<name>`
+  and, *before* creating it, registers `/.worktrees/` in this **clone's** `.git/info/exclude`
+  (shared by every linked worktree of this clone, never committed) — that's why `.worktrees/`
+  is intentionally NOT in the committed `.gitignore`: it's a local scratch convention, not
+  something every clone should carry. Remove a worktree with **`rig worktree remove <name>`**,
+  never by deleting its source files by hand (leaves stale `git worktree` metadata) and never
+  with plain `git worktree remove` either — that leaves the branch behind, and a later `rig
+  worktree create <same-name>` then fails because the branch already exists; `rig worktree
+  remove` deletes both the tree and its branch together.
+  - **First time in a clone** (including right after pulling this change, or on a brand new
+    clone/CI checkout): the exclude entry doesn't exist yet, so `git status` will show any
+    `.worktrees/*` content — pre-existing or hand-made — as untracked. Fix it by running `rig
+    worktree create <a-new-name> --from origin/main` once (same `--from` reasoning as above —
+    this bootstrap worktree is throwaway, remove it with `rig worktree remove` right after) —
+    the registration covers the whole `.worktrees/` directory, not just that one name, so it
+    retroactively ignores any existing entries too. (It must be a name that doesn't already
+    exist under `.worktrees/`: the command checks `target.exists()` and errors "already exists"
+    *before* it reaches the exclude reconcile, so re-running it for an already-created
+    worktree's own name does nothing.) The other fix is to append `/.worktrees/` to
+    `.git/info/exclude` by hand, no `rig worktree create` involved — run this from the
+    **primary checkout**, or resolve the shared path first with `git rev-parse
+    --git-common-dir` (inside a *linked* worktree `.git` is a file, not a directory, so a
+    literal `.git/info/exclude` path doesn't exist there). Do this before running `git add
+    -A`/`git add .` from the primary checkout — otherwise a stray `.worktrees/*` entry can get
+    staged as a broken gitlink (or, if a worktree's own `.git` file is missing, as plain files).
 - **The gates apply to you too.** Atomic, conventional commits (one logical change each); review
   before each commit (refresh the marker, *then* commit); never `--no-verify`; land only via the
   ship gate. These are the same guards this catalog installs for any repo — here they're

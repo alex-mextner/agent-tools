@@ -369,9 +369,36 @@ class PollResult:
     error: str = ""
 
 
+class _NoCrossOriginAuthRedirect(urllib.request.HTTPRedirectHandler):
+    """Strip Authorization when a redirect crosses to a different origin.
+
+    urllib's default redirect handler re-sends every original header to the redirect
+    target — a provider key (or the harvested omp OAuth token) would leak to any host the
+    endpoint 30x's to. Same-origin redirects keep the header; cross-origin drops it (the
+    request then fails auth honestly instead of exfiltrating the credential).
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is None:
+            return None
+        from urllib.parse import urlsplit  # lazy: only needed on an actual redirect
+
+        old, new_origin = urlsplit(req.full_url), urlsplit(new.full_url)
+        if (old.scheme, old.hostname, old.port) != (
+            new_origin.scheme,
+            new_origin.hostname,
+            new_origin.port,
+        ):
+            new.headers.pop("Authorization", None)
+            new.unredirected_hdrs.pop("Authorization", None)
+        return new
+
+
 def _http_get_json(url: str, headers: dict[str, str], timeout: float) -> dict[str, Any]:
     req = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — fixed https hosts
+    opener = urllib.request.build_opener(_NoCrossOriginAuthRedirect())
+    with opener.open(req, timeout=timeout) as resp:  # noqa: S310 — fixed https hosts
         body = resp.read().decode("utf-8", "replace")
     data = json.loads(body)
     return data if isinstance(data, dict) else {}
@@ -466,6 +493,120 @@ def _poll_zai(timeout: float) -> PollResult:
     return PollResult("zai", True, model_ids=_ids_from_openai_list(data))
 
 
+def _omp_agent_db() -> Path:
+    """omp's agent.db location, honoring the agent-dir env vars omp itself reads."""
+    for var in ("OMP_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"):
+        override = os.environ.get(var, "").strip()
+        if override:
+            return Path(override).expanduser() / "agent.db"
+    return Path.home() / ".omp" / "agent" / "agent.db"
+
+
+def _omp_kimi_code_oauth_token() -> str | None:
+    """Best-effort: a fresh OAuth access token for kimi-code from the local omp install.
+
+    The Kimi-for-Coding endpoint is OAuth-backed, so on a machine whose only Kimi
+    credential is the omp login the poller can still run instead of skipping. Primary path
+    is `omp token kimi-code` — omp's own resolver, which handles refresh and profiles.
+    Fallback is a READ-ONLY peek at omp's agent.db for when the CLI can't run (e.g. cron
+    PATH). Any failure returns None and the caller falls through to the usual skip. Never
+    raises, never refreshes by itself — an expired stored token surfaces as the endpoint's
+    401 error.
+    """
+    return _omp_token_cli() or _omp_token_agent_db()
+
+
+def _omp_token_cli() -> str | None:
+    """`omp token kimi-code` — the canonical, refresh-aware resolver. None on any failure."""
+    try:
+        res = subprocess.run(
+            ["omp", "token", "kimi-code"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    token = res.stdout.strip()
+    return token or None
+
+
+def _omp_agent_db() -> Path:
+    """omp's agent.db location, honoring the agent-dir env vars omp itself reads."""
+    for var in ("OMP_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"):
+        override = os.environ.get(var, "").strip()
+        if override:
+            return Path(override).expanduser() / "agent.db"
+    return Path.home() / ".omp" / "agent" / "agent.db"
+
+
+def _omp_token_agent_db() -> str | None:
+    """READ-ONLY peek at omp's agent.db (fallback when the omp CLI can't run).
+
+    Reads the newest enabled kimi-code oauth row; any failure (missing db, schema drift,
+    lock, malformed row) returns None. Never raises.
+    """
+    import sqlite3  # lazy: stdlib, but only this one resolver needs it
+
+    db_path = _omp_agent_db()
+    try:
+        if not db_path.is_file():
+            return None
+        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1)
+        try:
+            row = db.execute(
+                "SELECT data FROM auth_credentials"
+                " WHERE provider = 'kimi-code' AND credential_type = 'oauth'"
+                " AND disabled_cause IS NULL"
+                " ORDER BY updated_at DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            db.close()
+        if not row:
+            return None
+        data = json.loads(row[0])
+        if not isinstance(data, dict):
+            return None
+        token = data.get("access")
+        return token.strip() if isinstance(token, str) and token.strip() else None
+    except (OSError, sqlite3.Error, ValueError):
+        return None
+
+
+# The ONLY origin the harvested omp OAuth token may be sent to. A custom
+# KIMI_CODE_BASE_URL requires an explicit KIMI_API_KEY — otherwise one env var could
+# redirect a credential the user never handed this script to an arbitrary host.
+_KIMI_CODE_CANONICAL_BASE = "https://api.kimi.com/coding/v1"
+
+
+def _poll_kimi_code(timeout: float) -> PollResult:
+    key = resolve_key(("KIMI_API_KEY",))
+    from_oauth = key is None
+    if from_oauth:
+        key = _omp_kimi_code_oauth_token()
+    if not key:
+        return PollResult(
+            "kimi-code", False, skipped="no KIMI_API_KEY or omp kimi-code OAuth login"
+        )
+    # KIMI_CODE_BASE_URL is the OAuth-managed coding endpoint override; KIMI_BASE_URL is a
+    # DIFFERENT var (direct-API moonshot.ai) and must not redirect this poller.
+    base = os.environ.get("KIMI_CODE_BASE_URL", _KIMI_CODE_CANONICAL_BASE).rstrip("/")
+    if from_oauth and base != _KIMI_CODE_CANONICAL_BASE:
+        return PollResult(
+            "kimi-code",
+            False,
+            skipped="custom KIMI_CODE_BASE_URL requires an explicit KIMI_API_KEY"
+            " (the omp OAuth token is only sent to the canonical endpoint)",
+        )
+    try:
+        data = _http_get_json(f"{base}/models", {"Authorization": f"Bearer {key}"}, timeout)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return PollResult("kimi-code", False, error=str(exc))
+    return PollResult("kimi-code", True, model_ids=_ids_from_openai_list(data))
+
+
 # fireworks has no stable public model-list contract here; it routes through commandcode in
 # practice, so we don't poll it directly (skipped with a clear reason).
 def _poll_fireworks(timeout: float) -> PollResult:
@@ -478,6 +619,7 @@ POLLERS: dict[str, Callable[[float], PollResult]] = {
     "gemini": _poll_gemini,
     "commandcode": _poll_commandcode,
     "zai": _poll_zai,
+    "kimi-code": _poll_kimi_code,
     "fireworks": _poll_fireworks,
 }
 

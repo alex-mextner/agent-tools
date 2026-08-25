@@ -66,6 +66,7 @@ mechanisms are stack-agnostic (bun/node, python-uv, go).
 | -------------- | ----------------------------------------------------------------------------- |
 | `skills/`      | Advisory rules as markdown skills — `universal/` (any project), `by-type/{bot,backend,frontend,cli,library,infra,monorepo}/` (by project shape), and `by-stack/<l1>/<lang>[/<framework>]/` (by declared tech stack; a repo inherits every skill whose stack path is a prefix of its declared stack). Each is one `SKILL.md` with `name` + `description` frontmatter, the portable rule, a rationale, and a generic example. |
 | `agent-hooks/` | Programmatic guards that fire on an agent's tool use (the `agents-hooks/v1` contract). Each is a descriptor + executable + README. They enforce, mid-session, what a skill can only advise. |
+| `linters/` | Canonical linter/formatter carriers consumed by Rig (Oxc baseline: Oxlint + Oxfmt). |
 | `git-hooks/`   | Copyable `pre-commit` / `commit-msg` / `pre-push` / `no-secrets-scan` hooks plus a `lefthook.yml`, generalized across three toolchains — and a **global dispatcher** (`global-dispatcher/`) that runs every hook in `~/.config/git/global-hooks.d/` in **every** repo, even ones whose lefthook/husky override `core.hooksPath`. |
 | `ci/`          | Drop-in CI / PR-gate building blocks a CI-building agent looks for first — one slot per concern (workflow + optional shell script + README): secret-scan (gitleaks), CodeQL (incl. a no-GHAS self-gate), semgrep SAST, dependency-review + license, AI-review, Copilot-findings, unresolved-review-thread block, unchecked-checkbox block, mandatory screenshots, conventional-commit PR-title lint, leftover-marker grep, and a green-CI-gated `ship` merge command. See [`ci/README.md`](ci/README.md). |
 | `mcp/`         | The MCP-vs-CLI+skill policy (why `review` is a CLI+skill, not an MCP) and a code-search MCP slot. |
@@ -153,7 +154,8 @@ exit `10` = block, other = error → `on_error` policy). To install one:
 2. Set the descriptor's `cmd` to the script's **absolute path** (the runner rejects
    relative/bare commands).
 3. Drop the descriptor into your harness's hook directory for the matching point
-   (`pre-bash`, `pre-write`, `post-write`, `stop` — map to your harness's real event names).
+   (`pre-bash`, `pre-write`, `pre-agent`, `pre-skill`, `post-write`, `stop` — map to your
+   harness's real event names).
 
 `rig apply` does all three for you (it rewrites the `cmd` placeholder to the script's
 absolute path in your agent-tools checkout). See [`agent-hooks/README.md`](agent-hooks/README.md)
@@ -271,9 +273,12 @@ that nobody is required to stop at — see #543.
 - **By-stack skills:** 5 — `frontend/ts` (ts-strictness) + `frontend/ts/react`
   (vercel-react-patterns); `mobile/swift` (swift-concurrency) + `mobile/swift/swiftui`
   (swiftui-mvvm, tca-swiftui). Selected by declared stack prefix, not project shape.
-- **Agent-hooks:** 8 — block-no-verify, block-raw-pr-merge, block-secrets-write,
+- **Agent-hooks:** see `agent-hooks/` for the current directory listing and
+  `agent-hooks/README.md`'s point table for the full, authoritative set and count — a
+  representative sample: block-no-verify, block-raw-pr-merge, block-secrets-write,
   require-review-before-commit, enforce-timeout-on-bash, block-raw-process-env,
-  stop-completion-selfcheck, **format-on-write** (runs the project's configured formatter
+  stop-completion-selfcheck, pkill-guard (blocks a pattern-based kill of a shared process
+  name), **format-on-write** (runs the project's configured formatter
   on each file the agent writes — oxfmt/prettier/biome/ruff/black/gofmt/rustfmt; never
   blocks).
 - **Git-hooks:** 4 templates — pre-commit, commit-msg, pre-push, no-secrets-scan (+ a

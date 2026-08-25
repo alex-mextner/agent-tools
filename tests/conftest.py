@@ -8,6 +8,16 @@ that patches only `_TRUSTED_TG_CTL_PATHS` invoke the real binary. Pointing `reso
 clean temp home for tests closes that hole centrally. The two explicit real-OS-home tests below are
 exempt from the home patch; they only assert `resolve_home()`'s source of truth and do not resolve
 or execute `tg-ctl`.
+
+It also exports `AGENT_TOOLS_OVERRIDES_LOG` (a full file path under the same clean temp home) for
+every test. That env var is the escape-hatch audit sink's subprocess-reachable override (see
+`agenttools_hatch_escalation._resolve_overrides_log_path`): several hook tests run the hook
+script as a genuine SUBPROCESS (`subprocess.run([sys.executable, hook_path], ...)`), which gets a
+brand-new interpreter that the `pwd.getpwuid`/`resolve_home` monkeypatches below never reach — so
+without this env var, any subprocess test that sets the hatch env var to ANY value (even a bare
+`1` that never contacts tg-ctl) would append a real audit line to the DEVELOPER'S real
+`~/.config/agent-tools/overrides.log`. `monkeypatch.setenv` mutates the real process `os.environ`,
+so a subprocess built from `dict(os.environ)` inherits this override automatically.
 """
 
 from __future__ import annotations
@@ -62,6 +72,10 @@ def _hermetic_hatch_home(tmp_path_factory, monkeypatch, request):
     monkeypatch.setenv("AGENTTOOLS_TEST_HERMETIC_HOME", str(clean_home))
     monkeypatch.setenv("HOME", str(clean_home))
     monkeypatch.setenv("USERPROFILE", str(clean_home))
+    monkeypatch.setenv(
+        "AGENT_TOOLS_OVERRIDES_LOG",
+        str(clean_home / ".config" / "agent-tools" / "overrides.log"),
+    )
     is_real_os_home_test = request.node.get_closest_marker("real_os_home") is not None
 
     if is_real_os_home_test:

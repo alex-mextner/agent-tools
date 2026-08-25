@@ -31,7 +31,7 @@
     "fallback_chain": {
       "type": "array",
       "minItems": 1,
-      "description": "The agent-facing, cross-harness resilience order read by every harness (cc/codex/oc/pi). Priority order: on the Nth repeated model error the live executor drops to the next entry, and returns to the top once the preferred one recovers. `harness` is the EXECUTOR boundary (a model swap when it equals the running harness, a re-dispatch when it differs), not the closed `provider` enum.",
+      "description": "The agent-facing, cross-harness resilience order read by every harness (cc/codex/oc/pi/omp). Priority order: on the Nth repeated model error the live executor drops to the next entry, and returns to the top once the preferred one recovers. `harness` is the EXECUTOR boundary (a model swap when it equals the running harness, a re-dispatch when it differs), not the closed `provider` enum.",
       "items": { "$ref": "#/$defs/fallbackStep" }
     }
   },
@@ -75,7 +75,7 @@
         "provider": {
           "type": "string",
           "description": "Transport provider the checker can poll for a model list.",
-          "enum": ["anthropic", "openai", "gemini", "commandcode", "zai", "fireworks"]
+          "enum": ["anthropic", "openai", "gemini", "commandcode", "zai", "kimi-code", "fireworks"]
         },
         "capabilities": {
           "type": "array",

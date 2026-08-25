@@ -707,6 +707,35 @@ def test_leftover_tracked_todo_passes(tmp_path: Path):
     assert rc == 0, out
 
 
+@pytest.mark.parametrize("rel_path", ["ci/ship/ship.sh", "tests/test_ship.py"])
+def test_leftover_scans_ship_sh_and_test_ship_py_with_no_exemption(tmp_path: Path, rel_path: str):
+    """agent-tools#317/#318 review follow-up: the CI-up leftover-grep gate must scan
+    ci/ship/ship.sh and tests/test_ship.py themselves exactly like any other file — it
+    has no path-based exemption for the local ship.sh CI-outage fallback's own
+    implementation/test files (that fallback's design is now: never spell a marker as
+    one contiguous token in its own source, not a path carve-out — see ship.sh's
+    _local_leftover_check). Parametrized so EACH path is planted and asserted on its
+    OWN run — a single combined-commit version (planting both, asserting one pass/fail)
+    could not tell "neither path is exempt" from "exactly one of the two is exempt but
+    the other still trips the gate", which would silently hide half a regression.
+
+    The marker text below is split ("TO" "DO") rather than written as one literal —
+    this file becomes part of THIS SAME repo's own PR diff, so a bare "[T]ODO" here
+    would self-trigger ship.sh's CI-outage leftover-marker fallback on this exact
+    change, the very self-reference class of bug agent-tools#318 fixed."""
+    marker_todo = "TO" "DO"
+    repo = _leftover_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feat")
+    target = repo / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(f"x = 1  # {marker_todo} no ticket\n")
+    _commit(repo, "feat")
+    rc, out = _run(LEFTOVER, repo, env_extra={"LEFTOVER_BASE": "main", "LEFTOVER_HEAD": "HEAD"})
+    assert rc == 1, out
+    assert "untracked-todo" in out
+    assert rel_path in out, f"expected {rel_path} named in the gate's own output, got:\n{out}"
+
+
 def test_leftover_bare_seven_equals_is_not_a_conflict_marker(tmp_path: Path):
     """A source line of exactly 7 `=` is a common decorative separator, not a merge marker —
     it must NOT block (agent-tools#129 false positive)."""

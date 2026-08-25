@@ -4,10 +4,15 @@ The helper is intentionally small and stdlib-only: hook scripts import it direct
 agent-tools checkout, before package installation can be assumed. It turns a per-hook env var
 (`RIG_HATCH_REQUEST_<HOOK_ID>`) into a one-time `tg-ctl ask` call through a trusted absolute
 path. It never consults ambient PATH.
+
+Every attempt where the hatch env var carried ANY value is also appended, best-effort, as one
+JSON line to `overrides.log` (retrospective 2026-07-01, section 5.2.3 item 3 / gap G-8: "escape
+hatches have no audit sink"). See `_append_overrides_log` for the record shape and trust model.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import pwd
 import re
@@ -15,6 +20,7 @@ import shlex
 import signal
 import subprocess  # noqa: S404 - runs an already-resolved absolute tg-ctl path
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -40,6 +46,24 @@ _TRUSTED_TG_CTL_PATHS = (
     Path("/Users/ultra/.files/bin/tg-ctl"),
     Path("/usr/local/bin/tg-ctl"),
     Path("/opt/homebrew/bin/tg-ctl"),
+)
+
+# Default location of the escape-hatch audit sink, relative to the account's REAL home
+# (`resolve_home()`) — see `_resolve_overrides_log_path` for why it is rooted there and not at
+# `$HOME`/cwd. Mirrors the existing `ci/ship/ship.sh` convention of `~/.config/agent-tools/*` for
+# this repo's own audit artifacts (`ship-audit.jsonl`).
+_OVERRIDES_LOG_RELATIVE = Path(".config") / "agent-tools" / "overrides.log"
+# Optional full-path override for the audit sink, mirroring `ship.sh`'s `SHIP_AUDIT_FILE`. See
+# `_resolve_overrides_log_path` for the precedence order and its trust-level trade-off.
+_OVERRIDES_LOG_ENV = "AGENT_TOOLS_OVERRIDES_LOG"
+# Best-effort session/agent identifiers to check, in order, when no caller-supplied context value
+# is present. None of these are guaranteed to exist in a given hook's process env — that's why the
+# chain ends in a `pid:<getpid()>` fallback that is never empty.
+_SESSION_ID_ENV_VARS = (
+    "CLAUDE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ID",
+    "RIG_SESSION_ID",
+    "TMUX_PANE",
 )
 
 
@@ -154,6 +178,7 @@ def request_hatch_approval(
     tg_ctl_candidates: Sequence[Path | str] | None = None,
     timeout_s: float = DEFAULT_TG_CTL_TIMEOUT_S,
     process_margin_s: float = DEFAULT_PROCESS_MARGIN_S,
+    overrides_log_path: Path | str | None = None,
 ) -> HatchApprovalResult:
     """Request Telegram approval when this hook's hatch env var carries a real justification.
 
@@ -182,10 +207,16 @@ def request_hatch_approval(
     Unset (in both sources) means "hatch not requested" and does not block later mechanisms. A
     present but blank/bare-flag value is an invalid request: no Telegram call is made and the
     hook should deny rather than falling through to `approval_cmd`.
+
+    Every attempt where the env var carries ANY value (blank, bare-flag, or a real justification —
+    i.e. `env_present` ends up `True`) is a hatch USE and is appended, best-effort, to the
+    escape-hatch audit sink as one JSON line (`overrides_log_path`, defaulting to
+    `<real-home>/.config/agent-tools/overrides.log`). See `_append_overrides_log`.
     """
 
     env_map = env if env is not None else os.environ
     env_var = hatch_env_var(hook_id)
+    ctx = context or {}
     raw = env_map.get(env_var)
     if raw is None and command is not None:
         raw = _parse_inline_hatch_value(env_var, command)
@@ -198,9 +229,9 @@ def request_hatch_approval(
             env_present=False,
         )
     try:
-        return _request_present_hatch_approval(
+        result = _request_present_hatch_approval(
             hook_id,
-            context or {},
+            ctx,
             cwd=cwd,
             env_var=env_var,
             raw=raw,
@@ -209,13 +240,25 @@ def request_hatch_approval(
             process_margin_s=process_margin_s,
         )
     except Exception as exc:  # noqa: BLE001 - a hatch request must never fail open.
-        return HatchApprovalResult(
+        result = HatchApprovalResult(
             requested=True,
             approved=False,
             reason=f"Telegram hatch escalation errored: {exc}",
             env_var=env_var,
             env_present=True,
         )
+    _append_overrides_log(
+        hook_id,
+        env_var,
+        result,
+        command=command,
+        cwd=cwd,
+        justification=raw,
+        context=ctx,
+        env_map=env_map,
+        overrides_log_path=overrides_log_path,
+    )
+    return result
 
 
 def _request_present_hatch_approval(
@@ -327,6 +370,159 @@ def _request_present_hatch_approval(
         env_present=True,
         tg_ctl_path=str(tg_ctl),
     )
+
+
+def _append_overrides_log(
+    hook_id: str,
+    env_var: str,
+    result: HatchApprovalResult,
+    *,
+    command: str | None,
+    cwd: str,
+    justification: str,
+    context: Mapping[str, object],
+    env_map: Mapping[str, str],
+    overrides_log_path: Path | str | None,
+) -> None:
+    """Best-effort append of one JSON line recording this hatch USE to the audit sink (gap G-8,
+    retrospective 2026-07-01 section 5.2.3 item 3: "every escape-hatch use appends {ts, session,
+    hatch, command, reason} to overrides.log"). Called for every attempt where the env var carried
+    ANY value — blank, bare-flag, denied, or approved — because each of those is a real use of the
+    mechanism, not only a successful bypass (a denied/blank attempt is exactly the kind of pressure
+    a hidden hatch would otherwise mask). MUST NEVER raise or block the caller: an audit-log
+    failure (disk full, read-only home, permissions) must not become a hatch outage, mirroring
+    `ci/ship/ship.sh`'s own `_review_quorum_audit_log` best-effort contract.
+    """
+
+    try:
+        path = _resolve_overrides_log_path(overrides_log_path)
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": _utc_now_iso(),
+            "session": _resolve_session_id(context, env_map),
+            "hatch": hook_id,
+            "env_var": env_var,
+            # Fall back to context["command"] when the caller didn't also pass the command=
+            # kwarg — most hook call sites pass both (redundantly), but a caller that only
+            # threads it through `context` (e.g. a future hook) must not ship a blank audit
+            # `command` field just because the kwarg was omitted.
+            "command": str(command or context.get("command") or "")[:_DETAIL_CAP],
+            "reason": justification.strip()[:_DETAIL_CAP],
+            "decision": "approved" if result.approved else "denied",
+            "detail": result.reason[:_DETAIL_CAP],
+            "cwd": cwd,
+        }
+        _append_json_line_0600(path, entry)
+    except Exception:  # noqa: BLE001 - audit logging must never break the hatch flow.
+        return
+
+
+def _append_json_line_0600(path: Path, entry: dict[str, object]) -> None:
+    """Append one JSON line to `path`, forcing owner-only `0600` permissions — the audit line can
+    carry a free-text justification and a full shell command, so it deserves the same privacy
+    posture `lib/agenttools_log` already applies to its own file sink. `O_APPEND` makes the write
+    itself atomic against concurrent appenders (multiple hooks/hatches writing the same file);
+    `fchmod` re-tightens permissions on a PRE-EXISTING file too, not only one this call creates."""
+
+    line = (json.dumps(entry, ensure_ascii=True, sort_keys=True) + "\n").encode("utf-8")
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        _write_all(fd, line)
+    finally:
+        os.close(fd)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """`os.write` is not guaranteed to write the whole buffer in one call (POSIX allows a short
+    write, e.g. on a full disk or a signal interrupt) — loop until every byte is written rather
+    than assuming one call suffices, even though a single audit line is always small. A `0`
+    return is also POSIX-legal (distinct from a short write) and would otherwise spin the loop
+    forever without shrinking `view`; raise so the caller's best-effort `except Exception`
+    swallows it like any other audit-log failure instead of hanging the hook."""
+
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("os.write returned a non-positive byte count")
+        view = view[written:]
+
+
+def _resolve_overrides_log_path(explicit: Path | str | None) -> Path | None:
+    """The overrides.log path, checked in this order:
+
+    1. `explicit` (the `overrides_log_path=` kwarg — tests / advanced callers).
+    2. the `AGENT_TOOLS_OVERRIDES_LOG` env var (a full file path), mirroring
+       `ci/ship/ship.sh`'s own `SHIP_AUDIT_FILE` override for its ship-specific audit log — the
+       SAME precedent, same trust level. This tier exists for hook scripts invoked as a fresh
+       SUBPROCESS (every `agent-hooks/*` script, run by the real harness): a subprocess gets a
+       brand-new interpreter, so an in-process `monkeypatch.setattr(resolve_home, ...)` never
+       reaches it, but an exported env var does. `tests/conftest.py`'s autouse hermetic-home
+       fixture exports it for exactly this reason.
+    3. `<real-home>/.config/agent-tools/overrides.log`, `resolve_home()` — the SAME
+       non-agent-controllable trust anchor used to resolve `tg_ctl_path`.
+
+    SECURITY NOTE: unlike `tg_ctl_path`, tier 2 here IS environment-controllable — an agent could
+    in principle redirect its own audit line. This is an accepted, precedented trade-off (see
+    `SHIP_AUDIT_FILE` above): the audit sink is a best-effort SECONDARY record, never the
+    enforcement mechanism itself — the live `tg-ctl ask` round trip in
+    `_request_present_hatch_approval` is what actually gates the bypass, and an agent cannot
+    redirect or suppress THAT. Returns None when neither an override applies nor `resolve_home()`
+    resolves (fail-quiet: skip the write rather than fall back to an untrusted anchor).
+    """
+
+    if explicit is not None:
+        return Path(explicit)
+    env_override = os.environ.get(_OVERRIDES_LOG_ENV)
+    if env_override:
+        return Path(env_override)
+    home = resolve_home()
+    if home is None:
+        return None
+    return Path(home) / _OVERRIDES_LOG_RELATIVE
+
+
+def default_overrides_log_path() -> Path | None:
+    """Public accessor for the escape-hatch audit sink path a caller with no explicit
+    `overrides_log_path=` would actually write to, for consumers other than
+    `request_hatch_approval` itself (e.g. a future `rig status` "overrides this week" section or a
+    weekly tg digest, retrospective 5.2.3 item 3). This is the SAME tier-2/tier-3 resolution
+    `_resolve_overrides_log_path` uses: honors `AGENT_TOOLS_OVERRIDES_LOG` when set, else falls
+    back to `resolve_home()`-rooted. Returns None only when neither tier resolves (no env override
+    AND `resolve_home()` is None)."""
+
+    return _resolve_overrides_log_path(None)
+
+
+def _resolve_session_id(context: Mapping[str, object], env_map: Mapping[str, str]) -> str:
+    """Best-effort session/agent identifier for the audit line.
+
+    No existing call site threads a real session id into `context` today (every hook passes only
+    `{"hook": ..., "command": ...}`-shaped dicts), so this checks a `session_id`/`session` context
+    key first (future callers can supply a precise value with zero changes here), then a short
+    list of plausible harness-exported env vars, then falls back to `pid:<getpid()>` — the field is
+    NEVER empty, because a session-less audit line is still worth having.
+    """
+
+    for key in ("session_id", "session"):
+        value = context.get(key)
+        if value:
+            return str(value)
+    for var in _SESSION_ID_ENV_VARS:
+        value = env_map.get(var)
+        if value:
+            return value
+    return f"pid:{os.getpid()}"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _bounded_timeout(timeout_s: float) -> float:
@@ -501,6 +697,7 @@ __all__ = [
     "DEFAULT_TG_CTL_TIMEOUT_S",
     "HatchApprovalResult",
     "MAX_TG_CTL_TIMEOUT_S",
+    "default_overrides_log_path",
     "hatch_env_var",
     "request_hatch_approval",
     "resolve_home",

@@ -5,15 +5,16 @@ What it does
 ------------
 Counts CONSECUTIVE transient model errors (rate-limit / overload / API 5xx) for a unit of
 work and, past a threshold, switches the active executor down the cross-harness chain
-``claude:fable -> claude:opus -> oc:GLM-5.2 -> codex:gpt5.5``. Within a harness the switch
-is a model swap; across the boundary it tells the host to RE-DISPATCH the work to the next
-harness (opencode / codex exec) as an executor. On recovery it promotes back toward the
-preferred model (return-to-top). All the count/threshold/switch/recover logic is the pure
-:mod:`fallback_chain` module next to this file; this script is only the I/O shell.
+``claude:fable -> claude:opus -> oc:GLM-5.2 -> codex:gpt5.5 -> omp:k3``. Within a harness
+the switch is a model swap; across the boundary it tells the host to RE-DISPATCH the work
+to the next harness (opencode / codex exec / omp) as an executor. On recovery it promotes
+back toward the preferred model (return-to-top). All the count/threshold/switch/recover
+logic is the pure :mod:`fallback_chain` module next to this file; this script is only the
+I/O shell.
 
 The chain is read from ONE definition — ``lib/contracts/models.yaml`` ``fallback_chain:`` —
-so every harness (cc/codex/oc/pi) agrees on the order; the baked-in default is the offline
-fallback.
+so every harness (cc/codex/oc/pi/omp) agrees on the order; the baked-in default is the
+offline fallback.
 
 Contract (agents-hooks/v1)
 --------------------------

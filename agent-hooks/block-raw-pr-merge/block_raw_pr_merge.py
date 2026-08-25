@@ -191,6 +191,144 @@ _WRITE_METHOD_EQ = re.compile(r"^(--method|-X)=(PUT|POST)$", re.IGNORECASE)
 # at pre-exec time, so a graphql call carrying it is over-blocked (fail closed).
 _FIELDISH = frozenset({"-F", "--field", "-f", "--raw-field"})
 
+# ── pflag/cobra short-flag clustering (`gh api`'s own flag grammar) ──────────────────────────
+# `gh api`'s ONLY boolean short flag (`-i/--include`) can be clustered ahead of a value-taking
+# short flag in one token — `-iF query=x` == `-i -F query=x`, and the value may be glued on too
+# (`-iFquery=x` == `-i -F query=x`). Every detector below (`_gh_api_endpoint`,
+# `_graphql_carries_merge_mutation`, `_graphql_query_field_values`,
+# `_graphql_argument_role_is_unprovable`, `_rest_has_write_method`, `_rest_method_is_unprovable`)
+# only recognises a value flag at the START of a token (`-f`/`-F`/`-X`/...), so a merge query or a
+# write method smuggled behind a leading `-i` was invisible to all of them. Keep this set in sync
+# with `gh api --help`'s FLAGS section if a future `gh` adds another short boolean flag: if it is
+# NOT kept in sync, the new flag's char is unrecognized by BOTH short-char sets, which
+# `_gh_api_flags_contain_unprovable_cluster` (#333 review finding) now catches and blocks on —
+# drift here degrades to a (safe) over-block, never a silent bypass.
+_API_BOOL_SHORT_CHARS = frozenset({"i"})
+# Every value-taking short flag letter `gh api` defines (the short forms of `_API_VALUE_FLAGS`
+# plus `-f`/`-F`, which are tracked separately in `_FIELDISH`). Verified against `gh api --help`:
+# `-p`/`--preview` takes a `strings` argument (it is NOT the boolean `--paginate`, which has no
+# short form) — a review raised this as a possible misclassification; it is not one.
+_API_VALUE_SHORT_CHARS = frozenset({"f", "F", "H", "q", "X", "p", "t"})
+
+
+def _expand_clustered_short_flag(token: str) -> list[str] | None:
+    """If `token` is a pflag-style clustered short-flag group — one or more boolean short flags
+    (`_API_BOOL_SHORT_CHARS`) followed by exactly one value-taking short flag
+    (`_API_VALUE_SHORT_CHARS`), with the value either glued on (`-iFquery=x`) or left for the next
+    token (`-iF`) — return the equivalent unclustered tokens (e.g. `['-i', '-Fquery=x']` /
+    `['-i', '-F']`), so a query/method smuggled behind a leading boolean short flag becomes visible
+    to every detector that already understands the plain `-F`/`-f`/`-X`/... spelling.
+
+    Returns None when `token` is not such a cluster: a bare value flag (`-Fquery=x`, no leading
+    boolean) is left for the existing `-[fF]`-anchored handling; a long flag, `--`, a lone short
+    flag, or an all-boolean cluster (nothing to split off) is not a value carrier either."""
+    if not token.startswith("-") or token.startswith("--") or len(token) < 3:
+        return None
+    body = token[1:]
+    i = 0
+    while i < len(body) and body[i] in _API_BOOL_SHORT_CHARS:
+        i += 1
+    if i == 0 or i >= len(body):
+        return None  # no leading boolean short, or the whole cluster is booleans (nothing to split)
+    if body[i] not in _API_VALUE_SHORT_CHARS:
+        return None  # next char is not a recognized value flag in this position
+    return [f"-{c}" for c in body[:i]] + [f"-{body[i:]}"]
+
+
+def _short_flag_cluster_is_unprovable(token: str) -> bool:
+    """True iff `token` looks like a pflag-style clustered short-flag group whose leading char, or
+    the char right after a recognized leading boolean run, is NEITHER a recognized boolean short
+    flag (`_API_BOOL_SHORT_CHARS`) NOR a recognized value-taking one (`_API_VALUE_SHORT_CHARS`) —
+    i.e. `_expand_clustered_short_flag` gave up on it (returned None) for a reason OTHER than "this
+    is a plain, already-handled direct value flag" (`-Ffoo`, `-Xvalue`, ...).
+
+    Why this matters (review finding on #333): `_expand_clustered_short_flag` returning None for
+    such a token leaves it completely UNEXPANDED, and every downstream detector
+    (`_gh_api_endpoint`, `_graphql_carries_merge_mutation`, `_graphql_query_field_values`,
+    `_rest_has_write_method`, ...) treats ANY `-`-prefixed token it doesn't specifically recognize
+    as an inert boolean flag and skips over it. So a token like `-zFquery=@merge.graphql` — a
+    hypothetical FUTURE `gh api` boolean short flag `-z` clustered ahead of `-F` — would sail
+    through completely invisible to every detector, reopening the exact bypass class this whole
+    clustered-flag fix exists to close, the moment `gh` adds a second boolean short flag and this
+    hard-coded set is not updated in lockstep. Fail closed: an unrecognized short-flag char at the
+    classification boundary is UNPROVABLE (might be a future bool flag hiding a merge-carrying
+    value), not benign — the caller must block rather than silently pass the token through.
+
+    Deliberately NOT triggered by a token whose leading char is already a recognized, standalone
+    value flag (`-Ffoo`, `-Xvalue`, `-tsomething`, ...) — those are handled directly, by their own
+    `-[fF]`/`-X`/... prefix checks elsewhere, and are not a gap."""
+    if not token.startswith("-") or token.startswith("--") or len(token) < 2:
+        return False
+    body = token[1:]
+    i = 0
+    while i < len(body) and body[i] in _API_BOOL_SHORT_CHARS:
+        i += 1
+    if i >= len(body):
+        return False  # a pure recognized-boolean cluster (or a single bool char) — nothing hidden
+    if body[i] in _API_VALUE_SHORT_CHARS:
+        # A recognized value flag right at the boundary — either a direct/glued value flag with no
+        # leading boolean (`-Ffoo`, `-Xvalue`, i == 0) or a legitimate boolean-then-value cluster
+        # (`-iFquery=x`, i > 0). Both are handled correctly elsewhere (by `_expand_clustered_short_flag`
+        # or by the plain `-[fF]`/`-X`/... prefix checks), not a gap.
+        return False
+    return True  # unrecognized char at the classification boundary — can't prove it's safe
+
+
+def _gh_api_flags_contain_unprovable_cluster(rest: list[str]) -> bool:
+    """True iff some token in FLAG POSITION within `rest` (args after `gh api`) is an unprovable
+    short-flag cluster (see `_short_flag_cluster_is_unprovable`). Mirrors
+    `_expand_clustered_gh_api_flags`'s value-position tracking so a preceding detached value flag's
+    OPERAND (which may itself happen to start with `-` and look cluster-shaped) is never
+    misclassified as a flag to judge."""
+    expect_value = False
+    for tok in rest:
+        if expect_value:
+            expect_value = False  # the operand of a preceding detached value flag — never a flag
+            continue
+        if tok in _API_VALUE_FLAGS or tok in _FIELDISH:
+            expect_value = True
+            continue
+        if _short_flag_cluster_is_unprovable(tok):
+            return True
+        expanded = _expand_clustered_short_flag(tok)
+        if expanded is not None and len(expanded[-1]) == 2:  # trailing value flag, value detached
+            expect_value = True
+    return False
+
+
+def _expand_clustered_gh_api_flags(rest: list[str]) -> list[str]:
+    """Return `rest` (args after `gh api`) with every pflag-style clustered short-flag token in
+    FLAG POSITION expanded to its unclustered equivalent (see `_expand_clustered_short_flag`), so
+    downstream endpoint/field/method scanning sees the same tokens it would for the unclustered
+    spelling.
+
+    Tracks value-flag position exactly like `_gh_api_endpoint` does: the token right after a
+    DETACHED value-taking flag (`_API_VALUE_FLAGS` / `_FIELDISH`) is that flag's VALUE, not a flag
+    itself, and must pass through untouched even if it happens to look like a cluster (`-t -iX
+    graphql` — `-iX` is `-t`'s template-string value, not `-i`+`-X`; expanding it would shift
+    `_gh_api_endpoint` onto the wrong token and let a real merge slip past — a real regression a
+    review caught). A cluster's own trailing value flag with no glued value (`-iF` alone) likewise
+    puts the FOLLOWING token in value position."""
+    out: list[str] = []
+    expect_value = False
+    for tok in rest:
+        if expect_value:
+            out.append(tok)  # the operand of a preceding detached value flag — never a flag itself
+            expect_value = False
+            continue
+        if tok in _API_VALUE_FLAGS or tok in _FIELDISH:
+            out.append(tok)
+            expect_value = True
+            continue
+        expanded = _expand_clustered_short_flag(tok)
+        if expanded is None:
+            out.append(tok)
+            continue
+        out.extend(expanded)
+        if len(expanded[-1]) == 2:  # trailing value flag with nothing glued on (`-F`/`-f`/...)
+            expect_value = True
+    return out
+
 
 def emit(decision: str, message: str | None = None) -> None:
     out: dict[str, str] = {"hook_api": HOOK_API, "decision": decision}
@@ -695,6 +833,121 @@ def _graphql_argument_role_is_unprovable(rest: list[str]) -> bool:
     return False
 
 
+def _strip_graphql_string_literals(value: str) -> str:
+    """Return `value` with every GraphQL STRING LITERAL removed — a `"…"` string (honouring `\\"`
+    escapes) and a `\"\"\"…\"\"\"` block string. GraphQL has no single-quoted strings, so only double
+    quotes delimit a literal.
+
+    Used so a merge-mutation TOKEN that appears ONLY as data inside a read-only query — e.g.
+    `search(query: "mergePullRequest")` — is not mistaken for a mutation CALL. An UNTERMINATED
+    literal is unprovable (a merge call could hide after the dangling quote), so the ORIGINAL value
+    is returned unchanged — the token stays visible and the caller fails closed.
+
+    The stripper MIRRORS GraphQL's own string/comment lexing so a token that survives stripping is a
+    real field reference, never data hiding in a literal or comment:
+
+    - A `#` line COMMENT is skipped to end-of-line BEFORE quote handling, so a `"` in a comment
+      cannot open a phantom span that swallows a real call between two comment quotes.
+    - A block string honours GraphQL's ONLY block-string escape, `\\\"\"\"` (an escaped triple-quote
+      does NOT terminate the block string). Without this, two escaped delimiters re-pair across a
+      real `mergePullRequest(` and strip it — a bypass, not a false-positive.
+    - A regular string honours `\\<char>` escapes (so `\\\"` does not close it).
+
+    An UNTERMINATED string/block string is unprovable (a merge call could hide after the dangling
+    delimiter), so the ORIGINAL value is returned unchanged — the token stays visible and the caller
+    fails closed."""
+    out: list[str] = []
+    i, n = 0, len(value)
+    while i < n:
+        if value[i] == "#":  # GraphQL line comment: skip to EOL so a comment `"` opens no span
+            # GraphQL's LineTerminator is `\n`, `\r`, or `\r\n` — a bare `\r` also ends a comment.
+            # Scanning only for `\n` treats a `\r`-terminated comment as running past the real
+            # LineTerminator, swallowing an executable call that follows the `\r` (a fail-open bypass).
+            j = i + 1
+            while j < n and value[j] not in "\r\n":
+                j += 1
+            if j >= n:
+                break  # comment runs to end of value — nothing executable remains
+            i = j + 2 if value[j] == "\r" and j + 1 < n and value[j + 1] == "\n" else j + 1
+            continue
+        if value.startswith('"""', i):
+            j = i + 3
+            closed = False
+            while j < n:
+                if value[j] == "\\" and value.startswith('"""', j + 1):
+                    j += 4  # `\"""` — GraphQL's block-string escape, NOT a terminator
+                    continue
+                if value.startswith('"""', j):
+                    j += 3
+                    closed = True
+                    break
+                j += 1
+            if not closed:
+                return value  # unterminated block string → fail closed (do not strip)
+            i = j
+            continue
+        if value[i] == '"':
+            j = i + 1
+            closed = False
+            while j < n:
+                if value[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if value[j] == '"':
+                    closed = True
+                    j += 1
+                    break
+                j += 1
+            if not closed:
+                return value  # unterminated string → fail closed (do not strip)
+            i = j
+            continue
+        out.append(value[i])
+        i += 1
+    return "".join(out)
+
+
+def _graphql_carries_merge_mutation(rest: list[str]) -> bool:
+    """True iff a `gh api graphql` call actually PERFORMS a merge mutation.
+
+    Only the `query` field can carry a GraphQL operation; every other `-f`/`-F` field is a variable
+    (data). A merge-mutation token is a real merge only when it is a FIELD in a readable `query`
+    value — NOT when it appears solely as a STRING LITERAL there (a read-only `search`/code query
+    that merely NAMES the mutation).  So each readable `query` value is scanned with its string
+    literals stripped.
+
+    A merge token OUTSIDE a readable `query` value — in a non-`query` field, or a bare positional —
+    keeps the blunt over-block (fail closed): the guard cannot prove such a stray token is inert, so
+    it stays blocked. Unreadable / expandable query bodies are handled by
+    `_graphql_query_is_unprovable`; this function only rules on what it CAN read.
+
+    Scanning is TOKEN-PRECISE: each `query` field value is scanned with its string literals
+    stripped, and every other token is scanned raw. This avoids a positional string-`replace` that
+    could excise the wrong occurrence and either miss a token or splice a spurious one."""
+    i, n = 0, len(rest)
+    while i < n:
+        a = rest[i]
+        if a in _FIELDISH and i + 1 < n:  # detached field: `-f query=<v>` / `-F note=<v>`
+            key, _, val = rest[i + 1].partition("=")
+            probe = _strip_graphql_string_literals(val) if key == "query" else rest[i + 1]
+            if _MERGE_MUTATION.search(probe):
+                return True
+            i += 2
+            continue
+        m = re.match(r"^(?:--field|--raw-field|-[fF])=?(.*)$", a)  # glued: `-fquery=<v>` / `--field=note=<v>`
+        if m and m.group(1):
+            key, _, val = m.group(1).partition("=")
+            probe = _strip_graphql_string_literals(val) if key == "query" else a
+            if _MERGE_MUTATION.search(probe):
+                return True
+            i += 1
+            continue
+        if _MERGE_MUTATION.search(a):  # endpoint, flags, bare args: scan raw (fail closed)
+            return True
+        i += 1
+    return False
+
+
 def _graphql_query_is_unprovable(rest: list[str], strict: bool = False) -> bool:
     """True iff a `gh api graphql` call feeds its `query` (or the whole request body) from a source
     this hook CANNOT READ at pre-exec time — a file (`query=@f`), stdin (`query=@-` / `--input …`), or
@@ -721,14 +974,39 @@ def _graphql_query_is_unprovable(rest: list[str], strict: bool = False) -> bool:
 def _gh_api_is_merge(rest: list[str], strict: bool = False) -> bool:
     """`rest` = args after `gh api`. True iff this is a PR-merge REST call (`…/pulls/<n>/merge` +
     write method) or a graphql merge mutation (inline, or a file/stdin/substitution-backed query
-    that can't be proven safe). `strict` — see `_graphql_query_is_unprovable`."""
+    that can't be proven safe). `strict` — see `_graphql_query_is_unprovable`.
+
+    `rest` is expanded first (`_expand_clustered_gh_api_flags`) so a clustered short-flag spelling
+    (`-iFquery=...`, `-iXPUT`) is scanned exactly like its unclustered equivalent. Checked BEFORE
+    expansion for an unprovable cluster (`_gh_api_flags_contain_unprovable_cluster`, #333 review
+    finding): an unrecognized short-flag char is a token `_expand_clustered_gh_api_flags` leaves
+    completely untouched, invisible to every detector below — so it must force a block here rather
+    than silently fall through as "not a merge". This is the ONE call site wired to the guard
+    (`_is_merge_route` always reaches a `gh api` segment through this function); any future entry
+    point that scans `rest`/detector output directly, bypassing `_gh_api_is_merge`, would need the
+    same guard re-added — it is not (yet) structural to the expander itself (review finding).
+
+    Unconditional regardless of `strict` — unlike the graphql-query-value unprovability below
+    (which is genuinely quote-context-dependent: a nested caller may have already applied shell
+    expansion the top level hasn't), an unrecognized short-flag char is equally un-classifiable at
+    every recursion depth. It is the same class of "cannot be read at all" as a file/stdin-backed
+    query (`@f`/`--input`), which likewise blocks regardless of `strict` — not the class of "may be
+    expanded depending on quoting" that `strict` actually governs. A deliberate, broad
+    (endpoint-agnostic) over-block: an unrecognized cluster forces a block even on an unrelated
+    read-only endpoint, because the hidden char could be smuggling ANY flag/value, not only a
+    graphql query — narrowing the check to "only within a detected graphql/merge context" would
+    reopen exactly the invisibility gap this guard exists to close (review finding)."""
+    if _gh_api_flags_contain_unprovable_cluster(rest):
+        return True
+    rest = _expand_clustered_gh_api_flags(rest)
     endpoint = _gh_api_endpoint(rest)
     is_graphql = endpoint == "graphql" or (endpoint or "").endswith("/graphql")
     if is_graphql:
-        # A merge mutation token ANYWHERE in a graphql call blocks — this is a deliberate over-block:
-        # a graphql invocation carrying `mergePullRequest`/`enablePullRequestAutoMerge` in any field
-        # is almost certainly the mutation, and over-blocking is the safe direction (Opus review 2).
-        if _MERGE_MUTATION.search(" ".join(rest)):
+        # A merge mutation FIELD in the request blocks. A merge token that appears ONLY as a STRING
+        # LITERAL inside a read-only `query` (e.g. `search(query:"mergePullRequest")`) executes
+        # nothing and is allowed; a token OUTSIDE a readable query value keeps the blunt over-block
+        # (fail closed). See `_graphql_carries_merge_mutation`.
+        if _graphql_carries_merge_mutation(rest):
             return True
         if _graphql_query_is_unprovable(rest, strict=strict):
             return True
@@ -746,10 +1024,118 @@ def _gh_api_is_merge(rest: list[str], strict: bool = False) -> bool:
     return rest_path_hit and (_rest_has_write_method(rest) or _rest_method_is_unprovable(rest))
 
 
+# `ghgql` (skills/universal/gh-graphql/ghgql) is a wrapper that EXECS `gh api graphql`. A command-string
+# PreToolUse hook sees only the top-level `ghgql …` word, never the wrapped `gh` call, so the guard
+# must inspect `ghgql` itself or it becomes a raw-merge bypass. `ghgql`'s query grammar is mapped to the
+# equivalent `gh api graphql` request and run through the SAME graphql merge check.
+_GHGQL_WRAPPER = "ghgql"
+# ghgql flags whose NEXT token is a value (mirrors ghgql's own forwarding set) — consumed when mapping.
+_GHGQL_VALUE_FLAGS = frozenset(
+    {"-F", "--field", "-f", "--raw-field", "-H", "--header", "--jq", "--hostname",
+     "-p", "--preview", "-t", "--template", "--cache"}
+)
+
+
+def _ghgql_to_graphql_rest(argv: list[str]) -> list[str]:
+    """Map a `ghgql …` argv (argv[0] basename == `ghgql`) to the `gh api graphql` `rest` it execs, so
+    `_gh_api_is_merge` governs it. Conservative by construction: ghgql's query (`-q <v>` / a bare
+    positional / `@file` / `-` stdin) becomes a `-f query=<v>` field, with `-` mapped to stdin
+    (`@-`) so it reads as UNPROVABLE and blocks; forwarded `-f`/`-F` fields (incl. a smuggled second
+    `query=`) are carried through verbatim so a merge in any of them is caught. `--allow-mutation`
+    is ghgql's OWN opt-in and is irrelevant here — the guard rules on the resulting request. This
+    output is SCAN-ONLY: it feeds `_gh_api_is_merge`/`_graphql_query_field_values` to decide
+    allow/block and is never itself executed — this hook is a PreToolUse decision point, not an
+    invoker — so a non-`-f`/`-F` value flag rewritten into a canonical `-f query=<v>` field (see the
+    `_GHGQL_VALUE_FLAGS` branch below) only affects what the SCAN sees, never the real command
+    `ghgql`/`gh` actually runs."""
+    rest: list[str] = ["graphql"]
+    args = argv[1:]
+    query: str | None = None
+    # STICKY once set — unlike `query`, a later query source must NOT clear this. Real `ghgql`
+    # (its own `case` statement) only accepts `-q`/`--query` DETACHED as a QUERY source; a glued
+    # spelling (`--query=X`, `-qX`) is never treated as one there and instead falls to ghgql's `-*`
+    # catch-all, forwarded to `gh` verbatim. `--query=X` has no meaning to `gh` and errors; but a
+    # glued `-q<jq-filter>` IS a legitimate spelling of `gh`'s `--jq` shorthand (e.g. `-q.data.x`) —
+    # a real, benign read. Since this mapper cannot tell a jq-filter spelling from an attempted
+    # (non-functional) query override, ANY glued `-q`/`--query=` token makes the whole call
+    # unprovable and forces a block — a deliberate false-positive on the jq-shorthand case in
+    # exchange for never trusting a glued spelling's meaning — regardless of where it appears among
+    # other (possibly provable-looking) query sources; a later or earlier detached `-q`/positional
+    # query must not silently clear this back to "provable".
+    saw_unrecognized_glued_query_flag = False
+    i, n = 0, len(args)
+    while i < n:
+        a = args[i]
+        if a in ("-q", "--query") and i + 1 < n:
+            query = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--query=") or (a.startswith("-q") and len(a) > 2):
+            saw_unrecognized_glued_query_flag = True
+            rest.append(a)  # keep it visible to the raw-token scan too, as a safety net
+            i += 1
+            continue
+        if a == "--":  # everything after is forwarded to gh verbatim
+            rest.extend(args[i + 1:])
+            break
+        if a in _GHGQL_VALUE_FLAGS and i + 1 < n:
+            # Real ghgql's `case "$2" in query=*)` applies to EVERY one of these value flags, not
+            # only `-f`/`-F` — `ghgql -H query=@/dev/stdin` (or `--jq`/`--cache`/`-t`/etc. with a
+            # `query=` value) is captured by ghgql as THE query (unconditionally OVERWRITING any
+            # earlier query, per its `case` statement — last one wins at runtime), same as
+            # `-f query=…`. Forwarding it here as an opaque header/jq/template/cache field (the old
+            # behavior) hid the query entirely from `_graphql_query_field_values`, so a merge or
+            # unreadable-file/stdin query smuggled behind a non-`-f`/`-F` flag was never seen — a
+            # real bypass (#303 review, Codex). Mirror ghgql's own capture by emitting it in the
+            # SAME canonical `-f query=<v>` form `_graphql_query_field_values` already recognizes for
+            # `-f`/`-F` — for EVERY such flag, not just the first — so every candidate "the query
+            # ghgql might actually use" is visible to the scan and a merge/unprovable value in ANY of
+            # them blocks (conservative: we don't need to reproduce ghgql's last-wins precisely, only
+            # to never miss a query source it could resolve to).
+            val = args[i + 1]
+            if val.startswith("query="):
+                # Real ghgql resolves `query="-"` to STDIN uniformly, regardless of which flag
+                # captured it (its `[ "$query" = "-" ]` check runs AFTER parsing, on the one shared
+                # `query` variable) — so `-H query=-` reads a piped mutation exactly like `-q -`
+                # does. Apply the SAME `-` → `@-` canonicalization the primary query-capture path
+                # uses below, or a bare `-` here scans as a harmless 1-char literal instead of the
+                # unprovable stdin marker it actually is (a real gap: Fable review).
+                qv = val[len("query="):]
+                rest.append("-f")
+                rest.append(f"query={'@-' if qv == '-' else qv}")
+            else:
+                rest.append(a)
+                rest.append(val)
+            i += 2
+            continue
+        if a != "-" and a.startswith("-"):  # boolean/unknown flag (--allow-mutation, --paginate): forward
+            rest.append(a)
+            i += 1
+            continue
+        # a bare `-` (like a bare positional) is ghgql's stdin query — fall through as the query token
+        if query is None:  # first bare positional (or `-`) is the query
+            query = a
+        else:
+            rest.append(a)
+        i += 1
+    if query is not None:
+        rest.append("-f")
+        rest.append(f"query={'@-' if query == '-' else query}")
+    if saw_unrecognized_glued_query_flag:
+        # A glued `-q`/`--query=` token was present ANYWHERE in argv, regardless of whether a
+        # separate (possibly provable-looking) query source was also found. `_graphql_query_field_values`
+        # collects every `query=` field's value and `_graphql_query_is_unprovable` blocks if ANY of
+        # them is unreadable — appending a second, empty `query=` field forces that outcome without
+        # disturbing a real query value already recorded above (order-independent, non-clobbering).
+        rest.append("-f")
+        rest.append("query=")
+    return rest
+
+
 def _is_invoked_head(base: str) -> bool:
-    """True iff a token's basename names a command whose merge we detect directly: `gh`, a shell
-    interpreter (its `-c` string is re-scanned), or `eval`."""
-    return base == "gh" or base == "eval" or base in _SHELL_INTERPRETERS
+    """True iff a token's basename names a command whose merge we detect directly: `gh`, the `ghgql`
+    wrapper over `gh api graphql`, a shell interpreter (its `-c` string is re-scanned), or `eval`."""
+    return base == "gh" or base == _GHGQL_WRAPPER or base == "eval" or base in _SHELL_INTERPRETERS
 
 
 def _resolve_invoked_argv(argv: list[str]) -> list[str] | None:
@@ -845,6 +1231,10 @@ def _is_merge_route(segment: list[str], strict: bool = False) -> bool:
         if sub and sub[0] == "api":
             return _gh_api_is_merge(sub[1:], strict=strict)
         return False
+    if os.path.basename(argv[0]) == _GHGQL_WRAPPER:
+        # `ghgql` execs `gh api graphql`; inspect the request it would build (see `_ghgql_to_graphql_rest`)
+        # so a merge through the wrapper is blocked exactly like a direct `gh api graphql`.
+        return _gh_api_is_merge(_ghgql_to_graphql_rest(argv), strict=strict)
     # A shell interpreter / `eval`: re-scan the merge hidden in its `-c` / string arguments. That
     # string is a NESTED context whose inner quoting the outer shell may already have processed
     # (`bash -c "…query='$Q'…"` expands `$Q` at the outer level), so scan it strictly.
@@ -1083,7 +1473,15 @@ def _graphql_query_field_is_expandable(blanked_command: str) -> bool:
     blocked (`echo graphql query=$Q`), and parsing via shlex tokens covers every flag spelling. Kept
     separate from `_command_contains_gh_pr_merge` (which runs on the ORIGINAL command) so the blanking
     — which is not heredoc-aware — cannot disturb heredoc/substitution merge detection. An unparseable
-    command fails closed (block)."""
+    command fails closed (block).
+
+    ALSO covers the `ghgql` wrapper (#303): `ghgql` execs `gh api graphql` under the hood, and its OWN
+    mutation-refusal (`ghgql`'s read-only-by-default guard) is skipped under `--allow-mutation` — a
+    `ghgql --allow-mutation "$Q"` where `$Q` expands to a merge mutation reaches `_is_merge_route` only
+    through the non-strict top-level path, where an expandable query field was previously invisible
+    (only a direct `gh api graphql` invocation was inspected here). Mapping the `ghgql` argv through
+    `_ghgql_to_graphql_rest` — the SAME mapping `_is_merge_route` uses — makes an expandable ghgql query
+    unprovable/fail-closed exactly like a direct `gh api graphql -f query="$Q"`."""
     try:
         segments = _split_segments(blanked_command)
     except ValueError:
@@ -1093,12 +1491,19 @@ def _graphql_query_field_is_expandable(blanked_command: str) -> bool:
         return False
     for seg in segments:
         argv = _resolve_invoked_argv(_segment_argv(seg))
-        if not argv or os.path.basename(argv[0]) != "gh":
+        if not argv:
             continue
-        sub = _gh_subargs(argv)
-        if not sub or sub[0] != "api":
+        base = os.path.basename(argv[0])
+        if base == "gh":
+            sub = _gh_subargs(argv)
+            if not sub or sub[0] != "api":
+                continue
+            rest = sub[1:]
+        elif base == _GHGQL_WRAPPER:
+            rest = _ghgql_to_graphql_rest(argv)
+        else:
             continue
-        rest = sub[1:]
+        rest = _expand_clustered_gh_api_flags(rest)
         endpoint = _gh_api_endpoint(rest)
         if endpoint == "graphql" or (endpoint or "").endswith("/graphql"):
             if any("$" in val or "`" in val for val in _graphql_query_field_values(rest)):

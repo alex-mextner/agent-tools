@@ -37,6 +37,18 @@ _SHIP = Path(__file__).resolve().parents[1] / "ci" / "ship" / "ship.sh"
 # so a later explicit assignment there still wins over this default).
 os.environ.setdefault("SHIP_REVIEW_QUORUM", "0")
 
+# The post-merge task-cli notify step (`_ship_notify_task_cli`) also defaults to ENABLED, but
+# none of the ~30 fixtures in this file stub a fake `task` binary — leaving it on here would
+# invoke whatever REAL task-cli happens to be on the developer's PATH, against a fake merged
+# PR carrying garbage `--pr`/`--commit` values (an unintended mutation of a real ticket store
+# during a test run). Unconditional assignment, NOT `setdefault` (review finding: `setdefault`
+# yields to an ambient `SHIP_TASK_NOTIFY_ENABLED=1` a developer's shell might already export,
+# silently reproducing the exact hazard this line exists to prevent — unlike the quorum gate
+# below, a missed override here mutates a real ticket store, not just a loud gate refusal, so
+# it gets the stronger form). tests/test_ship_notify_task_cli.py exercises the feature itself
+# in isolation, with its own fake `task` binary, and overrides this back to "1" per-call.
+os.environ["SHIP_TASK_NOTIFY_ENABLED"] = "0"
+
 # A fake `gh` that answers exactly the calls ship.sh makes (with --skip-ci the CI rollup
 # is not queried). Branch name is read from $SHIP_TEST_BRANCH so the test controls it.
 _FAKE_GH = """\
@@ -331,6 +343,446 @@ def test_ship_from_inside_dirty_pr_worktree_is_not_removed(repo_with_pr_worktree
     assert "dirty unshipped work" in (wt / "README.md").read_text(encoding="utf-8")
     remaining = _sh("git", "worktree", "list", "--porcelain", cwd=main).stdout
     assert str(wt) in remaining, f"dirty worktree was unlinked:\n{remaining}"
+
+
+def _screenshot_upload_env(main: Path, bindir: Path, uploader: Path) -> dict:
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_IMAGE_UPLOAD_CMD"] = str(uploader)
+    return env
+
+
+def test_upload_png_quote_in_path_is_not_shell_injected(repo_with_pr_worktree, tmp_path):
+    """HYP-1260 regression: upload_png() must never let a screenshot PATH re-enter `eval`.
+
+    The pre-fix implementation did `eval "$SHIP_IMAGE_UPLOAD_CMD \\"$png\\""` — a literal `"`
+    in the path could close that quote and splice arbitrary shell syntax into the eval'd
+    string. Proven exploitable via PoC before the fix (a path containing
+    `evil"; touch PWNED; echo "` ran `touch`). Here a screenshot path containing a double
+    quote AND a `;`-separated shell command must reach the uploader as ONE inert argument —
+    no command runs, and the argument the uploader receives is byte-for-byte the raw path."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    injection_marker = tmp_path / "PWNED"
+    # A single path COMPONENT can't itself contain '/', so the injected payload reaches the
+    # absolute marker path via an inherited env var expansion (evaluated only if the eval-
+    # injection actually fires) rather than embedding a literal slash-bearing path in the
+    # directory name.
+    evil_dir = tmp_path / 'evil"; touch "$PWNED_TARGET"; echo "'
+    evil_dir.mkdir()
+    png = evil_dir / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, uploader)
+    env["PWNED_TARGET"] = str(injection_marker)
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert not injection_marker.exists(), (
+        "shell injection via the screenshot path executed `touch`!\n" + r.stdout + r.stderr
+    )
+    assert argv_log.exists(), f"uploader was never invoked:\n{r.stdout}\n{r.stderr}"
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == [str(png)], f"uploader must receive the raw path as ONE argument, got: {got}"
+    assert f"uploaded 'desc' -> https://example.invalid/uploaded.png" in r.stdout, r.stdout
+
+
+def test_upload_png_file_token_quote_in_path_is_not_shell_injected(repo_with_pr_worktree, tmp_path):
+    """Same HYP-1260 regression as above, but for the `{FILE}` token branch of upload_png()
+    (`SHIP_IMAGE_UPLOAD_CMD` containing a literal `{FILE}` placeholder rather than appending
+    the path as $1) — the pre-fix code built this branch via
+    `eval "${SHIP_IMAGE_UPLOAD_CMD//\\{FILE\\}/$png}"`, equally vulnerable to a quote in the
+    path breaking out of the template."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    injection_marker = tmp_path / "PWNED_FILE_TOKEN"
+    evil_dir = tmp_path / 'evil"; touch "$PWNED_TARGET"; echo "'
+    evil_dir.mkdir()
+    png = evil_dir / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded-file-token.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, uploader)
+    env["PWNED_TARGET"] = str(injection_marker)
+    # {FILE} branch: the config template embeds the placeholder plus an extra fixed arg,
+    # proving both the substituted element AND the surrounding trusted words survive intact.
+    env["SHIP_IMAGE_UPLOAD_CMD"] = f"{uploader} --file {{FILE}} --tag ci"
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert not injection_marker.exists(), (
+        "shell injection via the screenshot path executed `touch`!\n" + r.stdout + r.stderr
+    )
+    assert argv_log.exists(), f"uploader was never invoked:\n{r.stdout}\n{r.stderr}"
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == ["--file", str(png), "--tag", "ci"], (
+        f"uploader must receive the raw path as ONE argument in place of {{FILE}}, got: {got}"
+    )
+    assert "uploaded 'desc' -> https://example.invalid/uploaded-file-token.png" in r.stdout, r.stdout
+
+
+def test_upload_png_path_with_ampersand_and_backslash_is_not_corrupted(repo_with_pr_worktree, tmp_path):
+    """Regression pinned from multi-model review of the HYP-1260 fix: an earlier draft spliced
+    the path into a bash argv array via `${word//\\{FILE\\}/$png}`, an UNQUOTED `${var//pat/rep}`
+    replacement. Under bash's `patsub_replacement` option (default-on since bash 5.2), a bare
+    `&` in the replacement text is re-interpreted as "insert the matched pattern" and `\\` as an
+    escape character — so a path containing `&` or `\\` would come out mangled even though no
+    injection occurred. The shipped fix (`printf %q` + plain-string splice, no `${var//pat/rep}`
+    anywhere) must reproduce the path byte-for-byte regardless of `&`/`\\` in it."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    tricky_dir = tmp_path / "a&b\\c"
+    tricky_dir.mkdir()
+    png = tricky_dir / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded-ampersand.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, uploader)
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert argv_log.exists(), f"uploader was never invoked:\n{r.stdout}\n{r.stderr}"
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == [str(png)], f"path with '&'/'\\\\' must survive byte-for-byte, got: {got}"
+
+
+def test_upload_png_preserves_shell_pipeline_template(repo_with_pr_worktree, tmp_path):
+    """Regression pinned from multi-model review of the HYP-1260 fix: an earlier draft parsed
+    SHIP_IMAGE_UPLOAD_CMD into a plain argv array and ran it directly (no eval at all), which
+    silently broke any operator-configured template using shell syntax — a pipe, `&&`, an
+    env-var prefix, etc. (a realistic real-world config, e.g.
+    `curl -sF file=@{FILE} https://uploader.example | jq -r .url`). The shipped fix keeps
+    eval'ing the FULL trusted template (only the untrusted path is neutralized via `printf %q`),
+    so a template built from two chained commands must still work end-to-end."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n" + b"x" * 100)
+
+    # A template that only works if the WHOLE string is still eval'd as one pipeline: cat the
+    # file, count bytes, and print a URL that embeds the count — impossible to produce via a
+    # single argv-array `exec`, only via real shell chaining (| and &&).
+    stage = tmp_path / "url_from_size.sh"
+    stage.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -e\n"
+        f'n=$(wc -c < "{png}")\n'
+        'echo "https://example.invalid/size-${n// /}.png"\n',
+        encoding="utf-8",
+    )
+    stage.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, stage)
+    env["SHIP_IMAGE_UPLOAD_CMD"] = f"cat {{FILE}} | wc -c > /dev/null && {stage}"
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "uploaded 'desc' -> https://example.invalid/size-106.png" in r.stdout, (
+        "pipe/&&-based SHIP_IMAGE_UPLOAD_CMD template did not run end-to-end:\n" + r.stdout + r.stderr
+    )
+
+
+def test_upload_png_preserves_quoted_multiword_arg_template(repo_with_pr_worktree, tmp_path):
+    """Regression pinned from multi-model review of the HYP-1260 fix: a template with a quoted
+    multi-word argument (e.g. `my-uploader --token "a b" {FILE}`) must still pass that argument
+    as ONE word, exactly as the pre-fix eval-based implementation did."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded-quoted-arg.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, uploader)
+    env["SHIP_IMAGE_UPLOAD_CMD"] = f'{uploader} --token "a b" {{FILE}}'
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert argv_log.exists(), f"uploader was never invoked:\n{r.stdout}\n{r.stderr}"
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == ["--token", "a b", str(png)], (
+        f"quoted multi-word template arg must stay ONE word, got: {got}"
+    )
+
+
+@pytest.mark.parametrize("quote_style", ['"{FILE}"', "'{FILE}'"], ids=["double-quoted", "single-quoted"])
+def test_upload_png_quoted_file_token_with_space_in_path(repo_with_pr_worktree, tmp_path, quote_style):
+    """Regression pinned from a SECOND round of multi-model review of the HYP-1260 fix: quoting
+    the `{FILE}` placeholder (`uploader "{FILE}"` / `uploader '{FILE}'`) was the RECOMMENDED way
+    to handle a screenshot path containing a space under the pre-fix raw-substitution behavior.
+    A naive `%q`-then-splice-into-the-template's-own-quotes fix breaks exactly this case (the
+    %q token nests inside the operator's quotes and comes out corrupted, e.g. a backslash-
+    escaped space that no longer re-parses as one word). The shipped fix recognizes a
+    quote-wrapped `{FILE}` and replaces the WHOLE quoted form (dropping the now-redundant
+    operator quotes, since the %q token supplies its own), so this must still work."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    spaced_dir = tmp_path / "my shots"
+    spaced_dir.mkdir()
+    png = spaced_dir / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded-quoted-file-token.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, uploader)
+    env["SHIP_IMAGE_UPLOAD_CMD"] = f"{uploader} {quote_style}"
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert argv_log.exists(), f"uploader was never invoked:\n{r.stdout}\n{r.stderr}"
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == [str(png)], (
+        f"a space-containing path via a quoted {{FILE}} placeholder must arrive as ONE "
+        f"unmangled argument, got: {got}"
+    )
+
+
+def test_upload_png_quoted_file_token_blocks_injection(repo_with_pr_worktree, tmp_path):
+    """The quote-wrapped-`{FILE}` code path (added for the space-in-path regression above) is a
+    DISTINCT branch from the bare-`{FILE}` and appended-arg branches already covered by the
+    injection tests above — it must independently resist the same HYP-1260 injection PoC."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    injection_marker = tmp_path / "PWNED_QUOTED_FILE_TOKEN"
+    evil_dir = tmp_path / 'evil"; touch "$PWNED_TARGET"; echo "'
+    evil_dir.mkdir()
+    png = evil_dir / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded-quoted-file-token-injection.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, uploader)
+    env["PWNED_TARGET"] = str(injection_marker)
+    env["SHIP_IMAGE_UPLOAD_CMD"] = f'{uploader} "{{FILE}}"'
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert not injection_marker.exists(), (
+        "shell injection via a quoted {FILE} placeholder executed `touch`!\n" + r.stdout + r.stderr
+    )
+    assert argv_log.exists(), f"uploader was never invoked:\n{r.stdout}\n{r.stderr}"
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == [str(png)], f"uploader must receive the raw path as ONE argument, got: {got}"
+
+
+def test_upload_png_mixed_quoted_and_bare_file_token_forms_both_substitute(repo_with_pr_worktree, tmp_path):
+    """Regression pinned from a THIRD round of multi-model review of the HYP-1260 fix: an
+    earlier draft picked exactly ONE recognized `{FILE}` form per template (via `case`/`elif`),
+    so a template mixing a quoted and a bare occurrence — `--src "{FILE}" --thumb {FILE}`, a
+    realistic shape for e.g. attaching both a full image and deriving a checksum from the same
+    path — only substituted the first-matched form and left the other as the LITERAL string
+    `{FILE}`. The pre-fix `${var//pat/rep}` replaced every occurrence (global replace); the
+    shipped fix restores that: `_upload_png_compose_cmd` recognizes and substitutes every
+    occurrence of any of the three `{FILE}` forms in one left-to-right pass."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded-mixed-forms.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, uploader)
+    env["SHIP_IMAGE_UPLOAD_CMD"] = f'{uploader} --src "{{FILE}}" --thumb {{FILE}}'
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert argv_log.exists(), f"uploader was never invoked:\n{r.stdout}\n{r.stderr}"
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == ["--src", str(png), "--thumb", str(png)], (
+        f"both the quoted AND bare {{FILE}} occurrences must be substituted, got: {got}"
+    )
+
+
+def test_upload_png_path_containing_literal_file_token_text_is_not_corrupted(repo_with_pr_worktree, tmp_path):
+    """Regression pinned from a FOURTH round of multi-model review of the HYP-1260 fix: an
+    earlier draft chained three SEPARATE replacement passes (quoted-double, quoted-single,
+    bare), each operating on the OUTPUT of the previous. `printf %q` does not escape `{`/`}`,
+    so if the screenshot path itself contains the literal 7-character substring `{FILE}`, that
+    text survives into the %q-quoted replacement token spliced in by an earlier pass — and a
+    LATER pass (scanning the accumulated string) then re-matches and re-substitutes THAT text,
+    corrupting the composed command (e.g. duplicating/mangling the path). The shipped fix
+    (`_upload_png_compose_cmd`) does a SINGLE pass over the ORIGINAL template, so it can never
+    rescan text it already emitted. A directory literally named `{FILE}` is a real (if
+    unusual) shape — e.g. an operator's own placeholder convention colliding by coincidence."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    tricky_dir = tmp_path / "{FILE}"
+    tricky_dir.mkdir()
+    png = tricky_dir / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded-literal-file-token-path.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    # Quoted-{FILE} template: the exact shape where an earlier draft's pass ordering let a
+    # later pass re-scan the quoted form's already-spliced-in replacement text.
+    env = _screenshot_upload_env(main, bindir, uploader)
+    env["SHIP_IMAGE_UPLOAD_CMD"] = f'{uploader} "{{FILE}}"'
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert argv_log.exists(), f"uploader was never invoked:\n{r.stdout}\n{r.stderr}"
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == [str(png)], (
+        f"a path containing the literal text '{{FILE}}' must survive unmangled, got: {got}"
+    )
+
+
+def test_upload_png_trailing_newline_template_still_appends_path(repo_with_pr_worktree, tmp_path):
+    """Regression pinned from a FIFTH round of multi-model review of the HYP-1260 fix: an
+    earlier draft detected "no {FILE} placeholder -> append the path" by comparing the composed
+    output back to the template via `[ "$cmd" = "$SHIP_IMAGE_UPLOAD_CMD" ]`. `cmd=$(...)`
+    (command substitution) strips trailing newlines, so a placeholder-free template ending in a
+    newline would never equal its own (newline-stripped) compose output, the append branch
+    would never fire, and the path argument would be silently DROPPED — the uploader runs with
+    no file at all. The shipped fix detects the placeholder directly from the template
+    (`case "$SHIP_IMAGE_UPLOAD_CMD" in *'{FILE}'*)`), immune to that stripping, matching the
+    pre-fix `grep -q '{FILE}'` check exactly."""
+    main, wt = repo_with_pr_worktree
+    bindir = _fake_gh_dir(tmp_path)
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n")
+
+    argv_log = tmp_path / "uploader-argv.log"
+    uploader = tmp_path / "fake-uploader.sh"
+    uploader.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$@" >> "{argv_log}"\n'
+        "echo https://example.invalid/uploaded-trailing-newline.png\n",
+        encoding="utf-8",
+    )
+    uploader.chmod(0o755)
+
+    env = _screenshot_upload_env(main, bindir, uploader)
+    env["SHIP_IMAGE_UPLOAD_CMD"] = f"{uploader}\n"  # placeholder-free, trailing newline
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        "--screenshot", str(png), "desc",
+        cwd=wt, env=env,
+    )
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert argv_log.exists(), (
+        f"uploader was never invoked (path silently dropped):\n{r.stdout}\n{r.stderr}"
+    )
+    got = argv_log.read_text(encoding="utf-8").splitlines()
+    assert got == [str(png)], f"path must still be appended for a trailing-newline template, got: {got}"
 
 
 def test_cleanup_guard_leaves_worktree_dirtied_after_preflight(repo_with_pr_worktree, tmp_path):
@@ -704,6 +1156,44 @@ def test_ci_only_pr_is_not_required_to_bump(repo_with_pyproject, tmp_path):
 
     assert r.returncode == 0, f"CI-only PR must not be blocked\n{r.stdout}\n{r.stderr}"
     assert "no shippable source" in r.stdout, r.stdout
+
+
+def test_root_ship_config_only_pr_is_not_required_to_bump(repo_with_pyproject, tmp_path):
+    """A PR that only adds/edits the REPO-ROOT .ship-config is exempt -- it's ship's own
+    CI/merge-gate metadata, not product code."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    patch = (
+        "diff --git a/.ship-config b/.ship-config\n"
+        "--- a/.ship-config\n+++ b/.ship-config\n"
+        "@@ -0,0 +1 @@\n+SHIP_LOCAL_TEST_CMD=npm test\n"
+    )
+    r = _run_ship_vbump(main, bindir, name_only=".ship-config", patch=patch)
+
+    assert r.returncode == 0, f"root .ship-config-only PR must not be blocked\n{r.stdout}\n{r.stderr}"
+    assert "no shippable source" in r.stdout, r.stdout
+
+
+def test_nested_ship_config_named_file_still_requires_bump(repo_with_pyproject, tmp_path):
+    """Regression: a NESTED file that merely shares the basename `.ship-config` (e.g.
+    `src/.ship-config`) is NOT the file _ship_config_load ever reads (only the repo-root one
+    is), so it must NOT get the version-bump exemption -- the exemption is an exact-path
+    match, not a basename match."""
+    main, _wt = repo_with_pyproject
+    bindir = _fake_gh_vbump_dir(tmp_path)
+
+    patch = (
+        "diff --git a/src/.ship-config b/src/.ship-config\n"
+        "--- a/src/.ship-config\n+++ b/src/.ship-config\n"
+        "@@ -0,0 +1 @@\n+SHIP_LOCAL_TEST_CMD=npm test\n"
+    )
+    r = _run_ship_vbump(main, bindir, name_only="src/.ship-config", patch=patch)
+
+    assert r.returncode != 0, (
+        f"a nested src/.ship-config must still require a version bump\n{r.stdout}\n{r.stderr}"
+    )
+    assert "version in pyproject.toml is UNCHANGED" in r.stderr, r.stderr
 
 
 def test_ship_version_files_override_locates_nested_manifest(tmp_path):
@@ -1249,7 +1739,15 @@ def test_core_bare_fix_command_is_paste_safe_for_special_path(tmp_path):
 # outage and run a local fallback gate instead of blocking the merge. Tests here use:
 #   SHIP_TEST_CI_DOWN=1  — force-trigger ci_appears_structurally_down() without network
 #   SHIP_LOCAL_TEST_CMD  — override the auto-detected test runner command
-#   SHIP_TEST_DIFF       — inject custom diff text for the leftover-marker check
+#   SHIP_TEST_DIFF       — inject custom diff text for the leftover-marker check. Pass via
+#                          env_extra, not the ambient shell: _run_ship_cidown scrubs any
+#                          inherited SHIP_TEST_DIFF/SHIP_TEST_DIFF_FILE first, then
+#                          transparently spills a non-empty SHIP_TEST_DIFF from env_extra to
+#                          a file and sets SHIP_TEST_DIFF_FILE instead (read by the fake
+#                          `gh` scripts below) — a raw diff string left in the environment
+#                          can trip Linux execve()'s per-argument/per-env-string limit
+#                          (MAX_ARG_STRLEN, 128 KiB) for large fixtures (e.g. a whole
+#                          source file).
 #
 # The fake gh for these tests returns two FAILED checks (100% failure rate), answers
 # the local-gate sub-queries (review threads → 0, PR body → empty, diff → configurable),
@@ -1283,6 +1781,9 @@ case "$sub" in
       diff)
         if printf '%s ' "$@" | grep -q -- --name-only; then
           printf 'src/a.py'
+        elif [ -n "${SHIP_TEST_DIFF_FILE:-}" ]; then
+          [ -r "$SHIP_TEST_DIFF_FILE" ] || { echo "fake gh: SHIP_TEST_DIFF_FILE not readable: $SHIP_TEST_DIFF_FILE" >&2; exit 1; }
+          cat < "$SHIP_TEST_DIFF_FILE"
         else
           printf '%s\\n' "${SHIP_TEST_DIFF:-+new line without markers}"
         fi ;;
@@ -1370,6 +1871,9 @@ case "$sub" in
       diff)
         if printf '%s ' "$@" | grep -q -- --name-only; then
           printf 'src/a.py'
+        elif [ -n "${SHIP_TEST_DIFF_FILE:-}" ]; then
+          [ -r "$SHIP_TEST_DIFF_FILE" ] || { echo "fake gh: SHIP_TEST_DIFF_FILE not readable: $SHIP_TEST_DIFF_FILE" >&2; exit 1; }
+          cat < "$SHIP_TEST_DIFF_FILE"
         else
           printf '%s\\n' "${SHIP_TEST_DIFF:-+new line without markers}"
         fi ;;
@@ -1399,12 +1903,58 @@ def _run_ship_cidown(main: Path, bindir: Path, env_extra: dict | None = None):
     # may carry, so a test only sees a foreign target when it sets one explicitly via env_extra.
     env.pop("GH_REPO", None)
     env.pop("GH_SHIP_REPO", None)
+    # Never inherit a stale SHIP_TEST_DIFF / SHIP_TEST_DIFF_FILE from the ambient shell —
+    # the fake `gh` scripts prefer the file over the inline var, so a leftover value would
+    # silently override (or, if a stale file no longer exists, break) a test that sets
+    # neither. A test that wants either passes it explicitly via env_extra below.
+    env.pop("SHIP_TEST_DIFF", None)
+    env.pop("SHIP_TEST_DIFF_FILE", None)
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
     env["SHIP_TEST_BRANCH"] = "feat"
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
     if env_extra:
         env.update(env_extra)
+    # No caller passes both today (env_extra is dict[str, str] and diff fixtures are the
+    # ordinary source-text this fixture set always contains); fail loudly rather than
+    # silently pick a precedence if that ever changes, instead of guessing.
+    assert not (env.get("SHIP_TEST_DIFF") and env.get("SHIP_TEST_DIFF_FILE")), (
+        "_run_ship_cidown: env_extra set both SHIP_TEST_DIFF and SHIP_TEST_DIFF_FILE — "
+        "pick one (SHIP_TEST_DIFF is auto-spilled to a file for you)"
+    )
+    # Bash's `${SHIP_TEST_DIFF:-default}` (used by the fake `gh` scripts) falls through to
+    # the default on both unset AND empty — preserve that by only spilling a non-empty value.
+    diff_value = env.get("SHIP_TEST_DIFF")
+    if diff_value:
+        # Always spill through a file rather than a raw env string: Linux execve() rejects
+        # any single argv/envp string longer than MAX_ARG_STRLEN (128 KiB, kernel constant),
+        # independent of the overall ARG_MAX budget — a large fixture (e.g. this file's own
+        # ~427 KB source, prefixed with ci/ship/ship.sh) blows straight past that on GitHub's
+        # ubuntu-latest runners even though it silently "worked" locally (macOS has no
+        # equivalent per-string cap). Spilling unconditionally — not just above a size
+        # threshold — keeps exactly one code path so a small and a large fixture can never
+        # diverge, and exercises the file-read branch of the fake `gh` scripts on every
+        # platform and every cidown test that sets SHIP_TEST_DIFF at all (small or large),
+        # not only the rare oversized one.
+        # Match printf '%s\n' (what direct-env consumption used) so file-backed output is
+        # byte-identical to the old inline path for any consumer that's last-line sensitive.
+        # Plain strict UTF-8 (not surrogateescape): every fixture in this file is ordinary
+        # ASCII/UTF-8 source text, and `_sh` decodes ship.sh's stdout/stderr with strict
+        # UTF-8 too (see _sh above) — matching that keeps decode behavior consistent
+        # end-to-end instead of tolerating bytes on write that would crash on readback.
+        # Written into bindir (already the harness's own per-test scratch dir — unique per
+        # pytest invocation via `tmp_path`, and never the `main` checkout ship.sh operates
+        # on) so it can never surface as an untracked file or collide across parallel runs.
+        if "\x00" in diff_value:
+            # subprocess (the old direct-env path) rejects an embedded NUL in an env value
+            # with ValueError: embedded null byte — a file write wouldn't, but bash command
+            # substitution in ship.sh silently drops NULs, so a NUL fixture would silently
+            # change meaning instead of failing loudly. Match the old failure mode.
+            raise ValueError("SHIP_TEST_DIFF fixture contains an embedded NUL byte")
+        diff_file = bindir / "ship_test_diff.txt"
+        diff_file.write_text(diff_value + "\n", encoding="utf-8")
+        del env["SHIP_TEST_DIFF"]
+        env["SHIP_TEST_DIFF_FILE"] = str(diff_file)
     return _sh(
         "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
         cwd=main, env=env,
@@ -2214,16 +2764,1146 @@ def test_cidown_local_tests_fail_blocks(repo_with_pr_worktree, tmp_path):
     assert "merged #1" not in r.stdout, r.stdout
 
 
+def _fake_npm_logging_cwd(bindir: Path, log_path: Path) -> None:
+    """Write a fake `npm` on bindir's PATH that appends "<args>\\n<cwd>" to log_path,
+    so a test can assert both WHAT ran and WHERE it ran from."""
+    npm = bindir / "npm"
+    npm.write_text(
+        "#!/usr/bin/env bash\n"
+        f"{{ printf '%s\\n' \"$*\"; pwd; }} >> \"{log_path}\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    npm.chmod(0o755)
+
+
+def test_cidown_local_gate_autodetects_e2e_subdir_when_root_has_no_manifest(
+    repo_with_pr_worktree, tmp_path
+):
+    """Root has no pyproject.toml/package.json/Cargo.toml, but e2e/package.json does (the
+    hyper-ext-e2e shape, #309): the local gate must auto-detect it and run there instead of
+    failing closed with 'no recognized test runner found'."""
+    main, _wt = repo_with_pr_worktree
+    (main / "e2e").mkdir()
+    (main / "e2e" / "package.json").write_text('{"scripts":{"test":"e2e-suite"}}\n', encoding="utf-8")
+    _git("add", "e2e/package.json", cwd=main)
+    _git("commit", "-qm", "add e2e package.json", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must auto-detect the e2e/ subdir test runner\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    # Exactly one invocation (args, cwd) -- npm must not have ALSO run a second time
+    # anywhere else (e.g. a future root+subdir double-run bug).
+    assert lines == ["test", str((main / "e2e").resolve())], lines
+    assert "no recognized test runner found" not in r.stderr
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_dir_and_cmd_wins_over_autodetect(
+    repo_with_pr_worktree, tmp_path
+):
+    """.ship-config declaring both SHIP_LOCAL_TEST_DIR and SHIP_LOCAL_TEST_CMD must run
+    exactly that command from that directory, even when e2e/ also has a package.json that
+    auto-detection would otherwise guess (proves the config file outranks auto-detect)."""
+    main, _wt = repo_with_pr_worktree
+    (main / "e2e").mkdir()
+    (main / "e2e" / "package.json").write_text('{"scripts":{"test":"e2e-suite"}}\n', encoding="utf-8")
+    marker = tmp_path / "custom-cmd.log"
+    (main / ".ship-config").write_text(
+        "# audited local-test override for hyper-ext-e2e-shaped repos\n"
+        "SHIP_LOCAL_TEST_DIR=e2e\n"
+        f"SHIP_LOCAL_TEST_CMD=echo custom-ran >> {marker}\n",
+        encoding="utf-8",
+    )
+    _git("add", "e2e/package.json", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add e2e package.json and .ship-config", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must run the .ship-config command\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert marker.read_text(encoding="utf-8").strip() == "custom-ran"
+    assert ".ship-config: running in e2e" in r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_cmd_only_runs_from_root(repo_with_pr_worktree, tmp_path):
+    """.ship-config with only SHIP_LOCAL_TEST_CMD (no dir) runs from the repo root."""
+    main, _wt = repo_with_pr_worktree
+    marker = tmp_path / "root-cmd.log"
+    (main / ".ship-config").write_text(
+        f"SHIP_LOCAL_TEST_CMD=pwd >> {marker}\n",
+        encoding="utf-8",
+    )
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add root-only .ship-config", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must run the root-scoped .ship-config command\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert marker.read_text(encoding="utf-8").strip() == str(main.resolve())
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_env_override_still_wins_over_ship_config(
+    repo_with_pr_worktree, tmp_path
+):
+    """Regression guard: the pre-existing SHIP_LOCAL_TEST_CMD env var (test-only escape
+    hatch) must still take priority over a committed .ship-config file."""
+    main, _wt = repo_with_pr_worktree
+    marker = tmp_path / "should-not-run.log"
+    (main / ".ship-config").write_text(
+        f"SHIP_LOCAL_TEST_CMD=echo from-config >> {marker}\n",
+        encoding="utf-8",
+    )
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add .ship-config that must be overridden", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must succeed via the env override\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert not marker.exists(), "the .ship-config command must NOT have run"
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_malformed_ship_config_falls_through_to_autodetect(
+    repo_with_pr_worktree, tmp_path
+):
+    """A present .ship-config with neither recognized key set (just a comment) is ignored;
+    the gate falls through to normal auto-detection instead of erroring or blocking."""
+    main, _wt = repo_with_pr_worktree
+    (main / ".ship-config").write_text(
+        "# no recognized keys here, just a comment\n",
+        encoding="utf-8",
+    )
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "add malformed .ship-config plus root package.json", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "test"
+    assert lines[1] == str(main.resolve())
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_root_exit_code_2_blocks_not_falls_through(
+    repo_with_pr_worktree, tmp_path
+):
+    """Regression for the exit-code-2 sentinel collision: a root suite that legitimately
+    exits 2 (e.g. a pytest usage error) must NOT be misread as 'no manifest at root' and
+    silently fall through to a DIFFERENT, passing suite in e2e/ -- that would merge a PR
+    whose real root suite failed."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / "e2e").mkdir()
+    (main / "e2e" / "package.json").write_text('{"scripts":{"test":"e2e-suite"}}\n', encoding="utf-8")
+    _git("add", "package.json", "e2e/package.json", cwd=main)
+    _git("commit", "-qm", "add root and e2e package.json", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    root_resolved = str(main.resolve())
+    npm = bindir / "npm"
+    npm.write_text(
+        "#!/usr/bin/env bash\n"
+        f"{{ printf '%s\\n' \"$*\"; pwd; }} >> \"{npm_log}\"\n"
+        f"if [ \"$(pwd)\" = \"{root_resolved}\" ]; then exit 2; else exit 0; fi\n",
+        encoding="utf-8",
+    )
+    npm.chmod(0o755)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        "ship must block on the root suite's real exit-2 failure, not fall through to e2e/\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", root_resolved], lines  # npm ran exactly once, at root
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_root_manifest_wins_over_subdir_manifest(
+    repo_with_pr_worktree, tmp_path
+):
+    """When both root AND e2e/ have a manifest, the root one wins (priority 4 before 5) --
+    the subdir probe never even runs."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / "e2e").mkdir()
+    (main / "e2e" / "package.json").write_text('{"scripts":{"test":"e2e-suite"}}\n', encoding="utf-8")
+    _git("add", "package.json", "e2e/package.json", cwd=main)
+    _git("commit", "-qm", "add root and e2e package.json", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must succeed via the root manifest\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_subdir_only_e2e_used_when_test_and_tests_also_present(
+    repo_with_pr_worktree, tmp_path
+):
+    """When e2e/, test/, and tests/ ALL have a manifest, only e2e/ is ever used -- test/ and
+    tests/ are not fallback candidates at all (narrowed scope, see the priority-5 comment in
+    _local_test_runner), they simply happen to be irrelevant here since e2e/ already matches."""
+    main, _wt = repo_with_pr_worktree
+    for sub in ("e2e", "test", "tests"):
+        (main / sub).mkdir()
+        (main / sub / "package.json").write_text(
+            f'{{"scripts":{{"test":"{sub}-suite"}}}}\n', encoding="utf-8"
+        )
+    _git("add", "e2e/package.json", "test/package.json", "tests/package.json", cwd=main)
+    _git("commit", "-qm", "add three candidate subdirs", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must succeed via e2e/\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str((main / "e2e").resolve())], lines
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_wins_over_rig_yaml(repo_with_pr_worktree, tmp_path):
+    """.ship-config outranks rig.yaml + `dev` too, not just auto-detect -- it exists to
+    correct EITHER heuristic guessing wrong."""
+    main, _wt = repo_with_pr_worktree
+    (main / "rig.yaml").write_text("scripts:\n  test: echo from rig\n", encoding="utf-8")
+    marker = tmp_path / "config-ran.log"
+    (main / ".ship-config").write_text(
+        f"SHIP_LOCAL_TEST_CMD=echo config-ran >> {marker}\n", encoding="utf-8"
+    )
+    _git("add", "rig.yaml", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add rig.yaml and .ship-config", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    dev_log = tmp_path / "dev.log"
+    dev = bindir / "dev"
+    dev.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [ \"$1\" = '--agenttools-dev-probe' ]; then exit 0; fi\n"
+        "if [ \"$1\" = 'has-script' ]; then exit 0; fi\n"
+        "printf '%s\\n' \"$*\" >> \"$SHIP_TEST_DEV_LOG\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    dev.chmod(0o755)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_TEST_DEV_LOG": str(dev_log),
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must run the .ship-config command\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert marker.read_text(encoding="utf-8").strip() == "config-ran"
+    assert not dev_log.exists(), "dev must not have run -- .ship-config outranks rig.yaml"
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_dir_only_fails_closed_when_no_manifest(
+    repo_with_pr_worktree, tmp_path
+):
+    """.ship-config scopes auto-detect to a real directory that has none of the three
+    manifests -- fail closed with a clear message, no silent fallback elsewhere."""
+    main, _wt = repo_with_pr_worktree
+    (main / "empty-dir").mkdir()
+    (main / "empty-dir" / "README.md").write_text("no tests here\n", encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=empty-dir\n", encoding="utf-8")
+    _git("add", ".ship-config", "empty-dir/README.md", cwd=main)
+    _git("commit", "-qm", "add .ship-config pointing at a dir with no manifest", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must fail closed\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "no recognized test runner found in empty-dir" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_dir_nonexistent_fails_closed(
+    repo_with_pr_worktree, tmp_path
+):
+    """.ship-config pointing SHIP_LOCAL_TEST_DIR at a directory that doesn't exist at all
+    fails closed with a distinct, clear message (not a generic test failure)."""
+    main, _wt = repo_with_pr_worktree
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=does-not-exist\n", encoding="utf-8")
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add .ship-config pointing at a nonexistent dir", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must fail closed\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "does not exist under" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_rejects_unsafe_dir_absolute(
+    repo_with_pr_worktree, tmp_path
+):
+    """An absolute SHIP_LOCAL_TEST_DIR is rejected (logged) and ignored -- falls through to
+    root auto-detect rather than scoping the gate outside the repo."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=/etc\n", encoding="utf-8")
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "add .ship-config with an absolute (unsafe) dir", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"an unsafe dir must be ignored, falling through to root auto-detect\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not a safe repo-relative subdirectory" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_rejects_unsafe_dir_dotdot(
+    repo_with_pr_worktree, tmp_path
+):
+    """A SHIP_LOCAL_TEST_DIR containing a `..` component is rejected the same way."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=../escape\n", encoding="utf-8")
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "add .ship-config with a traversal (unsafe) dir", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"an unsafe dir must be ignored, falling through to root auto-detect\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not a safe repo-relative subdirectory" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_subdir_pyproject_without_nested_tests_dir(
+    repo_with_pr_worktree, tmp_path
+):
+    """A pyproject.toml manifest found in a non-root dir (subdir/`.ship-config`-scoped
+    auto-detect) whose own directory has NO nested tests/ subdir must run bare `pytest -q`,
+    not force a `tests/` path arg that would look for a nonexistent nested tests/tests/."""
+    main, _wt = repo_with_pr_worktree
+    (main / "e2e").mkdir()
+    (main / "e2e" / "pyproject.toml").write_text("[project]\nname = 'e2e'\n", encoding="utf-8")
+    _git("add", "e2e/pyproject.toml", cwd=main)
+    _git("commit", "-qm", "add e2e pyproject.toml with no nested tests/ dir", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    uv_log = tmp_path / "uv.log"
+    uv_fake = bindir / "uv"
+    uv_fake.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> \"{uv_log}\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    uv_fake.chmod(0o755)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must run pytest without a bogus tests/ arg\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert uv_log.read_text(encoding="utf-8").strip() == "run --with pytest pytest -q"
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_warns_on_unrecognized_line(
+    repo_with_pr_worktree, tmp_path
+):
+    """A typo'd key (neither whitelisted key matches) is logged, not silently swallowed, and
+    the gate falls through to auto-detection instead of treating the typo as a real config."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DR=e2e\n", encoding="utf-8")  # typo
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "add .ship-config with a typo'd key", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "ignoring unrecognized line" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_trims_value_whitespace(repo_with_pr_worktree, tmp_path):
+    """Whitespace directly around the `=` in a .ship-config value is trimmed, so
+    `SHIP_LOCAL_TEST_DIR= e2e ` resolves to the directory `e2e`, not ` e2e `."""
+    main, _wt = repo_with_pr_worktree
+    (main / "e2e").mkdir()
+    (main / "e2e" / "package.json").write_text('{"scripts":{"test":"e2e-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR= e2e \n", encoding="utf-8")
+    _git("add", ".ship-config", "e2e/package.json", cwd=main)
+    _git("commit", "-qm", "add .ship-config with padded whitespace around the value", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"whitespace around the config value must be trimmed\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str((main / "e2e").resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_cmd_exit_code_2_blocks_not_falls_through(
+    repo_with_pr_worktree, tmp_path
+):
+    """Regression for the _ship_config_run exit-code-2 sentinel collision: a
+    SHIP_LOCAL_TEST_CMD that legitimately exits 2 must NOT be misread as 'no config to act
+    on' and silently fall through to a DIFFERENT, passing heuristic (root auto-detect here)
+    -- the audited, explicitly-configured command's own failure must block the merge."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_CMD=exit 2\n", encoding="utf-8")
+    _git("add", "package.json", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add .ship-config whose command exits 2, plus a root manifest", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        "ship must block on the .ship-config command's real exit-2 failure, not fall "
+        f"through to root auto-detect\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert not npm_log.exists(), "npm (root auto-detect) must never have run"
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_e2e_symlink_escape_is_rejected(repo_with_pr_worktree, tmp_path):
+    """A symlinked e2e/ pointing OUTSIDE the repo must not be treated as a valid e2e/
+    candidate -- the physical-descendant check catches what a lexical check on the
+    configured/discovered name alone can't."""
+    main, _wt = repo_with_pr_worktree
+    outside = tmp_path / "outside-repo"
+    outside.mkdir()
+    (outside / "package.json").write_text('{"scripts":{"test":"escape-suite"}}\n', encoding="utf-8")
+    (main / "e2e").symlink_to(outside)
+    _git("add", "e2e", cwd=main)
+    _git("commit", "-qm", "add e2e as a symlink escaping the repo", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must fail closed, not follow the symlink outside the repo\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert not npm_log.exists(), "npm must never have run in the symlink target"
+    assert "e2e/ resolves (via a symlink) outside the repo root" in r.stderr, (
+        "the e2e/ symlink-escape skip must log a specific diagnostic (matching the "
+        f".ship-config SHIP_LOCAL_TEST_DIR path), not silently fall through to the generic "
+        f"'no recognized test runner found' message\nSTDERR:\n{r.stderr}"
+    )
+
+
+def test_cidown_local_gate_ship_config_dir_symlink_escape_is_rejected(
+    repo_with_pr_worktree, tmp_path
+):
+    """A .ship-config SHIP_LOCAL_TEST_DIR that is lexically safe (no '..', not absolute) but
+    physically resolves outside the repo via a symlink must be rejected."""
+    main, _wt = repo_with_pr_worktree
+    outside = tmp_path / "outside-repo2"
+    outside.mkdir()
+    (outside / "package.json").write_text('{"scripts":{"test":"escape-suite"}}\n', encoding="utf-8")
+    (main / "escape-link").symlink_to(outside)
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=escape-link\n", encoding="utf-8")
+    _git("add", "escape-link", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add a symlinked SHIP_LOCAL_TEST_DIR escaping the repo", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must fail closed\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "resolves (via a symlink) outside the repo root" in r.stderr, r.stderr
+    assert not npm_log.exists()
+
+
+def test_cidown_local_gate_ship_config_dir_symlink_to_root_itself_is_rejected(
+    repo_with_pr_worktree, tmp_path
+):
+    """Regression: a SHIP_LOCAL_TEST_DIR that is lexically safe (a plain subdirectory name,
+    not '.'  or './') but is ITSELF a symlink resolving back to the repo root must be
+    rejected -- _dir_is_real_descendant_of_root requires a STRICT descendant, equal-to-root
+    is not good enough (a prior version of this check wrongly accepted root-equivalence,
+    which would have let this bypass the lexical '.' rejection entirely)."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / "suite").symlink_to(".", target_is_directory=True)
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=suite\n", encoding="utf-8")
+    _git("add", "suite", "package.json", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add a SHIP_LOCAL_TEST_DIR symlinked back to the repo root", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must fail closed, not accept a symlink-to-root as a scoped subdirectory\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert not npm_log.exists(), "npm must never have run via the root-equivalent symlink"
+
+
+def test_cidown_local_gate_ship_config_nul_byte_is_rejected(repo_with_pr_worktree, tmp_path):
+    """A .ship-config committed with a NUL byte embedded in a key name is refused outright,
+    not parsed -- defends against bash silently STRIPPING a NUL when the git-show output
+    becomes a variable's value, which could turn a byte sequence that never spells a
+    whitelisted key in the actual committed bytes into one that does."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_bytes(b"SHIP_LOCAL_TEST_C\x00MD=echo evil\n")
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "add .ship-config with an embedded NUL byte", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect, ignoring the NUL-containing config\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "contains a NUL byte" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_tree_is_rejected(repo_with_pr_worktree, tmp_path):
+    """If HEAD:.ship-config is a TREE (someone committed a `.ship-config/` directory) rather
+    than a blob, ship must reject it outright instead of feeding `git show`'s tree listing to
+    the KEY=value parser -- a tree entry's NAME is a plain filename that can legally contain
+    '=' and spaces, so a file literally named `SHIP_LOCAL_TEST_CMD=echo evil` inside that
+    directory must never be parsed as committed file CONTENT."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    cfg_dir = main / ".ship-config"
+    cfg_dir.mkdir()
+    (cfg_dir / "SHIP_LOCAL_TEST_CMD=echo evil").write_text("", encoding="utf-8")
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "commit .ship-config as a directory (tree), not a file", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect, ignoring the tree at .ship-config\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "is not a regular file" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], (
+        "the tree's entry name must never reach the eval'd command path\n"
+        f"npm.log: {lines}"
+    )
+
+
+def test_cidown_local_gate_ship_config_symlink_is_rejected(repo_with_pr_worktree, tmp_path):
+    """If .ship-config is committed as a SYMLINK (git tree mode 120000), ship must reject it
+    instead of parsing its blob content -- a symlink's blob content is the link TARGET
+    STRING, not test-runner config, and `git cat-file -t` reports `blob` for a symlink just
+    like it does for a regular file, so a type-only check can't tell them apart. Craft the
+    symlink target so it would parse as a valid KEY=value line if it reached the parser."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").symlink_to("SHIP_LOCAL_TEST_CMD=echo evil")
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "commit .ship-config as a symlink", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect, ignoring the symlinked .ship-config\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "is not a regular file" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], (
+        "the symlink target string must never reach the eval'd command path\n"
+        f"npm.log: {lines}"
+    )
+
+
+def test_cidown_local_gate_ship_config_empty_file_is_treated_as_absent(
+    repo_with_pr_worktree, tmp_path
+):
+    """A genuinely empty (0-byte) but COMMITTED .ship-config must fall through to
+    auto-detect quietly -- not be misreported as 'contains a NUL byte' (an empty file also
+    fails the raw grep-based NUL check for an unrelated reason, so it needs its own guard)."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("", encoding="utf-8")
+    _git("add", ".ship-config", "package.json", cwd=main)
+    _git("commit", "-qm", "add an empty .ship-config", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "contains a NUL byte" not in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_dir_only_wins_over_root_manifest(
+    repo_with_pr_worktree, tmp_path
+):
+    """.ship-config's DIR-only scoping (no explicit CMD) must win over a ROOT manifest too,
+    not just over rig.yaml/auto-detect in general -- a reordering bug that put root
+    auto-detect ahead of the config-file scoping would pass every other precedence test but
+    fail this one."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / "e2e").mkdir()
+    (main / "e2e" / "package.json").write_text('{"scripts":{"test":"e2e-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=e2e\n", encoding="utf-8")
+    _git("add", "package.json", "e2e/package.json", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add root+e2e package.json and a DIR-only .ship-config", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must scope to e2e/ per .ship-config\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str((main / "e2e").resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_unsafe_dir_invalidates_whole_file(
+    repo_with_pr_worktree, tmp_path
+):
+    """An unsafe SHIP_LOCAL_TEST_DIR alongside a SHIP_LOCAL_TEST_CMD must invalidate the
+    WHOLE file, not silently relocate the command to run from the repo root instead of the
+    (rejected) directory the author asked for -- that would verify a different suite than
+    intended. Falls through to normal root auto-detect instead."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    marker = tmp_path / "should-not-run.log"
+    (main / ".ship-config").write_text(
+        "SHIP_LOCAL_TEST_DIR=../escape\n"
+        f"SHIP_LOCAL_TEST_CMD=echo config-ran >> {marker}\n",
+        encoding="utf-8",
+    )
+    _git("add", "package.json", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add .ship-config with an unsafe dir plus a cmd", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not a safe repo-relative subdirectory" in r.stderr, r.stderr
+    assert not marker.exists(), "the .ship-config command must NOT have run anywhere"
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_dir_cmd_nonexistent_dir_fails_closed(
+    repo_with_pr_worktree, tmp_path
+):
+    """The DIR+CMD branch gets the same clear "does not exist under" diagnostic as the
+    DIR-only branch, instead of an opaque raw `cd` error."""
+    main, _wt = repo_with_pr_worktree
+    (main / ".ship-config").write_text(
+        "SHIP_LOCAL_TEST_DIR=does-not-exist\n"
+        "SHIP_LOCAL_TEST_CMD=true\n",
+        encoding="utf-8",
+    )
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add .ship-config with a nonexistent dir plus a cmd", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must fail closed\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "does not exist under" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_untracked_ship_config_is_ignored(repo_with_pr_worktree, tmp_path):
+    """An untracked (not `git add`ed) .ship-config is NOT honored -- the "audited, committed"
+    trust story is enforced (read from `git show HEAD:...`, not the working tree), not just
+    documented. Falls through to root auto-detect."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    _git("add", "package.json", cwd=main)
+    _git("commit", "-qm", "add root package.json", cwd=main)
+    marker = tmp_path / "should-not-run.log"
+    # Deliberately NOT git-added -- this file is untracked in the checkout ship.sh reads.
+    (main / ".ship-config").write_text(
+        f"SHIP_LOCAL_TEST_CMD=echo config-ran >> {marker}\n", encoding="utf-8"
+    )
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not committed at HEAD" in r.stderr, r.stderr
+    assert not marker.exists(), "the untracked .ship-config command must NOT have run"
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_reads_committed_content_not_dirty_worktree(
+    repo_with_pr_worktree, tmp_path
+):
+    """A TRACKED .ship-config that was subsequently modified in the working tree WITHOUT a
+    new commit must still be honored per its last COMMITTED content (the original command),
+    not the uncommitted edit -- proves the "audited" read goes through `git show HEAD:...`,
+    not the mutable worktree file."""
+    main, _wt = repo_with_pr_worktree
+    committed_marker = tmp_path / "committed-ran.log"
+    dirty_marker = tmp_path / "dirty-ran.log"
+    (main / ".ship-config").write_text(
+        f"SHIP_LOCAL_TEST_CMD=echo committed-ran >> {committed_marker}\n", encoding="utf-8"
+    )
+    _git("add", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add .ship-config with the ORIGINAL command", cwd=main)
+    # Locally modify the tracked file WITHOUT committing -- this must be ignored.
+    (main / ".ship-config").write_text(
+        f"SHIP_LOCAL_TEST_CMD=echo dirty-ran >> {dirty_marker}\n", encoding="utf-8"
+    )
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must run the COMMITTED command\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert committed_marker.read_text(encoding="utf-8").strip() == "committed-ran"
+    assert not dirty_marker.exists(), "the uncommitted (dirty) edit must NOT have run"
+
+
+def test_cidown_local_gate_e2e_without_manifest_fails_closed(repo_with_pr_worktree, tmp_path):
+    """e2e/ exists but has NO manifest -- _LOCAL_TEST_MATCHED stays 0 and the gate correctly
+    fails closed instead of treating the mere existence of the directory as a pass. (Priority
+    5 auto-detect is narrowed to e2e/ ONLY -- test/ and tests/ are deliberately never probed,
+    see the priority-5 comment in _local_test_runner -- so there is no further candidate to
+    fall through to.)"""
+    main, _wt = repo_with_pr_worktree
+    (main / "e2e").mkdir()
+    (main / "e2e" / "README.md").write_text("not a test manifest\n", encoding="utf-8")
+    _git("add", "e2e/README.md", cwd=main)
+    _git("commit", "-qm", "add manifestless e2e/", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must fail closed\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "no recognized test runner found" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_test_and_tests_subdirs_are_never_auto_probed(
+    repo_with_pr_worktree, tmp_path
+):
+    """Regression pin for the narrowed priority-5 scope: test/ and tests/ manifests are
+    NEVER auto-detected (only e2e/ is), even when they are the ONLY subdirectories present
+    (no e2e/ at all) -- the gate must fail closed rather than guess a fixture-risk dir."""
+    main, _wt = repo_with_pr_worktree
+    (main / "test").mkdir()
+    (main / "test" / "package.json").write_text('{"scripts":{"test":"test-suite"}}\n', encoding="utf-8")
+    (main / "tests").mkdir()
+    (main / "tests" / "package.json").write_text('{"scripts":{"test":"tests-suite"}}\n', encoding="utf-8")
+    _git("add", "test/package.json", "tests/package.json", cwd=main)
+    _git("commit", "-qm", "add test/ and tests/ manifests, no e2e/", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must fail closed -- test/ and tests/ must never be auto-probed\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert not npm_log.exists(), "npm must never have run in test/ or tests/"
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_dir_dotslashdot_is_rejected(repo_with_pr_worktree, tmp_path):
+    """SHIP_LOCAL_TEST_DIR=./. (all path segments are '.') is rejected the same way plain
+    '.' is -- the safety check is component-wise, not a literal-string special case, so a
+    multi-segment all-dot path can't bypass the root-equivalence rejection."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=./.\n", encoding="utf-8")
+    _git("add", "package.json", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add .ship-config with DIR=./. (must be rejected)", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not a safe repo-relative" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+def test_cidown_local_gate_root_pyproject_with_tests_dir_still_uses_tests_arg(
+    repo_with_pr_worktree, tmp_path
+):
+    """Regression pin: a root pyproject.toml WITH a tests/ dir must still run the classic
+    `pytest tests/ -q` (byte-for-byte pre-existing root behavior) -- proves the "root" mode
+    parameter didn't accidentally loosen the primary production path to a bare `pytest -q`."""
+    main, _wt = repo_with_pr_worktree
+    (main / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+    (main / "tests").mkdir()
+    (main / "tests" / "test_x.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+    _git("add", "pyproject.toml", "tests/test_x.py", cwd=main)
+    _git("commit", "-qm", "add root pyproject.toml with a tests/ dir", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    uv_log = tmp_path / "uv.log"
+    uv_fake = bindir / "uv"
+    uv_fake.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> \"{uv_log}\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    uv_fake.chmod(0o755)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must succeed via the root pyproject.toml\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert uv_log.read_text(encoding="utf-8").strip() == "run --with pytest pytest tests/ -q"
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_subdir_suite_failure_blocks_merge(repo_with_pr_worktree, tmp_path):
+    """A matched subdirectory manifest whose test command FAILS blocks the merge -- the
+    subdir branch's own failure path, distinct from the root-exit-2 collision test."""
+    main, _wt = repo_with_pr_worktree
+    (main / "e2e").mkdir()
+    (main / "e2e" / "package.json").write_text('{"scripts":{"test":"e2e-suite"}}\n', encoding="utf-8")
+    _git("add", "e2e/package.json", cwd=main)
+    _git("commit", "-qm", "add e2e package.json", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm = bindir / "npm"
+    npm.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    npm.chmod(0o755)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must block on the e2e/ suite's failure\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_local_gate_ship_config_dir_with_dotdot_substring_is_not_rejected(
+    repo_with_pr_worktree, tmp_path
+):
+    """A legitimate directory whose NAME merely contains '..' as a substring (e.g. `v1..2`)
+    must NOT be rejected -- the safety check is a path-COMPONENT match, not a substring
+    match. Distinguishes this from an actual `../escape` traversal component."""
+    main, _wt = repo_with_pr_worktree
+    (main / "v1..2").mkdir()
+    (main / "v1..2" / "package.json").write_text('{"scripts":{"test":"v-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=v1..2\n", encoding="utf-8")
+    _git("add", "v1..2/package.json", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add a dir whose name merely contains '..' as a substring", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"a dir named 'v1..2' must be accepted, not rejected as unsafe\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not a safe repo-relative" not in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str((main / "v1..2").resolve())], lines
+
+
+def test_cidown_local_gate_ship_config_dir_dot_is_rejected(repo_with_pr_worktree, tmp_path):
+    """SHIP_LOCAL_TEST_DIR=. (meaning 'the repo root itself') is rejected -- routing root
+    through non-root auto-detect would bypass the mode="root" pytest-args guarantee in
+    _local_test_try_dir. The author should omit the key entirely to mean root."""
+    main, _wt = repo_with_pr_worktree
+    (main / "package.json").write_text('{"scripts":{"test":"root-suite"}}\n', encoding="utf-8")
+    (main / ".ship-config").write_text("SHIP_LOCAL_TEST_DIR=.\n", encoding="utf-8")
+    _git("add", "package.json", ".ship-config", cwd=main)
+    _git("commit", "-qm", "add .ship-config with DIR=. (must be rejected)", cwd=main)
+
+    bindir = _fake_gh_cidown_dir(tmp_path)
+    npm_log = tmp_path / "npm.log"
+    _fake_npm_logging_cwd(bindir, npm_log)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_REVIEW_DWELL": "0",
+    })
+
+    assert r.returncode == 0, (
+        f"ship must fall through to root auto-detect\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "not a safe repo-relative" in r.stderr, r.stderr
+    lines = npm_log.read_text(encoding="utf-8").splitlines()
+    assert lines == ["test", str(main.resolve())], lines
+
+
+# Split so this file's OWN source never spells a leftover marker as one contiguous
+# token — ship.sh's _local_leftover_check scans this test file's added diff lines
+# too (it is one of the two files that legitimately needs to exercise these markers
+# as literal test data), so a fixture/docstring that wrote a marker literally would
+# self-trigger the CI-outage fallback whenever a PR touches this file
+# (agent-tools#318). Same idea as the bracket-expression idiom ship.sh applies to its
+# own regex definition line — construct the marker at runtime, never spell it whole
+# in source.
+MARK_T = "TO" "DO"
+MARK_F = "FIX" "ME"
+MARK_H = "HAC" "K"
+MARK_X = "XX" "X"
+
+
 def test_cidown_leftover_markers_block(repo_with_pr_worktree, tmp_path):
-    """CI-down path: local tests pass but PR diff has a TODO leftover → local gate fails."""
+    """CI-down path: local tests pass but PR diff has an unfinished-work ([T]ODO)
+    leftover -> local gate fails."""
     main, _wt = repo_with_pr_worktree
     bindir = _fake_gh_cidown_dir(tmp_path)
 
     r = _run_ship_cidown(main, bindir, {
         "SHIP_TEST_CI_DOWN": "1",
         "SHIP_LOCAL_TEST_CMD": "true",
-        # Inject a diff addition with a TODO leftover marker
-        "SHIP_TEST_DIFF": "+new code  # TODO: clean this up later",
+        # Inject a diff addition with a leftover marker
+        "SHIP_TEST_DIFF": f"+new code  # {MARK_T}: clean this up later",
     })
 
     assert r.returncode != 0, (
@@ -2231,6 +3911,265 @@ def test_cidown_leftover_markers_block(repo_with_pr_worktree, tmp_path):
     )
     assert "leftover markers" in r.stderr, r.stderr
     assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_mktemp_template_not_flagged_as_leftover(repo_with_pr_worktree, tmp_path):
+    """CI-down path: a diff addition using bash's conventional mktemp XXXXXX (6-X)
+    template suffix (e.g. `mktemp -d "/tmp/foo.XXXXXX"`) must NOT be flagged as a
+    leftover [X]XX marker — this is standard, legitimate shell code, not a debug
+    marker (issue #316)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",  # disable dwell gate: fake PR has no review timestamps
+        "SHIP_TEST_DIFF": '+  tmp=$(mktemp -d "/tmp/foo.' + MARK_X + MARK_X + '")',
+    })
+
+    assert r.returncode == 0, (
+        f"ship must NOT block on a mktemp XXXXXX template\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" not in r.stderr, r.stderr
+
+
+def test_cidown_standalone_xxx_marker_still_blocks(repo_with_pr_worktree, tmp_path):
+    """CI-down path: a genuine standalone [X]XX marker (not part of a longer X run)
+    must still be caught by the leftover-marker gate after the word-boundary fix."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",  # disable dwell gate: keep the marker gate the only cause
+        "SHIP_TEST_DIFF": f"+// {MARK_X}: this is broken, fix before merge",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on a standalone [X]XX marker\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_cidown_todo_substring_still_blocks(repo_with_pr_worktree, tmp_path):
+    """CI-down path: [T]ODO/[F]IXME/[H]ACK deliberately keep plain substring matching
+    (unlike [X]XX) so this fallback gate stays at least as strict as the CI-side
+    ci/leftover-grep/leftover-grep.sh untracked-marker check, which also
+    substring-matches — a sentinel identifier like `[T]ODO_REMOVE_BEFORE_MERGE` must
+    still be caught here too, otherwise the CI-outage fallback would be weaker than
+    the normal CI-up gate (agent-tools#316 review discussion)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": f"+const retryCount = 3; // {MARK_T}_REMOVE_BEFORE_MERGE",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on a [T]ODO_-prefixed sentinel identifier\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
+def test_cidown_fixme_substring_still_blocks(repo_with_pr_worktree, tmp_path):
+    """Companion to the [T]ODO substring test: [F]IXME must independently trip the
+    same regex alternation. Not previously exercised — the original 6 tests from
+    #317 only ever injected [T]ODO or [X]XX fixtures, leaving the [F]IXME and [H]ACK
+    arms of the regex unverified (found in review while fixing agent-tools#318)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": f"+// {MARK_F}: this still needs a real implementation",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on a [F]IXME marker\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
+def test_cidown_hack_substring_still_blocks(repo_with_pr_worktree, tmp_path):
+    """Companion to the [T]ODO substring test: [H]ACK must independently trip the
+    same regex alternation (see test_cidown_fixme_substring_still_blocks for why this
+    was previously unverified)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": f"+// {MARK_H}: workaround for the flaky retry logic",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on a [H]ACK marker\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
+def test_cidown_three_x_mktemp_template_still_blocks(repo_with_pr_worktree, tmp_path):
+    """Documented residual limitation: a 3-character mktemp template (`foo.[X]XX`) is
+    indistinguishable from a real standalone [X]XX marker under the word-boundary
+    regex and still blocks. This pins the documented trade-off in ship.sh's
+    _local_leftover_check comment so it doesn't silently change if the boundary
+    mechanism is reworked later."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": '+  tmp=$(mktemp -d "/tmp/foo.' + MARK_X + '")',
+    })
+
+    assert r.returncode != 0, (
+        f"a bare 3-X mktemp template is expected to still block (documented limitation)\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
+def test_cidown_xxx_sentinel_identifier_still_blocks(repo_with_pr_worktree, tmp_path):
+    """The [X]XX guard only excludes it inside a longer run of X's (4+, the
+    mktemp-template shape) — it must still catch a genuine marker embedded in an
+    identifier, like `[X]XX_REMOVE_BEFORE_MERGE` or `foo[X]XX_debug()`, which a full
+    word-boundary (\\b/-w) fix would have missed. Pins that this is deliberately
+    narrower than a generic word-boundary fix (agent-tools#316 review discussion)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": f"+const x = 1; // {MARK_X}_REMOVE_BEFORE_MERGE",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on an [X]XX_-prefixed sentinel identifier\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
+def test_cidown_gate_editing_its_own_source_does_not_self_trigger(repo_with_pr_worktree, tmp_path):
+    """Regression test for agent-tools#318 itself: a diff that edits
+    _local_leftover_check's own regex/comment block (as this exact PR does) must NOT
+    self-trigger the CI-outage fallback, even though that block legitimately spells
+    out example marker text using the bracket-expression idiom. This exercises the
+    ACTUAL fix (de-literalized source, no exemption mechanism) rather than a
+    mechanism under test — the fixture below mirrors the real shape of
+    ci/ship/ship.sh's own doc comment."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    fixture_diff = "\n".join([
+        "+# Scan the PR diff additions for leftover markers: an unfinished-work marker",
+        '+# ("[T]ODO"/"[F]IXME"/"[H]ACK") or a standalone "[X]XX" marker.',
+        "+  hits=$(printf '%s\\n' \"$diff_out\" \\",
+        "+    | grep -E '^\\+' | grep -vE '^\\+\\+\\+' \\",
+        "+    | grep -E '([T]ODO|[F]IXME|[H]ACK)|(^|[^X])[X]XX($|[^X])' || true)",
+    ])
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": fixture_diff,
+    })
+
+    assert r.returncode == 0, (
+        f"ship must NOT block on the gate's own de-literalized regex/comment block\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" not in r.stderr, r.stderr
+
+
+def test_cidown_near_miss_of_gates_own_filenames_still_blocks(repo_with_pr_worktree, tmp_path):
+    """Regression guard for the design this PR replaced: an EARLIER version of this gate
+    exempted ci/ship/ship.sh and tests/test_ship.py by path via `awk -v re=...` with a
+    backslash-escaped regex (`^(ci/ship/ship\\.sh|tests/test_ship\\.py)$`). `awk -v` runs
+    its own escape-sequence processing on the assigned value, and `\\.` is not a
+    recognized escape sequence, so gawk/mawk silently collapsed it to a bare `.` (regex
+    wildcard) — verified directly:
+        awk -v re='^(ci/ship/ship\\.sh|tests/test_ship\\.py)$' \\
+          'BEGIN{print ("ci/ship/ship_sh" ~ re)}'   # => 1 (wrongly matches!)
+    Under that design, a file named `ci/ship/ship_sh` (underscore instead of dot) — a
+    one-character near-miss of the real path — would have been WRONGLY exempted from
+    the leftover scan. That whole path-exemption mechanism has since been removed in
+    favor of de-literalizing this gate's own source (see _local_leftover_check's
+    comment), so there is no path-matching logic left to fool — but this test pins that
+    a near-miss filename gets no special treatment: a real leftover marker on it must
+    still block, exactly like any other file."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    near_miss_diff = "\n".join([
+        "diff --git a/ci/ship/ship_sh b/ci/ship/ship_sh",
+        "index 0000000..1111111 100644",
+        "--- a/ci/ship/ship_sh",
+        "+++ b/ci/ship/ship_sh",
+        "@@ -1,0 +1,1 @@",
+        f"+echo real leftover  # {MARK_T} forgot to remove this before merge",
+    ])
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": near_miss_diff,
+    })
+
+    assert r.returncode != 0, (
+        f"ship must still refuse on a marker in a near-miss-named file "
+        f"(ci/ship/ship_sh, not the real ci/ship/ship.sh)\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" in r.stderr, r.stderr
+
+
+def test_cidown_real_ship_sh_and_test_ship_py_source_do_not_self_trigger(repo_with_pr_worktree, tmp_path):
+    """Self-enforcing regression guard (review finding on this PR itself): the design this
+    PR ships relies on a CONVENTION — never spell a leftover marker as one contiguous token
+    anywhere in ci/ship/ship.sh or tests/test_ship.py — rather than a structural mechanism.
+    A convention with nothing checking it can silently break (exactly what happened earlier
+    in this same PR: a fixture literally spelled the unfinished-work marker as one contiguous
+    token and would have self-triggered this very gate). Rather than hand-copy a snapshot of
+    a comment block (which drifts the moment
+    the real file is next edited), this test feeds this gate the REAL, CURRENT contents of
+    both files — every line prefixed as a diff addition — and asserts a clean pass. If either
+    file's source ever regains a literal, contiguous marker, this test catches it directly."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_cidown_dir(tmp_path)
+
+    own_source_diff = "\n".join(
+        f"+{line}"
+        for path in (_SHIP, Path(__file__))
+        for line in path.read_text().splitlines()
+    )
+
+    r = _run_ship_cidown(main, bindir, {
+        "SHIP_TEST_CI_DOWN": "1",
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_REVIEW_DWELL": "0",
+        "SHIP_TEST_DIFF": own_source_diff,
+    })
+
+    assert r.returncode == 0, (
+        f"ship must NOT block on its own real, current source or this test file's own source\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "leftover markers" not in r.stderr, r.stderr
 
 
 def test_partial_ci_failure_below_threshold_blocks_normally(repo_with_pr_worktree, tmp_path):
@@ -2247,6 +4186,298 @@ def test_partial_ci_failure_below_threshold_blocks_normally(repo_with_pr_worktre
     # Normal CI-failure block: no local gate or CI-down messaging.
     assert "CI infrastructure appears structurally unavailable" not in r.stderr, r.stderr
     assert "local fallback" not in r.stderr.lower(), r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+    # The refusal must point at the known-flake mechanism so an agent facing this exact
+    # shape (one check red, everything else green) doesn't need to remember a doc page.
+    assert "--known-flake" in r.stderr, r.stderr
+    assert "does NOT need human escalation" in r.stderr, r.stderr
+
+
+# ---------------------------------------------------------------------------------------
+# known-flake gate (--known-flake NAME) — a narrower sibling of the CI-down path: covers "one
+# specific check is a confirmed pre-existing flake, everything else is green" (below the 80%
+# ci_appears_structurally_down threshold), rather than a whole-infrastructure outage.
+#
+# The fake `gh` below answers the SAME statusCheckRollup shape as _FAKE_GH_PARTIAL_FAIL (one
+# FAILED "pytest" check, one SUCCESS "lint" check — 50%, below the outage threshold) plus:
+#   - `gh pr view --json baseRefName` -> the base branch name
+#   - `gh run list --branch <base> ...` -> one COMPLETED run, controllable conclusion
+#   - `gh run view <id> --json jobs -q .jobs` -> that run's per-job conclusions, controllable
+# so a test can dial "the base branch run also failed the same check" on or off.
+# ---------------------------------------------------------------------------------------
+
+_FAKE_GH_KNOWN_FLAKE = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q baseRefName; then
+          # No colon: an explicitly-set EMPTY SHIP_TEST_BASE stays empty (simulates an
+          # unreadable/blank baseRefName) — only an UNSET var falls back to "main". `:-` would
+          # treat empty-and-unset the same, which the unreadable-base test needs to tell apart.
+          printf '%s' "${SHIP_TEST_BASE-main}"
+        elif printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          printf '[{"name":"pytest","workflowName":"ci","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"lint","workflowName":"ci","conclusion":"SUCCESS","status":"COMPLETED","state":"SUCCESS"}]'
+        elif printf '%s ' "$@" | grep -q reviewThreads; then
+          echo "0"
+        elif printf '%s ' "$@" | grep -q body; then
+          echo ""
+        else
+          echo '[]'
+        fi ;;
+      diff)
+        if printf '%s ' "$@" | grep -q -- --name-only; then printf 'src/a.py'; else printf '+ok'; fi ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged"; [ -n "${SHIP_TEST_MERGE_LOG:-}" ] && printf '%s\\n' "$*" >> "$SHIP_TEST_MERGE_LOG" || true ;;
+      *) : ;;
+    esac ;;
+  run)
+    action="$1"; shift || true
+    case "$action" in
+      list)
+        printf '[{"databaseId":555,"conclusion":"%s"}]' "${SHIP_TEST_BASE_RUN_CONCLUSION:-failure}" ;;
+      view)
+        printf '[{"name":"pytest","conclusion":"%s"},{"name":"lint","conclusion":"success"}]' "${SHIP_TEST_BASE_JOB_CONCLUSION:-failure}" ;;
+      *) : ;;
+    esac ;;
+  api) echo 0 ;;
+  *) : ;;
+esac
+"""
+
+
+def _fake_gh_known_flake_dir(tmp_path: Path) -> Path:
+    bindir = tmp_path / "binkf"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_KNOWN_FLAKE, encoding="utf-8")
+    gh.chmod(0o755)
+    return bindir
+
+
+def _run_ship_known_flake(main: Path, bindir: Path, *known_flake_names: str, env_extra: dict | None = None):
+    """Like _run_ship_cidown, but the argv carries a --known-flake per name (this gate needs
+    the flag on the command line, which _run_ship_cidown's hardcoded argv does not support)."""
+    env = dict(os.environ)
+    env.pop("GH_REPO", None)
+    env.pop("GH_SHIP_REPO", None)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_REVIEW_DWELL"] = "0"  # disable dwell gate: fake PR has no review timestamps
+    if env_extra:
+        env.update(env_extra)
+    argv = ["bash", str(_SHIP), "1", "--no-screenshot-ok", "test"]
+    for name in known_flake_names:
+        argv += ["--known-flake", name]
+    return _sh(*argv, cwd=main, env=env)
+
+
+def test_known_flake_confirmed_runs_local_gate_and_merges(repo_with_pr_worktree, tmp_path):
+    """--known-flake pytest, and the base branch's own recent CI history shows the SAME check
+    also failed there -> confirmed, local gate runs and (green) ship merges normally. Also
+    pins the POSITIVE half of the audit-deferral invariant (review finding, round 3): the
+    `confirmed` line is written, and written exactly once, only once a real merge happened —
+    the negative half (no `confirmed` on a local-gate failure) was already covered by
+    test_known_flake_confirmed_but_local_gate_fails_still_blocks, but nothing previously
+    verified the deferred write actually FIRES on the success path; a regression that dropped
+    the post-merge `_known_flake_audit_log confirmed` call entirely would have passed every
+    test here before this assertion existed."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_known_flake_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+
+    r = _run_ship_known_flake(main, bindir, "pytest", env_extra={
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_AUDIT_FILE": str(audit),
+    })
+
+    assert r.returncode == 0, (
+        f"ship must merge when the sole failing check is a CONFIRMED known flake\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "CONFIRMED against main's recent CI history" in r.stderr, r.stderr
+    assert "known-flake gate PASSED" in r.stderr, r.stderr
+    assert "merged #1" in r.stdout, r.stdout
+    lines = [json.loads(line) for line in audit.read_text(encoding="utf-8").splitlines() if line.strip()]
+    known_flake_lines = [line for line in lines if line.get("gate") == "known-flake"]
+    assert len(known_flake_lines) == 1, f"expected exactly one known-flake audit line: {lines}"
+    assert known_flake_lines[0]["decision"] == "confirmed", f"audit trail: {lines}"
+
+
+def test_known_flake_unconfirmed_still_blocks(repo_with_pr_worktree, tmp_path):
+    """--known-flake pytest, but the base branch's recent runs do NOT show pytest failing there
+    (the base job conclusion is "success") -> NOT confirmed, ship still refuses. Proves this
+    gate cannot be satisfied by the flag alone — it independently checks reality."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_known_flake_dir(tmp_path)
+
+    # The base branch's own history never shows "pytest" failing (green there) — the claim a
+    # shipper would be making with --known-flake pytest is simply false here.
+    r = _run_ship_known_flake(main, bindir, "pytest", env_extra={
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_TEST_BASE_JOB_CONCLUSION": "success",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must NOT merge on an unconfirmed --known-flake claim\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "could NOT be confirmed" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_known_flake_not_asserted_for_failing_check_blocks(repo_with_pr_worktree, tmp_path):
+    """--known-flake names a DIFFERENT check than the one that's actually failing -> the real
+    failure ("pytest") is uncovered, ship still refuses even though the base-branch evidence
+    for the (irrelevant) asserted name would have checked out."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_known_flake_dir(tmp_path)
+
+    r = _run_ship_known_flake(main, bindir, "some-other-check", env_extra={"SHIP_LOCAL_TEST_CMD": "true"})
+
+    assert r.returncode != 0, (
+        f"ship must NOT merge when the actually-failing check has no matching --known-flake\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "was not asserted via --known-flake" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_known_flake_confirmed_but_local_gate_fails_still_blocks(repo_with_pr_worktree, tmp_path):
+    """A confirmed known flake is NOT a free pass on testing: if the local fallback gate itself
+    fails (e.g. the actual local test run is red), ship still refuses. The audit trail must
+    distinguish this ("confirmed the claim, but never actually merged") from a clean
+    `confirmed` decision — reviewing SHIP_AUDIT_FILE alone must not misread this as a merge."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_known_flake_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+
+    r = _run_ship_known_flake(main, bindir, "pytest", env_extra={
+        "SHIP_LOCAL_TEST_CMD": "false",
+        "SHIP_AUDIT_FILE": str(audit),
+    })
+
+    assert r.returncode != 0, (
+        f"ship must NOT merge when the known-flake IS confirmed but the local gate fails\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "local fallback gates also failed" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+    lines = audit.read_text(encoding="utf-8").splitlines()
+    decisions = [json.loads(line)["decision"] for line in lines if line.strip()]
+    assert "confirmed-local-gate-failed" in decisions, f"audit trail: {decisions}"
+    assert "confirmed" not in decisions, (
+        f"audit trail must not show a bare 'confirmed' for a ship that never merged: {decisions}"
+    )
+
+
+# Two FAILED checks ("pytest" and "codeql"); "pytest" is confirmable against the base branch,
+# "codeql" is not (its base-run job conclusion is controllable, defaulting to "success" — never
+# seen failing there). Proves "no partial credit": confirming ONE of two failing checks must
+# not be enough to pass the whole gate.
+_FAKE_GH_KNOWN_FLAKE_TWO_CHECKS = """\
+#!/usr/bin/env bash
+set -e
+sub="$1"; shift || true
+case "$sub" in
+  pr)
+    action="$1"; shift || true
+    case "$action" in
+      view)
+        if printf '%s ' "$@" | grep -q baseRefName; then
+          printf '%s' "${SHIP_TEST_BASE:-main}"
+        elif printf '%s ' "$@" | grep -q headRefName; then
+          printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
+        elif printf '%s ' "$@" | grep -q statusCheckRollup; then
+          printf '[{"name":"pytest","workflowName":"ci","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"codeql","workflowName":"ci","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"lint","workflowName":"ci","conclusion":"SUCCESS","status":"COMPLETED","state":"SUCCESS"}]'
+        elif printf '%s ' "$@" | grep -q reviewThreads; then
+          echo "0"
+        elif printf '%s ' "$@" | grep -q body; then
+          echo ""
+        else
+          echo '[]'
+        fi ;;
+      diff)
+        if printf '%s ' "$@" | grep -q -- --name-only; then printf 'src/a.py'; else printf '+ok'; fi ;;
+      comment) : ;;
+      merge) echo "[fake gh] merged"; [ -n "${SHIP_TEST_MERGE_LOG:-}" ] && printf '%s\\n' "$*" >> "$SHIP_TEST_MERGE_LOG" || true ;;
+      *) : ;;
+    esac ;;
+  run)
+    action="$1"; shift || true
+    case "$action" in
+      list)
+        printf '[{"databaseId":555,"conclusion":"failure"}]' ;;
+      view)
+        printf '[{"name":"pytest","conclusion":"failure"},{"name":"codeql","conclusion":"%s"},{"name":"lint","conclusion":"success"}]' "${SHIP_TEST_CODEQL_BASE_CONCLUSION:-success}" ;;
+      *) : ;;
+    esac ;;
+  api) echo 0 ;;
+  *) : ;;
+esac
+"""
+
+
+def _fake_gh_known_flake_two_checks_dir(tmp_path: Path) -> Path:
+    bindir = tmp_path / "binkf2"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_FAKE_GH_KNOWN_FLAKE_TWO_CHECKS, encoding="utf-8")
+    gh.chmod(0o755)
+    return bindir
+
+
+def test_known_flake_partial_coverage_of_multiple_failures_still_blocks(repo_with_pr_worktree, tmp_path):
+    """Two checks are failing; only ONE ("pytest") is asserted+confirmable, the other
+    ("codeql") is not confirmable on the base branch. The gate must require ALL failing
+    checks to be covered — one confirmed check must not paper over another genuine failure.
+    ship's own DEDUP_FILTER groups/sorts the rollup before this gate ever sees it, so which of
+    the two is evaluated first is an implementation detail (also exercises the short-circuit:
+    once one row is a certain loss, later rows are skipped, not individually re-verified) —
+    assert on the invariant (codeql's unconfirmable claim is surfaced, nothing merges), not on
+    a specific per-check message ordering."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_known_flake_two_checks_dir(tmp_path)
+
+    r = _run_ship_known_flake(main, bindir, "pytest", "codeql", env_extra={
+        "SHIP_LOCAL_TEST_CMD": "true",
+        # codeql never failed on the base branch — its --known-flake assertion is false.
+        "SHIP_TEST_CODEQL_BASE_CONCLUSION": "success",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must NOT merge when even ONE of several asserted checks is unconfirmed\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "'codeql' was asserted via --known-flake but could NOT be confirmed" in r.stderr, r.stderr
+    assert "merged #1" not in r.stdout, r.stdout
+
+
+def test_known_flake_unreadable_base_branch_fails_closed(repo_with_pr_worktree, tmp_path):
+    """If the PR's base branch can't be read (gh pr view --json baseRefName fails/empty), the
+    gate must refuse rather than silently falling back to guessing a branch to verify against
+    (a prior version of this gate did exactly that, review finding)."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _fake_gh_known_flake_dir(tmp_path)
+    # Force the baseRefName query to return an empty/unsafe value.
+    r = _run_ship_known_flake(main, bindir, "pytest", env_extra={
+        "SHIP_LOCAL_TEST_CMD": "true",
+        "SHIP_TEST_BASE": "",
+    })
+
+    assert r.returncode != 0, (
+        f"ship must refuse when the base branch can't be read, not guess $DEFAULT_BRANCH\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "could not read this PR's base branch" in r.stderr, r.stderr
     assert "merged #1" not in r.stdout, r.stdout
 
 
@@ -3048,25 +5279,60 @@ esac
 """
 
 # A fake `review` CLI answering `review task <code> [--check|--quorum-check] --min-iter N
-# --min-models M --json`. Behavior is driven entirely by env vars so each test controls it:
-#   SHIP_TEST_REVIEW_ITER / SHIP_TEST_REVIEW_MODELS   iteration/model counts to report (default 3/3)
+# [--min-models M] --min-roles R --json`. Behavior is driven entirely by env vars so each test
+# controls it:
+#   SHIP_TEST_REVIEW_ITER / SHIP_TEST_REVIEW_MODELS / SHIP_TEST_REVIEW_ROLES
+#                                       iteration/model/role counts to report (default 3/3/3)
 #   SHIP_TEST_REVIEW_SUPPORTS_CHECK=0   reject --check with an argparse-style error (exit 2,
 #                                       empty stdout) so ship.sh must fall back to --quorum-check
+#   SHIP_TEST_REVIEW_SUPPORTS_ROLES=0   reject ANY invocation carrying --min-roles with an
+#                                       argparse-style error (exit 2, empty stdout), on --check OR
+#                                       --quorum-check alike -- simulates a review-cli build that
+#                                       predates role support (review-cli#246), proving ship's
+#                                       3-tier retry (--check+roles -> --check-no-roles ->
+#                                       --quorum-check-no-roles) recovers real iter/model data
+#                                       with an honest 0-roles refusal, never "could not query".
+#   SHIP_TEST_REVIEW_ALWAYS_EMIT_ROLES=1   emit role keys even on a request that never asked for
+#                                       them (i.e. even when --min-roles was NOT part of the
+#                                       invocation) -- simulates a HYPOTHETICAL review-cli that
+#                                       reports roles unconditionally, proving ship's own
+#                                       QUORUM_ROLES_REQUESTED re-derivation (not just review-cli's
+#                                       real gate-on-the-flag behavior) is what keeps tier 2/3
+#                                       from ever authorizing.
+#   SHIP_TEST_REVIEW_OMIT_MODELS=1      omit distinct_models_passed/models from the payload
+#                                       entirely, even though the real review-cli always includes
+#                                       them (verified against reviewlib.stats.quorum_check and a
+#                                       live CLI call) -- simulates a HYPOTHETICAL non-conforming
+#                                       build, proving ship's QMODELS_N -gt 0 sanity check fails
+#                                       closed on a missing count rather than crashing or treating
+#                                       the absent key as satisfied.
 #   SHIP_TEST_REVIEW_BROKEN=1           fail BOTH --check and --quorum-check (simulates an
 #                                       unreadable stats store) -> ship.sh must fail closed
 #   SHIP_TEST_REVIEW_LOG                if set, append the flag actually used (check/quorum-check)
 #                                       so a test can assert which one ship.sh invoked
+#   SHIP_TEST_REVIEW_ARGS_LOG           if set, append one line per invocation recording whether
+#                                       --min-models / --min-roles were actually PASSED on the
+#                                       command line (min_models_given=0|1 min_roles_given=0|1) —
+#                                       lets a test prove ship.sh only sends --min-models when the
+#                                       operator explicitly asked (role-based is the default now,
+#                                       review-cli#246), while --min-roles is always sent.
 #   SHIP_TEST_REVIEW_FORCE_PASSED       if set (true/false), emit `passed` VERBATIM instead of
 #                                       computing it from the counts — lets a test forge a hollow
 #                                       `passed:true` with 0/0 counts (an older/hostile review-cli)
 #                                       to prove ship's independent arithmetic gate fails closed (#242).
-#   SHIP_TEST_REVIEW_MIN_ITER_ECHO      if set, emit THIS as the JSON `min_iter`/`min_models` echo
-#                                       instead of the flag values, so a test can inspect the floor
-#                                       ship actually passed to review-cli.
+#   SHIP_TEST_REVIEW_MIN_ITER_ECHO      if set, emit THIS as the JSON `min_iter`/`min_models`/
+#                                       `min_roles` echo instead of the flag values, so a test can
+#                                       inspect the floor ship actually passed to review-cli.
 #
-# The JSON keys match review-cli's real output: `passed_iterations` / `distinct_models_passed`
-# (NOT `iterations` / `distinct_models`, which review-cli never emitted — that key mismatch was
-# half of the #242 hole; a fake using the wrong keys would validate a fiction).
+# `passed` mirrors review-cli's own review-cli#246 AND-logic: each floor (iter always, models/
+# roles only when the corresponding flag was actually GIVEN on the command line) must
+# independently be met — a floor that was never passed as a flag is vacuously satisfied, exactly
+# like the real review-cli distinguishes an explicit ask from "not asked at all".
+#
+# The JSON keys match review-cli's real output: `passed_iterations` / `distinct_models_passed` /
+# `distinct_roles_passed` (NOT `iterations` / `distinct_models`, which review-cli never emitted —
+# that key mismatch was half of the #242 hole; a fake using the wrong keys would validate a
+# fiction).
 _FAKE_REVIEW = """\
 #!/usr/bin/env bash
 sub="${1:-}"; shift || true
@@ -3075,15 +5341,27 @@ code="${1:-}"; shift || true
 flag=""
 minit=3
 minmodels=3
+minroles=3
+models_given=0
+roles_given=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) flag="check" ;;
     --quorum-check) flag="quorum-check" ;;
     --min-iter) shift; minit="$1" ;;
-    --min-models) shift; minmodels="$1" ;;
+    --min-models) shift; minmodels="$1"; models_given=1 ;;
+    --min-roles) shift; minroles="$1"; roles_given=1 ;;
   esac
   shift || true
 done
+if [ -n "${SHIP_TEST_REVIEW_ARGS_LOG:-}" ]; then
+  printf 'min_models_given=%s min_roles_given=%s minmodels=%s minroles=%s\\n' \\
+    "$models_given" "$roles_given" "$minmodels" "$minroles" >> "${SHIP_TEST_REVIEW_ARGS_LOG}"
+fi
+if [ "$roles_given" = "1" ] && [ "${SHIP_TEST_REVIEW_SUPPORTS_ROLES:-1}" = "0" ]; then
+  echo "review task: error: unrecognized arguments: --min-roles" >&2
+  exit 2
+fi
 if [ "$flag" = "check" ] && [ "${SHIP_TEST_REVIEW_SUPPORTS_CHECK:-1}" = "0" ]; then
   echo "review task: error: unrecognized arguments: --check" >&2
   exit 2
@@ -3095,22 +5373,67 @@ if [ "${SHIP_TEST_REVIEW_BROKEN:-0}" = "1" ]; then
 fi
 iterations="${SHIP_TEST_REVIEW_ITER:-3}"
 models_n="${SHIP_TEST_REVIEW_MODELS:-3}"
+roles_n="${SHIP_TEST_REVIEW_ROLES:-3}"
 if [ -n "${SHIP_TEST_REVIEW_FORCE_PASSED:-}" ]; then
   passed="${SHIP_TEST_REVIEW_FORCE_PASSED}"
 else
+  ok=1
+  [ "$iterations" -ge "$minit" ] || ok=0
+  if [ "$models_given" = "1" ] && [ "$models_n" -lt "$minmodels" ]; then ok=0; fi
+  if [ "$roles_given" = "1" ] && [ "$roles_n" -lt "$minroles" ]; then ok=0; fi
   passed="false"
-  if [ "$iterations" -ge "$minit" ] && [ "$models_n" -ge "$minmodels" ]; then passed="true"; fi
+  [ "$ok" = "1" ] && passed="true"
 fi
 echo_min="${SHIP_TEST_REVIEW_MIN_ITER_ECHO:-}"
-[ -n "$echo_min" ] && { minit="$echo_min"; minmodels="$echo_min"; }
+[ -n "$echo_min" ] && { minit="$echo_min"; minmodels="$echo_min"; minroles="$echo_min"; }
+# A fixed pool of role names, truncated to the reported role count -- keeps the displayed
+# "roles seen" list consistent with distinct_roles_passed instead of a fixed/mismatched array.
+role_pool="backend security architecture frontend qa"
+roles_json="["; sep=""; n=0
+for r in $role_pool; do
+  [ "$n" -ge "$roles_n" ] && break
+  roles_json="${roles_json}${sep}\\"${r}\\""; sep=","; n=$((n+1))
+done
+roles_json="${roles_json}]"
+# Same truncation for the models array: a self-contradictory fixture (e.g. models_n=1 alongside
+# a hardcoded 3-entry array) would let a test's "(models seen: ...)" text silently disagree with
+# its own count, masking the exact class of fixture/reality mismatch this fake exists to avoid.
+model_pool="claude codex gemini k3 glm"
+models_json="["; sep=""; n=0
+for m in $model_pool; do
+  [ "$n" -ge "$models_n" ] && break
+  models_json="${models_json}${sep}\\"${m}\\""; sep=","; n=$((n+1))
+done
+models_json="${models_json}]"
+# Mirror the real review-cli: distinct_roles_passed/roles/min_roles are included ONLY when
+# --min-roles was actually part of THIS invocation (roles_given=1) -- a request that never asked
+# about roles gets no role keys at all, not a zeroed-out placeholder (reviewlib.stats.quorum_check
+# gates the whole roles block on `min_roles is not None`).
+roles_fields=""
+if [ "$roles_given" = "1" ] || [ "${SHIP_TEST_REVIEW_ALWAYS_EMIT_ROLES:-0}" = "1" ]; then
+  # SHIP_TEST_REVIEW_ALWAYS_EMIT_ROLES simulates a HYPOTHETICAL review-cli that emits role keys
+  # unconditionally (not gated on whether --min-roles was in THIS request) -- proving ship's own
+  # QUORUM_ROLES_REQUESTED re-derivation is load-bearing, not dead code riding on today's real
+  # review-cli behavior (which does gate on it, per reviewlib.stats.quorum_check).
+  roles_fields=$(printf ',"distinct_roles_passed":%s,"roles":%s,"min_roles":%s' "$roles_n" "$roles_json" "$minroles")
+fi
+# The real review-cli emits distinct_models_passed/models UNCONDITIONALLY (never gated on
+# --min-models, unlike roles) -- verified against both reviewlib.stats.quorum_check's source and
+# a live `review task ... --check --min-roles N --json` call with NO --min-models, which still
+# returned a real distinct_models_passed/models. SHIP_TEST_REVIEW_OMIT_MODELS simulates a
+# HYPOTHETICAL non-conforming build that omits them anyway, proving ship's QMODELS_N -gt 0
+# sanity check (not just "today's real review-cli always includes it") is what keeps that
+# scenario fail-closed rather than crashing or silently authorizing on an absent count.
+models_fields=$(printf ',"distinct_models_passed":%s,"models":%s' "$models_n" "$models_json")
+[ "${SHIP_TEST_REVIEW_OMIT_MODELS:-0}" = "1" ] && models_fields=""
 if [ "${SHIP_TEST_REVIEW_LEGACY_KEYS:-0}" = "1" ]; then
   # Emit ONLY the never-emitted legacy key names (`iterations` / `distinct_models`) to prove ship
   # reads the REAL keys and treats a legacy-only payload as 0/0 -> fail-closed refuse (#242).
-  printf '{"task_code":"%s","iterations":%s,"distinct_models":%s,"models":["claude","codex","gemini"],"min_iter":%s,"min_models":%s,"passed":%s}\\n' \\
-    "$code" "$iterations" "$models_n" "$minit" "$minmodels" "$passed"
+  printf '{"task_code":"%s","iterations":%s,"distinct_models":%s,"models":%s,"min_iter":%s,"min_models":%s,"passed":%s}\\n' \\
+    "$code" "$iterations" "$models_n" "$models_json" "$minit" "$minmodels" "$passed"
 else
-  printf '{"task_code":"%s","passed_iterations":%s,"total_iterations":%s,"distinct_models_passed":%s,"models":["claude","codex","gemini"],"min_iter":%s,"min_models":%s,"passed":%s}\\n' \\
-    "$code" "$iterations" "$iterations" "$models_n" "$minit" "$minmodels" "$passed"
+  printf '{"task_code":"%s","passed_iterations":%s,"total_iterations":%s%s%s,"min_iter":%s,"min_models":%s,"passed":%s}\\n' \\
+    "$code" "$iterations" "$iterations" "$models_fields" "$roles_fields" "$minit" "$minmodels" "$passed"
 fi
 """
 
@@ -3211,6 +5534,16 @@ def _run_ship_quorum(main, gh_bindir, review_bindir, *, branch="feat", extra_arg
     # turn a plain refusal into a live tg-ctl call). Tests that exercise the hatch set it via
     # env_extra AFTER this pop.
     env.pop("RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM", None)
+    # Same hygiene for the model-floor explicitness flag: ship.sh tells "explicitly asked for a
+    # model floor" apart from "not asked at all" via `${SHIP_REVIEW_QUORUM_MIN_MODELS+x}`, so an
+    # ambient value leaking in from the real shell would silently turn a "default, role-only" test
+    # into an "explicit model floor" one. Tests that want it explicit set it via env_extra AFTER
+    # this pop.
+    env.pop("SHIP_REVIEW_QUORUM_MIN_MODELS", None)
+    # Same hygiene for the role-floor: an operator/CI environment with a raised
+    # SHIP_REVIEW_QUORUM_MIN_ROLES would otherwise leak in and silently change what
+    # a "default 3-role floor" test actually asserts (codex review, PR #416).
+    env.pop("SHIP_REVIEW_QUORUM_MIN_ROLES", None)
     if env_extra:
         env.update(env_extra)
     return _sh(
@@ -3266,9 +5599,17 @@ def test_review_quorum_calls_check_flag_by_default(tmp_path):
     assert log.read_text().strip() == "check", f"expected --check to be used, log: {log.read_text()!r}"
 
 
-def test_review_quorum_falls_back_to_quorum_check_flag(tmp_path):
-    """When the installed review-cli doesn't yet support --check (rename in flight), ship.sh
-    falls back to the legacy --quorum-check spelling and still evaluates correctly."""
+def test_review_quorum_legacy_quorum_check_fallback_refuses_honestly_on_zero_roles(tmp_path):
+    """When the installed review-cli doesn't support --check at all (predates the rename —
+    review-cli's own history shows this build is necessarily also older than role support,
+    which arrived six weeks after the rename, review-cli#135 vs #246), ship.sh's 3rd-tier query
+    reaches the legacy --quorum-check spelling and gets a REAL response (iterations/models are
+    genuine, 3/3). But a build this old cannot report role coverage at all, and role coverage is
+    now the MANDATORY primary floor (no override) — so ship correctly REFUSES with an honest
+    '0/3 distinct roles', not the old 'AUTHORITY CONFIRMED'. This is the intended, fail-closed
+    consequence of making role coverage mandatory: an operator on a review-cli this old must
+    upgrade to ever satisfy the gate again, and the refusal message says so accurately (roles
+    0/3, iterations/models real) rather than misdiagnosing it as 'could not query review-cli'."""
     main, _wt = _make_repo_with_branch(tmp_path, "feat")
     gh = _fake_gh_quorum_dir(tmp_path)
     rv = _fake_review_dir(tmp_path)
@@ -3281,9 +5622,138 @@ def test_review_quorum_falls_back_to_quorum_check_flag(tmp_path):
             "SHIP_TEST_REVIEW_LOG": str(log),
         },
     )
-    assert r.returncode == 0, f"fallback to --quorum-check should still pass a met quorum\n{r.stdout}\n{r.stderr}"
-    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
-    assert log.read_text().strip() == "quorum-check", f"expected the --quorum-check fallback, log: {log.read_text()!r}"
+    assert r.returncode != 0, f"a review-cli old enough to lack --check cannot report roles, so it must refuse\n{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" not in r.stdout, r.stdout
+    assert "bar NOT met" in r.stderr, r.stderr
+    # The refusal must show the REAL iteration count (query succeeded) and 0 roles (unavailable
+    # from this build) — never "could not query review-cli", which would misdiagnose the cause.
+    assert "3/3 iterations" in r.stderr, r.stderr
+    assert "0/3 distinct roles" in r.stderr, r.stderr
+    assert "could not query review-cli" not in r.stderr, r.stderr
+    # A 0-roles read from a request that never even asked about roles gets the disambiguating
+    # upgrade hint, distinguishing it from a modern review-cli that genuinely found no roles.
+    assert "does not support --min-roles" in r.stderr, r.stderr
+    assert log.read_text().strip() == "quorum-check", f"expected the --quorum-check fallback to be reached, log: {log.read_text()!r}"
+    assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_review_quorum_falls_back_when_review_cli_lacks_role_support(tmp_path):
+    """A review-cli build that supports the --check rename but predates role support entirely
+    (a real, six-week-wide population between review-cli#135's rename and review-cli#246's
+    --min-roles) rejects --min-roles on the FIRST --check attempt; ship's 2nd-tier retry
+    (--check WITHOUT --min-roles) recovers real iteration/model data. Since roles are still
+    mandatory, ship refuses honestly with 0/3 distinct roles — proving the retry recovers a
+    real diagnosis instead of falling all the way to a misleading 'could not query' refusal."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    log = tmp_path / "review-flag.log"
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-320",
+            "SHIP_TEST_REVIEW_SUPPORTS_ROLES": "0",
+            "SHIP_TEST_REVIEW_LOG": str(log),
+        },
+    )
+    assert r.returncode != 0, f"a review-cli lacking role support cannot satisfy the mandatory role floor\n{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" not in r.stdout, r.stdout
+    assert "bar NOT met" in r.stderr, r.stderr
+    assert "3/3 iterations" in r.stderr, r.stderr
+    assert "0/3 distinct roles" in r.stderr, r.stderr
+    assert "could not query review-cli" not in r.stderr, r.stderr
+    assert "does not support --min-roles" in r.stderr, r.stderr
+    # The 2nd-tier retry still uses --check (the rename IS supported here), not --quorum-check.
+    assert log.read_text().strip() == "check", f"expected the roles-less --check retry, log: {log.read_text()!r}"
+    assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_review_quorum_explicit_min_models_survives_the_roles_less_retry(tmp_path):
+    """When a review-cli build lacks role support (forcing the tier-2 retry) AND the operator
+    explicitly set SHIP_REVIEW_QUORUM_MIN_MODELS, the retry's REVIEW_CHECK_ARGS_NOROLES must
+    still carry --min-models — a regression that dropped it from the roles-less arg set would
+    pass every other test (they only inspect the FIRST args-log line, the failed tier-1 attempt)
+    but would silently stop enforcing an explicit model floor on any pre-#246 review-cli."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    args_log = tmp_path / "review-args.log"
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-324",
+            "SHIP_TEST_REVIEW_SUPPORTS_ROLES": "0",
+            "SHIP_REVIEW_QUORUM_MIN_MODELS": "3",
+            "SHIP_TEST_REVIEW_ARGS_LOG": str(args_log),
+        },
+    )
+    assert r.returncode != 0, f"a review-cli lacking role support still refuses (mandatory role floor)\n{r.stdout}\n{r.stderr}"
+    lines = args_log.read_text().strip().splitlines()
+    assert len(lines) >= 2, f"expected a failed tier-1 attempt followed by a successful retry: {lines}"
+    # lines[0] = the failed tier-1 attempt (roles requested); lines[-1] = the retry that actually
+    # answered (roles-less) -- both must show the explicit model floor was carried through.
+    assert "min_models_given=1" in lines[0], lines[0]
+    assert "min_models_given=1" in lines[-1], lines[-1]
+    assert "minmodels=3" in lines[-1], lines[-1]
+    assert "min_roles_given=0" in lines[-1], lines[-1]
+
+
+def test_review_quorum_ignores_role_data_never_actually_requested(tmp_path):
+    """Defense-in-depth: even if a (hypothetical, non-conforming) review-cli emitted role keys
+    on a request that never included --min-roles, ship must NOT authorize on them. Today's real
+    review-cli only emits distinct_roles_passed/roles when --min-roles was actually asked
+    (reviewlib.stats.quorum_check gates the whole block on `min_roles is not None`), so this
+    scenario can't happen against the real binary — but ship's own QUORUM_ROLES_REQUESTED check
+    (not just trust in that external contract) is what actually prevents authorization here,
+    matching the file's own #242 philosophy of re-deriving verdicts rather than trusting the
+    subprocess. --min-roles is rejected (tier 1 fails), so ship's OWN bookkeeping correctly marks
+    QUORUM_ROLES_REQUESTED=0 for the tier-2 response, even though that response's JSON body (via
+    the ALWAYS_EMIT knob) reports a real-looking 3/3 role count."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-322",
+            "SHIP_TEST_REVIEW_SUPPORTS_ROLES": "0",
+            "SHIP_TEST_REVIEW_ALWAYS_EMIT_ROLES": "1",
+            "SHIP_TEST_REVIEW_ITER": "3",
+            "SHIP_TEST_REVIEW_ROLES": "3",
+        },
+    )
+    assert r.returncode != 0, (
+        f"role data from a request that never asked for it must NOT authorize\n{r.stdout}\n{r.stderr}"
+    )
+    assert "AUTHORITY CONFIRMED" not in r.stdout, r.stdout
+    assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_review_quorum_refuses_when_models_field_is_absent(tmp_path):
+    """Defense-in-depth for the reverse direction: the real review-cli always includes
+    distinct_models_passed/models regardless of --min-models (verified against
+    reviewlib.stats.quorum_check's source and a live CLI call), so this can't happen against the
+    real binary — but if a non-conforming build ever omitted the field, ship's QMODELS_N -gt 0
+    sanity check (independent of whether an explicit model floor is even requested) must still
+    refuse rather than treat the missing count as satisfied. 3 iterations and 3 roles alone must
+    NOT be enough when the models data a genuine record always carries is simply absent."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-323",
+            "SHIP_TEST_REVIEW_ITER": "3",
+            "SHIP_TEST_REVIEW_ROLES": "3",
+            "SHIP_TEST_REVIEW_OMIT_MODELS": "1",
+        },
+    )
+    assert r.returncode != 0, (
+        f"a payload missing the models count entirely must refuse, not silently authorize\n{r.stdout}\n{r.stderr}"
+    )
+    assert "AUTHORITY CONFIRMED" not in r.stdout, r.stdout
+    assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
 
 
 def test_review_quorum_disabled_via_env(tmp_path):
@@ -3347,6 +5817,144 @@ def test_review_quorum_derives_code_from_pr_body(tmp_path):
     assert "AUTHORITY CONFIRMED" in r.stdout and "HYP-999" in r.stdout, r.stdout
 
 
+def test_review_quorum_derives_descriptive_code_from_pr_body(tmp_path):
+    """No $REVIEW_TASK_CODE and no ticket in the branch name -> ship also derives a purely
+    descriptive (non-numeric) review-cli task code from the PR body — the real-world #384
+    case: a docs-only PR whose 3 review-quorum iterations were recorded under task
+    `SME-ROADMAP-WORKTREE-NOTE`, same shape as review-cli's own run-stats.jsonl."""
+    main, _wt = _make_repo_with_branch(tmp_path, "roadmap-worktree-convention-note")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        branch="roadmap-worktree-convention-note",
+        env_extra={
+            "SHIP_TEST_PR_BODY": "Review findings addressed, task SME-ROADMAP-WORKTREE-NOTE.",
+        },
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "SME-ROADMAP-WORKTREE-NOTE" in r.stdout, r.stdout
+
+
+def test_review_quorum_derives_descriptive_code_from_branch_name(tmp_path):
+    """A branch name carrying an all-uppercase, hyphen-joined descriptive task code (no
+    digits) is picked up too, same as the numeric HYP-<n> case."""
+    branch = "fix/WT-GITIGNORE-EXCLUDE-followup"
+    main, _wt = _make_repo_with_branch(tmp_path, branch)
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, rv, branch=branch)
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "WT-GITIGNORE-EXCLUDE" in r.stdout, r.stdout
+
+
+def test_review_quorum_descriptive_pattern_does_not_match_bare_acronyms(tmp_path):
+    """The descriptive-code pattern requires 2+ hyphens (3+ segments), so ordinary PR-body
+    prose full of unrelated all-caps acronyms (PASSED, PR, CI, README) — but no 3-segment
+    hyphenated all-caps token — must NOT be mistaken for a task code; ship still refuses."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "SHIP_TEST_PR_BODY": "All models PASSED. See README and CI, updates in PR body.",
+        },
+    )
+    assert r.returncode != 0, f"bare acronyms must not be treated as a task code\n{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_descriptive_pattern_does_not_match_two_word_prose(tmp_path):
+    """Common TWO-word hyphenated English (READ-ONLY, CI-CD, PRE-COMMIT, API-KEY) is exactly
+    the false-positive class two independent review-cli models flagged against an earlier,
+    looser version of this pattern (#384 review round 1) — the 3-segment floor must reject all
+    of it, not just hyphen-less acronyms."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "SHIP_TEST_PR_BODY": (
+                "sandbox: READ-ONLY. Ran CI-CD, added a PRE-COMMIT hook, rotated the API-KEY."
+            ),
+        },
+    )
+    assert r.returncode != 0, f"two-word hyphenated prose must not be treated as a task code\n{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_descriptive_pattern_rejects_digit_bearing_token(tmp_path):
+    """A token with a digit buried mid-segment (`SME-ROADMAP-V2-NOTE`) must be rejected
+    outright, not silently truncate-matched down to a bogus prefix (`SME-ROADMAP-V`) — the
+    boundary bug an earlier version of this pattern had (#384 review round 1)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"SHIP_TEST_PR_BODY": "Task code SME-ROADMAP-V2-NOTE covers this."},
+    )
+    assert r.returncode != 0, f"a digit-bearing token must not derive a truncated code\n{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "SME-ROADMAP-V" not in r.stderr, f"must not silently truncate-match: {r.stderr}"
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_descriptive_pattern_filters_per_candidate(tmp_path):
+    """A rejected digit-bearing candidate must not shadow a CLEAN descriptive code appearing
+    later in the same text -- pins the per-candidate (not whole-text) filtering design (#384
+    review round 2): a whole-text-reject-all implementation would also pass the
+    `rejects_digit_bearing_token` test above without actually filtering per candidate, so this
+    is the test that distinguishes the two."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "SHIP_TEST_PR_BODY": "Task SME-ROADMAP-V2-NOTE superseded by REAL-TASK-CODE-HERE.",
+        },
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "REAL-TASK-CODE-HERE" in r.stdout, r.stdout
+
+
+def test_review_quorum_descriptive_code_is_case_sensitive(tmp_path):
+    """A lowercase descriptive code must NOT match — only the fully-uppercase shape counts,
+    same posture as the numeric generic pattern."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"SHIP_TEST_PR_BODY": "Part of sme-roadmap-worktree-note, lowercase."},
+    )
+    assert r.returncode != 0, f"lowercase must not derive a task code\n{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_numeric_code_takes_precedence_over_descriptive(tmp_path):
+    """When a PR body carries both a numeric-suffix ticket and a descriptive code, the numeric
+    arm (tried first) wins — pinning the fallback order the function's docblock describes."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "SHIP_TEST_PR_BODY": "Fixes ABC-123, related to SME-ROADMAP-WORKTREE-NOTE.",
+        },
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "ABC-123" in r.stdout, r.stdout
+    assert "SME-ROADMAP-WORKTREE-NOTE" not in r.stdout, r.stdout
+
+
 def test_review_quorum_refuses_when_no_task_code_derivable(tmp_path):
     """No $REVIEW_TASK_CODE, no ticket in the branch, no ticket in the PR body -> refuse with
     guidance rather than silently skip the gate."""
@@ -3381,6 +5989,12 @@ def test_review_quorum_audit_log_records_authorized(tmp_path):
     assert rec["task_code"] == "HYP-107", rec
     assert rec["iterations"] == 3, rec
     assert rec["models"] == 3, rec
+    # Role-based coverage is the mandatory floor now (review-cli#246): the real 3-role count and
+    # the floor it was checked against both land in the audit line. No SHIP_REVIEW_QUORUM_MIN_MODELS
+    # was set, so min_models reads 0 — the unambiguous "model floor was NOT enforced" sentinel.
+    assert rec["roles"] == 3, rec
+    assert rec["min_roles"] == 3, rec
+    assert rec["min_models"] == 0, rec
     assert rec["pr"] == "1", rec
     assert "ts" in rec, rec
 
@@ -3406,6 +6020,12 @@ def test_review_quorum_audit_log_records_refused(tmp_path):
     assert rec["task_code"] == "HYP-108", rec
     assert rec["iterations"] == 1, rec
     assert rec["models"] == 1, rec
+    # Refused on the iteration floor (1 < 3) even though the default 3 roles were reported —
+    # the audit line still carries the real role count/floor and the unenforced model-floor
+    # sentinel (0), so an auditor can tell exactly which numbers gated this decision.
+    assert rec["roles"] == 3, rec
+    assert rec["min_roles"] == 3, rec
+    assert rec["min_models"] == 0, rec
 
 
 def test_review_quorum_audit_log_skipped_in_dry_run(tmp_path):
@@ -3474,8 +6094,10 @@ def test_review_quorum_reads_real_passed_iteration_keys(tmp_path):
     )
     assert r.returncode == 0, f"a real 4×3 record should authorize\n{r.stdout}\n{r.stderr}"
     assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
-    # The confirmed line must show the REAL counts (4 iterations across 3 models), not 0/0.
-    assert "4 iterations across 3 models" in r.stdout, r.stdout
+    # The confirmed line must show the REAL iteration/role counts (4 iterations across the
+    # default 3 roles), not 0/0. No SHIP_REVIEW_QUORUM_MIN_MODELS was set, so the model-count
+    # (still 3, real) is not part of the default role-based message (review-cli#246).
+    assert "4 iterations across 3 roles" in r.stdout, r.stdout
     assert "merged #1" in r.stdout, r.stdout
 
 
@@ -3548,6 +6170,268 @@ def test_review_quorum_below_floor_positive_value_cannot_weaken_bar(tmp_path):
     assert r.returncode != 0, f"a 2×2 record under a clamped-to-3 floor must refuse\n{r.stdout}\n{r.stderr}"
     assert "hard floor" in r.stderr, f"expected a floor-clamp warning raising 2 to 3\n{r.stderr}"
     assert "2/3 iterations" in r.stderr, f"floor must be enforced at 3, not the weakened 2\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" not in r.stdout, r.stdout
+    assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
+
+
+# --- role-based quorum (review-cli#246): roles are now the PRIMARY/default gate, an explicit
+# model floor is additionally enforced only when the operator opts in via
+# SHIP_REVIEW_QUORUM_MIN_MODELS ------------------------------------------------------------
+
+def test_review_quorum_role_based_default_passes_without_model_floor(tmp_path):
+    """Enough distinct BOARD ROLES (3) but FEWER than 3 distinct models, and NO explicit
+    SHIP_REVIEW_QUORUM_MIN_MODELS -> ship still AUTHORIZES: role-based coverage is the
+    primary/default gate now, and there is no default model floor any more (review-cli#246)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    args_log = tmp_path / "review-args.log"
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-310",
+            "SHIP_TEST_REVIEW_ITER": "3",
+            "SHIP_TEST_REVIEW_ROLES": "3",
+            "SHIP_TEST_REVIEW_MODELS": "1",
+            "SHIP_TEST_REVIEW_ARGS_LOG": str(args_log),
+        },
+    )
+    assert r.returncode == 0, f"3 roles should authorize even with only 1 model (no model floor set)\n{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
+    assert "3 iterations across 3 roles" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+    # Prove ship did NOT send --min-models: passing it unconditionally would make review-cli
+    # treat the model floor as explicitly requested too (it can't see "just ship's default").
+    log_line = args_log.read_text().strip().splitlines()[0]
+    assert "min_models_given=0" in log_line, log_line
+    assert "min_roles_given=1" in log_line, log_line
+
+
+def test_review_quorum_explicit_min_models_authorizes_when_both_floors_met(tmp_path):
+    """The SUCCESS-side twin of the explicit-model-floor refusal test: 3 roles AND 3 models,
+    with SHIP_REVIEW_QUORUM_MIN_MODELS explicitly set to 3 -> ship AUTHORIZES, the confirmed
+    message names BOTH roles and models, and the audit line's min_models is the REAL enforced
+    floor (3) rather than the '0 = unenforced' sentinel — the success-path branches (the
+    'N roles and M models' message, and a non-zero min_models on an `authorized` line) were
+    previously untested; only the refusal side was covered."""
+    import json
+
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    audit = tmp_path / "ship-audit.jsonl"
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-316",
+            "SHIP_TEST_REVIEW_ITER": "3",
+            "SHIP_TEST_REVIEW_ROLES": "3",
+            "SHIP_TEST_REVIEW_MODELS": "3",
+            "SHIP_REVIEW_QUORUM_MIN_MODELS": "3",
+            "SHIP_AUDIT_FILE": str(audit),
+        },
+    )
+    assert r.returncode == 0, f"3 roles and 3 models with an explicit 3-model floor must authorize\n{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
+    assert "3 iterations across 3 roles and 3 models" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+    rec = json.loads(audit.read_text().strip().splitlines()[0])
+    assert rec["decision"] == "authorized", rec
+    assert rec["min_models"] == 3, rec
+    assert rec["models"] == 3, rec
+    assert rec["roles"] == 3, rec
+
+
+def test_review_quorum_blank_min_models_counts_as_explicit_opt_in(tmp_path):
+    """SHIP_REVIEW_QUORUM_MIN_MODELS set to the EMPTY STRING (not unset) must still count as
+    opting in to the model floor — the README's own subtlest claim: `${VAR+x}` distinguishes
+    "genuinely unset" from "set to anything, even blank", and only genuinely unsetting the var
+    skips the model floor. A regression to a plain `[ -n "$VAR" ]` truthiness check would
+    silently treat a blank value as "not set" and authorize here; this pins the correct
+    behavior: blank still means explicit, so a 1-model record refuses at the clamped floor 3."""
+    import json
+
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    audit = tmp_path / "ship-audit.jsonl"
+    args_log = tmp_path / "review-args.log"
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-317",
+            "SHIP_TEST_REVIEW_ITER": "3",
+            "SHIP_TEST_REVIEW_ROLES": "3",
+            "SHIP_TEST_REVIEW_MODELS": "1",
+            "SHIP_REVIEW_QUORUM_MIN_MODELS": "",
+            "SHIP_AUDIT_FILE": str(audit),
+            "SHIP_TEST_REVIEW_ARGS_LOG": str(args_log),
+        },
+    )
+    assert r.returncode != 0, f"a blank MIN_MODELS must still count as explicit and enforce the clamped floor\n{r.stdout}\n{r.stderr}"
+    assert "bar NOT met" in r.stderr, r.stderr
+    assert "1/3 distinct models" in r.stderr, r.stderr
+    assert "AUTHORITY CONFIRMED" not in r.stdout, r.stdout
+    assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
+    rec = json.loads(audit.read_text().strip().splitlines()[0])
+    assert rec["decision"] == "refused", rec
+    # The CLAMPED floor (3), not the blank raw value, is what ship actually sends to review-cli.
+    log_line = args_log.read_text().strip().splitlines()[0]
+    assert "min_models_given=1" in log_line, log_line
+    assert "minmodels=3" in log_line, log_line
+    assert rec["min_models"] == 3, rec
+
+
+def test_review_quorum_explicit_min_models_still_enforced_alongside_roles(tmp_path):
+    """The SAME 3-roles / 1-model record as above, but WITH SHIP_REVIEW_QUORUM_MIN_MODELS
+    explicitly set to 3 -> ship now REFUSES: an operator who explicitly asks for a model floor
+    gets it honored in addition to the role floor (AND logic, review-cli#246 PR #246/#249/#252),
+    it is never silently outvoted by role coverage."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    args_log = tmp_path / "review-args.log"
+    audit = tmp_path / "ship-audit.jsonl"
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-311",
+            "SHIP_TEST_REVIEW_ITER": "3",
+            "SHIP_TEST_REVIEW_ROLES": "3",
+            "SHIP_TEST_REVIEW_MODELS": "1",
+            "SHIP_REVIEW_QUORUM_MIN_MODELS": "3",
+            "SHIP_TEST_REVIEW_ARGS_LOG": str(args_log),
+            "SHIP_AUDIT_FILE": str(audit),
+        },
+    )
+    assert r.returncode != 0, f"an explicit min-models floor must still be enforced\n{r.stdout}\n{r.stderr}"
+    assert "bar NOT met" in r.stderr, r.stderr
+    assert "1/3 distinct models" in r.stderr, r.stderr
+    assert "AUTHORITY CONFIRMED" not in r.stdout, r.stdout
+    assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
+    log_line = args_log.read_text().strip().splitlines()[0]
+    assert "min_models_given=1" in log_line, log_line
+    # The audit line's min_models is the REAL enforced floor (3), not the 0 "unenforced" sentinel
+    # — proving the sentinel actually distinguishes the two cases, not just always reading 0.
+    import json
+
+    rec = json.loads(audit.read_text().strip().splitlines()[0])
+    assert rec["decision"] == "refused", rec
+    assert rec["min_models"] == 3, rec
+    assert rec["models"] == 1, rec
+
+
+def test_review_quorum_role_only_regression_matches_pre_existing_behavior(tmp_path):
+    """Regression guard: a caller that doesn't care about roles at all, but has enough of BOTH
+    (3 iterations / 3 models / 3 roles) and never touches SHIP_REVIEW_QUORUM_MIN_MODELS, still
+    authorizes exactly as before this change — backward compatible."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-312",
+            "SHIP_TEST_REVIEW_ITER": "3",
+            "SHIP_TEST_REVIEW_MODELS": "3",
+            "SHIP_TEST_REVIEW_ROLES": "3",
+        },
+    )
+    assert r.returncode == 0, f"a real 3x3x3 record should still authorize unchanged\n{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout, r.stdout
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_review_quorum_role_floor_enforced_even_with_many_models(tmp_path):
+    """Distinct models are plentiful (5) but distinct ROLES are below the floor (1 of 3) -> ship
+    REFUSES: the role floor is ALWAYS required now (the primary/default mechanism), independent
+    of how many models were involved."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-313",
+            "SHIP_TEST_REVIEW_ITER": "3",
+            "SHIP_TEST_REVIEW_MODELS": "5",
+            "SHIP_TEST_REVIEW_ROLES": "1",
+        },
+    )
+    assert r.returncode != 0, f"a below-floor role count must refuse regardless of model count\n{r.stdout}\n{r.stderr}"
+    assert "bar NOT met" in r.stderr, r.stderr
+    assert "1/3 distinct roles" in r.stderr, r.stderr
+    assert "AUTHORITY CONFIRMED" not in r.stdout, r.stdout
+    assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_review_quorum_zero_roles_from_modern_review_cli_gets_no_upgrade_hint(tmp_path):
+    """A MODERN review-cli (tier 1 succeeds — --min-roles was understood and answered) that
+    genuinely has 0 role-tagged passed iterations must refuse plainly, WITHOUT the "upgrade
+    review-cli" hint — that hint is reserved for the 2nd/3rd-tier case where the build never
+    even understood --min-roles. Proves the disambiguation is a real distinction, not just
+    always-on boilerplate appended to every 0-roles refusal."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-321",
+            "SHIP_TEST_REVIEW_ITER": "3",
+            "SHIP_TEST_REVIEW_ROLES": "0",
+        },
+    )
+    assert r.returncode != 0, f"0 real roles must still refuse\n{r.stdout}\n{r.stderr}"
+    assert "bar NOT met" in r.stderr, r.stderr
+    assert "0/3 distinct roles" in r.stderr, r.stderr
+    assert "does not support --min-roles" not in r.stderr, (
+        f"a modern review-cli's genuine 0-role answer must NOT get the upgrade hint\n{r.stderr}"
+    )
+    assert "AUTHORITY CONFIRMED" not in r.stdout, r.stdout
+    assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_review_quorum_min_roles_below_floor_cannot_weaken_bar(tmp_path):
+    """SHIP_REVIEW_QUORUM_MIN_ROLES=1 (an attempt to weaken the mandatory role floor) is clamped
+    back up to the hard floor 3, same as MIN_ITER/MIN_MODELS (#242) — a genuine 1-role record
+    still refuses '1/3', not '1/1'."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-314",
+            "SHIP_REVIEW_QUORUM_MIN_ROLES": "1",
+            "SHIP_TEST_REVIEW_ITER": "3",
+            "SHIP_TEST_REVIEW_ROLES": "1",
+        },
+    )
+    assert r.returncode != 0, f"a 1-role record under a clamped-to-3 floor must refuse\n{r.stdout}\n{r.stderr}"
+    assert "hard floor" in r.stderr, f"expected a floor-clamp warning raising 1 to 3\n{r.stderr}"
+    assert "1/3 distinct roles" in r.stderr, f"floor must be enforced at 3, not the weakened 1\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" not in r.stdout, r.stdout
+    assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
+
+
+def test_review_quorum_min_roles_raised_above_floor_is_honored(tmp_path):
+    """SHIP_REVIEW_QUORUM_MIN_ROLES=5 (raising the bar, which IS allowed) with only 4 real roles
+    refuses '4/5' — proving the raise-only direction works, not just the raise-only clamp."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "REVIEW_TASK_CODE": "HYP-315",
+            "SHIP_REVIEW_QUORUM_MIN_ROLES": "5",
+            "SHIP_TEST_REVIEW_ITER": "3",
+            "SHIP_TEST_REVIEW_ROLES": "4",
+        },
+    )
+    assert r.returncode != 0, f"a raised 5-role bar with only 4 real roles must refuse\n{r.stdout}\n{r.stderr}"
+    assert "4/5 distinct roles" in r.stderr, r.stderr
     assert "AUTHORITY CONFIRMED" not in r.stdout, r.stdout
     assert "merged #1" not in r.stdout, "must refuse BEFORE merging"
 
@@ -4063,6 +6947,13 @@ def test_ship_fails_closed_when_helper_unreachable(tmp_path):
     assert "[fake gh] merged" not in r.stdout
     rec = json.loads(audit.read_text().strip().splitlines()[-1])
     assert rec["decision"] == "bypass:denied", rec
+    # ship.sh (not the helper) writes this fail-closed line, so it must carry the same
+    # roles/min_roles/min_models fields as the other review-quorum decision types — this is the
+    # ONLY non-dry-run path that exercises the shell-side bypass:denied call with real gate state
+    # (the short bar here reports the default 3 roles, no explicit model floor was set).
+    assert rec["roles"] == 3, rec
+    assert rec["min_roles"] == 3, rec
+    assert rec["min_models"] == 0, rec
 
 
 def test_ship_fails_closed_when_python3_exits_zero_without_sentinel(tmp_path):

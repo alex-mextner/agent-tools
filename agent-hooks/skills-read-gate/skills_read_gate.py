@@ -7,12 +7,19 @@ must follow (e.g. `delegate-work-to-subagents` before dispatching, `visual-proof
 before a UI "done"); doing the work without first reading the skill skips those rules.
 
 How it knows a skill was invoked — the MARKER CONTRACT:
-  A skill-invocation wrapper touches one file per invoked skill in a marker dir:
-      ~/.cache/agent-tools/skills-invoked/<skill-name>      (mtime = invocation time)
+  A skill-invocation wrapper touches one file per invoked skill, nested under the CC session
+  id that invoked it, in a marker dir:
+      ~/.cache/agent-tools/skills-invoked/<session-id>/<skill-name>  (mtime = invocation time)
   A skill counts as invoked if its marker is FRESH (within SKILLS_FRESH_WINDOW_S, default
-  7200s). The wrapper that touches it is the honest, satisfiable action — see the README.
-  Configure the dir with SKILLS_INVOKED_DIR; the mandatory set with MANDATORY_SKILLS
-  (comma-separated, default `delegate-work-to-subagents,visual-proof-cycle`).
+  7200s) and EITHER was written by THIS session, OR (lower precedence) the pre-session-
+  scoping GLOBAL marker is fresh — see `_missing_skills`/`_marker_path`. The session-scoped
+  check is what closes the leak: without it, one Claude Code session invoking a skill would
+  silently satisfy every other concurrent session's gate too, and in practice CC's own
+  writer never touches the global path anymore once a session id is available. The global
+  fallback stays only for a harness with no session-aware writer of its own (Codex/opencode
+  today) or a manual `touch`. The wrapper that touches it is the honest, satisfiable
+  action — see the README. Configure the dir with SKILLS_INVOKED_DIR; the mandatory set with
+  MANDATORY_SKILLS (comma-separated, default `delegate-work-to-subagents,visual-proof-cycle`).
 
 TIERED (warn → block): if a mandatory skill has no fresh marker, the FIRST work action in
 the window WARNs (allow + message); a REPEAT BLOCKs (tracked by a marker keyed by cwd, like
@@ -121,6 +128,28 @@ DEFAULT_MANDATORY = "delegate-work-to-subagents,visual-proof-cycle"
 #     #112): the prior state forced an ALLOW_SKIP_SKILLS override on EVERY subagent commit. A
 #     project that wants visual proof enforced on subagents can add a project-specific UI skill to
 #     MANDATORY_SKILLS (those are NOT dropped). The orchestrator (no agent_id) still gets both.
+#
+# OPEN QUESTION, documented rather than silently assumed: whether a dispatched subagent's CC
+# events carry the SAME top-level session_id as its parent orchestrator's, or a distinct one, is
+# not settled by anything in this repo (no existing fixture sets both agent_id and session_id
+# together). If it is the SAME id, session-scoping (see `_marker_path`) is transparent here —
+# orchestrator and subagent share markers within one conversation, as before. If it is DISTINCT,
+# a subagent's own project-specific mandatory skill (the ones NOT in SUBAGENT_NA_SKILLS) would
+# need its own fresh marker written from inside that subagent's session — a subagent that relies
+# on the orchestrator having invoked it would now see it as missing.
+#
+# CORRECTION vs. an earlier version of this comment: the worst case is NOT "an extra advisory
+# WARN, never a hard block" — the WARN/BLOCK escalation TIER is ALSO session-scoped (see
+# `_tier_marker`), so a subagent that repeats a work action within its OWN session while
+# genuinely missing a project-specific skill escalates to a real BLOCK on the second action,
+# same as any other session would. This is arguably the CORRECT behavior, not a bug: if the
+# subagent's session truly never invoked the skill, it plausibly never had that skill's rules
+# loaded either, so demanding it invoke its own copy is consistent with what the gate is FOR —
+# but it is a real behavior change from the pre-session-scoping global-marker world (where the
+# parent's invocation transparently satisfied the subagent via the shared global marker), not
+# the harmless "extra WARN" this comment previously claimed. Same mitigation as any other false
+# positive: `RIG_HATCH_REQUEST_SKILLS_READ_GATE` (see `_block_message`) is the escape valve, not
+# a code-level exemption for the DISTINCT-session-id case.
 SUBAGENT_NA_SKILLS = frozenset({"delegate-work-to-subagents", "visual-proof-cycle"})
 
 # Work-shaped actions this gate fires on: a commit, or a build/test command.
@@ -352,19 +381,82 @@ def _fresh(p: Path) -> bool:
         return False
 
 
-def _missing_skills(*, subagent: bool = False) -> list[str]:
-    return [s for s in _mandatory_skills(subagent=subagent) if not _fresh(INVOKED_DIR / s)]
+_MAX_SESSION_ID_LEN = 128
 
 
-def _tier_marker(event: dict) -> Path:
+# SYNC: duplicated (near-verbatim) from skills-marker-writer's own `_sanitize_session_id` —
+# same "each hook is a self-contained standalone script, no shared import path" convention as
+# the hatch-escalation loader above. Edit both copies together.
+def _sanitize_session_id(session_id: str) -> str | None:
+    """Return `session_id` if safe to use as a SINGLE path segment, else None (caller falls
+    back to the pre-existing global, non-session-scoped marker path). A session id is never
+    expected to contain `/` — CC generates it, not the model."""
+    session_id = session_id.strip()
+    if not session_id or len(session_id) > _MAX_SESSION_ID_LEN or "\x00" in session_id:
+        return None
+    if "/" in session_id or "\\" in session_id or session_id in (".", ".."):
+        return None
+    return session_id
+
+
+def _marker_path(skill: str, session_seg: str | None) -> Path:
+    """The freshness-marker path for `skill`, nested under `session_seg` when one is present,
+    else the pre-session-scoping global path. `session_seg` is CC's own session id, forwarded
+    with T2 precedence in lib/cc_hook_bridge/dispatch.py (the same treatment as `agent_id`) —
+    a value riding in via `tool_input` cannot spoof it into borrowing another session's
+    marker."""
+    if session_seg:
+        return INVOKED_DIR / session_seg / skill
+    return INVOKED_DIR / skill
+
+
+def _missing_skills(*, subagent: bool = False, session_seg: str | None = None) -> list[str]:
+    """A skill is satisfied if EITHER its session-scoped marker is fresh, OR (when a session
+    is known) its global marker is fresh. Two reasons this is an OR, not "session only":
+
+    - Without session-scoping at all, the marker is one mtime file shared by every concurrent
+      Claude Code session for this user — session A invoking a mandatory skill would silently
+      satisfy session B's gate even though B never read it. The session-scoped check closes
+      that: `skills-marker-writer` (CC's own producer) always writes to the session-scoped
+      path when a real CC session id is available, which it always is on live CC traffic, so
+      in practice CC's own writes never land on the global path at all.
+    - The global path is still the ONLY marker path any harness/workflow WITHOUT a session-
+      aware producer can write to — e.g. Codex/opencode (no `pre-skill` mapping yet, see
+      `agent-hooks/README.md`'s `pre-skill` section), or the documented manual `touch` recipe
+      in this hook's own README. Making the session-scoped check exclusive would silently
+      break that pre-existing, still-relied-on fallback the moment ANY session id rides along
+      on the event (Codex's own bridge forwards one on `pre-bash` too) even though nothing
+      ever writes the session-scoped marker for it. So the global marker stays a valid,
+      lower-precedence signal — it just never wins for CC because CC has moved off it."""
+    missing = []
+    for s in _mandatory_skills(subagent=subagent):
+        if _fresh(_marker_path(s, session_seg)):
+            continue
+        if session_seg and _fresh(_marker_path(s, None)):
+            continue
+        missing.append(s)
+    return missing
+
+
+def _tier_marker(event: dict, session_seg: str | None) -> Path:
+    """The WARN/BLOCK escalation-tier marker for this cwd, keyed by session when one is
+    known. Without `session_seg` in the key, a WARN in session A's cwd would make session
+    B's FIRST action in that same cwd escalate straight to BLOCK — B never got its own WARN,
+    which defeats the tiering doctrine (first offense warns, repeat blocks) just as surely
+    as the freshness marker leaking cross-session did. Unlike the freshness marker
+    (`_missing_skills`), there is no global-fallback OR-check here: no harness/workflow has
+    ever relied on a shared, non-session-scoped tier marker (it is pure local escalation
+    state, not something a human manually primes), so there is nothing to preserve
+    compatibility with."""
     cwd = str(event.get("cwd") or "default")
-    sid = hashlib.sha256(cwd.encode()).hexdigest()[:16]
+    key = f"{session_seg}\x1f{cwd}" if session_seg else cwd
+    sid = hashlib.sha256(key.encode()).hexdigest()[:16]
     return TIER_DIR / f"{sid}.warned"
 
 
-def _is_repeat(event: dict) -> bool:
-    """True if a WARN already fired in this cwd within the window (→ now BLOCK)."""
-    m = _tier_marker(event)
+def _is_repeat(event: dict, session_seg: str | None) -> bool:
+    """True if a WARN already fired in this (session, cwd) within the window (→ now BLOCK)."""
+    m = _tier_marker(event, session_seg)
     try:
         if m.exists() and (time.time() - m.stat().st_mtime) <= FRESH_WINDOW_S:
             return True
@@ -424,7 +516,9 @@ def main() -> int:
     # A dispatched subagent IS the delegated work and may have no UI to prove, so the two
     # orchestration/visual defaults are dropped from its demanded set (project skills still apply).
     subagent = _is_subagent(event)
-    missing = _missing_skills(subagent=subagent)
+    raw_session_id = args.get("session_id")
+    session_seg = _sanitize_session_id(raw_session_id) if isinstance(raw_session_id, str) else None
+    missing = _missing_skills(subagent=subagent, session_seg=session_seg)
     if not missing:
         emit("allow")  # every demanded skill has a fresh marker → satisfied
         return 0
@@ -449,7 +543,7 @@ def main() -> int:
         return BLOCK_EXIT_CODE
 
     # WARN first, BLOCK on repeat within the window.
-    if _is_repeat(event):
+    if _is_repeat(event, session_seg):
         emit("block", message)
         return BLOCK_EXIT_CODE
     warn(message)

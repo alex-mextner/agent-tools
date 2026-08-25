@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# ghgql — an ergonomic, read-only-by-default wrapper over `gh api graphql`.
+#
+# Why this exists: `gh api graphql` is powerful but verbose — every call needs
+# `-f query=<...>`, variables are `-F name=value`, and paginating a connection is a
+# multi-flag incantation. `ghgql` collapses the common read case to `ghgql '<query>'`,
+# passes variables through unchanged, and (by default) REFUSES a mutation so an
+# accidental write never leaves this helper. It is a thin, transparent front-end: it
+# builds an argv and execs `gh`, printing the exact command with `--dry-run`.
+#
+# Hook-safety: `ghgql` is read-only by default and refuses a mutation before running — including a
+# file-backed (`-q @file`) or stdin (`-q -`) query, which it reads and inspects itself (#303) so the
+# refusal holds even standalone, with no `block-raw-pr-merge` hook installed. It is ALSO covered by
+# that guard: the guard maps a `ghgql …` invocation to the `gh api graphql` request it execs and
+# blocks any merge through it (even with `--allow-mutation`), so `ghgql` is never a raw-merge bypass.
+# A read-only query — including one that only NAMES a merge token in a string literal — is allowed
+# by both `ghgql` and the guard.
+#
+# Usage:
+#   ghgql '<graphql query>'                 run a read-only query
+#   ghgql -F owner=cli -F name=cli '<q>'    with GraphQL variables ($owner, $name)
+#   ghgql --paginate '<q with $endCursor>'  follow a connection to the end
+#   ghgql --jq '.data.x' '<q>'              post-process with jq
+#   ghgql -q @query.graphql                 read the query from a file
+#   ghgql -q - < query.graphql              read the query from stdin
+#   ghgql --allow-mutation '<mutation>'     opt in to a write (never a PR merge — the
+#                                         guard blocks mergePullRequest regardless)
+#   ghgql --dry-run '<q>'                   print the gh argv without running it
+#
+# Everything after a lone `--`, and any flag ghgql does not recognize, is forwarded to
+# `gh api graphql` verbatim.
+set -euo pipefail
+
+_ghgql_die() { printf 'ghgql: %s\n' "$1" >&2; exit 2; }
+
+_ghgql_usage() {
+  sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+}
+
+# --- argument parsing -------------------------------------------------------------
+query=""
+have_query=0
+allow_mutation=0
+dry_run=0
+gh_args=()          # forwarded flags (variables, --paginate, --jq, --hostname, …)
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)      _ghgql_usage; exit 0 ;;
+    --allow-mutation) allow_mutation=1; shift ;;
+    --dry-run)      dry_run=1; shift ;;
+    -q|--query)     [ $# -ge 2 ] || _ghgql_die "$1 needs a value"; query="$2"; have_query=1; shift 2 ;;
+    -F|--field|-f|--raw-field|-H|--header|--jq|--hostname|-p|--preview|-t|--template|--cache)
+                    [ $# -ge 2 ] || _ghgql_die "$1 needs a value"
+                    # A `-f query=…`/`-F query=…` IS the query (the native gh form), not a variable:
+                    # capture it so `ghgql -f query='…'` works and never builds a duplicate query field.
+                    case "$2" in
+                      query=*) query="${2#query=}"; have_query=1 ;;
+                      *)       gh_args+=("$1" "$2") ;;
+                    esac
+                    shift 2 ;;
+    --paginate|--slurp|--verbose|-i|--include)
+                    gh_args+=("$1"); shift ;;
+    --)             shift; while [ $# -gt 0 ]; do gh_args+=("$1"); shift; done ;;
+    -)              if [ "$have_query" -eq 0 ]; then query="-"; have_query=1; else gh_args+=("$1"); fi; shift ;;
+    -*)             gh_args+=("$1"); shift ;;   # forward any other gh flag verbatim
+    *)              if [ "$have_query" -eq 0 ]; then query="$1"; have_query=1; else gh_args+=("$1"); fi; shift ;;
+  esac
+done
+
+[ "$have_query" -eq 1 ] || _ghgql_die "no query given (try 'ghgql --help')"
+
+# --- inline file-backed / stdin query sources --------------------------------------
+# A `-q @file` or `-q -` (stdin) query is READ HERE so the read-only-by-default guard below can
+# inspect its actual text — otherwise the guard could not see a mutation hidden in a file/stdin
+# query and this "read-only by default" helper would perform an unrefused write whenever the
+# downstream `block-raw-pr-merge` hook is not installed or not covering this wrapper (#303). Once
+# inlined, `query` always holds literal text; the `@`/`-` special forms below are gone by the time
+# the guard and the `gh` invocation run.
+if [ "$query" = "-" ]; then
+  query="$(cat)"
+elif [ "$query" != "${query#@}" ]; then
+  _qfile="${query#@}"
+  [ -r "$_qfile" ] || _ghgql_die "cannot read query file: $_qfile"
+  query="$(cat "$_qfile")"
+fi
+
+# --- read-only-by-default guard ---------------------------------------------------
+if [ "$allow_mutation" -eq 0 ]; then
+  # Strip GraphQL double-quoted string literals before the check, so a read-only query that merely
+  # NAMES a mutation as data — `search(query: "mergePullRequest")`, which the merge guard allows —
+  # is not falsely refused. This is a COARSE approximation of the hook's
+  # `_strip_graphql_string_literals` (it does not understand `\"` escapes, `"""` block strings, or
+  # `#` line comments), so it can OVER-refuse an exotic read — safe direction; the hook stays the
+  # AUTHORITATIVE merge gate when installed (#303 review, Codex). An earlier revision of this line
+  # also stripped `#` comments to fix a narrower `\r`-comment edge case in this wrapper's OWN
+  # standalone guard — but stripping comments BEFORE strings deletes real code whenever a string
+  # literal itself contains `#` (`x(q:"#") mutation M{...}` loses the trailing mutation entirely,
+  # a WORSE fail-open than the edge case it fixed), and stripping strings first re-opens the
+  # original comment-quote-pairing bug. Neither pass ordering is sound without a real interleaved
+  # lexer, so this deliberately stays string-only: it can still OVER-refuse (never a bypass) but
+  # never deletes real code out from under the scan. Only the `query` operation can execute, so a
+  # token surviving outside a string is a write.
+  q_scan=$(printf '%s' "$query" | sed 's/"[^"]*"//g')
+  case "$q_scan" in
+    *mutation*|*mergePullRequest*|*enablePullRequestAutoMerge*|*enqueuePullRequest*|*mergeBranch*)
+      _ghgql_die "query looks like a mutation; pass --allow-mutation to run a write (a PR merge is blocked regardless)" ;;
+  esac
+fi
+
+# --- build and run ----------------------------------------------------------------
+set -- api graphql -f "query=$query" ${gh_args[@]+"${gh_args[@]}"}
+
+if [ "$dry_run" -eq 1 ]; then
+  printf 'gh'; for a in "$@"; do printf ' %q' "$a"; done; printf '\n'
+  exit 0
+fi
+exec gh "$@"
