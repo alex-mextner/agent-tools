@@ -17,18 +17,35 @@ The gate shells out to `git -C <cwd> diff --cached --name-only` and flags a stag
 If **no** user-visible file is staged → **allow** (nothing to prove). If git can't be queried
 (not a repo, timeout, error), the lister returns nothing and the gate **fails open**.
 
-## The marker contract (how it knows a screenshot was looked at)
+## The proof contract (how it knows a screenshot was looked at)
 
-The `visual-proof-cycle` skill / a screenshot-capture step **touches a file** after the agent
-VIEWS the capture:
+**Preferred: a bound attestation from `dev shot`.**
 
+```bash
+dev shot http://localhost:4173/ --out shot.png --viewport 1440x900
 ```
-~/.cache/agent-tools/visual-proof/<key>     # mtime = "looked at it" time
-```
 
-Any fresh file in that dir (within `VISUAL_PROOF_WINDOW_S`, default `3600`s) satisfies the
-gate. Configure the dir with `VISUAL_PROOF_DIR`. This is the honest, satisfiable action —
-look at the screenshot, the capture step records that you did.
+That command captures (viewport before open, scroll sweep so reveal-on-scroll content is
+actually visible), measures the PNG, and writes a JSON record ONLY if the capture is
+admissible — rejecting a blank page, a large blank band, a wrong-width capture, or a
+viewport-only shot of a tall page. The record carries:
+
+- `capture_sha256` — the bytes that were measured;
+- `staged_sha256` — sha256 of `git diff --cached` at capture time.
+
+The gate recomputes the staged hash and re-hashes the capture file, so a record **cannot** be
+reused for a different change, cannot survive further staging, and cannot outlive the image
+it describes.
+
+**Legacy: any fresh file in the marker dir.** Any file in `VISUAL_PROOF_DIR` (default
+`~/.cache/agent-tools/visual-proof`) with an mtime within `VISUAL_PROOF_WINDOW_S` (default
+`3600`s) still satisfies the gate, so repositories that have not adopted `dev shot` keep
+working. Set `VISUAL_PROOF_REQUIRE_BINDING=1` to refuse it and demand a bound attestation.
+
+Why the legacy form is weak: a bare `touch` satisfies it, so it proves nothing about whether
+a screenshot exists or whether it was blank. Both failures happened in practice — one capture
+attested on in good faith was 42% a single blank band, because reveal-on-scroll sections were
+photographed while still at `opacity: 0`.
 
 > The env-configured marker dir is read at import time; CC re-invokes the script per call, so
 > each call picks up the current env — this is fine, not a footgun.
