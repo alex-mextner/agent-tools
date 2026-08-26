@@ -33,6 +33,22 @@ look at the screenshot, the capture step records that you did.
 > The env-configured marker dir is read at import time; CC re-invokes the script per call, so
 > each call picks up the current env — this is fine, not a footgun.
 
+> **In a worktree-isolated session, keep the touch a single flat command — no `$()`, no
+> pipe, no loop.** Claude Code's own worktree-isolation Bash guard (separate from this gate,
+> built into the CLI) refuses ANY Bash command whose parsed shape isn't "simple" — including
+> a command with zero `git` in it — with a misleading refusal that talks about "git operations".
+> `touch ~/.cache/agent-tools/visual-proof/hyp-1234-reviewed` passes; the common habit
+> `touch .../hyp-1234-reviewed-$(date +%s)` gets refused, wasting a round trip for no reason:
+> freshness is judged by the file's **mtime**, not by a unique/timestamped name, so the
+> timestamp suffix buys nothing and should be dropped in a worktree-isolated session. If you
+> hit "is too complex to verify that it stays inside the worktree" while trying to satisfy
+> *this* gate, that's the CLI guard, not this hook — see upstream
+> anthropics/claude-code#88776 (duplicate of #84720, #86340, #87959; Anthropic engineering
+> acknowledged the false-positive on #86340: the too-complex bail fires before checking
+> whether the command touches git at all). `mkdir -p <dir> && touch <dir>/<key>` (no
+> substitution) still works fine — it's specifically `$()`/pipes/loops/certain heredocs that
+> trip the CLI guard, not `&&` chaining by itself.
+
 ## Block, not warn (doctrine)
 
 Doctrine says "block a commit that changes UI with no attached screenshot", so this is a

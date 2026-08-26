@@ -67,6 +67,19 @@ Configure via env:
 - `REVIEW_MARKER` — marker file path (default `~/.cache/agent-tools/last-review`)
 - `REVIEW_FRESH_WINDOW_S` — how recent the marker must be, in seconds (default `3600`)
 
+> **In a worktree-isolated session, the `"${REVIEW_MARKER:-...}"` form above can itself get
+> refused.** Claude Code's own worktree-isolation Bash guard (separate from this gate, built
+> into the CLI) refuses any Bash command whose parsed shape it can't statically resolve as
+> "simple" — that includes `${VAR:-default}` parameter expansion, not just `$(...)` command
+> substitution — even when the command has zero `git` in it. The refusal text talks about
+> "git operations", which is misleading here since neither `review` nor `touch` touches git.
+> Prefer a literal path in a worktree-isolated session:
+> `touch ~/.cache/agent-tools/last-review` (no `${...}` expansion) instead of the
+> `${REVIEW_MARKER:-default}` form, or run the `review --uncommitted` step and the marker
+> `touch` as two separate Bash tool calls rather than one `&&`-joined command containing the
+> expansion. Tracked upstream: anthropics/claude-code#88776 (duplicate of #84720, #86340,
+> #87959) — Anthropic engineering acknowledged the false-positive on #86340.
+
 ## Why an agent-hook
 
 The review has to happen *before* the commit, mid-session, while the diff is still
