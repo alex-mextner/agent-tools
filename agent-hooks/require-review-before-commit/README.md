@@ -53,32 +53,98 @@ takes precedence over an inline one.
 
 ## How it knows a review ran
 
-It looks for a **marker file** that your review tool touches on a successful run, and
-checks the marker is fresh (within a window, default 1h). Wire it up like:
+It looks for a **marker file** that gets touched on a successful review run, and checks the
+marker is fresh (within a window, default 1h).
+
+### PRIMARY: let review-cli touch it for you — no `touch` command, ever
+
+**Before staging, check the index is what you expect** — `git status` (or `git diff
+--cached --stat`) — especially in a shared/dirty worktree. `git add` only ADDS to the
+index; it does not clear anything another process or agent already staged. If something
+unrelated (or a secret like `.env`) is already staged, unstage it first (`git restore
+--staged <path>`) so the recipe below reviews and commits only your intended change.
 
 ```bash
-review --uncommitted && touch "${REVIEW_MARKER:-$HOME/.cache/agent-tools/last-review}"
-# or
-codex exec review --uncommitted && touch "$REVIEW_MARKER"
+git add -- 'path/to/changed-file.py' && review diff --staged --task 'TICKET-CODE'
 ```
+
+Stage the SPECIFIC files that make up your change, not `git add -A` — a broad add in a
+dirty or shared worktree can sweep in unrelated edits (or untracked secrets) that then get
+reviewed and committed as if they were intentional. Replace `path/to/changed-file.py` with
+each file you actually changed (repeatable), and `TICKET-CODE` with your real ticket/task
+id — do NOT wrap either in `<...>`: that's shell input-redirection syntax in bash/zsh, so
+`git add <the files you changed>` is a parse error, not a placeholder an agent fills in.
+**Keep BOTH placeholders quoted when you fill them in** — `git add -- 'real/path.py'`
+(`--` first so a path starting with `-` isn't misread as a flag) and `--task
+'TICKET-CODE'`. Neither `git add` nor review-cli's `--task` sanitizes its argument, so an
+unquoted real value containing shell metacharacters (a filename like `fix;id.py`, a task id
+copied from an untrusted integration as `OPS-7;id`) would execute as a second shell
+command if pasted bare. **A single-quoted template is not a full escape**, either — a value
+containing a literal `'` (e.g. a task id lifted verbatim from an external system as
+`OPS-7'; id #`) closes the quote early and the rest still runs as shell. Only substitute a
+value you chose yourself or one whose exact bytes you've checked — never splice raw
+external/untrusted text into the command; if you must handle text you don't control,
+construct the argument with a real shell-quoting function (e.g. Python's
+`shlex.quote(value)`) instead of hand-wrapping it in `'...'`.
+
+**A task code is REQUIRED by the current review-cli**, given EITHER as `--task 'CODE'`
+(shown above, any task/ticket identifier — the Linear/GitHub issue this change belongs to)
+OR by exporting `REVIEW_TASK_CODE='CODE'` first (quote it there too — the same unquoted
+metacharacter risk applies to `export`) and omitting `--task`; omitting BOTH exits nonzero
+immediately, runs no review, and touches no marker at all — `review diff --staged` with
+neither form does NOT satisfy this gate.
+
+review-cli's own `_touch_review_marker()` (`reviewlib/install.py`, wired into
+`_stamp_if_staged_commit_review` in `reviewlib/modes/review.py`) writes `REVIEW_MARKER`
+itself, in Python, the instant a `--staged` review passes. There is no shell `touch`
+involved anywhere in this path, so there is nothing for a worktree-isolated session's
+`$()`/`${...}`/bare-`$VAR` guard to trip on — the recipe is structurally immune, not just
+carefully worded. **`--staged` is also required**: an unstaged `review diff` (default, no
+flag) reviews the working tree but does NOT touch the marker (see
+`reviewlib/modes/review.py`) — reviewing without `--staged` and then getting blocked here
+anyway is the single most common reason an agent falls back to hand-rolling a `touch`,
+which is where the guard trap below actually bites in practice. Stage first, then review
+staged with a task code, and this gate is satisfied as a side effect of doing the review.
 
 Configure via env:
 
 - `REVIEW_MARKER` — marker file path (default `~/.cache/agent-tools/last-review`)
 - `REVIEW_FRESH_WINDOW_S` — how recent the marker must be, in seconds (default `3600`)
 
-> **In a worktree-isolated session, the `"${REVIEW_MARKER:-...}"` form above can itself get
-> refused.** Claude Code's own worktree-isolation Bash guard (separate from this gate, built
-> into the CLI) refuses any Bash command whose parsed shape it can't statically resolve as
-> "simple" — that includes `${VAR:-default}` parameter expansion, not just `$(...)` command
-> substitution — even when the command has zero `git` in it. The refusal text talks about
-> "git operations", which is misleading here since neither `review` nor `touch` touches git.
-> Prefer a literal path in a worktree-isolated session:
-> `touch ~/.cache/agent-tools/last-review` (no `${...}` expansion) instead of the
-> `${REVIEW_MARKER:-default}` form, or run the `review --uncommitted` step and the marker
-> `touch` as two separate Bash tool calls rather than one `&&`-joined command containing the
-> expansion. Tracked upstream: anthropics/claude-code#88776 (duplicate of #84720, #86340,
-> #87959) — Anthropic engineering acknowledged the false-positive on #86340.
+### FALLBACK: manual touch (only when no reviewer actually ran)
+
+Use this ONLY when a human, not an agent, already reviewed the change, or some other
+process satisfied the review requirement outside review-cli — never as a shortcut to skip
+running a real review; that is exactly the self-service bypass this gate was hardened
+against (see "No self-service skip" below).
+
+> **In a worktree-isolated Claude Code session, the touch must be a FLAT command — no
+> `$(...)`, no `${...}`, no bare `$VAR`, not even split across two Bash calls.** Claude
+> Code's own worktree-isolation Bash guard (separate from this gate, built into the CLI)
+> refuses any Bash command whose parsed shape it can't statically resolve as "simple" — that
+> includes `${VAR:-default}` parameter expansion AND a bare `$VAR` reference, not just
+> `$(...)` command substitution — even when the command has zero `git` in it. The refusal
+> text talks about "git operations", which is misleading here since neither `review` nor
+> `touch` touches git. This means `touch "${REVIEW_MARKER:-default}"` gets refused, and so
+> does `touch "$REVIEW_MARKER"` on its own — including as the SECOND of two separate Bash
+> calls, since the expansion is still in that command's text. There is no way to reference
+> the variable at all; you have to resolve its value first, then write the literal:
+>
+> 1. If `REVIEW_MARKER` isn't overridden, just `touch ~/.cache/agent-tools/last-review` — no
+>    variable involved, done.
+> 2. If it might be overridden, resolve it with a separate call that passes the var NAME as
+>    a plain string argument rather than expanding it: `printenv REVIEW_MARKER`. `printenv`
+>    never expands anything itself, so this call always passes the guard. Empty output means
+>    unset — use the default.
+> 3. `touch` whatever literal path `printenv` printed (or the default) as its own flat
+>    command, e.g. `touch /custom/path/last-review` — still no `$()`/`${...}`/`$VAR`. If the
+>    path has spaces or shell-special characters, single-quote the LITERAL value —
+>    `touch '/custom/path with spaces/last-review'` — quoting a literal is not an expansion
+>    (no `$` inside it), so it still passes the guard; it just makes the path parse as one
+>    argument.
+>
+> Tracked upstream: anthropics/claude-code#88776 (duplicate of #84720, #86340, #87959) —
+> Anthropic engineering acknowledged the false-positive on #86340.
 
 ## Why an agent-hook
 

