@@ -47,6 +47,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess  # noqa: S404 — listing staged files is the whole job
 import sys
 import time
@@ -732,6 +733,75 @@ def _staged_diff_hash(cwd: str) -> str | None:
     return hashlib.sha256(proc.stdout).hexdigest()
 
 
+# A proof record is a small JSON object. Anything larger is not one, and reading it is how
+# the hook gets hung: `truncate -s 50G planted.json` is a REGULAR file, so a type check alone
+# lets it through and the read then thrashes past the bridge timeout into `on_error: open`.
+MAX_RECORD_BYTES = 1024 * 1024
+
+
+def _read_record(path: Path) -> str | None:
+    """Read a proof record, or None if it is not one we are willing to open.
+
+    The type check happens on the OPEN, not before it. Checking with ``lstat`` and reading
+    afterwards is a time-of-check/time-of-use race the gated agent can win by swapping the
+    path between a regular file and a FIFO in a loop until a commit attempt lands in the
+    window - the read then blocks, the bridge times out, and ``on_error: open`` allows the
+    very commit this gate exists to hold.
+
+    ``O_NOFOLLOW`` refuses a symlink, ``O_NONBLOCK`` makes opening a FIFO return immediately
+    instead of hanging, and ``fstat`` on the resulting descriptor cannot be raced - it
+    describes the object actually opened.
+    """
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_RECORD_BYTES:
+            return None
+        return os.read(fd, MAX_RECORD_BYTES).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _git_toplevel(cwd: str) -> Path | None:
+    """Resolved repository root for ``cwd``, or None when git cannot answer.
+
+    ``dev shot`` records the repo ROOT. Comparing that against ``cwd`` itself would reject a
+    perfectly good record whenever `git commit` runs from a subdirectory — the gate would be
+    unsatisfiable without changing directory or reaching for the hatch. Both sides must be
+    normalised to the same thing, and the top-level is that thing.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            timeout=GIT_DIFF_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    # os.fsdecode, not decode("replace"): a path is bytes, and "replace" silently mangles a
+    # non-UTF-8 one into a path that exists nowhere. Strip only git's single trailing newline
+    # - .strip() would eat a real trailing space from a directory legitimately named "repo ".
+    raw = proc.stdout
+    if raw.endswith(b"\n"):
+        raw = raw[:-1]
+    if not raw:
+        return None
+    try:
+        return Path(os.fsdecode(raw)).resolve()
+    except (OSError, ValueError):
+        return None
+
+
 def _fresh_records(now: float) -> list[Path]:
     """Fresh `.json` candidates in PROOF_DIR. Scanned BEFORE hashing the staged diff so a
     repo with no `dev shot` adoption does not pay an extra `git diff --cached` per commit —
@@ -748,7 +818,14 @@ def _fresh_records(now: float) -> list[Path]:
         if child.suffix != ".json":
             continue
         try:
-            if (now - child.stat().st_mtime) <= PROOF_WINDOW_S:
+            # The guard `_capture_digest` applies to captures, for the same reason: a FIFO
+            # named `*.json` blocks the later `read_text()` until the bridge timeout, and
+            # `on_error: open` then ALLOWS the very commit this gate exists to hold. A symlink
+            # could likewise redirect the read. lstat, so the link itself is what is judged.
+            st = child.lstat()
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            if (now - st.st_mtime) <= PROOF_WINDOW_S:
                 fresh.append(child)
         except OSError:
             continue
@@ -792,14 +869,16 @@ def _bound_proof_matches(cwd: str) -> bool:
     staged = _staged_diff_hash(cwd)
     if staged is None:
         return False
-    try:
-        repo_root = Path(cwd).resolve()
-    except OSError:
+    repo_root = _git_toplevel(cwd)
+    if repo_root is None:
         return False
     for child in candidates:
+        text = _read_record(child)
+        if text is None:
+            continue
         try:
-            record = json.loads(child.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, ValueError):
+            record = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
             continue
         if not isinstance(record, dict):
             continue
