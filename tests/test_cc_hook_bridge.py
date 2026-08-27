@@ -53,6 +53,10 @@ LINT_ON_WRITE = _REPO / "agent-hooks" / "lint-on-write" / "lint_on_write.py"
 SKILLS_MARKER_WRITER = (
     _REPO / "agent-hooks" / "skills-marker-writer" / "skills_marker_writer.py"
 )
+# The pre-monitor guard: subagent-no-monitor (blocks a subagent's Monitor tool call outright).
+SUBAGENT_NO_MONITOR = (
+    _REPO / "agent-hooks" / "subagent-no-monitor" / "subagent_no_monitor.py"
+)
 
 
 def _install_descriptor(hooks_dir: Path, *, hook_id: str, point: str, cmd: Path,
@@ -101,6 +105,8 @@ def test_point_for_event_maps_tool_to_logical_point():
     assert dispatch.point_for_event("PreToolUse", "Task") == "pre-agent"
     # invoking a skill maps to pre-skill (the skills-invoked marker-writer point)
     assert dispatch.point_for_event("PreToolUse", "Skill") == "pre-skill"
+    # calling Monitor maps to pre-monitor (the subagent-no-monitor point)
+    assert dispatch.point_for_event("PreToolUse", "Monitor") == "pre-monitor"
     assert dispatch.point_for_event("Stop", None) == "stop"
     # a COMPLETED write maps to the reactive post-write point (format-on-write, lint-on-write)
     assert dispatch.point_for_event("PostToolUse", "Write") == "post-write"
@@ -562,6 +568,52 @@ def test_pre_skill_marker_is_session_scoped_clean_room(tmp_path):
     assert marker.is_file(), "marker was not written under the real (top-level) session id"
     forged = home / ".cache" / "agent-tools" / "skills-invoked" / "forged" / "visual-proof-cycle"
     assert not forged.exists(), "a forged tool_input.session_id must not have been used"
+
+
+def test_pre_monitor_subagent_call_is_blocked_clean_room(tmp_path):
+    """End-to-end: a `Monitor` PreToolUse event WITH agent_id (a dispatched subagent), driven
+    through the REAL bridge subprocess + the REAL subagent-no-monitor script, is DENIED — the
+    fix for HYP-1350's retrospective (a subagent Monitor-ing its own child then wedging on a
+    notification only the main loop receives)."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="subagent-no-monitor", point="pre-monitor",
+                        cmd=SUBAGENT_NO_MONITOR, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Monitor",
+        "tool_input": {"description": "watch my background test run", "timeout_ms": 300000,
+                        "persistent": False},
+        "agent_id": "sub-77",
+        "agent_type": "general-purpose",
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
+    assert "Monitor" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_pre_monitor_orchestrator_call_passes_clean_room(tmp_path):
+    """The same descriptor, but the SAME event with NO agent_id (the top-level orchestrator
+    watching a backgrounded subagent) must NOT be denied — its Monitor use is legitimate."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="subagent-no-monitor", point="pre-monitor",
+                        cmd=SUBAGENT_NO_MONITOR, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Monitor",
+        "tool_input": {"description": "watch a dispatched subagent", "timeout_ms": 300000,
+                        "persistent": False},
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    if proc.stdout.strip():
+        out = json.loads(proc.stdout)
+        assert out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", out
 
 
 def test_unmatched_tool_does_not_run_pre_bash_hook(tmp_path):

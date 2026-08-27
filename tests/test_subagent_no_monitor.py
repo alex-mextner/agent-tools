@@ -1,0 +1,175 @@
+"""Tests for the subagent-no-monitor agent-hook (pre-monitor, hard block).
+
+The wedge this kills (HYP-1350's retrospective, hyperide/hyper-saas PR #754): a dispatched
+SUBAGENT calls the Monitor tool — CC's fire-and-forget background event-stream watch, e.g. on
+its own spawned Bash `run_in_background` child — then ends its turn awaiting a Monitor-event
+notification it will never receive (only the main loop is re-invoked by such notifications),
+wedging forever. Sibling of `subagent-no-bg-longproc` (agent-tools#52) for a different CC tool.
+
+Covers: BLOCK (any subagent call to Monitor, unconditionally — there's no foreground/background
+axis to classify since Monitor IS the background primitive), ALLOW (the orchestrator's own
+Monitor use — no agent_id), the top-level agent_id fallback, and the deny-by-default Telegram
+hatch escalation (RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR with a written justification asks
+tg-ctl and allows only on exit 0; a bare `1` denies without contacting Telegram).
+
+Run from the repo root::
+
+    uv run --with pytest python -m pytest tests/test_subagent_no_monitor.py -q
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import io
+import json
+import sys
+from pathlib import Path
+
+_HOOK = (
+    Path(__file__).resolve().parents[1]
+    / "agent-hooks"
+    / "subagent-no-monitor"
+    / "subagent_no_monitor.py"
+)
+_spec = importlib.util.spec_from_file_location("subagent_no_monitor", _HOOK)
+assert _spec and _spec.loader
+hook = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(hook)
+
+
+def _run(
+    monkeypatch,
+    *,
+    agent_id="sub-1",
+    description="watch tests",
+    env: dict | None = None,
+    event: dict | None = None,
+) -> tuple[str, str, int]:
+    if event is None:
+        args = {"description": description}
+        if agent_id is not None:
+            args["agent_id"] = agent_id
+        event = {"args": args}
+    out, err = io.StringIO(), io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    monkeypatch.delenv("RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR", raising=False)
+    for k, v in (env or {}).items():
+        monkeypatch.setenv(k, v)
+    code = hook.main()
+    return out.getvalue(), err.getvalue(), code
+
+
+def _decision(out: str) -> str:
+    return json.loads(out)["decision"]
+
+
+# ── BLOCK: a subagent calling Monitor at all (the wedge) ─────────────────────────────────
+
+def test_block_subagent_monitor_call(monkeypatch):
+    out, _e, code = _run(monkeypatch, agent_id="sub-1")
+    assert code == hook.BLOCK_EXIT_CODE
+    payload = json.loads(out)
+    assert payload["decision"] == "block"
+    assert "SUBAGENT" in payload["message"]
+    assert "Monitor" in payload["message"]
+
+
+def test_block_regardless_of_what_is_watched(monkeypatch):
+    """No 'own child process' special-casing — every subagent Monitor call is the wedge."""
+    out, _e, code = _run(monkeypatch, agent_id="sub-1", description="watch some other service")
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_agent_id_top_level_event_fallback(monkeypatch):
+    """`agent_id` may be surfaced at the top level of the event (not under args) → still
+    treated as a subagent and BLOCK. Symmetric with subagent-no-bg-longproc's own test."""
+    event = {"args": {"description": "watch tests"}, "agent_id": "sub-top"}
+    out, _e, code = _run(monkeypatch, event=event)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_block_message_names_the_synchronous_poll_alternative(monkeypatch):
+    out, _e, _c = _run(monkeypatch, agent_id="sub-1")
+    msg = json.loads(out)["message"]
+    assert "foreground" in msg.lower()
+    assert "timeout" in msg
+
+
+# ── ALLOW: the orchestrator's own Monitor use (no agent_id) ──────────────────────────────
+
+def test_allow_orchestrator_monitor_call(monkeypatch):
+    out, _e, code = _run(monkeypatch, agent_id=None)
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_allow_orchestrator_empty_agent_id(monkeypatch):
+    """An empty-string agent_id must not be treated as a subagent signal (mirrors the
+    `_is_subagent` `.strip()` guard in the sibling hook)."""
+    out, _e, code = _run(monkeypatch, agent_id="   ")
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+# ── fail-open & robustness ────────────────────────────────────────────────────────────────
+
+def test_unparseable_stdin_fails_open(monkeypatch):
+    out, err = io.StringIO(), io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO("not json"))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    code = hook.main()
+    assert code == 0
+    assert _decision(out.getvalue()) == "allow"
+
+
+# ── Telegram hatch escalation (deny-by-default) ───────────────────────────────────────────
+
+def _fake_tg_ctl(path: Path, body: str) -> Path:
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return path
+
+
+def test_hatch_unset_blocks_and_names_env_var(monkeypatch):
+    out, _e, code = _run(monkeypatch, agent_id="sub-1")
+    assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR" in json.loads(out)["message"]
+
+
+def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nexit 0\n")
+    monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _e, code = _run(monkeypatch, agent_id="sub-1",
+                         env={"RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR": "1"})
+    assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert not marker.exists()
+
+
+def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nprintf approved\nexit 0\n")
+    monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _e, code = _run(
+        monkeypatch, agent_id="sub-1",
+        env={"RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR": "self-managed watchdog, polls inline"},
+    )
+    assert code == 0 and _decision(out) == "allow"
+    assert marker.exists()
+    assert "hatch escalation" in json.loads(out)["message"].lower()
+
+
+def test_hatch_justification_exit1_blocks(tmp_path, monkeypatch):
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", "exit 1\n")
+    monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _e, code = _run(
+        monkeypatch, agent_id="sub-1",
+        env={"RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR": "self-managed watchdog, polls inline"},
+    )
+    assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "hatch escalation denied" in json.loads(out)["message"].lower()
