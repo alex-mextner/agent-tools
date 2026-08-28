@@ -149,11 +149,15 @@ def main() -> int:
         )
         return 0
 
-    if _is_bare_or_blank(justification):
-        _audit("external-review:bypass:denied", "blank/bare justification")
-        sys.stdout.write(f"{_VERDICT_DENIED} {_blank_bare_denial_reason(justification)}\n")
-        return 1
-
+    # NOTE (real-run path only — the dry-run branch above never calls the shared lib at all, by
+    # design, and is unaffected): a blank/bare value is NOT short-circuited locally here. The
+    # shared lib's own `_request_present_hatch_approval` already denies blank/bare BEFORE ever
+    # resolving/contacting tg-ctl (same safety property a local check would give), but ALSO
+    # unconditionally records the attempt to the escape-hatch audit sink (`overrides.log`,
+    # gap G-8) for every case where the env var carried any value at all -- blank, bare, denied,
+    # or approved. A local early return here would skip that shared sink entirely, hiding a
+    # blank/bare hatch attempt from the repo-wide "escape hatches have no audit sink" tracking
+    # (review-cli Codex pass, GH-459: this exact gap, closed here by NOT special-casing blank).
     kw: dict[str, float] = {}
     timeout_s = _float_env("SHIP_HATCH_TIMEOUT_S")
     if timeout_s is not None:
