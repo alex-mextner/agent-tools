@@ -128,8 +128,10 @@
 #                          time to FORM its comments. Default 600 (10 min). 0 disables the gate.
 #   REVIEW_TASK_CODE       the task/ticket code (e.g. HYP-931) this ship belongs to, for the
 #                          review-quorum gate. If unset, ship derives it from a ticket-like
-#                          token in the branch name, then the PR body. If none is found, the
-#                          gate refuses (fail-closed) with guidance.
+#                          token in the branch name, then the PR title, then the PR body (a
+#                          HYP-<n> match in either the title or the body wins over a generic/
+#                          descriptive match in either — see _review_quorum_extract_hyp). If
+#                          none is found, the gate refuses (fail-closed) with guidance.
 #   SHIP_REVIEW_QUORUM_ENABLED / SHIP_REVIEW_QUORUM  set either to 0 to disable the
 #                          review-quorum gate entirely (default: enabled).
 #   SHIP_TASK_NOTIFY_ENABLED  set to 0/false/no to disable the post-merge task-cli notify step
@@ -2587,6 +2589,17 @@ _ship_derive_task_code_for_notify() {
   # for title+body (2 round trips instead of 2 separate `gh pr view` calls), split positionally
   # rather than via `read`'s IFS field-splitting (see that function's own header comment).
   _ship_fetch_pr_title_body
+
+  # Same HYP-<n>-before-generic-arm precedence as the gate above, for the same reason: a
+  # generic-arm hit in the title (e.g. `DO-NOT-MERGE`) must never preempt a real HYP-<n> that
+  # exists in the body. HYP-<n> always carries a digit, so it always passes the digit check
+  # below trivially — this is a strict narrowing of what the two generic-arm checks would
+  # otherwise have found, not a new acceptance path.
+  candidate=$(_review_quorum_extract_hyp "$PR_TITLE_QC")
+  [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
+
+  candidate=$(_review_quorum_extract_hyp "$PR_BODY_QC")
+  [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
 
   candidate=$(_review_quorum_extract_ticket "$PR_TITLE_QC")
   [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
