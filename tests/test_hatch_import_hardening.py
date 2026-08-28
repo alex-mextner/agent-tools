@@ -21,6 +21,7 @@ REAL_HATCH_INIT = REAL_HATCH_PACKAGE / "__init__.py"
 
 HATCH_HOOKS = (
     "agent-hooks/background-subagent-gate/background_subagent_gate.py",
+    "agent-hooks/block-devserver-primary/block_devserver_primary.py",
     "agent-hooks/block-raw-pr-merge/block_raw_pr_merge.py",
     "agent-hooks/block-reset-hard/block_reset_hard.py",
     "agent-hooks/decision-request-format/decision_request_format.py",

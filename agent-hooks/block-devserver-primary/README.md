@@ -1,0 +1,144 @@
+# block-devserver-primary
+
+**Point:** `pre-bash` · **Fail policy:** `open` · **Priority:** 40
+
+Blocks launching a dev server / dev-watch process (`npm run dev`, `vite`, `next dev`, ...)
+while the effective working directory sits on an **enrolled** repo's **default branch**.
+
+## The gap this closes
+
+`worktree-only-writes` (pre-write) already denies an Edit/Write on the default branch, and
+`pin-primary-worktree` (pre-bash) already denies a `git checkout`/`switch` off it. Neither sees
+a dev server starting — it's not an Edit/Write tool call and not a `git` command. Claude Code's
+own built-in worktree-isolation Bash guard is also git-focused: verified live, a plain
+`cd <shared-checkout> && npm run dev` (zero `git` anywhere) sails through it untouched.
+
+**Reproduced (2026-08-28, internal task #191):** hyperide's canvas preview generator
+(`lib/preview-generator`) overwrites `client/App.tsx` and the git-tracked
+`client/__canvas_preview__.tsx` as a side effect of the dev server running. One "quick live
+verification" pass against the shared checkout corrupted both files with 2000+ generated
+lines — no `Edit`/`Write` tool call and no `git` command anywhere in that session for any
+existing hook to catch.
+
+## What's detected
+
+A fixed, well-known list of dev-server launch shapes: `npm`/`yarn`/`pnpm run dev|start|preview|
+serve` (and the bare `npm start` / `yarn dev` forms, plus `npm exec`/`pnpm dlx` as the
+package-manager equivalent of `npx`), `bun run dev|start` / `bun dev|start`, `npx`/`bunx
+vite|next dev|astro dev`, the bare binaries `vite`, `next dev`, `astro dev`, `webpack serve` /
+`webpack-dev-server`. A directory-changing flag (`--prefix`/`-C`/`--dir`/`--cwd`) is resolved as
+a ONE-SHOT cwd override for that one launch (`npm --prefix <shared-checkout> run dev` from a
+feature worktree is still caught, without ever changing the tracked `cd` state for a later
+segment). A literal leading `cd <dir> &&` prefix in the same command is tracked (also via `;`)
+so `cd /path/to/shared-checkout && npm run dev` is caught even when the agent's own shell `cwd`
+is elsewhere; a literal `\`-newline continuation is folded first so a wrapped command isn't
+split into two unclassifiable pieces. Read-only info flags (`--help`/`-h`/`--version`/`-v`) are
+excluded so `vite --version` doesn't trip the gate.
+
+## What's deliberately NOT covered
+
+**Generic file mutation via Bash (`>`, `tee`, `sed -i`, `rm`) is a DIFFERENT hook's job, already
+done — not a gap this hook needs to fill.** The sibling `no-shell-file-edit` hook (also
+`pre-bash`) already hard-blocks an in-place edit or redirect onto a tracked source file
+REPO-WIDE, on every branch, unconditional on `worktree_only` enrollment — see its own README
+for the full parsed-not-raw-matched coverage. A worktree-scoped reimplementation here would be
+redundant, not additive. A bare `git commit` directly in the primary checkout is likewise
+handled by design elsewhere: `require-review-before-commit` / `require-ticket-before-commit`
+gate every commit regardless of location, and an unpushed commit on the primary checkout's
+`main` is still caught at push time by the pre-push `protect-main` git-hook — `worktree-only-
+writes`'s own docstring documents this split (pre-write blocks the AUTHORING, pre-push blocks
+the PUSH). What was genuinely uncovered by anything — this repo's own hooks OR Claude Code's
+built-in worktree-isolation Bash guard (confirmed live to be git-command-focused) — was a
+dev-server LAUNCH: nothing recognized `npm run dev` at all, on any branch, in any checkout.
+That's the one gap this hook exists to close, with a narrow, fixed, low-false-positive
+signature rather than a general "any Bash mutation" detector.
+
+## Per-repo opt-in
+
+Shares the **same** knob as the two sibling hooks — one feature, one flag:
+
+1. `RIG_WORKTREE_ONLY=1` (force on) / `=0` (force off).
+2. the repo's committed `rig.yaml` → `agent_hooks.worktree_only: true`.
+3. default OFF.
+
+## No self-service bypass — external approval only
+
+Deny-by-default, same pattern as the sibling hooks: no env-var self-grant. A genuine one-off
+need requests a one-time Telegram approval with a written justification in
+`RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY`; a bare `1`/`true`/`yes`/`on` is rejected outright
+(no Telegram round-trip). Approved → allow; declined, timed out, or unset → block.
+
+## Known scope limits (heuristic, not a sandbox)
+
+- Only a literal leading `cd <dir> &&` prefix in the SAME command is tracked; a `cd` inside a
+  subshell, a function, or a later segment reached via `;`/`|` after the first is not re-tracked
+  beyond the simple running-cwd update this hook does per segment. A bare `cd` (→ `$HOME`) or
+  `cd -` (→ `$OLDPWD`, a value this hook never sees) are both left UNTRACKED — the running cwd
+  stays at whatever it was, so a segment after either shape is judged against a possibly-stale
+  directory rather than the real one.
+- **A `cd` target (or a directory flag's value) must be a LITERAL path.** `cd "$SHARED_CHECKOUT"
+  && npm run dev` or `cd $(dirname "$REPO")/hyperide && npm run dev` are not expanded — the
+  hook has no shell to evaluate `$VAR`/`$(...)` against, so the literal, unresolvable string is
+  used as the cwd, `git -C` on it fails, and the gate fails open (allow). This is the easiest
+  non-literal evasion of the exact incident shape; same limitation for `bash -c "npm run dev"`
+  (an opaque single argument, not decomposed) and `npm --prefix "$VAR" run dev`.
+- The detected command list is fixed and will miss an unlisted tool (a bespoke dev-server
+  wrapper script, an uncommon framework CLI) or an unusually-named package.json script that
+  doesn't share a `dev`/`start`/`preview`/`serve` prefix before its first `:` (a colon-namespaced
+  variant like `dev:client` IS matched). Extend `_classify_devserver_segment` /
+  `_is_dev_script`'s known-script set if a new incident surfaces one.
+- Cannot see writes made by a process this hook already ALLOWED to start (e.g. one already
+  running from a previous Bash call, or one launched from an un-enrolled/feature-branch
+  checkout that later gets switched). This hook only gates the launch command itself.
+- **`npx`/`bunx` flag-skipping doesn't distinguish a valueless flag from one that takes a
+  value.** `npx -p cowsay vite` reads `cowsay` (the `-p` package-name value) as the tool, misses
+  `vite` entirely, and allows the command. Same for `npx -p webpack webpack serve`. A full argv
+  parser for every possible `npx` flag was judged not worth the complexity for a discipline
+  gate; the direct-binary and `npm run <script>` forms are unaffected.
+- **Heredoc bodies are not exempted from chain-splitting.** `_split_chain` (inherited from
+  `pin-primary-worktree`) has no heredoc awareness, so a line inside a `cat > file <<'EOF' ...
+  EOF` body that happens to read `npm run dev` (e.g. documentation being written into a
+  README/script) is split out as its own segment and classified like a real launch — a false
+  BLOCK on an enrolled default-branch repo. `pin-primary-worktree` shares the same limitation
+  for `git checkout` text; here it's more likely to bite because `npm run dev` / `vite` are
+  common strings inside documentation and scripts. Not yet worked around — if this causes a
+  real false positive, either special-case `<<`/`<<-` markers in `_split_chain` or accept the
+  Telegram hatch as the escape hatch.
+- A literal `\`-newline continuation is folded before chain-splitting (see
+  `_normalize_line_continuations`), but this only recognizes the exact `\` immediately followed
+  by a newline — any other multi-line shape (heredocs above, an unescaped newline meant as
+  free-form text inside an unclosed quote that `shlex` itself already rejects) is unaffected.
+- **A COMMAND WRAPPER — `nohup`, `env`, `sudo`, `time`, `nice`, `setsid`, `exec`, `command`, `bash
+  -c`/`sh -c` — is not unwrapped before classification.** `nohup npm run dev &` (the classic
+  "leave the dev server running and detach" shape — arguably the MOST realistic way an agent
+  actually launches one) has head token `nohup`, not `npm`, so it is NOT recognized and is
+  ALLOWED. Same for `env npm run dev`, `sudo -u dev npm run dev`, `bash -c "npm run dev"`. The
+  sibling `no-shell-file-edit` hook already unwraps `bash -c`/`sh -c` and peels `VAR=` prefixes
+  for its own detection — this hook only does the `VAR=` peel (`_strip_leading_assignments`),
+  not the wrapper unwrapping. Tracked as a follow-up
+  ([agent-tools#463](https://github.com/alex-mextner/agent-tools/issues/463)) rather than folded
+  into this PR: unwrapping needs its own care (recursion depth cap, `bash -c` re-tokenizing the
+  inner script, `env`'s own `VAR=val` args vs. its target command) and deserves review on its
+  own rather than inflating this PR further; the RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY
+  escape hatch and simply not doing this in a shared checkout remain the mitigations until then.
+- **`_split_chain` doesn't track which operator (`&&`/`;`/`||`) precedes a `cd` segment, so a
+  `cd <shared> || npm run dev` is judged as if the `cd` succeeded.** In a real shell, `||`'s
+  right-hand side runs ONLY when the left-hand side FAILED — so `cd <shared> || npm run dev`
+  from a feature worktree only ever runs `npm run dev` in the ORIGINAL feature worktree (the cd
+  never took effect). This hook still applies `<shared>` as the tracked `effective_cwd` for the
+  following segment regardless of operator, which can produce a false BLOCK on a launch that
+  would never actually happen in the protected checkout. Over-blocking, not under-blocking — the
+  safe direction — so left as a known limitation rather than adding operator-aware tracking to
+  `_split_chain` (which is SYNC'd with `pin-primary-worktree` and shouldn't diverge lightly).
+- **A subshell — `(npm run dev)`, `$(cd /shared && npm run dev)` — is missed ENTIRELY, not just
+  "not re-tracked".** The opening `(` glues to the head token (`(npm`) and the closing `)` glues
+  to the last token (`dev)`), so neither `_resolve_cd_target` nor `_classify_devserver_segment`
+  recognizes either half — the whole construct is invisible to this hook, not merely
+  stale-tracked. (An earlier draft of this note undersold this as a tracking-staleness issue;
+  it's a full miss.)
+
+## Test
+
+```bash
+python -m pytest -q tests/test_block_devserver_primary.py
+```
