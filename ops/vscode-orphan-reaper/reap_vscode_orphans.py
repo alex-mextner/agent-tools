@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""reap_vscode_orphans.py — periodic sweep for leaked, isolated VS Code E2E-harness
+Electron windows (macOS).
+
+WHY THIS EXISTS (2026-08-27/28 incident, see agent-hooks/heavy-op-memory-gate/
+heavy_op_memory_gate.py for the fuller writeup): the `hyperide` repo's e2e test
+harness (`ext-test-projects/e2e/setup/electron-app.ts`, `launchVSCode()`) launches
+fully isolated VS Code windows for capture/debug/matrix scripts — a distinct
+`--user-data-dir=<tmp>/hvsc-<worker>-<uuid>` + `--extensionDevelopmentPath=...` per
+launch. Teardown (`closeVSCode`/`forceCloseVSCode`) explicitly kills that process
+tree and `fs.rm`s its userDataDir — but ONLY IF the launching script reaches its
+`finally` block. When the script is killed instead (session churn, an interrupted
+agent, a hung Electron that never returns control), the window is orphaned: no
+script is left alive to ever call teardown. A live launch also does a PRE-LAUNCH
+sweep of exactly this class of orphan (see that TypeScript file's
+`reapOrphanedIsolatedVSCodeProcesses`) — but that only fires on the NEXT launch. On
+a day with no new launch for a while (or right when the orphan was created), the
+window just sits there, stuck on its own settings-restart modal, consuming real
+memory. 340 `hvsc-*` userDataDir fossils were found under the tmp dir on this
+machine spanning 2026-07-14..2026-08-28 (20 from 2026-08-28 alone) — every one is a
+launch whose teardown never ran, i.e. a launch whose kill-the-process-tree step
+also never ran. This script is the OS-level backstop for the residual case: a
+periodic launchd job that sweeps regardless of whether anything is about to launch.
+
+DELIBERATE COUPLING (documented, not hidden): the `hvsc-<n>-<uuid>` naming
+convention and the `--extensionDevelopmentPath` argv marker are OWNED by
+`ext-test-projects/e2e/setup/electron-app.ts` — this script duplicates that
+positive-match predicate (NOT the inverse-match `killStrayVSCodeProcesses` uses)
+rather than importing it, because this script must run as a standalone OS process
+(launchd has no access to that repo's TypeScript toolchain) and must keep working
+even if that repo is temporarily unavailable/moved. If the naming convention ever
+changes there, this script's `_ISOLATED_MARKERS` / positive-match logic must change
+here too — there is no automated drift guard between the two today (a real gap;
+see this directory's README for the tracked follow-up).
+
+SAFETY — same two-tier age gate as the pre-launch sweep, and for the same reason
+(never kill a live matrix run or long capture script out from under itself):
+  - ppid == 1 (reparented to launchd, i.e. its owning script/shell is provably
+    gone) + elapsed >= REPARENTED_MIN_AGE_S is reaped.
+  - ANY isolated instance, regardless of parent, is reaped once elapsed >=
+    STALE_MIN_AGE_S (a generous bar past any real matrix run).
+Never matches on the ABSENCE of markers — only a confirmed positive match
+(`/hvsc-` AND `--extensionDevelopmentPath` in argv) is ever a candidate. The
+distinguishing test is NOT the binary name (verified live on this machine: the
+real installed editor really does run as `.../MacOS/Code`, distinct from the
+`.../MacOS/Electron` this greps for, contrary to an earlier review comment that
+claimed otherwise without checking) — it's the two-marker conjunction, which is
+why `is_orphaned_isolated_instance` checks it independently of which `ps` pattern
+found the candidate in the first place.
+
+TREE KILL, NOT SINGLE-PID KILL: the Electron MAIN process is only the anchor used
+to find a candidate — its renderer/GPU/extension-host helper processes run under
+different binary names (`Code Helper (Renderer)` etc.) and would survive a
+single-pid kill, leaving the memory leak only partially closed. Once an anchor is
+confirmed orphaned, this script extracts its `--user-data-dir=<value>` and kills
+EVERY process (anchor + helpers) sharing that exact value — the same shared-value
+reap `reapVSCodeProcessesByToken` already does on the TypeScript side for a normal
+teardown. Each pid is RE-READ and RE-VERIFIED (still carries that value)
+immediately before it is signalled, closing the PID-reuse race a plain
+list-then-kill has (a matched pid could exit and be recycled by an unrelated
+process between listing and killing).
+
+USAGE
+    reap_vscode_orphans.py              # reap + report
+    reap_vscode_orphans.py --dry-run    # report only, kill nothing
+    reap_vscode_orphans.py --json       # machine-readable report on stdout
+
+Stdlib only — no third-party deps, so it can run standalone under launchd's bare
+`/usr/bin/python3` without a virtualenv.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+from dataclasses import asdict, dataclass, field
+from typing import Callable, Optional
+
+REPARENTED_MIN_AGE_S = 15 * 60  # 15 min, only when ppid == 1
+STALE_MIN_AGE_S = 90 * 60  # 90 min, regardless of parent
+
+_ELECTRON_PATTERN = "Visual Studio Code.app/Contents/MacOS/Electron"
+_ISOLATED_MARKERS = ("/hvsc-", "--extensionDevelopmentPath")
+_USER_DATA_DIR_RE = re.compile(r"--user-data-dir=(\S+)")
+
+# `ps -o pid=,ppid=,etime=,args=` row shape: pid, ppid, a NO-SPACE elapsed-time
+# field (`[[dd-]hh:]mm:ss`), then args (may itself contain spaces).
+_PS_ROW = re.compile(r"^(\d+)\s+(\d+)\s+(\S+)\s+(.*)$")
+
+
+def _warn(msg: str) -> None:
+    # launchd routes this process's stderr to the configured log file (see
+    # install.sh / the plist template) — a warning here is a VISIBLE event in
+    # that log, not silent. This is the fix for the class of bug this script
+    # itself shipped with once already: `ps -eo ... etimes= ...` doesn't exist
+    # on macOS (`etimes` is a Linux/procps extension; BSD `ps` only has
+    # `etime`), `ps` still exits 0 and just drops the unrecognized column, and
+    # the old row regex then silently failed to match every single line —
+    # this reaper ran every 15 minutes reporting "0 orphans" forever while
+    # parsing exactly zero real rows. Caught in review, fixed by switching to
+    # `etime=` + `_parse_bsd_elapsed_time` below; this warning is the backstop
+    # for the NEXT such silent-parsing regression, not a fix for this one.
+    print(f"reap-vscode-orphans: WARNING: {msg}", file=sys.stderr)
+
+
+def _parse_bsd_elapsed_time(etime: str) -> Optional[float]:
+    """Parse BSD `ps -o etime=` format (`[[dd-]hh:]mm:ss`) into seconds.
+
+    Mirrors `parseBsdElapsedTime` in `ext-test-projects/e2e/setup/
+    electron-app.ts` (kept in sync by hand — see the module docstring's
+    DELIBERATE COUPLING note; same drift risk as `_ISOLATED_MARKERS`).
+    """
+    m = re.match(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$", etime.strip())
+    if not m:
+        return None
+    days, hours, minutes, seconds = m.groups()
+    total = int(minutes) * 60 + int(seconds)
+    if hours is not None:
+        total += int(hours) * 3600
+    if days is not None:
+        total += int(days) * 86400
+    return float(total)
+
+
+@dataclass
+class ProcessInfo:
+    pid: int
+    ppid: int
+    age_s: float
+    args: str
+
+
+@dataclass
+class ReapReport:
+    reaped: list[ProcessInfo] = field(default_factory=list)
+    skipped: list[ProcessInfo] = field(default_factory=list)
+    killed_pids: list[int] = field(default_factory=list)
+    dry_run: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "dry_run": self.dry_run,
+            "reaped": [asdict(p) for p in self.reaped],
+            "reaped_count": len(self.reaped),
+            "killed_pid_count": len(self.killed_pids),
+            "skipped_isolated_count": len(self.skipped),
+        }
+
+
+def is_orphaned_isolated_instance(args: str, ppid: int, age_s: float) -> bool:
+    """Pure predicate — see module docstring's SAFETY section. Mirrors
+    `isOrphanedIsolatedInstance` in `ext-test-projects/e2e/setup/electron-app.ts`
+    (kept in sync by hand; no shared source between the two languages/repos)."""
+    if not all(marker in args for marker in _ISOLATED_MARKERS):
+        return False
+    reparented = ppid == 1 and age_s >= REPARENTED_MIN_AGE_S
+    stale_regardless = age_s >= STALE_MIN_AGE_S
+    return reparented or stale_regardless
+
+
+def _extract_user_data_dir(args: str) -> Optional[str]:
+    m = _USER_DATA_DIR_RE.search(args)
+    return m.group(1) if m else None
+
+
+def _run_ps(run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run) -> Optional[str]:
+    """Raw `ps -eo pid=,ppid=,etime=,args=` stdout for EVERY process, or None
+    on failure (never `[]`-shaped success — see `_warn`'s docstring note)."""
+    try:
+        proc = run(["ps", "-eo", "pid=,ppid=,etime=,args="], capture_output=True, text=True, timeout=10)
+    except Exception as exc:
+        _warn(f"ps invocation failed: {exc}")
+        return None
+    if proc.returncode != 0:
+        _warn(f"ps exited {proc.returncode}: {(proc.stderr or '').strip()}")
+        return None
+    return proc.stdout
+
+
+def _parse_ps_rows(stdout: str) -> list[ProcessInfo]:
+    out: list[ProcessInfo] = []
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        m = _PS_ROW.match(stripped)
+        if not m:
+            continue
+        pid_s, ppid_s, etime_s, args = m.groups()
+        age_s = _parse_bsd_elapsed_time(etime_s)
+        if age_s is None:
+            continue
+        try:
+            out.append(ProcessInfo(pid=int(pid_s), ppid=int(ppid_s), age_s=age_s, args=args))
+        except ValueError:
+            continue
+    return out
+
+
+def _list_electron_processes(run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run) -> list[ProcessInfo]:
+    """Candidate ANCHOR processes: every `MacOS/Electron` row. This is a
+    narrower view than `_run_ps`'s full process table — used only to FIND
+    candidates; killing walks the full table again by `--user-data-dir=`
+    value (see `_pids_sharing_user_data_dir`) to also catch helper/renderer
+    processes that don't match this binary-name pattern.
+    """
+    stdout = _run_ps(run)
+    if stdout is None:
+        return []
+    return [p for p in _parse_ps_rows(stdout) if _ELECTRON_PATTERN in p.args]
+
+
+def _pids_sharing_user_data_dir(
+    user_data_dir: str, run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run
+) -> list[int]:
+    """Every pid (main + renderer/GPU/extension-host helpers) whose argv
+    contains the exact `--user-data-dir=` value, from a FRESH `ps` call.
+    Returns `[]` (not the anchor) on a `ps` failure — the caller falls back
+    to the anchor pid alone rather than treating failure as "found nothing to
+    add", which would silently narrow a tree-kill to a single-pid kill
+    without any visible signal (the failure itself is already warned by
+    `_run_ps`)."""
+    stdout = _run_ps(run)
+    if stdout is None:
+        return []
+    return [p.pid for p in _parse_ps_rows(stdout) if user_data_dir in p.args]
+
+
+def _reread_args(pid: int, run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run) -> Optional[str]:
+    """Re-read `pid`'s CURRENT argv immediately before killing it — the
+    PID-reuse race guard: a pid gathered by an earlier `ps` snapshot may have
+    exited and been recycled by an unrelated process by the time we get
+    around to signalling it. Returns None when the pid no longer exists
+    (`ps -p` exits non-zero) or on any read failure — the caller must treat
+    that as "do not kill", not as "assume it's still the same process"."""
+    try:
+        proc = run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    args = proc.stdout.strip()
+    return args or None
+
+
+def _kill_tree(
+    anchor: ProcessInfo,
+    *,
+    list_by_user_data_dir: Callable[[str], list[int]],
+    reread_args: Callable[[int], Optional[str]],
+    kill: Callable[[int], None],
+) -> list[int]:
+    """Kill `anchor` and every process sharing its `--user-data-dir=` value,
+    each re-verified immediately before signalling. Returns the pids actually
+    killed. Falls back to the anchor pid alone when no value is extractable
+    (e.g. a malformed/unexpected argv shape) or the lookup fails."""
+    user_data_dir = _extract_user_data_dir(anchor.args)
+    candidates = list_by_user_data_dir(user_data_dir) if user_data_dir else []
+    if anchor.pid not in candidates:
+        candidates = [anchor.pid, *candidates]
+
+    killed: list[int] = []
+    for pid in candidates:
+        current_args = reread_args(pid)
+        if current_args is None:
+            continue  # already gone — not an error, just nothing left to do
+        if user_data_dir is not None and user_data_dir not in current_args:
+            continue  # PID reused by an unrelated process since listing — do NOT kill
+        try:
+            kill(pid)
+            killed.append(pid)
+        except (ProcessLookupError, PermissionError):
+            continue  # gone the instant before kill, or not ours to signal — best effort
+    return killed
+
+
+def _default_kill(pid: int) -> None:
+    os.kill(pid, signal.SIGKILL)
+
+
+def sweep(
+    list_processes: Optional[Callable[[], list[ProcessInfo]]] = None,
+    list_by_user_data_dir: Optional[Callable[[str], list[int]]] = None,
+    reread_args: Optional[Callable[[int], Optional[str]]] = None,
+    kill: Optional[Callable[[int], None]] = None,
+    dry_run: bool = False,
+) -> ReapReport:
+    # Defaults resolved INSIDE the body (not bound as parameter defaults) so
+    # monkeypatching the module-level `_list_electron_processes` /
+    # `_pids_sharing_user_data_dir` / `_reread_args` names — as `main()`'s
+    # tests do, exercising the real end-to-end call path `main()` itself
+    # takes — actually takes effect. A parameter default binds the original
+    # function object at import time and silently ignores a patch (the same
+    # footgun documented and fixed for `read_pressure_level` in the sibling
+    # heavy-op-memory-gate hook).
+    list_processes = list_processes or _list_electron_processes
+    list_by_user_data_dir = list_by_user_data_dir or _pids_sharing_user_data_dir
+    reread_args = reread_args or _reread_args
+    kill = kill or _default_kill
+
+    report = ReapReport(dry_run=dry_run)
+    for info in list_processes():
+        if not is_orphaned_isolated_instance(info.args, info.ppid, info.age_s):
+            # Includes both "not isolated at all" (never touched — positive-match
+            # only) and "isolated but still within its age grace" (reported as
+            # skipped so `main()`'s summary distinguishes the two).
+            if all(marker in info.args for marker in _ISOLATED_MARKERS):
+                report.skipped.append(info)
+            continue
+        if dry_run:
+            report.reaped.append(info)
+            continue
+        killed_pids = _kill_tree(
+            info, list_by_user_data_dir=list_by_user_data_dir, reread_args=reread_args, kill=kill
+        )
+        if killed_pids:
+            report.reaped.append(info)
+            report.killed_pids.extend(killed_pids)
+    return report
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--dry-run", action="store_true", help="report only, kill nothing")
+    parser.add_argument("--json", action="store_true", help="machine-readable report on stdout")
+    args = parser.parse_args(argv)
+
+    report = sweep(dry_run=args.dry_run)
+
+    if args.json:
+        print(json.dumps(report.to_dict()))
+    else:
+        verb = "would reap" if args.dry_run else "reaped"
+        if report.reaped:
+            for p in report.reaped:
+                print(
+                    f"reap-vscode-orphans: {verb} pid={p.pid} ppid={p.ppid} "
+                    f"age={round(p.age_s / 60)}min"
+                )
+        killed_note = "" if args.dry_run else f" ({len(report.killed_pids)} process(es) signalled, incl. helpers)"
+        print(
+            f"reap-vscode-orphans: {verb} {len(report.reaped)} orphan(s){killed_note}, "
+            f"{len(report.skipped)} isolated instance(s) still within age grace"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
