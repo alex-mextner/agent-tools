@@ -44,7 +44,11 @@ case "$sub" in
       view)
         args="$*"
         [ -n "${SHIP_TEST_GH_CALL_LOG:-}" ] && printf '%s\\n' "$args" >> "${SHIP_TEST_GH_CALL_LOG}"
-        if printf '%s' "$args" | grep -q headRefName; then
+        if printf '%s' "$args" | grep -q -- '--json reviews'; then
+          # See tests/test_ship.py's identical fixture rationale: default ONE qualifying
+          # review so the external-review gate never blocks this file's notify-path tests.
+          echo "${SHIP_TEST_REVIEW_COUNT:-1}"
+        elif printf '%s' "$args" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
         elif printf '%s' "$args" | grep -q statusCheckRollup; then
           printf '%s\\n' '[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI"}]'

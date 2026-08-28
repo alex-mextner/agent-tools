@@ -9,6 +9,10 @@
 #   • There are unresolved review threads (see ci/review-threads/).
 #   • The PR is younger than the review-dwell window (async review hasn't had time to form
 #     its questions yet — "0 unresolved threads" is vacuous if no review has posted).
+#   • The PR has ZERO GitHub-side reviews (`gh pr view --json reviews` is empty) — Guard-B and
+#     "0 unresolved threads" are both vacuous when nobody reviewed at all (real incident: PR
+#     #764/HYP-1380 merged this way). Deny-by-default, no self-service override — see the
+#     external-review gate below (mirrors the review-quorum/--skip-ci hatch pattern).
 #   • A UI-touching PR has no embedded screenshot (see ci/screenshots/) — unless overridden.
 #   • The local branch has unpushed/diverged commits, or its worktree is dirty.
 #   • The review-quorum bar (Guard-B of the self-merge-authority program) is not met: the
@@ -159,12 +163,20 @@
 #                          the PR's repo), then a trusted-paths allowlist. Neither the lib dir nor
 #                          tg-ctl is env- or repo-overridable, so nothing the shipper/PR controls
 #                          can redirect approval to a stub.
+#   SHIP_EXTERNAL_REVIEW_ENABLED / SHIP_EXTERNAL_REVIEW  set either to 0 to disable the
+#                          external-review gate entirely (default: enabled). This gate refuses a
+#                          merge when `gh pr view --json reviews` is empty — see that gate below.
+#   RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW  one-time bypass request for the external-review
+#                          gate, same shape/hardening as RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM
+#                          above — see ci/ship/external_review_hatch.py.
 #   SHIP_AUDIT_FILE        path for the gate audit JSONL (default
 #                          ~/.config/agent-tools/ship-audit.jsonl). One line is appended per
 #                          non-dry-run gated ship. review-quorum gate decisions: authorized /
 #                          bypass:approved / bypass:denied / refused (has a `task_code` field).
 #                          --skip-ci gate decisions: skipci:bypass:approved / skipci:bypass:denied
-#                          / skipci:refused (has a `gate":"skip-ci"` field). --dry-run prints the
+#                          / skipci:refused (has a `gate":"skip-ci"` field). external-review gate
+#                          decisions: external-review:bypass:approved / :bypass:denied /
+#                          :refused (has a `gate":"external-review"` field). --dry-run prints the
 #                          would-be audit instead of writing.
 #
 # Knobs (file):
@@ -241,6 +253,9 @@ _SHIP_HATCH_PY="$_SHIP_SELF_DIR/review_quorum_hatch.py"
 # fixed path and resolves tg-ctl off the account's REAL home — no self-service flag, no env-/repo-
 # overridable authority. Fails CLOSED (refuse) if ship.sh was copied out of the checkout.
 _SHIP_SKIP_CI_HATCH_PY="$_SHIP_SELF_DIR/skip_ci_hatch.py"
+# Same deal for the external-review gate (see that gate below): its one-time Telegram bypass
+# routes through ci/ship/external_review_hatch.py, same shared lib, same hardening.
+_SHIP_EXTERNAL_REVIEW_HATCH_PY="$_SHIP_SELF_DIR/external_review_hatch.py"
 
 # --- arg parse (PR number is the lone bare arg; --screenshot takes path + optional desc) --
 args=("$@"); i=0; n=${#args[@]}
@@ -2456,6 +2471,143 @@ else
         _review_quorum_refuse_or_hatch "bar NOT met for ${TASK_CODE} — ${QITER}/${MIN_ITER} iterations, ${QROLES_N}/${MIN_ROLES} distinct roles${QROLES:+ (roles seen: ${QROLES})}${MODELS_SUMMARY}${QERR:+ (${QERR})}${ROLES_UNAVAILABLE_HINT}"
       fi
     fi
+  fi
+fi
+
+# --- external-review gate: refuse a merge with ZERO GitHub-side PR reviews ----------------
+# WHY: Guard-B (the review-quorum gate above) verifies review-cli's own automated multi-model
+# pass for the PR's task code — it is NOT a signal that anyone (human, Codex, a second agent)
+# ever looked at THIS PR on GitHub. The unresolved-threads + review-dwell gates further above only
+# prove that IF a review posted comments they're resolved, and that there was TIME for one to
+# land — neither proves a review actually happened. All three passed for real on PR #764
+# (HYP-1380, hyperide/hyper-saas): it merged via `gh ship` with `gh pr view --json reviews`
+# returning `[]`, because Guard-B alone was wrongly treated as sufficient. This gate closes that
+# gap directly: it queries GitHub's own review list and refuses outright when it is empty.
+#
+# ORDERING: deliberately placed here, AFTER every non-interactive preflight (local-branch-sanity,
+# version-bump, screenshot, review-quorum) and right before the merge — NOT immediately after
+# review-dwell, where it originally landed. Reason (review-cli Codex pass, GH-459 iteration 3,
+# P1): the interactive path below can contact Alex live on Telegram. Running that BEFORE the
+# cheap deterministic gates meant a zero-review PR with a valid hatch justification could burn a
+# real-time approval and still refuse later on a dirty worktree / missing version bump / unmet
+# quorum — the audit trail would show `bypass:approved` for a ship that never merged. Placing the
+# hatch here (matching where review-quorum's own live-approval hatch already sits) means Alex is
+# only interrupted once every non-interactive check has already passed and a merge is imminent.
+#
+# Residual, accepted (review-cli GLM pass, GH-459 iteration 4, P3): the `--skip-ci` hatch runs
+# LATER still — inside the merge branches below (`_skip_ci_hatch_gate`), not here — because it
+# only applies on the `--skip-ci` path. A ship run as `gh ship --skip-ci` on a zero-review PR
+# with BOTH `RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW` and `RIG_HATCH_REQUEST_SHIP_SKIP_CI` set can
+# still burn the external-review Telegram approval first and then have --skip-ci's own hatch
+# deny afterward — the exact "approved but never merged" shape this relocation otherwise closes,
+# just for this one remaining combination. Narrower than the original bug (requires BOTH hatches
+# requested simultaneously) and still fails closed (no bad merge happens) — accepted rather than
+# further nesting this gate inside both merge branches.
+#
+# "Qualifying" = at least one entry in `reviews` (any state — APPROVED/COMMENTED/
+# CHANGES_REQUESTED/DISMISSED all count, existence is the signal, not the verdict), from ANY
+# author, including the PR's own. No self-review exclusion: this repo's PRs are opened under one
+# shared GitHub identity regardless of who/what actually did the work (verified against #764 and
+# #760 — both authored by the same account that also left a genuine Codex-independent review on
+# #760), so filtering by author would wrongly block a real review under that identity. Residual,
+# accepted (same threat-model boundary the rest of this script already lives with): a shipper
+# who wants to defeat this can leave a trivial self-review — this gate closes the "nobody looked
+# at all" case, it is not a content-quality bar.
+#
+# Deny-by-default, NO self-service flag — an agent-settable override here would just recreate
+# the exact failure this gate exists to close. Bypass only via a one-time live Telegram approval:
+# RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW="<justification>" (see external_review_hatch.py, which
+# mirrors skip_ci_hatch.py's hardening). SHIP_EXTERNAL_REVIEW_ENABLED=0 / SHIP_EXTERNAL_REVIEW=0
+# is the ops off-switch (default: enabled).
+EXTREV_ENABLED=1
+case "${SHIP_EXTERNAL_REVIEW_ENABLED:-1}" in 0|false|no) EXTREV_ENABLED=0 ;; esac
+case "${SHIP_EXTERNAL_REVIEW:-1}" in 0|false|no) EXTREV_ENABLED=0 ;; esac
+
+# One external-review audit line -> SHIP_AUDIT_FILE. Mirrors _skip_ci_audit_log's shape/dry-run
+# contract; the Python hatch helper owns the bypass:approved/denied line for a REAL run, this
+# shell helper records only what the helper does not (env-absent "refused", fail-closed paths).
+_external_review_audit_log() {  # $1=decision $2=reason(optional)
+  local decision="$1" reason="${2:-}"
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "[dry-run] would append external-review audit: decision=${decision}" >&2
+    return 0
+  fi
+  local file="${SHIP_AUDIT_FILE:-$HOME/.config/agent-tools/ship-audit.jsonl}"
+  mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
+  local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local esc_pr esc_branch esc_reason
+  esc_pr=$(printf '%s' "$PR" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+  esc_branch=$(printf '%s' "${BRANCH:-}" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+  esc_reason=$(printf '%s' "$reason" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+  { if [ -n "$reason" ]; then
+      printf '{"ts":"%s","pr":"%s","branch":"%s","gate":"external-review","decision":"%s","override_reason":"%s"}\n' \
+        "$ts" "$esc_pr" "$esc_branch" "$decision" "$esc_reason"
+    else
+      printf '{"ts":"%s","pr":"%s","branch":"%s","gate":"external-review","decision":"%s"}\n' \
+        "$ts" "$esc_pr" "$esc_branch" "$decision"
+    fi; } >> "$file" 2>/dev/null || true
+}
+
+# Ask Alex, live on Telegram, to approve a one-time external-review bypass. Same `python3 -I`
+# isolation + fixed-path lib import as the skip-ci hatch. Called ONLY when
+# RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW is set.
+_external_review_hatch_check() {  # uses $PR $BRANCH $DRY_RUN
+  SHIP_HATCH_PR="$PR" \
+  SHIP_HATCH_BRANCH="${BRANCH:-}" \
+  SHIP_DRY_RUN="$DRY_RUN" \
+  python3 -I "$_SHIP_EXTERNAL_REVIEW_HATCH_PY"
+}
+
+if [ "$EXTREV_ENABLED" = "0" ]; then
+  echo "[ship] external-review gate disabled (SHIP_EXTERNAL_REVIEW_ENABLED/SHIP_EXTERNAL_REVIEW=0)."
+else
+  # Guarded like every other `$(gh ...)` in this file (see the dwell/threads gates above) --
+  # under `set -euo pipefail`, an UNGUARDED substitution would abort the whole script the
+  # instant `gh` exits non-zero (expired auth, rate limit, network blip), skipping the
+  # friendly refusal below and the fail-closed audit line entirely (found by review-cli GLM
+  # pass, GH-459 iteration 2: F1 -- ship.sh:1734 was the one `$(gh ...)` call in the file
+  # without an errexit guard).
+  REVIEW_COUNT=$(gh pr view "$PR" --json reviews -q '(.reviews // []) | length' 2>/dev/null) || REVIEW_COUNT=""
+  case "$REVIEW_COUNT" in
+    ''|*[!0-9]*)
+      echo "Refusing: could not query PR #$PR reviews (gh api failed) — refusing to merge rather than fail open." >&2
+      _external_review_audit_log "external-review:refused" "gh query failed"
+      exit 1 ;;
+  esac
+  if [ "$REVIEW_COUNT" -gt 0 ]; then
+    echo "[ship] external-review gate OK — PR #$PR has $REVIEW_COUNT GitHub review(s)."
+  elif [ -n "${RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW+x}" ]; then
+    hrc=0; hout=$(_external_review_hatch_check 2>/dev/null) || hrc=$?
+    hverdict="${hout%% *}"; hreason=""
+    case "$hout" in *" "*) hreason="${hout#* }" ;; esac
+    if [ "$hrc" = "0" ] && [ "$hverdict" = "APPROVED" ]; then
+      if [ "$DRY_RUN" = "1" ]; then
+        echo "[ship] external-review --dry-run: justification present — a REAL run would request live Telegram approval before merging with zero reviews. (${hreason})"
+      else
+        echo "[ship] external-review: a one-time Telegram hatch escalation was APPROVED by Alex — proceeding with zero GitHub reviews. (${hreason})"
+      fi
+    else
+      { echo "Refusing: external-review hatch escalation was requested but NOT approved: ${hreason:-no approval}."
+        echo "  Obtain live approval, or get an actual review posted on PR #$PR before shipping."; } >&2
+      # The helper logs its own bypass:denied only when it emitted DENIED during a REAL run. In
+      # dry-run it writes nothing (ship prints the would-be line); in every other non-DENIED case
+      # (fake/broken/absent interpreter, import-fail, unexpected verdict) it did NOT audit ->
+      # record fail-closed here.
+      case "$hverdict" in
+        DENIED) [ "$DRY_RUN" = "1" ] && _external_review_audit_log "external-review:bypass:denied" "$hreason" ;;
+        *) _external_review_audit_log "external-review:bypass:denied" "$hreason" ;;
+      esac
+      exit 1
+    fi
+  else
+    { echo "Refusing: PR #$PR has ZERO GitHub-side reviews. Guard-B (review-cli's own automated pass) and 0 unresolved review threads do NOT prove a review ever happened — see PR #764 (HYP-1380), which merged this exact way."
+      echo "  Get a real review posted (a human, or a review bot like Codex) before shipping."
+      echo "  There is NO self-service override. To request a ONE-TIME bypass, set:"
+      echo "    RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW=\"<justification>\""
+      echo "  which asks Alex live on Telegram and proceeds ONLY on his real-time approval."
+      echo "  SHIP_EXTERNAL_REVIEW_ENABLED=0 disables this gate entirely (ops off-switch)."; } >&2
+    _external_review_audit_log "external-review:refused" ""
+    exit 1
   fi
 fi
 

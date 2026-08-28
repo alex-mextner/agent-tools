@@ -65,7 +65,19 @@ case "$sub" in
     case "$action" in
       view)
         # --json headRefName,state,mergeable,isCrossRepository,mergeStateStatus
-        if printf '%s ' "$@" | grep -q headRefName; then
+        if printf '%s ' "$@" | grep -q -- '--json reviews'; then
+          # SHIP_TEST_REVIEW_QUERY_FAIL exercises the gh-failure path (expired auth / rate limit /
+          # network blip): exit non-zero with nothing on stdout, exactly like a real `gh` failure.
+          if [ -n "${SHIP_TEST_REVIEW_QUERY_FAIL:-}" ]; then
+            echo "fake gh: simulated reviews-query failure" >&2
+            exit 1
+          fi
+          # Default: ONE qualifying GitHub review present (the common/good case) — the
+          # external-review gate refuses to merge with zero, so a full-pipeline test shouldn't
+          # need to know about it. Override via SHIP_TEST_REVIEW_COUNT (a dedicated test sets 0
+          # to exercise the gate's refusal/hatch paths).
+          echo "${SHIP_TEST_REVIEW_COUNT:-1}"
+        elif printf '%s ' "$@" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           # One GREEN check so the CI gate passes on the normal (non-admin) merge path — this is
@@ -840,7 +852,13 @@ case "$sub" in
     action="$1"; shift || true
     case "$action" in
       view)
-        if printf '%s ' "$@" | grep -q headRefName; then
+        if printf '%s ' "$@" | grep -q -- '--json reviews'; then
+          # Default: ONE qualifying GitHub review present (the common/good case) — the
+          # external-review gate refuses to merge with zero, so a full-pipeline test shouldn't
+          # need to know about it. Override via SHIP_TEST_REVIEW_COUNT (a dedicated test sets 0
+          # to exercise the gate's refusal/hatch paths).
+          echo "${SHIP_TEST_REVIEW_COUNT:-1}"
+        elif printf '%s ' "$@" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           printf '%s\\n' '[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI"}]'
@@ -1765,7 +1783,13 @@ case "$sub" in
     action="$1"; shift || true
     case "$action" in
       view)
-        if printf '%s ' "$@" | grep -q headRefName; then
+        if printf '%s ' "$@" | grep -q -- '--json reviews'; then
+          # Default: ONE qualifying GitHub review present (the common/good case) — the
+          # external-review gate refuses to merge with zero, so a full-pipeline test shouldn't
+          # need to know about it. Override via SHIP_TEST_REVIEW_COUNT (a dedicated test sets 0
+          # to exercise the gate's refusal/hatch paths).
+          echo "${SHIP_TEST_REVIEW_COUNT:-1}"
+        elif printf '%s ' "$@" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           # Two checks, both FAILED — 100% failure rate.
@@ -1806,7 +1830,13 @@ case "$sub" in
     action="$1"; shift || true
     case "$action" in
       view)
-        if printf '%s ' "$@" | grep -q headRefName; then
+        if printf '%s ' "$@" | grep -q -- '--json reviews'; then
+          # Default: ONE qualifying GitHub review present (the common/good case) — the
+          # external-review gate refuses to merge with zero, so a full-pipeline test shouldn't
+          # need to know about it. Override via SHIP_TEST_REVIEW_COUNT (a dedicated test sets 0
+          # to exercise the gate's refusal/hatch paths).
+          echo "${SHIP_TEST_REVIEW_COUNT:-1}"
+        elif printf '%s ' "$@" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           printf '[{"name":"pytest","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"lint","conclusion":"SUCCESS","status":"COMPLETED","state":"SUCCESS"}]'
@@ -1857,6 +1887,8 @@ case "$sub" in
       view)
         if printf '%s ' "$@" | grep -q baseRefName; then
           printf '%s' "${SHIP_TEST_BASE:-main}"
+        elif printf '%s ' "$@" | grep -q -- '--json reviews'; then
+          echo "${SHIP_TEST_REVIEW_COUNT:-1}"
         elif printf '%s ' "$@" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
@@ -2070,6 +2102,8 @@ case "$sub" in
       view)
         if printf '%s ' "$@" | grep -q baseRefName; then
           printf '%s' "${SHIP_TEST_BASE:-main}"
+        elif printf '%s ' "$@" | grep -q -- '--json reviews'; then
+          echo "${SHIP_TEST_REVIEW_COUNT:-1}"
         elif printf '%s ' "$@" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
@@ -2141,7 +2175,13 @@ case "$sub" in
     action="$1"; shift || true
     case "$action" in
       view)
-        if printf '%s ' "$@" | grep -q headRefName; then
+        if printf '%s ' "$@" | grep -q -- '--json reviews'; then
+          # Default: ONE qualifying GitHub review present (the common/good case) — the
+          # external-review gate refuses to merge with zero, so a full-pipeline test shouldn't
+          # need to know about it. Override via SHIP_TEST_REVIEW_COUNT (a dedicated test sets 0
+          # to exercise the gate's refusal/hatch paths).
+          echo "${SHIP_TEST_REVIEW_COUNT:-1}"
+        elif printf '%s ' "$@" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           printf '[{"name":"pytest","conclusion":"SUCCESS","status":"COMPLETED","state":"SUCCESS"}]'
@@ -4220,6 +4260,8 @@ case "$sub" in
           # unreadable/blank baseRefName) — only an UNSET var falls back to "main". `:-` would
           # treat empty-and-unset the same, which the unreadable-base test needs to tell apart.
           printf '%s' "${SHIP_TEST_BASE-main}"
+        elif printf '%s ' "$@" | grep -q -- '--json reviews'; then
+          echo "${SHIP_TEST_REVIEW_COUNT:-1}"
         elif printf '%s ' "$@" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
@@ -4394,6 +4436,8 @@ case "$sub" in
       view)
         if printf '%s ' "$@" | grep -q baseRefName; then
           printf '%s' "${SHIP_TEST_BASE:-main}"
+        elif printf '%s ' "$@" | grep -q -- '--json reviews'; then
+          echo "${SHIP_TEST_REVIEW_COUNT:-1}"
         elif printf '%s ' "$@" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
@@ -4503,7 +4547,13 @@ case "$sub" in
     action="$1"; shift || true
     case "$action" in
       view)
-        if printf '%s ' "$@" | grep -q headRefName; then
+        if printf '%s ' "$@" | grep -q -- '--json reviews'; then
+          # Default: ONE qualifying GitHub review present (the common/good case) — the
+          # external-review gate refuses to merge with zero, so a full-pipeline test shouldn't
+          # need to know about it. Override via SHIP_TEST_REVIEW_COUNT (a dedicated test sets 0
+          # to exercise the gate's refusal/hatch paths).
+          echo "${SHIP_TEST_REVIEW_COUNT:-1}"
+        elif printf '%s ' "$@" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           printf '%s' "${SHIP_TEST_ROLLUP}"
@@ -4564,7 +4614,13 @@ case "$sub" in
     action="$1"; shift || true
     case "$action" in
       view)
-        if printf '%s ' "$@" | grep -q headRefName; then
+        if printf '%s ' "$@" | grep -q -- '--json reviews'; then
+          # Default: ONE qualifying GitHub review present (the common/good case) — the
+          # external-review gate refuses to merge with zero, so a full-pipeline test shouldn't
+          # need to know about it. Override via SHIP_TEST_REVIEW_COUNT (a dedicated test sets 0
+          # to exercise the gate's refusal/hatch paths).
+          echo "${SHIP_TEST_REVIEW_COUNT:-1}"
+        elif printf '%s ' "$@" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           n=0; [ -f "${SHIP_TEST_COUNTER}" ] && n=$(cat "${SHIP_TEST_COUNTER}")
@@ -5259,6 +5315,7 @@ case "$sub" in
       view)
         case "$*" in
           *headRefName*) printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}" ;;
+          *"--json reviews"*) echo "${SHIP_TEST_REVIEW_COUNT:-1}" ;;
           *"--json body"*) printf '%s' "${SHIP_TEST_PR_BODY:-}" ;;
           *statusCheckRollup*) printf '%s\\n' '[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI"}]' ;;
           *) echo '[]' ;;
@@ -7287,6 +7344,310 @@ def test_skip_ci_dry_run_with_blank_justification_still_refuses(repo_with_two_wo
     assert "[fake gh] merged" not in r.stdout
 
 
+# --- external-review hatch escalation (deny-by-default; mirrors the skip-ci hatch tests above) --
+# Same rationale as the skip-ci block above: the live approve/deny/dry-run MECHANICS are tested
+# IN-PROCESS against the real ci/ship/external_review_hatch.py helper with resolve_home
+# monkeypatched to a fake home (the only way to exercise a controllable tg-ctl); deny-by-default
+# refusal end-to-end through a real ship.sh subprocess is covered separately below.
+
+
+def _load_external_review_hatch_module():
+    """Import ci/ship/external_review_hatch as a module (fresh each call so a monkeypatched
+    resolve_home never leaks between tests)."""
+    import importlib
+
+    if _HATCH_MOD_DIR not in sys.path:
+        sys.path.insert(0, _HATCH_MOD_DIR)
+    mod = importlib.import_module("external_review_hatch")
+    return importlib.reload(mod)
+
+
+def _run_external_review_hatch_main(monkeypatch, *, request, resolve_home, audit,
+                                     timeout="5", dry_run=None):
+    """Call external_review_hatch.main() with resolve_home monkeypatched to a fixed fake home and
+    the hatch env set. Returns the exit code."""
+    mod = _load_external_review_hatch_module()
+    monkeypatch.setattr(mod, "resolve_home", lambda: str(resolve_home))
+    monkeypatch.setattr(mod.hatch_escalation, "resolve_home", lambda: str(resolve_home))
+    monkeypatch.setenv("RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW", request)
+    monkeypatch.setenv("SHIP_AUDIT_FILE", str(audit))
+    monkeypatch.setenv("SHIP_HATCH_PR", "1")
+    monkeypatch.setenv("SHIP_HATCH_BRANCH", "feat")
+    monkeypatch.setenv("SHIP_HATCH_TIMEOUT_S", timeout)
+    if dry_run is None:
+        monkeypatch.delenv("SHIP_DRY_RUN", raising=False)
+    else:
+        monkeypatch.setenv("SHIP_DRY_RUN", dry_run)
+    return mod.main()
+
+
+def test_external_review_hatch_blank_denied_without_tg_contact(tmp_path, monkeypatch):
+    """A blank RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW is invalid: denied without contacting
+    tg-ctl, exit 1, audits external-review:bypass:denied."""
+    import json
+
+    marker = tmp_path / "tg-called"
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body=f"touch {marker}\nexit 0\n")
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_external_review_hatch_main(monkeypatch, request="", resolve_home=home, audit=audit)
+    assert rc == 1, "a blank hatch value must be denied"
+    assert not marker.exists(), "tg-ctl must NOT be contacted for a blank hatch request"
+    rec = json.loads(audit.read_text().strip())
+    assert rec["decision"] == "external-review:bypass:denied", rec
+    assert rec["gate"] == "external-review", rec
+
+
+def test_external_review_hatch_bare_flag_denied_without_tg_contact(tmp_path, monkeypatch):
+    """A bare truthy flag ('1'/'yes'/'true') is NOT a justification: denied without tg-ctl."""
+    marker = tmp_path / "tg-called"
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body=f"touch {marker}\nexit 0\n")
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_external_review_hatch_main(monkeypatch, request="1", resolve_home=home, audit=audit)
+    assert rc == 1, "a bare '1' must be denied — a self-set flag is not an approval"
+    assert not marker.exists(), "tg-ctl must NOT be contacted for a bare flag"
+
+
+def test_external_review_hatch_reason_triggers_tg_ask_and_approval_returns_0(tmp_path, monkeypatch):
+    """A real justification runs `tg-ctl ask`; on Alex's live approval the helper returns 0, the
+    question carries the hook id + justification + PR context, and it audits
+    external-review:bypass:approved."""
+    import json
+
+    question_file = tmp_path / "question.txt"
+    tg = _write_fake_tg_ctl(
+        tmp_path, name="tg-ctl",
+        body=f'printf "%s" "$2" > "{question_file}"\nprintf "approved by Alex\\n"\nexit 0\n',
+    )
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_external_review_hatch_main(
+        monkeypatch,
+        request="reviewer unreachable, genuinely urgent hotfix HYP-999",
+        resolve_home=home, audit=audit,
+    )
+    assert rc == 0, "a live-approved external-review hatch must return 0"
+    question = question_file.read_text()
+    assert "ship-external-review" in question, question
+    assert "reviewer unreachable" in question, question
+    rec = json.loads(audit.read_text().strip())
+    assert rec["decision"] == "external-review:bypass:approved", rec
+    assert "approved by Alex" in rec.get("override_reason", ""), rec
+
+
+def test_external_review_hatch_denial_returns_1_and_audits(tmp_path, monkeypatch):
+    """When Alex declines (tg-ctl exits non-zero) the helper returns 1 and audits
+    external-review:bypass:denied."""
+    import json
+
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body='printf "declined\\n"\nexit 1\n')
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_external_review_hatch_main(
+        monkeypatch, request="please just let this through", resolve_home=home, audit=audit,
+    )
+    assert rc == 1, "a declined external-review hatch must return 1"
+    rec = json.loads(audit.read_text().strip())
+    assert rec["decision"] == "external-review:bypass:denied", rec
+
+
+def test_external_review_hatch_dry_run_reason_approves_without_tg_contact(tmp_path, monkeypatch):
+    """`--dry-run` is a preview that must NOT fire a live Telegram round-trip: a written
+    justification yields an APPROVED preview sentinel (exit 0) while contacting NO tg-ctl."""
+    marker = tmp_path / "tg-called"
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body=f"touch {marker}\nexit 0\n")
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_external_review_hatch_main(
+        monkeypatch, request="preview: would ship with zero reviews",
+        resolve_home=home, audit=audit, dry_run="1",
+    )
+    assert rc == 0, "a dry-run preview with a real justification must return 0"
+    assert not marker.exists(), "dry-run must NOT contact tg-ctl (no live round-trip in a preview)"
+    assert not audit.exists() or audit.read_text().strip() == "", "dry-run must not write a real audit line"
+
+
+def test_external_review_hatch_dry_run_blank_still_denied(tmp_path, monkeypatch):
+    """Deny-by-default holds even in dry-run: a blank/bare justification is DENIED in preview too."""
+    tg = _write_fake_tg_ctl(tmp_path, name="tg-ctl", body="exit 0\n")
+    home = _fake_home_with_tg_ctl(tmp_path, tg)
+    audit = tmp_path / "audit.jsonl"
+    rc = _run_external_review_hatch_main(
+        monkeypatch, request="", resolve_home=home, audit=audit, dry_run="1",
+    )
+    assert rc == 1, "a blank justification must be denied even in dry-run"
+
+
+# --- external-review gate: refuse a merge with ZERO GitHub-side PR reviews (HYP-1380/#764) ----
+# _fake_gh_dir's default answers ONE qualifying review for `--json reviews` (SHIP_TEST_REVIEW_COUNT
+# defaults to 1) so every pre-existing full-pipeline test above reaches the merge unaffected; these
+# tests explicitly set SHIP_TEST_REVIEW_COUNT=0 to reproduce the PR #764 signature.
+
+
+def test_external_review_passes_with_a_qualifying_review(repo_with_two_worktrees, tmp_path):
+    """The default fixture answer (one qualifying review) lets a normal ship proceed to merge —
+    documents the happy path this gate must never block."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    r = _run_ship(main, bindir)
+    assert r.returncode == 0, f"a PR with a qualifying review must not be blocked\n{r.stdout}\n{r.stderr}"
+    assert "external-review gate OK" in r.stdout, r.stdout
+    assert "[fake gh] merged" in r.stdout, r.stdout
+
+
+def test_external_review_deny_by_default_refuses_before_merge(repo_with_two_worktrees, tmp_path):
+    """End-to-end reproduction of the PR #764 gap: zero GitHub reviews, no
+    RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW set -> ship refuses (deny-by-default) BEFORE any merge,
+    and audits a plain 'refused' decision."""
+    import json
+
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_AUDIT_FILE"] = str(audit)
+    env["SHIP_TEST_REVIEW_COUNT"] = "0"
+    env.pop("RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW", None)
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode != 0, f"deny-by-default: zero reviews must refuse without a hatch\n{r.stdout}\n{r.stderr}"
+    assert "ZERO GitHub-side reviews" in r.stderr, r.stderr
+    assert "RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+    rec = json.loads(audit.read_text().strip())
+    assert rec["decision"] == "external-review:refused", rec
+    assert rec["gate"] == "external-review", rec
+
+
+def test_external_review_gh_query_failure_refuses_with_friendly_message_not_silent_abort(
+    repo_with_two_worktrees, tmp_path
+):
+    """Regression for review-cli GLM finding F1 (GH-459 iteration 2): ship.sh runs under
+    `set -euo pipefail`, and the `REVIEW_COUNT=$(gh pr view ... --json reviews ...)` substitution
+    was the one `$(gh ...)` call in the file with no errexit guard (every sibling gate guards
+    theirs). A real `gh` failure (expired auth, rate limit, network blip) would abort the whole
+    script silently at that line -- gh's raw exit code, no 'Refusing: could not query ...' message,
+    no audit line -- instead of reaching the friendly fail-closed refusal a few lines down. Assert
+    the refusal message and its audit line ARE reached when the gh query fails, proving the
+    `|| REVIEW_COUNT=""` guard fixed it (a pre-fix run would just exit 1 with none of this)."""
+    import json
+
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_AUDIT_FILE"] = str(audit)
+    env["SHIP_TEST_REVIEW_QUERY_FAIL"] = "1"
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode != 0, f"a failed reviews query must refuse, not merge\n{r.stdout}\n{r.stderr}"
+    assert "could not query PR" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout, "must refuse BEFORE merging"
+    rec = json.loads(audit.read_text().strip())
+    assert rec["decision"] == "external-review:refused", rec
+    assert rec["gate"] == "external-review", rec
+
+
+def test_external_review_disabled_via_env_lets_zero_reviews_through(repo_with_two_worktrees, tmp_path):
+    """SHIP_EXTERNAL_REVIEW_ENABLED=0 is the ops off-switch: with it set, zero reviews no longer
+    blocks the merge."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_TEST_REVIEW_COUNT"] = "0"
+    env["SHIP_EXTERNAL_REVIEW_ENABLED"] = "0"
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode == 0, f"the ops off-switch must let a zero-review PR merge\n{r.stdout}\n{r.stderr}"
+    assert "external-review gate disabled" in r.stdout, r.stdout
+    assert "[fake gh] merged" in r.stdout, r.stdout
+
+
+def test_external_review_short_alias_env_var_also_disables_gate(repo_with_two_worktrees, tmp_path):
+    """SHIP_EXTERNAL_REVIEW=0 (the short alias) must behave identically to
+    SHIP_EXTERNAL_REVIEW_ENABLED=0 -- both are documented as the ops off-switch in README.md and
+    AGENTS.md, but only the long form had a test until now."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_TEST_REVIEW_COUNT"] = "0"
+    env["SHIP_EXTERNAL_REVIEW"] = "0"
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode == 0, f"the short-alias off-switch must let a zero-review PR merge\n{r.stdout}\n{r.stderr}"
+    assert "external-review gate disabled" in r.stdout, r.stdout
+    assert "[fake gh] merged" in r.stdout, r.stdout
+
+
+def test_external_review_fails_closed_when_python3_exits_zero_without_sentinel(repo_with_two_worktrees, tmp_path):
+    """Security fail-closed: a fake/broken `python3` that exits 0 but prints NO `APPROVED` sentinel
+    must NOT be mistaken for approval — ship refuses and audits bypass:denied. Mirrors the
+    skip-ci gate's identical fail-closed guard."""
+    import json
+
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    audit = tmp_path / "audit.jsonl"
+    fakepy = tmp_path / "fakepy"
+    fakepy.mkdir()
+    (fakepy / "python3").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (fakepy / "python3").chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join([str(fakepy), str(bindir), env["PATH"]])
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_AUDIT_FILE"] = str(audit)
+    env["SHIP_TEST_REVIEW_COUNT"] = "0"
+    env["RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW"] = "genuine reason but python3 is faked"
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode != 0, f"a fake python3 exiting 0 must fail closed\n{r.stdout}\n{r.stderr}"
+    assert "NOT approved" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+    lines = audit.read_text().strip().splitlines()
+    assert len(lines) == 1, f"expected exactly one audit line, got {lines}"
+    rec = json.loads(lines[0])
+    assert rec["decision"] == "external-review:bypass:denied", rec
+
+
+def test_external_review_approved_hatch_reaches_merge_e2e(repo_with_two_worktrees, tmp_path):
+    """End-to-end happy path for the escape valve: with an APPROVED external-review hatch, a real
+    ship.sh proceeds to merge despite zero GitHub reviews. The hatch helper is stood in by a fake
+    `python3` that emits the APPROVED sentinel (same e2e seam as the skip-ci hatch test — a
+    subprocess can't inject a fake tg-ctl, authority is the real home)."""
+    main, _wt1, _wt2 = repo_with_two_worktrees
+    bindir = _fake_gh_dir(tmp_path)
+    fakepy = tmp_path / "fakepy"
+    fakepy.mkdir()
+    (fakepy / "python3").write_text("#!/bin/sh\nprintf 'APPROVED live-approved (test)\\n'\nexit 0\n", encoding="utf-8")
+    (fakepy / "python3").chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join([str(fakepy), str(bindir), env["PATH"]])
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    env["SHIP_MAIN_CHECKOUT"] = str(main)
+    env["SHIP_AUDIT_FILE"] = str(tmp_path / "audit.jsonl")
+    env["SHIP_TEST_REVIEW_COUNT"] = "0"
+    env["RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW"] = "genuinely urgent, reviewer unreachable"
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=main, env=env)
+    assert r.returncode == 0, f"an approved external-review hatch must reach the merge\n{r.stdout}\n{r.stderr}"
+    assert "APPROVED by Alex" in r.stdout, r.stdout
+    assert "[fake gh] merged" in r.stdout, r.stdout
+
+
 # --- #268: auto-resolve addressed bot-nit review threads --------------------------------
 
 # A fake `gh` that also answers the auto-resolve path: the resolve-eligible query (routed by the
@@ -7302,7 +7663,13 @@ case "$sub" in
     action="$1"; shift || true
     case "$action" in
       view)
-        if printf '%s ' "$@" | grep -q headRefName; then
+        if printf '%s ' "$@" | grep -q -- '--json reviews'; then
+          # Default: ONE qualifying GitHub review present (the common/good case) — the
+          # external-review gate refuses to merge with zero, so a full-pipeline test shouldn't
+          # need to know about it. Override via SHIP_TEST_REVIEW_COUNT (a dedicated test sets 0
+          # to exercise the gate's refusal/hatch paths).
+          echo "${SHIP_TEST_REVIEW_COUNT:-1}"
+        elif printf '%s ' "$@" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           # One GREEN check so the normal (non-admin) CI gate passes — --skip-ci is now hatch-gated.
@@ -7421,7 +7788,13 @@ case "$sub" in
     action="$1"; shift || true
     case "$action" in
       view)
-        if printf '%s ' "$@" | grep -q headRefName; then
+        if printf '%s ' "$@" | grep -q -- '--json reviews'; then
+          # Default: ONE qualifying GitHub review present (the common/good case) — the
+          # external-review gate refuses to merge with zero, so a full-pipeline test shouldn't
+          # need to know about it. Override via SHIP_TEST_REVIEW_COUNT (a dedicated test sets 0
+          # to exercise the gate's refusal/hatch paths).
+          echo "${SHIP_TEST_REVIEW_COUNT:-1}"
+        elif printf '%s ' "$@" | grep -q headRefName; then
           printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}"
         elif printf '%s ' "$@" | grep -q statusCheckRollup; then
           printf '[{"name":"pytest","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"},{"name":"codeql","conclusion":"FAILURE","status":"COMPLETED","state":"FAILURE"}]'

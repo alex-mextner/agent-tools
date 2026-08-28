@@ -188,6 +188,14 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   `SHIP_RESOLVE_ADDRESSED_THREADS=1`) to let ship first auto-close the threads that are safe without
   a human (unresolved + outdated = addressed by a later commit + authored entirely by bots); a human
   or still-unaddressed thread is never touched and still blocks (#268);
+- the PR has **at least one GitHub-side review** — `gh pr view --json reviews` must be
+  non-empty (any state, any author; existence is the signal, not the verdict). Closes a gap
+  the unresolved-threads check above cannot: zero reviews means zero threads, which is
+  vacuously "clean". Real incident: hyperide/hyper-saas PR #764 merged with zero reviews on
+  Guard-B alone. Disable with `SHIP_EXTERNAL_REVIEW_ENABLED=0` (or the shorter
+  `SHIP_EXTERNAL_REVIEW=0`); no self-service override — a one-time bypass is
+  `RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW="<justification>"` (same shared hatch lib as
+  `--skip-ci`/review-quorum; see `ci/ship/external_review_hatch.py`);
 - a UI-touching PR carries an embedded **screenshot** (override with `--no-screenshot-ok
   <reason>`);
 - a PR that changes **shippable source** (not docs/test/CI) has **bumped the declared
@@ -220,14 +228,16 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   var carrying a value — blank, bare-flag, denied, or approved — appends one JSON line to
   `overrides.log` (default `<real-home>/.config/agent-tools/overrides.log`,
   `default_overrides_log_path()`), closing gap G-8 from the 2026-07-01 agent-ecosystem retrospective
-  (`docs/specs/…` in hyperide, section 5.2.3 item 3: "escape hatches have no audit sink"). One
-  pre-existing exception: `ci/ship/skip_ci_hatch.py` denies a blank/bare
-  `RIG_HATCH_REQUEST_SHIP_SKIP_CI` LOCALLY (a deliberate, lib-version-independent guard, unrelated
-  to this feature) before ever calling the shared lib, so that specific blank/bare case is recorded
-  only in `SHIP_AUDIT_FILE` on the non-dry-run path — and in NEITHER file on `--dry-run` (its local
-  guard denies without calling `_audit`, and `ship.sh`'s own dry-run audit helper prints the
-  would-be line without writing it). Every other outcome (denied/approved, and the review-quorum
-  hatch's own blank/bare case) routes through the lib as described above. A `rig
+  (`docs/specs/…` in hyperide, section 5.2.3 item 3: "escape hatches have no audit sink"). Two
+  pre-existing exceptions, same shape: `ci/ship/skip_ci_hatch.py` (for
+  `RIG_HATCH_REQUEST_SHIP_SKIP_CI`) and `ci/ship/external_review_hatch.py` (for
+  `RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW`) each deny a blank/bare value LOCALLY (a deliberate,
+  lib-version-independent guard, unrelated to this feature) before ever calling the shared lib, so
+  that specific blank/bare case is recorded only in `SHIP_AUDIT_FILE` on the non-dry-run path — and
+  in NEITHER file on `--dry-run` (the local guard denies without calling `_audit`, and `ship.sh`'s
+  own dry-run audit helper prints the would-be line without writing it). Every other outcome
+  (denied/approved, and the review-quorum hatch's own blank/bare case) routes through the lib as
+  described above. A `rig
   status` "overrides this week" section and a weekly tg digest reading this file are tracked as
   follow-up work, not yet built;
 - the local branch has **no unpushed/diverged commits** and a **clean worktree**.
