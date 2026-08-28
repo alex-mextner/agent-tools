@@ -217,9 +217,13 @@ def _heredoc_delimiters(text: str, bare: str) -> list[tuple[str, bool]]:
     successors stay commands — fail-closed. Same for a delimiter `_read_delimiter` will not
     resolve exactly."""
 
-    code = _blank_arithmetic(bare)
-    if _UNMODELLED_EXPANSION.search(code):
+    if _UNMODELLED_EXPANSION.search(bare):
         return []
+    # Checked BEFORE blanking, never after: `_ARITH_SPAN` is non-greedy, so on a NESTED
+    # expression (`$(( ((1)) << 2 ))`) it stops at the inner `))` and blanks away the very `$`
+    # that marks the line as unmodelled — leaving `<< 2` exposed and re-opening the bypass this
+    # guard exists to close. Blanking then only has to serve the `(( ))` form, which has no `$`.
+    code = _blank_arithmetic(bare)
     found: list[tuple[str, bool]] = []
     for op in _HEREDOC_OP.finditer(code):
         word = _read_delimiter(text, op.end())
