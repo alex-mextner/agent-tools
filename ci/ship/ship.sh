@@ -2023,16 +2023,48 @@ fi
 #     valid descriptive code appearing later in the same PR body -- the descriptive arm below then
 #     never even runs. Same fail-closed trade-off: review-cli has no record for "UTF-8" either, so
 #     ship still refuses, just without ever trying the real code (#384 review round 3).
-_review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing; ALWAYS exits 0
+# Arm 1 alone (the unambiguous HYP-<n> pattern), factored out of _review_quorum_extract_ticket
+# below so a caller juggling MULTIPLE texts (title, body) can search all of them for a real,
+# numeric HYP-<n> code BEFORE falling back to any text's generic/descriptive arm — arms 2-3
+# are far more prone to matching ordinary prose they weren't meant to (SHA-256, UTF-8,
+# RFC-2119, DO-NOT-MERGE) than arm 1 is, so they must never preempt a genuine HYP-<n> that
+# exists in a DIFFERENT text (review finding on the title-priority fix below).
+_review_quorum_extract_hyp() {  # $1 = text -> prints HYP-<n> (uppercased), or nothing; ALWAYS exits 0
   local text="$1" m
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE 'HYP-[0-9]+' | head -1 || true)
-  if [ -n "$m" ]; then printf '%s' "$m" | LC_ALL=C tr '[:lower:]' '[:upper:]'; return 0; fi
+  if [ -n "$m" ]; then printf '%s' "$m" | LC_ALL=C tr '[:lower:]' '[:upper:]'; fi
+  return 0
+}
+_review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing; ALWAYS exits 0
+  local text="$1" m
+  m=$(_review_quorum_extract_hyp "$text")
+  if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z]+-[0-9]+' | head -1 || true)
   if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z0-9]*(-[A-Z0-9]+)*' \
         | LC_ALL=C grep -xE '[A-Z][A-Z]+(-[A-Z][A-Z]+){2,}' | head -1 || true)
   printf '%s' "$m"
   return 0
+}
+
+# Fetches the PR's title+body in ONE `gh pr view` call and splits them into the globals
+# PR_TITLE_QC / PR_BODY_QC — shared by the review-quorum gate below and
+# _ship_derive_task_code_for_notify, so both consumers query and split the SAME way (the
+# wrong-ticket incident this file documents — PR #764 deriving HYP-1350 instead of HYP-1380 —
+# happened in a gate that had its OWN, separately-maintained, narrower derivation than
+# notify's; two copies of the same logic is exactly how that class of bug recurs). POSITIONAL
+# split (%%/#), not `read`'s IFS field-splitting: bash's `read` treats a LEADING tab as IFS
+# whitespace and skips it rather than producing an empty first field, so an empty title —
+# impossible on real GitHub, but exactly what a test fixture produces whenever it sets only
+# the body — silently read the body text into PR_TITLE_QC instead of PR_BODY_QC (review
+# finding). `@tsv` guarantees exactly one separator tab between the two fields on success, so
+# a positional split on the first tab is exact.
+_ship_fetch_pr_title_body() {
+  local line
+  IFS= read -r line < <(gh pr view "$PR" --json title,body \
+    -q '[(.title // ""), (.body // "")] | map(gsub("\n";" ")) | @tsv' 2>/dev/null) || line=""
+  PR_TITLE_QC="${line%%$'\t'*}"
+  PR_BODY_QC="${line#*$'\t'}"
 }
 
 # Clamp a quorum floor value to the hard minimum (3). Fail-closed: an unset, non-numeric,
@@ -2316,12 +2348,35 @@ else
   TASK_CODE="${REVIEW_TASK_CODE:-}"
   [ -n "$TASK_CODE" ] || TASK_CODE=$(_review_quorum_extract_ticket "$BRANCH")
   if [ -z "$TASK_CODE" ]; then
-    PR_BODY_QC=$(gh pr view "$PR" --json body -q '.body // ""' 2>/dev/null) || PR_BODY_QC=""
-    TASK_CODE=$(_review_quorum_extract_ticket "$PR_BODY_QC")
+    # TITLE is checked BEFORE body: this repo's convention puts exactly one ticket code in
+    # the PR title ("type(scope): description (HYP-NNN)"), while the body is free-form prose
+    # that may legitimately mention OTHER tickets — a "this is distinct from HYP-XXXX"
+    # disclaimer, a related/overlapping-ticket cross-reference, a follow-ups-filed list.
+    # Scanning body first and taking the FIRST HYP-NNN-shaped token is not reliably the PR's
+    # own ticket.
+    #
+    # Real incident: PR #764 (titled "... (HYP-1380)") shipped with this gate deriving
+    # HYP-1350 instead — AUTHORITY CONFIRMED and the task-cli notify both referenced the
+    # wrong ticket, posting a false "shipped" comment onto HYP-1350. Root cause, confirmed
+    # against the actual PR: the branch name (fix/hyp1380-...) has no hyphen between "hyp"
+    # and "1380" so `HYP-[0-9]+` never matched it at all, and the PR body's own opening
+    # sentence read "this is distinct from HYP-1350's actual Linear scope" — the first (and
+    # at the time, only) HYP-NNN-shaped token `grep -oiE 'HYP-[0-9]+' | head -1` found in the
+    # body. HYP-1380 existed only in the title, which this gate never consulted at all before
+    # this fix (notify's own, separately-maintained candidate list already did).
+    _ship_fetch_pr_title_body
+    # HYP-<n> arm only, title then body, BEFORE either text's generic/descriptive arm (review
+    # finding): the generic arm is far more prone to matching prose it wasn't meant to
+    # (SHA-256, UTF-8, RFC-2119, DO-NOT-MERGE) than the unambiguous HYP-<n> pattern, so a
+    # generic-arm hit in the title must never preempt a real HYP-<n> that exists in the body.
+    TASK_CODE=$(_review_quorum_extract_hyp "$PR_TITLE_QC")
+    [ -n "$TASK_CODE" ] || TASK_CODE=$(_review_quorum_extract_hyp "$PR_BODY_QC")
+    [ -n "$TASK_CODE" ] || TASK_CODE=$(_review_quorum_extract_ticket "$PR_TITLE_QC")
+    [ -n "$TASK_CODE" ] || TASK_CODE=$(_review_quorum_extract_ticket "$PR_BODY_QC")
   fi
 
   if [ -z "$TASK_CODE" ]; then
-    _review_quorum_refuse_or_hatch "could not derive a task code (set \$REVIEW_TASK_CODE, or put the ticket code e.g. HYP-931 in the branch name or PR body)"
+    _review_quorum_refuse_or_hatch "could not derive a task code (set \$REVIEW_TASK_CODE, or put the ticket code e.g. HYP-931 in the branch name, PR title, or PR body)"
   elif ! command -v review >/dev/null 2>&1; then
     _review_quorum_refuse_or_hatch "'review' CLI not found on PATH — cannot verify the bar for ${TASK_CODE} (install review-cli)"
   elif ! command -v jq >/dev/null 2>&1; then
@@ -2495,12 +2550,12 @@ fi
 # a real, unintended mutation of a real ticket store during a test run).
 #
 # Task-code derivation reuses _review_quorum_extract_ticket (the same matcher the review-quorum
-# gate above uses) but tries MORE sources, each validated independently, falling through to the
-# next on rejection: the gate's own $TASK_CODE (if it already ran and found one — avoids a
-# redundant `gh pr view` on the common path) → branch → PR TITLE → PR body. The title is a
-# deliberate gap-fix over the quorum gate (which only ever tries branch → body): a PR whose
-# ticket code lives only in its title (a common shape — "HYP-931: fix the thing") would
-# otherwise never be found here even though a human reads it immediately.
+# gate above uses) and now the SAME precedence too — the gate's own $TASK_CODE (if it already
+# ran and found one, avoiding a redundant `gh pr view` on the common path) → branch → PR TITLE
+# → PR body (via the shared _ship_fetch_pr_title_body). Both consumers used to maintain their
+# own, independently-written title/body derivation; that divergence is exactly how PR #764
+# (see the gate's own comment above) shipped with the gate and this notify step disagreeing
+# on which ticket the PR belonged to. They now call the same helper.
 #
 # EACH candidate — including a reused $TASK_CODE — is validated (must contain a DIGIT) before
 # being accepted; a rejected one falls through to try the NEXT source rather than giving up
@@ -2528,26 +2583,15 @@ _ship_derive_task_code_for_notify() {
   candidate=$(_review_quorum_extract_ticket "$BRANCH")
   [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
 
-  local pr_title pr_body_local
-  # One combined query for title+body (2 round trips instead of 2 separate `gh pr view` calls).
-  #
-  # IFS=$'\t' (review finding): a bare `read -r a b` splits on DEFAULT IFS (space/tab/newline),
-  # not just the `@tsv` separator — a real title/body is virtually never a single word, so the
-  # default-IFS form silently truncated `pr_title` to its first word and dumped the rest into
-  # `pr_body_local`. Concretely: "Fix the thing (HYP-931)" read as `pr_title="Fix"` (no match)
-  # instead of finding HYP-931 — the exact wrong-ticket hazard the digit check above exists to
-  # catch, reachable because the RIGHT code got mis-parsed away before the check ever saw it.
-  # jq's `@tsv` escapes any literal tab in a value, so splitting on tab alone is the correct,
-  # unambiguous delimiter (title/body may freely contain spaces and newlines — the `gsub` above
-  # only strips newlines so a MULTI-LINE body still round-trips as ONE tsv line).
-  IFS=$'\t' read -r pr_title pr_body_local < <(gh pr view "$PR" --json title,body \
-    -q '[(.title // ""), (.body // "")] | map(gsub("\n";" ")) | @tsv' 2>/dev/null) \
-    || { pr_title=""; pr_body_local=""; }
+  # Shared with the review-quorum gate above (_ship_fetch_pr_title_body) — one combined query
+  # for title+body (2 round trips instead of 2 separate `gh pr view` calls), split positionally
+  # rather than via `read`'s IFS field-splitting (see that function's own header comment).
+  _ship_fetch_pr_title_body
 
-  candidate=$(_review_quorum_extract_ticket "$pr_title")
+  candidate=$(_review_quorum_extract_ticket "$PR_TITLE_QC")
   [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
 
-  candidate=$(_review_quorum_extract_ticket "$pr_body_local")
+  candidate=$(_review_quorum_extract_ticket "$PR_BODY_QC")
   [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
 
   return 0

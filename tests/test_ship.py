@@ -5259,6 +5259,7 @@ case "$sub" in
       view)
         case "$*" in
           *headRefName*) printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}" ;;
+          *"--json title,body"*) printf '%s\\t%s\\n' "${SHIP_TEST_PR_TITLE:-}" "${SHIP_TEST_PR_BODY:-}" ;;
           *"--json body"*) printf '%s' "${SHIP_TEST_PR_BODY:-}" ;;
           *statusCheckRollup*) printf '%s\\n' '[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI"}]' ;;
           *) echo '[]' ;;
@@ -5815,6 +5816,69 @@ def test_review_quorum_derives_code_from_pr_body(tmp_path):
     )
     assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
     assert "AUTHORITY CONFIRMED" in r.stdout and "HYP-999" in r.stdout, r.stdout
+
+
+def test_review_quorum_prefers_title_over_body_ticket_mention(tmp_path):
+    """The PR title's own ticket code wins over a DIFFERENT ticket merely mentioned in the
+    body's prose. Regression for the real PR #764 incident: title "... (HYP-1380)", branch
+    without the HYP-<n> hyphen convention (so no branch-name match at all), and a body whose
+    first sentence read "this is distinct from HYP-1350's actual Linear scope" — the OLD
+    body-only derivation picked up HYP-1350 (the first HYP-NNN-shaped token in the body,
+    mentioned only to disclaim it) instead of the PR's real ticket, HYP-1380. AUTHORITY
+    CONFIRMED and the downstream task-cli notify both referenced the wrong ticket as a result."""
+    branch = "fix/hyp1380-approuter-createroot-hmr-guard"
+    main, _wt = _make_repo_with_branch(tmp_path, branch)
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv, branch=branch,
+        env_extra={
+            "SHIP_TEST_PR_TITLE": "fix(preview): guard against Bun HMR double-mount (HYP-1380)",
+            "SHIP_TEST_PR_BODY": "This is distinct from HYP-1350's actual Linear scope.",
+        },
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "HYP-1380" in r.stdout, r.stdout
+    assert "HYP-1350" not in r.stdout, r.stdout
+
+
+def test_review_quorum_derives_code_from_pr_body_when_title_has_none(tmp_path):
+    """A NON-EMPTY title with no ticket code + the real code only in the body must still be
+    found — the body-fallback branch, genuinely exercised with a real title present (not the
+    empty-title edge case, which a bash `read` field-splitting quirk made ambiguous)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "SHIP_TEST_PR_TITLE": "fix the widget rendering glitch",
+            "SHIP_TEST_PR_BODY": "Fixes HYP-999 for the widget regression.",
+        },
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "HYP-999" in r.stdout, r.stdout
+
+
+def test_review_quorum_hyp_in_body_beats_descriptive_match_in_title(tmp_path):
+    """A title that trips the matcher's digit-free descriptive arm (e.g. "DO-NOT-MERGE
+    experimental spike" -> "DO-NOT-MERGE", a documented accepted false positive — see
+    _review_quorum_extract_ticket's own comment) must NOT preempt a real, numeric HYP-<n>
+    ticket code that exists in the body. The HYP-only arm is tried across BOTH title and body
+    before either text's generic/descriptive arm runs, specifically so this can't happen."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "SHIP_TEST_PR_TITLE": "DO-NOT-MERGE experimental spike",
+            "SHIP_TEST_PR_BODY": "Fixes HYP-777 for the widget regression.",
+        },
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "HYP-777" in r.stdout, r.stdout
+    assert "DO-NOT-MERGE" not in r.stdout, r.stdout
 
 
 def test_review_quorum_derives_descriptive_code_from_pr_body(tmp_path):
