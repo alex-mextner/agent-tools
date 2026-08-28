@@ -57,6 +57,38 @@ def point_for_event(hook_name: str, tool_name: str | None) -> str | None:
     return None
 
 
+def _detached_agent_id() -> str:
+    """The ONE authoritative subagent identity source for opencode sessions.
+
+    The forge-strip in ``to_v1_event`` removes any model/tool-supplied agent_id
+    (the same trust boundary as the CC bridge's T2 precedence: an event may carry
+    model-influenced fields, so they can never self-exempt). CC has an
+    authoritative top-level agent field to restore it from; opencode has NONE —
+    which made every opencode session, including a rig-dispatched detached
+    ``opencode run`` agent, look like "the orchestrator" to every gate.
+
+    The sanctioned source here is the opencode PROCESS ENVIRONMENT, read at
+    launch: ``RIG_AGENT_ID=<name>`` (identity) or ``RIG_DETACHED_AGENT=1``
+    (anonymous marker), set by the rig detached-agent launcher. plugin.js spawns
+    this dispatcher with ``{...process.env}``, so the marker set when the child
+    opencode was launched is visible here on every tool call.
+
+    Trust reasoning: a running orchestrator cannot retroactively mutate its own
+    process environment — it can only set these vars for a CHILD process it
+    dispatches, which is exactly the sanctioned act of dispatching a subagent
+    (and the very act the delegation gates exist to encourage). This matches the
+    module family's stated threat model: a cooperative orchestrator, discipline
+    rather than a security boundary, on_error=open. A bare/whitespace value is
+    not a marker.
+    """
+    val = os.environ.get("RIG_AGENT_ID", "").strip()
+    if val:
+        return val
+    if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
+        return "detached"
+    return ""
+
+
 def to_v1_event(opencode_event: dict, *, point: str) -> dict:
     """Translate the opencode plugin payload into agents-hooks/v1."""
     tool = _tool_name(opencode_event)
@@ -64,6 +96,9 @@ def to_v1_event(opencode_event: dict, *, point: str) -> dict:
     args = dict(raw_args)
     for key in _FORGED_AGENT_KEYS:
         args.pop(key, None)
+    detached_id = _detached_agent_id()
+    if detached_id:
+        args["agent_id"] = detached_id
     _normalize_task_args(args)
 
     command = _tool_command(tool, raw_args)
