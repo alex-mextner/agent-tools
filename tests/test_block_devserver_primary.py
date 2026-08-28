@@ -760,6 +760,82 @@ def test_pm_exec_dlx_classifies_webpack_like_npx(tmp_path, monkeypatch, command)
     assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block", command
 
 
+# ── Codex review round 2 (PR agent-tools#469): both cd-branches + isolation + more parsers ──
+
+def test_conditional_cd_toward_protected_checkout_also_blocked(tmp_path, monkeypatch):
+    """Regression (Codex P1, round 2): the MIRROR of the round-1 fix. `true && cd
+    /path/to/enrolled-main; npm run dev` from a FEATURE worktree. `true` always succeeds, so
+    `cd` DOES run, and `npm run dev` (unconditional via `;`) really launches in the now-current,
+    protected checkout. A fix that assumes a conditional `cd` "never happened" (the round-1 fix,
+    taken alone) gets this direction wrong — it would leave `effective_cwd` at the harmless
+    feature worktree and ALLOW. Must BLOCK: tracking BOTH possible outcomes of an unevaluable
+    `&&`/`||` is required, not just one fixed assumption."""
+    protected = _make_repo(tmp_path, branch="main")
+    feat = tmp_path / "feat-worktree"
+    feat.mkdir()
+    command = f"true && cd {protected}; npm run dev"
+    out, code = _run(feat, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_piped_cd_does_not_persist(tmp_path, monkeypatch):
+    """Regression (Codex P1, round 2): `cd /feature | cat; npm run dev` from a protected
+    checkout. A `cd` that is itself piped into another command runs in a subshell bash forks
+    for the pipeline stage — its directory change is discarded when that subshell exits and
+    never reaches the parent shell. `npm run dev` (unconditional via `;`) really launches in the
+    still-protected original checkout. Must BLOCK, not fall through to the harmless `/feature`
+    reading."""
+    protected = _make_repo(tmp_path, branch="main")
+    feat = tmp_path / "feat-worktree"
+    feat.mkdir()
+    command = f"cd {feat} | cat; npm run dev"
+    out, code = _run(protected, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_backgrounded_cd_does_not_persist(tmp_path, monkeypatch):
+    """Regression (Codex P1, round 2): `cd /feature & npm run dev` from a protected checkout.
+    Backgrounding a `cd` forks a subshell to run it asynchronously — the parent shell continues
+    immediately with `npm run dev`, which still runs in the ORIGINAL, still-protected checkout
+    (the backgrounded `cd`'s effect never reaches it). Must BLOCK."""
+    protected = _make_repo(tmp_path, branch="main")
+    feat = tmp_path / "feat-worktree"
+    feat.mkdir()
+    command = f"cd {feat} & npm run dev"
+    out, code = _run(protected, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_escaped_quote_opening_outside_quotes_doesnt_hide_launch(tmp_path, monkeypatch):
+    """Regression (Codex P2, round 2): `echo \\" && npm run dev` — the backslash-escaped `"` is a
+    literal character in a real shell, not the start of a new quoted region. Unconditionally
+    opening a quote there swallows the real `&&` that follows into an "unterminated string",
+    hiding the `npm run dev` member from ever being split out and classified. Must BLOCK."""
+    repo = _make_repo(tmp_path, branch="main")
+    command = 'echo \\" && npm run dev'
+    out, code = _run(repo, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_bun_run_consumes_leading_run_flags(tmp_path, monkeypatch):
+    """Regression (Codex P2, round 2): `bun run --silent dev` — bun's own `run` documents
+    `--silent`/`--if-present` too. Stopping before consuming the flag reads it as the
+    script-name position and misses `dev` entirely. Must BLOCK."""
+    repo = _make_repo(tmp_path, branch="main")
+    command = "bun run --silent dev"
+    out, code = _run(repo, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_pnpm_dlx_consumes_flags_before_tool(tmp_path, monkeypatch):
+    """Regression (Codex P2, round 2): `pnpm dlx --silent vite` — `--silent` is a documented
+    `dlx` option. Reading it as the tool name itself misses `vite` entirely. Must BLOCK."""
+    repo = _make_repo(tmp_path, branch="main")
+    command = "pnpm dlx --silent vite"
+    out, code = _run(repo, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
 # ── unit: segment classification ────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("segment,expected_matched", [

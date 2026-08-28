@@ -122,16 +122,31 @@ need requests a one-time Telegram approval with a written justification in
   own rather than inflating this PR further; the RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY
   escape hatch and simply not doing this in a shared checkout remain the mitigations until then.
 - ~~`_split_chain` doesn't track which operator precedes a `cd` segment~~ — **fixed** (Codex
-  review, PR agent-tools#469). `_split_chain` now returns each segment's preceding operator, and
-  a `cd` reached via `&&`/`||` (whose actual execution depends on an exit code this hook cannot
-  evaluate) is treated as "did not happen" — `effective_cwd` is left untouched, same as an
-  unresolvable target. Only a `cd` that is the first segment of the command, or that follows an
-  UNCONDITIONAL separator (`;`, newline, background `&`, `|`), is trusted. This closed a real
-  bypass, not just a false-block nuisance: `false && cd /feature; npm run dev` from a protected
-  checkout previously judged the (unconditional, `;`-separated) `npm run dev` against `/feature`
-  and wrongly ALLOWED it, when in a real shell `cd` never runs (`false` fails the `&&`) and the
-  server actually launches in the still-protected checkout. `_split_chain` is no longer a
-  byte-identical copy of `pin-primary-worktree`'s — see that function's own module comment.
+  review, PR agent-tools#469, two rounds). `main()` now tracks a SET of possible `effective_cwd`
+  states, not a single one. A `cd` reached via `&&`/`||` (whose actual execution depends on an
+  exit code this hook cannot evaluate) BRANCHES the set into both possible outcomes (the `cd`
+  ran / didn't run) — a later dev-server segment is blocked if EITHER possible state is gated.
+  A `cd` piped into/out of another command or backgrounded (`cd X | cat`, `cd X &`) runs in a
+  subshell whose directory change never reaches the parent shell at all — the set is left
+  unchanged regardless of what precedes it. Only a `cd` that is BOTH unconditionally reached
+  (first segment, or after `;`/newline/`&`) AND not itself isolated in a subshell is trusted
+  deterministically. See `_apply_cd_to_candidates`'s docstring for the two asymmetric bypass
+  shapes this closes (one per round): `false && cd /feature; npm run dev` from a protected
+  checkout (needs "the cd didn't run" to correctly BLOCK) and `true && cd /protected-main;
+  npm run dev` from a feature worktree (needs "the cd DID run" to correctly BLOCK) — a single
+  fixed assumption in either direction gets one of the two wrong; tracking both keeps both
+  correct. `_split_chain` is no longer a byte-identical copy of `pin-primary-worktree`'s — see
+  that function's own module comment.
+- **The one-line form of this hook's OWN recommended remediation is over-blocked.** `MESSAGE`
+  tells an agent to run `git worktree add ../wt-<feature> ...` and then, as a SEPARATE command,
+  `cd ../wt-<feature> && <command>` — that two-step form works fine (the `cd` there is the first
+  segment of its own command, unconditionally trusted). But the compressed one-liner
+  `git worktree add ../wt -b f origin/main && cd ../wt && npm run dev` is BLOCKED: `cd ../wt` is
+  reached via `&&` (conditional, from `git worktree add`'s success), so the candidate set
+  branches to `{original, ../wt}`, and since `original` is still gated, the whole command is
+  blocked even though the launch really would happen in the new worktree. Over-blocking, the
+  documented safe direction — run the worktree creation and the `cd … && <launch>` as two
+  separate commands (exactly as `MESSAGE` already spells it), or use the Telegram hatch.
 - **A subshell — `(npm run dev)`, `$(cd /shared && npm run dev)` — is missed ENTIRELY, not just
   "not re-tracked".** The opening `(` glues to the head token (`(npm`) and the closing `)` glues
   to the last token (`dev)`), so neither `_resolve_cd_target` nor `_classify_devserver_segment`

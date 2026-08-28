@@ -258,11 +258,15 @@ def _split_chain(command: str) -> list[tuple[str | None, str]]:
     """Split on shell operators (&&, ||, ;, |, newline, a bare control &) that lie OUTSIDE quotes.
 
     Returns ``(preceding_operator, segment_text)`` pairs — the operator that separates this
-    segment from the one before it (``None`` for the very first segment). `main()` needs this to
-    tell an UNCONDITIONALLY-reached `cd` (the first segment, or one following `;`/newline/`&`/
-    `|`, which always runs regardless of any prior command's exit code) from a CONDITIONALLY-
-    reached one (following `&&`/`||`, whose execution depends on an exit code this hook has no
-    way to evaluate) — see `main()`'s docstring note for why only the former may be trusted.
+    segment from the one before it (``None`` for the very first segment). `main()` uses this
+    two ways: (1) to tell an UNCONDITIONALLY-reached `cd` (the first segment, or one following
+    `;`/newline/`&`, which always runs regardless of any prior command's exit code) from a
+    CONDITIONALLY-reached one (following `&&`/`||`, whose execution depends on an exit code this
+    hook has no way to evaluate — see `main()`'s docstring note for how it handles this
+    uncertainty); (2) alongside the FOLLOWING segment's own preceding-operator, to tell a `cd`
+    that runs in an isolated subshell (piped into/out of via `|`, or backgrounded via `&`, either
+    of which discards its directory change once that subshell exits) from one that actually
+    affects the parent shell's cwd.
 
     A double-quoted region honors a backslash-escaped quote (``\\"``) as a literal character, not
     the end of the string — an odd number of trailing backslashes immediately before a `"` escapes
@@ -270,9 +274,15 @@ def _split_chain(command: str) -> list[tuple[str | None, str]]:
     closes the quoted region one character early ('a\\"' reads as a complete, escaped-quote-naive
     string), leaving the trailing ``b" && npm run dev`` parsed as UNQUOTED text — the `&&` inside
     it is then treated as a real chain-operator split point mid-string, silently misplacing where
-    the `npm run dev` member actually starts. Single quotes need no such handling — POSIX single
-    quotes are fully literal, backslash has no special meaning inside them, so the existing
-    generic "close on matching quote char" branch is already correct for them."""
+    the `npm run dev` member actually starts. The same escape-awareness also applies when
+    OPENING a quote from outside any quoted region: `echo \\" && npm run dev`'s `\\"` is a literal
+    escaped quote in a real shell, not a region opener — unconditionally opening one there (an
+    earlier version of this function did) swallows the real `&&` that follows into the
+    "unterminated string", hiding the `npm run dev` member from ever being split out at all.
+    Single quotes need no closing-escape handling — POSIX single quotes are fully literal,
+    backslash has no special meaning inside them, so the existing generic "close on matching
+    quote char" branch is already correct for closing one; OPENING one is still escape-checked
+    (`\\'` outside quotes is equally a literal character, not a region opener)."""
     segs: list[tuple[str | None, str]] = []
     buf: list[str] = []
     quote: str | None = None
@@ -298,9 +308,20 @@ def _split_chain(command: str) -> list[tuple[str | None, str]]:
                 quote = None
             i += 1
         elif c in ("'", '"'):
-            quote = c
+            # Regression (Codex review, PR agent-tools#469): a backslash-escaped quote OUTSIDE
+            # any quoted region (`echo \" && npm run dev`) is a literal character in a real
+            # shell, not the start of a new quoted region. Opening a quote here anyway would
+            # swallow the rest of the command — including its real `&&` — into an "unterminated
+            # string", hiding a `npm run dev` member from ever being split out and classified.
+            bs = 0
+            j = len(buf) - 1
+            while j >= 0 and buf[j] == "\\":
+                bs += 1
+                j -= 1
             buf.append(c)
             i += 1
+            if bs % 2 == 0:  # not escaped — an even (incl. zero) run of backslashes
+                quote = c
         elif command[i:i + 2] in ("&&", "||"):
             segs.append((pending_op, "".join(buf)))
             pending_op = command[i:i + 2]
@@ -326,8 +347,21 @@ def _split_chain(command: str) -> list[tuple[str | None, str]]:
 # A segment preceded by one of these operators only runs if the PRECEDING segment's exit code
 # meets a condition (`&&` = succeeded, `||` = failed) that this hook has no shell to evaluate —
 # see the `cd`-conditional-tracking note in `main()`. Every other preceding separator (`;`,
-# newline, background `&`, `|`, or no separator at all — the first segment) runs unconditionally.
+# newline, background `&`, or no separator at all — the first segment) runs unconditionally.
+# `|` is handled separately, by `_ISOLATING_OPS` below — a segment either side of a pipe is not
+# "conditional" in the &&/|| sense (it always RUNS), but its `cd` effect never reaches the
+# parent shell either way, for a different reason (subshell isolation, not uncertain exit code).
 _CONDITIONAL_OPS = frozenset({"&&", "||"})
+
+# A `cd` whose OWN following operator is one of these runs in a subshell that bash forks to
+# execute it — a pipeline stage (`cd X | cat`) or a backgrounded job (`cd X &`) — so its
+# directory change is discarded when that subshell exits and never reaches the parent shell,
+# REGARDLESS of the operator preceding it. Same for a `cd` that is itself the RECEIVING end of a
+# pipe (preceding operator `|`): by default (no `shopt -s lastpipe`, which this hook cannot
+# detect and does not assume), every pipeline stage — including the last — runs in a subshell.
+# Deterministic, unlike `_CONDITIONAL_OPS`: a piped/backgrounded `cd` NEVER persists, there is no
+# "maybe it did" branch to account for.
+_ISOLATING_OPS = frozenset({"&", "|"})
 
 _ASSIGN_RE = re.compile(r"^\w+=")
 
@@ -581,7 +615,13 @@ def _classify_pm_segment(head: str, rest: list[str]) -> tuple[str, str | None] |
             return f"{head} run {script_toks[0]}", cwd_override
         return None
     if rest[:1] and rest[0] in _PM_EXEC_SUBCOMMANDS and len(rest) > 1:
-        exec_toks = rest[2:] if rest[1] == "--" else rest[1:]  # `exec -- <tool>` / `exec <tool>`
+        # `_skip_flags` (shared with `_classify_npx_segment`) eats the literal `--` separator
+        # AND any recognized-or-not valueless flag before the tool name in one pass — covers
+        # both `exec -- <tool>` and a documented exec/dlx option like `--silent` (Codex review,
+        # PR agent-tools#469: `pnpm dlx --silent vite` previously read `--silent` itself as the
+        # tool and missed `vite` entirely — an under-block, the launch allowed on protected main).
+        exec_toks = rest[1:]
+        exec_toks = exec_toks[_skip_flags(exec_toks):]
         tool = exec_toks[0] if exec_toks else None
         sub = exec_toks[1] if len(exec_toks) > 1 else None
         if tool in _RUNNER_TOOLS and _is_runner_devserver(tool, sub):
@@ -606,8 +646,17 @@ def _classify_bun_segment(rest: list[str]) -> tuple[str, str | None] | None:
     if rest[:1] == ["x"]:
         return _classify_npx_segment("bun x", rest[1:])
     rest, cwd_override = _peel_dir_flag(rest)
-    if rest[:1] == ["run"] and len(rest) > 1 and _is_dev_script(rest[1], _BUN_DEV_SCRIPTS):
-        return f"bun run {rest[1]}", cwd_override
+    if rest[:1] == ["run"]:
+        script_toks = rest[1:]
+        # Same fix as `_classify_pm_segment`'s `run` branch (Codex review, PR agent-tools#469):
+        # `bun run --silent dev` — bun's own `run` documents `--silent`/`--if-present` too
+        # (checked bun 1.2.14 --help) — stopping before consuming the flag reads it as the
+        # script-name position and misses `dev`, an under-block on protected main.
+        while script_toks[:1] and script_toks[0] in _RUN_FLAGS:
+            script_toks = script_toks[1:]
+        if script_toks and _is_dev_script(script_toks[0], _BUN_DEV_SCRIPTS):
+            return f"bun run {script_toks[0]}", cwd_override
+        return None
     if rest[:1] and _is_dev_script(rest[0], _BUN_DEV_SCRIPTS):
         return f"bun {rest[0]}", cwd_override
     return None
@@ -772,7 +821,77 @@ def _decide_block(cwd: str, branch: str, label: str, full_command: str) -> int:
     return BLOCK_EXIT_CODE
 
 
+# Real commands rarely chain more than a couple of conditional `cd`s; without a cap, N
+# conditional `cd`s to N distinct new targets could branch the candidate set to up to 2**N.
+# Once the cap is hit, `_apply_cd_to_candidates` stops adding NEW branches (existing candidates,
+# including any already-branched ones, are kept) — pathological input degrades to "stop tracking
+# further branching", not a hang or a memory blowup.
+_MAX_CANDIDATE_CWDS = 8
+
+
+def _apply_cd_to_candidates(
+    candidates: set[str], toks: list[str], op: str | None, following_op: str | None,
+) -> set[str]:
+    """Given the current set of POSSIBLE `effective_cwd` states — see `main()`'s docstring for
+    why there can be more than one — apply one `cd` segment's tokens and return the updated set.
+    ``op`` is the operator preceding this `cd` (``None``/``;``/newline/``&`` = unconditional,
+    ``&&``/``||`` = conditional); ``following_op`` is the operator that terminates it (``|``/``&``
+    = isolated in a subshell whose directory change never reaches the parent shell at all).
+
+    - Isolated (Codex review, PR agent-tools#469): a `cd` piped into/out of another command
+      (`cd X | cat`) or backgrounded (`cd X &`) runs in a subshell bash forks for that purpose —
+      its effect is discarded when the subshell exits and NEVER reaches the parent shell,
+      regardless of what precedes it. The candidate set is returned UNCHANGED.
+    - Unconditional, not isolated: the `cd` DEFINITELY runs — each candidate is DETERMINISTICALLY
+      replaced by its own resolved target (or left as-is if the target doesn't exist — a failed
+      `cd` leaves the shell where it was, see `_resolve_cd_target`'s own docstring).
+    - Conditional, not isolated (Codex review, PR agent-tools#469): the `cd` MAY OR MAY NOT run
+      — this hook cannot evaluate the preceding command's exit code — so each candidate BRANCHES
+      into both possible successor states (itself, unchanged: the `cd` didn't run; and its
+      resolved target: the `cd` did run). A single always-safe direction (e.g. "assume it never
+      ran") is NOT sound here: `false && cd /feature; npm run dev` from a protected checkout
+      needs "didn't run" to correctly BLOCK (the launch stays in the protected checkout), but
+      `true && cd /protected-main; npm run dev` from a feature worktree needs "did run" to
+      correctly BLOCK (the launch reaches the protected checkout) — the same fixed assumption
+      gets one of the two wrong. Tracking both keeps both correct."""
+    if following_op in _ISOLATING_OPS or op == "|":
+        return candidates
+    if op in _CONDITIONAL_OPS:
+        branched = set(candidates)
+        for c in candidates:
+            if len(branched) >= _MAX_CANDIDATE_CWDS:
+                break
+            target = _resolve_cd_target(toks, c)
+            if target is not None:
+                branched.add(target)
+        return branched
+    return {_resolve_cd_target(toks, c) or c for c in candidates}
+
+
+def _gate_for_any_candidate(
+    candidates: set[str], cwd_override: str | None, cache: dict[str, str | None],
+) -> tuple[str, str] | None:
+    """``(check_cwd, branch)`` for the first of the possibly-several candidate `effective_cwd`
+    states (see `main()`'s docstring) that resolves to a gate, or ``None`` if none do — a
+    dev-server segment is blocked if ANY possible state it might actually run in is gated.
+    ``cwd_override`` (a directory flag like `--prefix`) is resolved against EACH candidate
+    rather than replacing the set outright — it scopes only THIS launch, same as the single-
+    candidate case, just applied per-branch."""
+    for c in candidates:
+        check_cwd = _resolve_relative_path(cwd_override, c) if cwd_override is not None else c
+        branch = _resolve_gate(check_cwd, cache)
+        if branch is not None:
+            return check_cwd, branch
+    return None
+
+
 def main() -> int:
+    """Tracks a SET of possible `effective_cwd` states, not a single one, because a `cd` gated
+    behind `&&`/`||` may or may not have actually executed in the real shell — this hook has no
+    way to evaluate the preceding exit code (see `_apply_cd_to_candidates`). A later dev-server
+    segment is blocked if ANY candidate state is gated (`_gate_for_any_candidate`) — the only
+    sound choice when the real state is genuinely ambiguous, consistent with this hook's
+    over-block-not-under-block philosophy throughout."""
     try:
         event = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError) as exc:
@@ -788,32 +907,18 @@ def main() -> int:
         emit("allow")
         return 0
 
-    effective_cwd = cwd
+    segments = _split_chain(_normalize_line_continuations(command))
+    candidate_cwds: set[str] = {cwd}
     gate_cache: dict[str, str | None] = {}
-    for op, segment in _split_chain(_normalize_line_continuations(command)):
+    for idx, (op, segment) in enumerate(segments):
         try:
             toks = _strip_leading_assignments(shlex.split(segment))
         except ValueError:
             toks = []
 
         if toks and toks[0] == "cd":
-            if op in _CONDITIONAL_OPS:
-                # Regression (Codex review, PR agent-tools#469): `false && cd /feature;
-                # npm run dev` from a protected checkout. `;` puts `npm run dev` OUTSIDE the
-                # `&&` group — it always runs, regardless of whether `false` (or `cd`) actually
-                # succeeded. Unconditionally trusting this `cd` (as an earlier version of this
-                # function did) moves `effective_cwd` to `/feature` whenever it's REACHED in the
-                # token stream, whether or not it was REACHED in a real shell — so the
-                # unconditional `npm run dev` gets judged against `/feature` (ALLOW) instead of
-                # the real, still-protected checkout the command actually launches in (should
-                # BLOCK). This hook has no shell to evaluate `&&`'s left-hand exit code, so the
-                # only safe assumption for a `cd` gated behind `&&`/`||` is "did not happen" —
-                # `effective_cwd` is left untouched, same treatment as an unresolvable target
-                # (see `_resolve_cd_target`'s own docstring for why that's the safe direction).
-                continue
-            cd_target = _resolve_cd_target(toks, effective_cwd)
-            if cd_target is not None:
-                effective_cwd = cd_target
+            following_op = segments[idx + 1][0] if idx + 1 < len(segments) else None
+            candidate_cwds = _apply_cd_to_candidates(candidate_cwds, toks, op, following_op)
             continue
 
         # `cd` is never a wrapper head, so peeling here is a no-op for the `cd` branch above —
@@ -823,18 +928,11 @@ def main() -> int:
         if classified is None:
             continue
         label, cwd_override = classified
-        # A directory flag (`npm --prefix <dir> run dev`) is a ONE-SHOT cwd for THIS launch
-        # only — unlike `cd`, it never changes `effective_cwd` for a later chain segment.
-        check_cwd = (
-            _resolve_relative_path(cwd_override, effective_cwd)
-            if cwd_override is not None
-            else effective_cwd
-        )
 
-        branch = _resolve_gate(check_cwd, gate_cache)
-        if branch is None:
+        gate = _gate_for_any_candidate(candidate_cwds, cwd_override, gate_cache)
+        if gate is None:
             continue  # not enrolled, on a feature branch, or undetermined → fail-open
-
+        check_cwd, branch = gate
         return _decide_block(check_cwd, branch, label, command)
 
     emit("allow")
