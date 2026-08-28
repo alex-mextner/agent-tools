@@ -137,28 +137,144 @@ def warn(msg: str) -> None:
     sys.stderr.write(f"visual-proof-gate: {msg}\n")
 
 
+# A heredoc redirection (`<<EOF`, `<<-'EOF'`, `<< "EOF"`), but NOT a herestring (`<<<`). The
+# BODY that follows is DATA fed to a command's stdin, never a sequence of commands, so
+# `_split_unquoted_lines` must not offer its lines to the command-head anchors.
+_HEREDOC_START = re.compile(r"""(?<!<)<<-?(?!<)[ \t]*(?P<q>['"]?)(?P<delim>[A-Za-z_]\w*)(?P=q)""")
+
+
+def _scan_line(line: str, quote: str | None) -> tuple[str, str | None, bool]:
+    """Walk one physical line, tracking quote state. Returns its text, the quote state left
+    open at end-of-line, and whether the line ended in an unescaped backslash (a continuation).
+
+    A backslash escapes the next character everywhere except inside single quotes, where the
+    shell treats it literally."""
+
+    out: list[str] = []
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote != "'" and ch == "\\":
+            if i + 1 == len(line):
+                return "".join(out), quote, True  # trailing `\` = line continuation
+            out.append(ch)
+            out.append(line[i + 1])  # an escaped char is literal text, kept as-is
+            i += 2
+            continue
+        if quote is None and ch in "\"'":
+            quote = ch
+        elif quote == ch:
+            quote = None
+        out.append(ch)
+        i += 1
+    return "".join(out), quote, False
+
+
+def _split_unquoted_lines(command: str) -> list[str]:
+    """Split `command` at the newlines a real shell treats as command separators.
+
+    Three kinds of newline are NOT separators: one inside quotes (a multi-line commit message
+    is ordinary text), one escaped by a backslash (a line CONTINUATION, which splices the next
+    line onto this command), and every newline inside a HEREDOC BODY. The heredoc body is
+    dropped outright — it is stdin data for the command on the redirection line, so surfacing
+    its lines as commands would make `cat > ship.sh <<'EOF' / git commit -m x / EOF` look like
+    a commit and hard-BLOCK a command that only writes a file.
+
+    Best-effort, and deliberately so: this only has to be right often enough that the
+    command-head anchors see real command heads. KNOWN GAP (unchanged by this parser, it
+    predates it): a body actually EXECUTED by a shell — `bash <<'EOF' / git commit -m x / EOF`
+    — is also dropped, so a commit hidden that way is not detected. Closing that needs the
+    interpreter-vs-data distinction, which is a separate change."""
+
+    segments: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    heredoc_delim: str | None = None
+    for raw in command.split("\n"):
+        # Only `\r\n` is a line ending; a LONE `\r` is an ordinary character to a POSIX shell
+        # and must not split a command.
+        line = raw[:-1] if raw.endswith("\r") else raw
+        if heredoc_delim is not None:
+            if line.strip() == heredoc_delim:
+                heredoc_delim = None
+            continue  # body text is stdin data, never a command
+        text, quote, continued = _scan_line(line, quote)
+        buf.append(text)
+        if continued:
+            continue  # backslash-newline splices the next line onto this command
+        if quote is not None:
+            buf.append("\n")  # a newline inside a quoted string is ordinary text
+            continue
+        segment = "".join(buf)
+        match = _HEREDOC_START.search(segment)
+        heredoc_delim = match.group("delim") if match else None
+        segments.append(segment)
+        buf = []
+    if buf:
+        segments.append("".join(buf))
+    return segments
+
+
+def _shell_tokens(command: str) -> list[str]:
+    """`shlex.split(command, comments=True)`, but with unquoted NEWLINES surfaced as explicit
+    `;` separator tokens instead of silently vanishing.
+
+    A newline separates commands in every shell, exactly like `;`. Plain `shlex.split` drops
+    it, so the token stream for `cd repo\\ngit commit -m x` came out identical to
+    `cd repo git commit -m x` — ONE long command instead of two. Every consumer reads that
+    stream (the command-head anchors via `_strip_shell_comment`, plus `_segments`,
+    `is_skip_commit`, `effective_cwd`), so a `git commit` written on any line below the first
+    stopped looking like a command head at all and the gate waved it straight through: no
+    proof, no hatch, no `overrides.log` line (agent-tools#472). Multi-line is the ordinary
+    shape an agent writes a commit in, which is what made this near-total rather than an edge
+    case.
+
+    Comments are stripped PER LINE, because `#` only runs to end-of-line. Collapsing newlines
+    before tokenizing would let a single `#` swallow every command after it — failing OPEN,
+    the same direction as the bug being fixed. Raises `ValueError` on unbalanced quotes just
+    as `shlex.split` does, so callers keep their existing fail-safe fallbacks."""
+
+    tokens: list[str] = []
+    for line in _split_unquoted_lines(command):
+        line_tokens = shlex.split(line, comments=True)
+        if not line_tokens:
+            continue  # a blank or comment-only line separates nothing
+        if tokens and tokens[-1] not in _SHELL_SEP:
+            # A line ending in `&&`/`||`/`|` already carries its separator forward; the
+            # newline after it starts no new command and must not inject an empty segment.
+            tokens.append(";")
+        tokens.extend(line_tokens)
+    return tokens
+
+
 def _strip_shell_comment(command: str) -> str:
     """Drop a trailing shell comment (`# …`) that the shell never executes.
 
     Only an UNQUOTED `#` that starts a word begins a comment, so a `#` inside a quoted commit
-    message (`-m 'fix #42'`) or glued to a token (`color=#fff`) is preserved. Best-effort: on a
-    tokenization failure (unbalanced quotes) the raw command is returned unchanged."""
+    message (`-m 'fix #42'`) or glued to a token (`color=#fff`) is preserved. Newlines survive
+    as `;` separators (see `_shell_tokens`). Best-effort: on a tokenization failure (unbalanced
+    quotes) the raw command is returned unchanged."""
     try:
-        tokens = shlex.split(command, comments=True)
+        tokens = _shell_tokens(command)
     except ValueError:
         return command
     return " ".join(tokens)
 
 
-# A leading inline `VAR=value` env-assignment run at a command head (line start or right after a
-# `|`/`&`/`;` separator). A real shell applies it as environment to the following command, so it
-# is transparent to WHICH command runs — but it pushes `git` off the command head and defeats the
-# `GIT_COMMIT` anchor. Chief case: the documented inline hatch form
+# A leading inline `VAR=value` env-assignment run at a command head (line start, a NEWLINE, or
+# right after a `|`/`&`/`;` separator). A real shell applies it as environment to the following
+# command, so it is transparent to WHICH command runs — but it pushes `git` off the command head
+# and defeats the `GIT_COMMIT` anchor. Chief case: the documented inline hatch form
 # `RIG_HATCH_REQUEST_VISUAL_PROOF_GATE="why" git commit …`, which must still be detected as a
-# commit (else the gate silently allows it, never reaching the Telegram hatch). Stripped only for
-# detection. SYNC with skills_read_gate.py's `_strip_leading_inline_env`.
+# commit (else the gate silently allows it, never reaching the Telegram hatch). `\n` belongs in
+# the separator class for the same reason it belongs in `_shell_tokens`: this runs on the RAW
+# command, before tokenizing, so without it an inline hatch written on any line but the first
+# (`cd repo` / `RIG_HATCH_REQUEST_…="why" git commit`) is left in place and re-defeats the anchor
+# — the newline fix would otherwise stop one line short of the hatch form it exists to protect
+# (agent-tools#472). Stripped only for detection. SYNC with skills_read_gate.py's
+# `_strip_leading_inline_env`.
 _INLINE_ENV_PREFIX = re.compile(
-    r"(?P<sep>^|[|&;]\s*)"
+    r"(?P<sep>^|[|&;\r\n]\s*)"
     r"(?:[A-Za-z_]\w*=(?:\"[^\"]*\"|'[^']*'|[^\s|&;]+)[ \t]+)+"
 )
 
@@ -540,7 +656,7 @@ def effective_cwd(command: str, session_cwd: str) -> str:
     an interactive editor, which isn't a realistic agent-driven shell invocation (same
     tokenization-gluing family as #173; a `punctuation_chars` tokenizer would close this too)."""
     try:
-        tokens = shlex.split(command, comments=True)
+        tokens = _shell_tokens(command)
     except ValueError:
         return session_cwd
 
@@ -640,7 +756,7 @@ def is_skip_commit(command: str) -> bool:
     review-approved fix in skills_read_gate.py's `is_skip_commit` — keeps both hooks' skip-flag
     handling in step, per the SYNC comment above."""
     try:
-        tokens = shlex.split(command, comments=True)
+        tokens = _shell_tokens(command)
     except ValueError:
         return False
     commit_segments_flags = [

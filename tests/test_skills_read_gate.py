@@ -99,6 +99,104 @@ def test_block_build_missing_skills_on_repeat(tmp_path, monkeypatch):
     assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
+# ── #472: a NEWLINE is a command separator, exactly like `;` ───────────────────────────
+# `_strip_shell_comment` flattened the command to a space-joined token stream, erasing every
+# newline. Both `GIT_COMMIT` and `BUILD_OR_TEST` anchor to a command HEAD, so a commit or a
+# build/test written on any line but the first stopped being recognised as a work action at
+# all and this gate never fired — the same silent miss found in its twin, visual_proof_gate.py.
+
+@pytest.mark.parametrize("command", [
+    "cd /repo\ngit commit -m x",
+    "set -e\ngit commit -m x",
+    'echo "building"\nnpm run build',
+    "cd /repo\nnpm test",
+])
+def test_multiline_work_action_is_detected(tmp_path, monkeypatch, command):
+    """A work action on any line of a multi-line command must still trip the gate."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _run(command, monkeypatch, invoked=invoked, tier=tier)  # first → warn
+    out, _e, c = _run(command, monkeypatch, invoked=invoked, tier=tier)  # repeat → block
+    assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_multiline_prose_is_not_a_work_action(tmp_path, monkeypatch):
+    """Newlines becoming separators must not make PROSE match: `git` and `commit` on two lines
+    of one echoed string are two words, not an invocation."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _run('echo "remember to git\nthen commit"', monkeypatch, invoked=invoked, tier=tier)
+    out, _e, c = _run('echo "remember to git\nthen commit"', monkeypatch,
+                      invoked=invoked, tier=tier)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_multiline_skip_commit_still_exempt(tmp_path, monkeypatch):
+    """Rebase plumbing stays exempt when written across lines."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _run("cd /repo\ngit commit --continue", monkeypatch, invoked=invoked, tier=tier)
+    out, _e, c = _run("cd /repo\ngit commit --continue", monkeypatch,
+                      invoked=invoked, tier=tier)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_comment_only_line_does_not_swallow_the_next_command(tmp_path, monkeypatch):
+    """`#` runs to end-of-LINE. Comments must be stripped per line — collapsing newlines first
+    would let one comment swallow the commit below it, failing OPEN."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    cmd = "# stage everything first\ngit commit -m x"
+    _run(cmd, monkeypatch, invoked=invoked, tier=tier)
+    out, _e, c = _run(cmd, monkeypatch, invoked=invoked, tier=tier)
+    assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("command", [
+    "cat > Makefile <<'EOF'\ntest:\n\tnpm test\nEOF",
+    "cat > ship.sh <<EOF\ngit commit -m release\nEOF",
+])
+def test_heredoc_body_is_data_not_a_work_action(tmp_path, monkeypatch, command):
+    """A heredoc BODY is stdin data, never commands. Writing a Makefile or a release script by
+    heredoc must not be read as running `npm test` or committing — that would warn-then-BLOCK
+    an ordinary file-writing command."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    _run(command, monkeypatch, invoked=invoked, tier=tier)
+    out, _e, c = _run(command, monkeypatch, invoked=invoked, tier=tier)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_real_work_action_after_a_heredoc_is_still_detected(tmp_path, monkeypatch):
+    """Dropping the body must stop at the delimiter, or the exemption becomes a bypass."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    cmd = "cat > f <<'EOF'\nnothing\nEOF\ngit commit -m x"
+    _run(cmd, monkeypatch, invoked=invoked, tier=tier)
+    out, _e, c = _run(cmd, monkeypatch, invoked=invoked, tier=tier)
+    assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_lone_carriage_return_is_not_a_separator(tmp_path, monkeypatch):
+    """Only `\\r\\n` ends a line; a lone `\\r` is an ordinary character to a POSIX shell."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    cmd = "echo x\rgit commit -m y"
+    _run(cmd, monkeypatch, invoked=invoked, tier=tier)
+    out, _e, c = _run(cmd, monkeypatch, invoked=invoked, tier=tier)
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_crlf_and_continuation_shapes(tmp_path, monkeypatch):
+    """CRLF line endings separate; a backslash-newline continuation does not."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    for cmd in ("cd /repo\r\ngit commit -m x", "git \\\n  commit -m x"):
+        _run(cmd, monkeypatch, invoked=invoked, tier=tier)
+        out, _e, c = _run(cmd, monkeypatch, invoked=invoked, tier=tier)
+        assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block", cmd
+
+
+def test_multiline_inline_hatch_on_a_later_line_is_still_a_commit(tmp_path, monkeypatch):
+    """The inline hatch form written below the first line must still be recognised as a
+    commit, or the newline fix stops one line short of the form it exists to protect."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    cmd = 'cd /repo\nRIG_HATCH_REQUEST_SKILLS_READ_GATE="why" git commit -m x'
+    assert srg.GIT_COMMIT.search(srg._strip_shell_comment(srg._strip_leading_inline_env(cmd)))
+
+
 # ── ALLOW (non-work command) ───────────────────────────────────────────────────────────
 
 def test_allow_non_work_command(tmp_path, monkeypatch):
