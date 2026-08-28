@@ -208,9 +208,10 @@ def test_notify_includes_commit_when_merge_commit_present(repo_with_pr_worktree,
 
 
 def test_notify_falls_back_to_pr_title_when_branch_has_no_code(repo_with_pr_worktree, tmp_path):
-    """The gap the review-quorum gate has (branch/body only, never title) must NOT be
-    inherited here: a generic branch name with the ticket code only in the PR title must
-    still be found."""
+    """A generic branch name with the ticket code only in the PR title must still be found
+    here. (Historical note: the review-quorum gate used to have this exact gap — branch/body
+    only, never title — until agent-tools#451 fixed it to match this notify step's own
+    pre-existing title-checking behavior.)"""
     main, _wt = repo_with_pr_worktree
     bindir = _bindir(tmp_path, with_task=True)
 
