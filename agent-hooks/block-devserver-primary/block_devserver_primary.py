@@ -248,20 +248,51 @@ def worktree_only_enabled(cwd: str) -> bool:
 
 
 # ── bash chain + `cd` tracking ────────────────────────────────────────────────────────────────
-# SYNC: chain-split copied from pin-primary-worktree._split_chain (itself copied from
-# orchestrator-stays-thin._split_chain) — same quote-aware algorithm.
+# NOTE: originally a byte-identical SYNC copy of pin-primary-worktree._split_chain (itself
+# copied from orchestrator-stays-thin._split_chain). It has since DIVERGED — this copy now also
+# returns each segment's preceding operator (needed for conditional-`cd` tracking, see `main()`)
+# and honors backslash-escaped double quotes (Codex review, PR agent-tools#469) — neither fix
+# has been backported to the siblings. No test enforces byte-identity across the three copies.
 
-def _split_chain(command: str) -> list[str]:
-    """Split on shell operators (&&, ||, ;, |, newline, a bare control &) that lie OUTSIDE quotes."""
-    segs: list[str] = []
+def _split_chain(command: str) -> list[tuple[str | None, str]]:
+    """Split on shell operators (&&, ||, ;, |, newline, a bare control &) that lie OUTSIDE quotes.
+
+    Returns ``(preceding_operator, segment_text)`` pairs — the operator that separates this
+    segment from the one before it (``None`` for the very first segment). `main()` needs this to
+    tell an UNCONDITIONALLY-reached `cd` (the first segment, or one following `;`/newline/`&`/
+    `|`, which always runs regardless of any prior command's exit code) from a CONDITIONALLY-
+    reached one (following `&&`/`||`, whose execution depends on an exit code this hook has no
+    way to evaluate) — see `main()`'s docstring note for why only the former may be trusted.
+
+    A double-quoted region honors a backslash-escaped quote (``\\"``) as a literal character, not
+    the end of the string — an odd number of trailing backslashes immediately before a `"` escapes
+    it (Codex review, PR agent-tools#469). Without this, ``printf '%s' "a\\"b" && npm run dev``
+    closes the quoted region one character early ('a\\"' reads as a complete, escaped-quote-naive
+    string), leaving the trailing ``b" && npm run dev`` parsed as UNQUOTED text — the `&&` inside
+    it is then treated as a real chain-operator split point mid-string, silently misplacing where
+    the `npm run dev` member actually starts. Single quotes need no such handling — POSIX single
+    quotes are fully literal, backslash has no special meaning inside them, so the existing
+    generic "close on matching quote char" branch is already correct for them."""
+    segs: list[tuple[str | None, str]] = []
     buf: list[str] = []
     quote: str | None = None
+    pending_op: str | None = None
     i, n = 0, len(command)
     while i < n:
         c = command[i]
         prev = command[i - 1] if i > 0 else ""
         nxt = command[i + 1] if i + 1 < n else ""
-        if quote is not None:
+        if quote == '"' and c == '"':
+            bs = 0
+            j = len(buf) - 1
+            while j >= 0 and buf[j] == "\\":
+                bs += 1
+                j -= 1
+            buf.append(c)
+            i += 1
+            if bs % 2 == 0:  # not escaped — an even (incl. zero) run of backslashes
+                quote = None
+        elif quote is not None:
             buf.append(c)
             if c == quote:
                 quote = None
@@ -271,23 +302,32 @@ def _split_chain(command: str) -> list[str]:
             buf.append(c)
             i += 1
         elif command[i:i + 2] in ("&&", "||"):
-            segs.append("".join(buf))
+            segs.append((pending_op, "".join(buf)))
+            pending_op = command[i:i + 2]
             buf = []
             i += 2
         elif c == "&" and prev not in ("&", ">") and nxt not in ("&", ">"):
-            segs.append("".join(buf))
+            segs.append((pending_op, "".join(buf)))
+            pending_op = "&"
             buf = []
             i += 1
         elif c in (";", "|", "\n"):
-            segs.append("".join(buf))
+            segs.append((pending_op, "".join(buf)))
+            pending_op = c
             buf = []
             i += 1
         else:
             buf.append(c)
             i += 1
-    segs.append("".join(buf))
-    return [s for s in segs if s.strip()]
+    segs.append((pending_op, "".join(buf)))
+    return [(op, s) for op, s in segs if s.strip()]
 
+
+# A segment preceded by one of these operators only runs if the PRECEDING segment's exit code
+# meets a condition (`&&` = succeeded, `||` = failed) that this hook has no shell to evaluate —
+# see the `cd`-conditional-tracking note in `main()`. Every other preceding separator (`;`,
+# newline, background `&`, `|`, or no separator at all — the first segment) runs unconditionally.
+_CONDITIONAL_OPS = frozenset({"&&", "||"})
 
 _ASSIGN_RE = re.compile(r"^\w+=")
 
@@ -529,7 +569,13 @@ def _classify_pm_segment(head: str, rest: list[str]) -> tuple[str, str | None] |
     rest, cwd_override = _peel_dir_flag(rest)
     if rest[:1] == ["run"]:
         script_toks = rest[1:]
-        if script_toks[:1] and script_toks[0] in _RUN_FLAGS:  # `run --if-present <script>`
+        # Consume EVERY leading `_RUN_FLAGS` token, not just one (Codex review, PR
+        # agent-tools#469): `npm run --silent --if-present dev` stopping after `--silent` reads
+        # `--if-present` as the script-name position and misses `dev` entirely — a real
+        # under-block (the launch is allowed on the protected default branch), not the safe
+        # over-block direction, since combining two valid, independently-documented `npm run`
+        # flags is ordinary usage, not an edge case.
+        while script_toks[:1] and script_toks[0] in _RUN_FLAGS:
             script_toks = script_toks[1:]
         if script_toks and _is_dev_script(script_toks[0]):
             return f"{head} run {script_toks[0]}", cwd_override
@@ -540,6 +586,13 @@ def _classify_pm_segment(head: str, rest: list[str]) -> tuple[str, str | None] |
         sub = exec_toks[1] if len(exec_toks) > 1 else None
         if tool in _RUNNER_TOOLS and _is_runner_devserver(tool, sub):
             return f"{head} {rest[0]} {tool}" + (f" {sub}" if sub else ""), cwd_override
+        # Agree with `_classify_npx_segment`, which covers webpack too (Codex review, PR
+        # agent-tools#469): `npm exec -- webpack serve` / `pnpm dlx webpack-dev-server` start
+        # the exact same watcher `npx webpack serve` and the direct `webpack serve` form already
+        # block — omitting them here let the package-manager `exec`/`dlx` spelling evade the
+        # gate on a protected default branch while the `npx` spelling of the same command caught it.
+        if tool in _WEBPACK_TOOLS and _is_webpack_devserver(tool, exec_toks[1:]):
+            return f"{head} {rest[0]} {_webpack_label(tool)}", cwd_override
         return None
     if rest[:1] and _is_dev_script(rest[0]):
         return f"{head} {rest[0]}", cwd_override
@@ -737,13 +790,27 @@ def main() -> int:
 
     effective_cwd = cwd
     gate_cache: dict[str, str | None] = {}
-    for segment in _split_chain(_normalize_line_continuations(command)):
+    for op, segment in _split_chain(_normalize_line_continuations(command)):
         try:
             toks = _strip_leading_assignments(shlex.split(segment))
         except ValueError:
             toks = []
 
         if toks and toks[0] == "cd":
+            if op in _CONDITIONAL_OPS:
+                # Regression (Codex review, PR agent-tools#469): `false && cd /feature;
+                # npm run dev` from a protected checkout. `;` puts `npm run dev` OUTSIDE the
+                # `&&` group — it always runs, regardless of whether `false` (or `cd`) actually
+                # succeeded. Unconditionally trusting this `cd` (as an earlier version of this
+                # function did) moves `effective_cwd` to `/feature` whenever it's REACHED in the
+                # token stream, whether or not it was REACHED in a real shell — so the
+                # unconditional `npm run dev` gets judged against `/feature` (ALLOW) instead of
+                # the real, still-protected checkout the command actually launches in (should
+                # BLOCK). This hook has no shell to evaluate `&&`'s left-hand exit code, so the
+                # only safe assumption for a `cd` gated behind `&&`/`||` is "did not happen" —
+                # `effective_cwd` is left untouched, same treatment as an unresolvable target
+                # (see `_resolve_cd_target`'s own docstring for why that's the safe direction).
+                continue
             cd_target = _resolve_cd_target(toks, effective_cwd)
             if cd_target is not None:
                 effective_cwd = cd_target

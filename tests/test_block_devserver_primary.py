@@ -675,6 +675,91 @@ def test_empty_command_allows(tmp_path, monkeypatch):
     assert code == 0 and _decision(out) == "allow"
 
 
+# ── Codex review round (PR agent-tools#469): conditional-`cd` + parser hardening ───────────
+
+def test_conditional_cd_via_and_and_not_trusted(tmp_path, monkeypatch):
+    """Regression (Codex P1): `false && cd /feature; npm run dev` from a protected default-branch
+    checkout. The `;` puts `npm run dev` OUTSIDE the `&&` group — in a REAL shell it always runs,
+    regardless of whether `false` (and therefore `cd`) actually executed, and since `false`
+    always fails, `cd` never runs there — the dev server launches in the STILL-PROTECTED original
+    checkout. A version that unconditionally trusts a reached `cd` (an earlier version of this
+    hook did) moves `effective_cwd` to `/feature` anyway, and wrongly ALLOWS. Must BLOCK."""
+    shared = _make_repo(tmp_path, branch="main")
+    feat = tmp_path / "feat-worktree"
+    feat.mkdir()
+    command = f"false && cd {feat}; npm run dev"
+    out, code = _run(shared, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_conditional_cd_via_or_not_trusted(tmp_path, monkeypatch):
+    """Same failure mode, mirrored through `||`: `true || cd /feature; npm run dev`. `||`'s
+    right-hand side runs ONLY when the left-hand side FAILS — `true` always succeeds, so `cd`
+    never runs, and `npm run dev` (unconditional via `;`) launches in the original, still-
+    protected checkout. Must BLOCK, not fall through to the untouched `/feature` reading."""
+    shared = _make_repo(tmp_path, branch="main")
+    feat = tmp_path / "feat-worktree"
+    feat.mkdir()
+    command = f"true || cd {feat}; npm run dev"
+    out, code = _run(shared, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_unconditional_cd_as_first_segment_still_trusted(tmp_path, monkeypatch):
+    """The conditional-`cd` fix must not regress the ordinary, already-covered case: a `cd` that
+    IS the first segment of the whole command has no preceding operator at all (unconditionally
+    reached, whatever operator follows it) — still trusted normally."""
+    shared = _make_repo(tmp_path, branch="main")
+    feat = tmp_path / "feat-worktree"
+    feat.mkdir()
+    _git(feat, "init", "-b", "feat/x")
+    _git(feat, "config", "user.email", "t@t.t")
+    _git(feat, "config", "user.name", "t")
+    (feat / "seed.txt").write_text("x")
+    _git(feat, "add", "-A")
+    _git(feat, "commit", "-m", "seed")
+    command = f"cd {feat} && npm run dev"
+    out, code = _run(shared, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == 0 and _decision(out) == "allow"
+
+
+def test_escaped_quote_inside_double_quotes_doesnt_split_chain(tmp_path, monkeypatch):
+    """Regression (Codex P2): `printf '%s' "a\\"b" && npm run dev` — the backslash-escaped `"`
+    inside the double-quoted region must NOT be read as the end of the string. A quote-scanner
+    naive about escaping closes the string one character early, leaving `&&` inside the
+    remaining unquoted tail treated as a real chain-operator split — which can hide the
+    `npm run dev` member of the chain from classification entirely. Must still BLOCK."""
+    repo = _make_repo(tmp_path, branch="main")
+    command = 'printf \'%s\' "a\\"b" && npm run dev'
+    out, code = _run(repo, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_pm_run_consumes_multiple_leading_run_flags(tmp_path, monkeypatch):
+    """Regression (Codex P2): `npm run --silent --if-present dev` — TWO valid `_RUN_FLAGS`
+    stacked before the script name. Stopping after the first (`--silent`) reads `--if-present` as
+    the script-name position and misses `dev` entirely — an under-block. Must BLOCK."""
+    repo = _make_repo(tmp_path, branch="main")
+    command = "npm run --silent --if-present dev"
+    out, code = _run(repo, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("command", [
+    "npm exec -- webpack serve",
+    "pnpm dlx webpack-dev-server",
+    "npm exec webpack serve",
+])
+def test_pm_exec_dlx_classifies_webpack_like_npx(tmp_path, monkeypatch, command):
+    """Regression (Codex P2): the package-manager `exec`/`dlx` form of launching a tool (already
+    covered for `_RUNNER_TOOLS`, i.e. `npm exec vite`) must agree with `npx`/`bunx`, which
+    already recognizes webpack too. Before this fix, `npx webpack serve` blocked but the
+    equivalent `npm exec -- webpack serve` did not — same watcher, inconsistent coverage."""
+    repo = _make_repo(tmp_path, branch="main")
+    out, code = _run(repo, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block", command
+
+
 # ── unit: segment classification ────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("segment,expected_matched", [

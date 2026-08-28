@@ -95,8 +95,8 @@ need requests a one-time Telegram approval with a written justification in
   `vite` entirely, and allows the command. Same for `npx -p webpack webpack serve`. A full argv
   parser for every possible `npx` flag was judged not worth the complexity for a discipline
   gate; the direct-binary and `npm run <script>` forms are unaffected.
-- **Heredoc bodies are not exempted from chain-splitting.** `_split_chain` (inherited from
-  `pin-primary-worktree`) has no heredoc awareness, so a line inside a `cat > file <<'EOF' ...
+- **Heredoc bodies are not exempted from chain-splitting.** `_split_chain` has no heredoc
+  awareness, so a line inside a `cat > file <<'EOF' ...
   EOF` body that happens to read `npm run dev` (e.g. documentation being written into a
   README/script) is split out as its own segment and classified like a real launch — a false
   BLOCK on an enrolled default-branch repo. `pin-primary-worktree` shares the same limitation
@@ -121,15 +121,17 @@ need requests a one-time Telegram approval with a written justification in
   inner script, `env`'s own `VAR=val` args vs. its target command) and deserves review on its
   own rather than inflating this PR further; the RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY
   escape hatch and simply not doing this in a shared checkout remain the mitigations until then.
-- **`_split_chain` doesn't track which operator (`&&`/`;`/`||`) precedes a `cd` segment, so a
-  `cd <shared> || npm run dev` is judged as if the `cd` succeeded.** In a real shell, `||`'s
-  right-hand side runs ONLY when the left-hand side FAILED — so `cd <shared> || npm run dev`
-  from a feature worktree only ever runs `npm run dev` in the ORIGINAL feature worktree (the cd
-  never took effect). This hook still applies `<shared>` as the tracked `effective_cwd` for the
-  following segment regardless of operator, which can produce a false BLOCK on a launch that
-  would never actually happen in the protected checkout. Over-blocking, not under-blocking — the
-  safe direction — so left as a known limitation rather than adding operator-aware tracking to
-  `_split_chain` (which is SYNC'd with `pin-primary-worktree` and shouldn't diverge lightly).
+- ~~`_split_chain` doesn't track which operator precedes a `cd` segment~~ — **fixed** (Codex
+  review, PR agent-tools#469). `_split_chain` now returns each segment's preceding operator, and
+  a `cd` reached via `&&`/`||` (whose actual execution depends on an exit code this hook cannot
+  evaluate) is treated as "did not happen" — `effective_cwd` is left untouched, same as an
+  unresolvable target. Only a `cd` that is the first segment of the command, or that follows an
+  UNCONDITIONAL separator (`;`, newline, background `&`, `|`), is trusted. This closed a real
+  bypass, not just a false-block nuisance: `false && cd /feature; npm run dev` from a protected
+  checkout previously judged the (unconditional, `;`-separated) `npm run dev` against `/feature`
+  and wrongly ALLOWED it, when in a real shell `cd` never runs (`false` fails the `&&`) and the
+  server actually launches in the still-protected checkout. `_split_chain` is no longer a
+  byte-identical copy of `pin-primary-worktree`'s — see that function's own module comment.
 - **A subshell — `(npm run dev)`, `$(cd /shared && npm run dev)` — is missed ENTIRELY, not just
   "not re-tracked".** The opening `(` glues to the head token (`(npm`) and the closing `)` glues
   to the last token (`dev)`), so neither `_resolve_cd_target` nor `_classify_devserver_segment`
