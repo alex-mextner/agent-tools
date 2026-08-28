@@ -93,9 +93,9 @@ These are the *logical* points; map them to your harness's actual tool-use event
 > **Claude Code:** CC does NOT run these descriptors directly — it only runs hooks declared
 > in `settings.json`. The `lib/cc_hook_bridge` dispatcher is the carrier that makes them
 > fire: rig wires it into `settings.json` (PreToolUse for `pre-bash`/`pre-write`/`pre-agent`/
-> `pre-skill`, PostToolUse for `post-write`, Stop for `stop`) and translates the exit-10
-> BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`. Without that bridge
-> these hooks are inert in CC (agent-tools#18).
+> `pre-skill`/`pre-worktree-enter`, PostToolUse for `post-write`, Stop for `stop`) and
+> translates the exit-10 BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`.
+> Without that bridge these hooks are inert in CC (agent-tools#18).
 
 > **Codex:** Codex also needs a carrier bridge. `lib/codex_hook_bridge` is the first
 > dispatcher for the confirmed Codex hooks contract: TOML hooks call it for `PreToolUse`
