@@ -28,16 +28,70 @@ Use a small state file instead, and make generating it idempotent so the
 exact same command is correct whether it's your first call or your fifth:
 
 ```bash
-f="$(git rev-parse --absolute-git-dir 2>/dev/null || echo "${TMPDIR:-/tmp}")/agent-browser-session.<your-task-label>"
-[ -s "$f" ] || echo "<your-task-label>-$(date +%s)-$RANDOM-$$" > "$f"
-export AGENT_BROWSER_SESSION="$(cat "$f")"
+raw='<your-task-label>'
+label="$(printf '%s' "$raw" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')_$(printf '%s' "$raw" | cksum | cut -d' ' -f1)"
+d="$(git rev-parse --absolute-git-dir 2>/dev/null)" || { d="${TMPDIR:-/tmp}/agent-browser-$(id -u)"; mkdir -m 700 -p "$d" 2>/dev/null; }
+f="$d/agent-browser-session.$label"
+umask 077
+( set -C; echo "$label-$(date +%s)-$RANDOM-$$" > "$f" ) 2>/dev/null
+s=""; for _ in 1 2 3 4 5; do s="$(cat "$f" 2>/dev/null)"; [ -n "$s" ] && break; sleep 0.05; done
+if [ -z "$s" ] && [ -e "$f" ]; then
+  # Present but still empty after ~200ms of retrying means the writer that
+  # created it (via set -C) died before its echo landed — not a live sibling
+  # mid-write. Reclaim it once: a genuine live sibling's write would have
+  # shown up well within the retry window above.
+  rm -f "$f"
+  ( set -C; echo "$label-$(date +%s)-$RANDOM-$$" > "$f" ) 2>/dev/null
+  s="$(cat "$f" 2>/dev/null)"
+fi
+if [ -n "$s" ]; then
+  export AGENT_BROWSER_SESSION="$s"
+else
+  unset AGENT_BROWSER_SESSION
+  echo "agent-browser-concurrency: could not get a session name for label '$label' ($f) — most likely the sanitized label plus checksum is too long for this filesystem, so the create itself never produced a file to recover; shorten the raw label. Not exporting a session var — behavior without one is unverified here, don't assume it's a safe default." >&2
+fi
 ```
+
+Three things in this snippet exist only to survive concurrent siblings, not
+for style — don't simplify them away:
+
+- **The checksum suffix.** Plain `tr` sanitizing is many-to-one — `review/quorum`,
+  `review:quorum`, and `review quorum` all collapse to the same
+  `review_quorum`, silently merging two actors the labeling rule says must
+  stay distinct (this is exactly the multi-role-sharing-a-worktree case
+  described below, where the raw labels are likely to differ only in
+  punctuation). Appending a checksum of the *un-sanitized* label keeps two
+  such labels apart even after `tr` collapses their visible characters.
+- **`( set -C; echo ... > "$f" )`.** Without `set -C` (noclobber), the
+  original "does the file already have content?  no?  then write" is a
+  check-then-act race: two Bash tool calls for the same task, issued in
+  parallel, can both see no file and both write, and only one of their
+  generated names survives — the other's daemon is now orphaned under a name
+  nothing points at. `set -C` makes bash's own `>` redirect fail (silently,
+  via the discarded stderr) if the file already exists, so at most one
+  concurrent writer ever succeeds.
+- **The retry loop around `cat`.** `set -C` makes *creation* exclusive, but
+  the file exists (empty) for the instant between the winning `echo`'s open
+  and its write landing — a sibling's `cat` in that window reads `""`, not
+  the winner's name. Retrying a few times at a 50ms interval closes that
+  window in practice without needing a real lock; only export once `$s` is
+  actually non-empty, never the raw single-shot `cat` result.
 
 **`<your-task-label>` is required, not decoration — pick something that
 distinguishes this task from any sibling that might run concurrently**, and
 substitute it in both places above (a role name, a skill name, whatever you
 already have; it doesn't need to be globally unique, just distinct from any
-task that could genuinely run alongside yours). This is what makes the
+task that could genuinely run alongside yours). Always run it through the
+`tr` step shown, even if it looks safe already: a label with a `/` in it (a
+branch name, a path-like role such as `review/quorum`) makes the file write
+fail silently — a plain Bash tool call has no `set -e`, so execution
+continues past the failure and `AGENT_BROWSER_SESSION` ends up exported as
+an empty string instead of a real session name. Whether the CLI then falls
+back to `default` or fails some other way isn't verified here either way,
+but nothing about this failure prints an error you'd notice — the label
+silently didn't do its job. The `tr` step makes the
+label filesystem-safe unconditionally, so this can't happen regardless of
+where the label text came from. This is what makes the
 scheme safe when two tasks share a worktree — `--absolute-git-dir` already
 gives each worktree its own admin directory, so a fixed label is enough
 whenever your task has its own worktree (the standard pattern for concurrent
@@ -47,10 +101,24 @@ takes on real weight when several actors deliberately share one worktree
 actor's own role name serves directly as the label. The file itself lives
 inside the git directory, not your working tree, so it's never visible to
 `git add`, never needs a `.gitignore` entry, and can't be pre-committed by
-repo content to hijack your session name. Outside a git repo, it falls back
-to `$TMPDIR` (shared machine-wide, and without the git-dir placement's
-guarantee that pre-existing content can't be planted there — the label
-matters more there than in the common, in-repo case).
+repo content to hijack your session name. Outside a git repo (or if `git
+rev-parse` fails for any other reason — an ancient git, a broken repo, not
+just "no repo here"), it falls back to a per-uid directory under `$TMPDIR`,
+created `0700` (`mkdir -m 700`, plus `umask 077` before the file itself is
+created) so another local user can't read or enumerate it even if they guess
+the deterministic `agent-browser-$(id -u)` path. That closes the read/list
+side. It does **not** close the plant side: `mkdir -m 700 -p` on a directory
+that already exists (planted earlier, before this task ever ran, with
+different ownership) does not change that directory's existing permissions
+or owner — `mkdir` is a no-op on an existing path regardless of the mode you
+asked for. `set -C` still refuses to *overwrite* a planted file inside it
+rather than silently trusting it, but it can't tell a legitimate leftover
+from this task's own earlier attempt apart from a hostile plant by content
+alone. Verifying the directory's actual ownership before trusting it (`[ "$(stat -f%u
+"$d" 2>/dev/null || stat -c%u "$d")" = "$(id -u)" ]`, platform-specific
+`stat` flags) is the remaining one-line-ish check this pass didn't add;
+treat that specific gap as accepted for now on a single-operator machine,
+revisit if this skill is ever used somewhere that assumption doesn't hold.
 
 Run this one snippet at the start of **every** command you issue for this
 task — first call or later, doesn't matter, it produces the same session
@@ -69,21 +137,40 @@ needed:
 agent-browser open https://example.com
 ```
 
-**Close as your last action** when the task is done, with the same snippet
-first (so `AGENT_BROWSER_SESSION` is set even if this is a fresh call), then
-remove the state file so a later, unrelated task reusing this label doesn't
-inherit your session name:
+**Close as your last action** when the task is done. Unlike the open/use
+snippet, do **not** reuse the idempotent-create line here — if the state
+file is already gone (a sibling cleaned up, a previous `close` in this same
+task already ran, `$TMPDIR` got cleared), generating a brand-new name and
+"closing" it exits 0 having closed nothing, while any real daemon under the
+lost name keeps running unreclaimed until Rule 2's idle timeout — silently
+reporting success on a leak instead of surfacing that something needs
+attention:
 
 ```bash
-f="$(git rev-parse --absolute-git-dir 2>/dev/null || echo "${TMPDIR:-/tmp}")/agent-browser-session.<your-task-label>"
-[ -s "$f" ] || echo "<your-task-label>-$(date +%s)-$RANDOM-$$" > "$f"
-export AGENT_BROWSER_SESSION="$(cat "$f")"
-agent-browser close && rm -f "$f"
+raw='<your-task-label>'
+label="$(printf '%s' "$raw" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')_$(printf '%s' "$raw" | cksum | cut -d' ' -f1)"
+d="$(git rev-parse --absolute-git-dir 2>/dev/null)" || d="${TMPDIR:-/tmp}/agent-browser-$(id -u)"
+f="$d/agent-browser-session.$label"
+s="$(cat "$f" 2>/dev/null)"
+if [ -n "$s" ]; then
+  export AGENT_BROWSER_SESSION="$s"
+  agent-browser close && rm -f "$f"
+else
+  echo "agent-browser-concurrency: no session recorded for label '$label' — nothing to close (if a session for this task is genuinely still running, its name is already lost and this step can't reclaim it; Rule 2's idle timeout is the only remaining backstop)" >&2
+fi
 ```
 
-(`&&`, not two separate commands — if `close` fails, keep the file so the
-session name isn't lost for a retry; only delete it once `close` actually
-succeeded.)
+(`&&`, not two separate commands, inside the `if` — if `close` fails, keep
+the file so the session name isn't lost for a retry; only delete it once
+`close` actually succeeded. Read the file into `$s` once and branch on
+*that*, rather than testing `[ -s "$f" ]` and then `cat`-ing it as two
+separate steps — a sibling's `rm -f` landing between those two steps would
+otherwise make `cat` fail after the test already passed, exporting an empty
+`AGENT_BROWSER_SESSION` and sending `close` at the shared `default` session
+instead of doing nothing. The `if` turning "nothing recorded" into a
+reported, distinct case — instead of fabricating and discarding a fresh
+session in its place — is what's new here; the empty-vs-missing distinction
+above is what keeps that check itself race-free.)
 
 Don't use a shell `trap` for this — a trap set in one Bash tool call fires at
 the end of *that call*, not at the end of your task, and won't carry into a

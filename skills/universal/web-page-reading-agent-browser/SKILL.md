@@ -30,23 +30,49 @@ installed separately — `npm i -g agent-browser && agent-browser install` (or
 > happens to run alongside it in the same worktree:
 >
 > ```bash
-> f="$(git rev-parse --absolute-git-dir 2>/dev/null || echo "${TMPDIR:-/tmp}")/agent-browser-session.<your-task-label>"
-> [ -s "$f" ] || echo "<your-task-label>-$(date +%s)-$RANDOM-$$" > "$f"
-> export AGENT_BROWSER_SESSION="$(cat "$f")"
+> raw='<your-task-label>'
+> label="$(printf '%s' "$raw" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')_$(printf '%s' "$raw" | cksum | cut -d' ' -f1)"
+> d="$(git rev-parse --absolute-git-dir 2>/dev/null)" || { d="${TMPDIR:-/tmp}/agent-browser-$(id -u)"; mkdir -m 700 -p "$d" 2>/dev/null; }
+> f="$d/agent-browser-session.$label"
+> umask 077
+> ( set -C; echo "$label-$(date +%s)-$RANDOM-$$" > "$f" ) 2>/dev/null
+> s=""; for _ in 1 2 3 4 5; do s="$(cat "$f" 2>/dev/null)"; [ -n "$s" ] && break; sleep 0.05; done
+> if [ -z "$s" ] && [ -e "$f" ]; then
+>   rm -f "$f"; ( set -C; echo "$label-$(date +%s)-$RANDOM-$$" > "$f" ) 2>/dev/null
+>   s="$(cat "$f" 2>/dev/null)"
+> fi
+> if [ -n "$s" ]; then export AGENT_BROWSER_SESSION="$s"
+> else unset AGENT_BROWSER_SESSION; echo "no session name for label '$label' — not exporting a session var" >&2
+> fi
 > ```
+>
+> (None of this is decoration — `tr` alone can collapse two different labels
+> to the same filename (the checksum suffix fixes that), a plain
+> `[ -s "$f" ] || echo … > "$f"` is a check-then-act race between two
+> parallel Bash calls (`set -C` fixes that), and even with `set -C` a reader
+> can land in the instant between file creation and the write landing (the
+> retry loop closes that window). See `agent-browser-concurrency` Rule 1 for
+> the full reasoning on all three, plus the per-uid temp directory.)
 >
 > Every plain `agent-browser` command below then uses it automatically — no
 > per-command flag needed, including in the examples that follow, exactly as
-> written. **Close when you're done reading** with the same snippet first
-> (never a bare `agent-browser close` on its own — in a fresh call with
-> nothing exported yet, that hits the shared `default` session instead), then
-> remove the state file:
+> written. **Close when you're done reading** — unlike the setup snippet
+> above, don't regenerate the name if the file is already gone; that would
+> "close" a session that was never opened and hide the fact that nothing was
+> actually cleaned up:
 >
 > ```bash
-> f="$(git rev-parse --absolute-git-dir 2>/dev/null || echo "${TMPDIR:-/tmp}")/agent-browser-session.<your-task-label>"
-> [ -s "$f" ] || echo "<your-task-label>-$(date +%s)-$RANDOM-$$" > "$f"
-> export AGENT_BROWSER_SESSION="$(cat "$f")"
-> agent-browser close && rm -f "$f"
+> raw='<your-task-label>'
+> label="$(printf '%s' "$raw" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')_$(printf '%s' "$raw" | cksum | cut -d' ' -f1)"
+> d="$(git rev-parse --absolute-git-dir 2>/dev/null)" || d="${TMPDIR:-/tmp}/agent-browser-$(id -u)"
+> f="$d/agent-browser-session.$label"
+> s="$(cat "$f" 2>/dev/null)"
+> if [ -n "$s" ]; then
+>   export AGENT_BROWSER_SESSION="$s"
+>   agent-browser close && rm -f "$f"
+> else
+>   echo "no session recorded for label '$label' — nothing to close" >&2
+> fi
 > ```
 >
 > See `agent-browser-concurrency` for the full contract (why a file instead
