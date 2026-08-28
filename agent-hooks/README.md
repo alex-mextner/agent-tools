@@ -118,7 +118,7 @@ These are the *logical* points; map them to your harness's actual tool-use event
 | point          | fires when…                                  | hooks                                   |
 | -------------- | -------------------------------------------- | --------------------------------------- |
 | `pre-agent` **(live in Claude Code and opencode when rig provisions their bridges; NOT mapped in Codex yet)** | before a subagent dispatch (Agent/Task/opencode task tool) | background-subagent-gate                 |
-| `pre-bash`     | before a shell command runs                  | block-no-verify, block-raw-pr-merge, block-reset-hard, pkill-guard, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash, orchestrator-stays-thin, no-long-inline-process, subagent-no-bg-longproc, no-shell-file-edit, skills-read-gate, visual-proof-gate, decision-request-format |
+| `pre-bash`     | before a shell command runs                  | block-devserver-primary, block-no-verify, block-raw-pr-merge, block-reset-hard, pin-primary-worktree, pkill-guard, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash, orchestrator-stays-thin, no-long-inline-process, subagent-no-bg-longproc, no-shell-file-edit, skills-read-gate, visual-proof-gate, decision-request-format |
 | `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env, orchestrator-stays-thin, worktree-only-writes |
 | `pre-skill` **(live in Claude Code when rig provisions the bridge; NOT mapped in Codex/opencode yet)** | before a Skill-tool invocation | skills-marker-writer |
 | `post-write`   | after a file write/edit has landed on disk   | format-on-write, lint-on-write          |
