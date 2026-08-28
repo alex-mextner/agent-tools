@@ -891,8 +891,53 @@ def test_every_heredoc_on_a_command_is_tracked(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("command", [
+    ": $((1 << 2))\ngit commit -m bypass\n2",   # `$(( ))` arithmetic shift
+    "(( 1 << 2 ))\ngit commit -m bypass\n2",    # `(( ))` arithmetic command
+])
+def test_arithmetic_shift_is_not_a_heredoc(tmp_path, monkeypatch, command):
+    """`<<` inside an arithmetic expansion is a SHIFT operator. Reading it as a redirection is
+    not merely cosmetic: if the operand later appears alone on a line it CLOSES the false
+    heredoc, so everything in between is silently swallowed as body — a working bypass, not a
+    fail-closed misparse."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(command, repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("first_line", [": # ignored \\", ": # it's fine"])
+def test_comment_stops_syntax_interpretation(tmp_path, monkeypatch, first_line):
+    """A comment runs to end-of-line, so bash neither continues on a trailing backslash inside
+    one nor opens a quote from one. Interpreting comment text as syntax splices the next
+    line's real command onto this one, hiding it from the command-head anchors."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(f"{first_line}\ngit commit -m bypass", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_delimiter_word_is_assembled_from_adjacent_fragments(tmp_path, monkeypatch):
+    """Bash quote-removes `<<E'OF'` to the single word `EOF`, so the heredoc closes on line 2
+    and the commit runs. Reading only the first fragment (`E`) makes the parser hunt for the
+    wrong terminator and swallow the real one — and the commit — as body."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(": <<E'OF'\nEOF\ngit commit -m bypass\nE", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_empty_quoted_delimiter_is_a_real_heredoc(tmp_path, monkeypatch):
+    """`<<''` quote-removes to the empty string — a legal delimiter that terminates on a blank
+    line. An empty delimiter must stay distinguishable from "no delimiter found", or the body
+    is exposed as commands and an ordinary file-writing command gets blocked."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("cat <<''\ngit commit -m data\n", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("command", [
     "cat <<EOF\ngit commit -m x",          # delimiter never arrives
-    "x=$((a << b))\ngit commit -m x",      # an arithmetic shift, not a redirection
+    "cat <<NOPE\ngit commit -m x\nOTHER",  # only a non-matching line follows
 ])
 def test_unterminated_heredoc_fails_closed(tmp_path, monkeypatch, command):
     """A body that never meets its delimiter was never a body. Handing those lines back as

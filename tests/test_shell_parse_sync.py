@@ -30,7 +30,15 @@ _SOURCES = {
 }
 
 # The parser functions duplicated verbatim across both hooks.
-_SHARED_FUNCTIONS = ("_scan_line", "_split_unquoted_lines", "_shell_tokens")
+_SHARED_FUNCTIONS = (
+    "_blank_arithmetic",
+    "_read_delimiter",
+    "_heredoc_delimiters",
+    "_closes_heredoc",
+    "_scan_line",
+    "_split_unquoted_lines",
+    "_shell_tokens",
+)
 
 
 def _load(name: str, path: Path):

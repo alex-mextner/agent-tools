@@ -139,48 +139,75 @@ def warn(msg: str) -> None:
 
 # A heredoc OPERATOR (`<<`, `<<-`), but not a herestring (`<<<`) and not the tail of one.
 # Matched against the line's BARE projection (see `_scan_line`) so a `<<` inside a quoted
-# argument or a comment is not mistaken for a redirection.
+# argument, a comment, or an arithmetic expansion cannot be mistaken for a redirection.
 _HEREDOC_OP = re.compile(r"(?<!<)<<(?P<dash>-?)(?!<)")
-# The delimiter word right after the operator, read from the RAW line so `<<'EOF'` / `<< "EOF"`
-# still yield `EOF` (the bare projection has blanked the quoted characters).
-# A heredoc delimiter is any shell WORD, not just an identifier: `<<'EOF-1'`, `<<"end.txt"`
-# and `<<_v2` are all valid, and failing to recognise one exposes that heredoc's DATA lines to
-# the command-head anchors as if they were commands (a false block on a data-writing command).
-# Quoted forms take everything up to the closing quote; the unquoted form stops at whitespace
-# or a shell metacharacter, so it cannot swallow a following redirection or separator.
-_HEREDOC_DELIM = re.compile(
-    r"""[ \t]*(?:'(?P<sq>[^']*)'|"(?P<dq>[^"]*)"|(?P<bare>[^\s;&|<>()'"#]+))"""
-)
+# An arithmetic expansion/command — `$((a << b))`, `((a << b))`. Its `<<` is a SHIFT operator,
+# not a redirection. Blanked before operator detection: a false heredoc whose delimiter happens
+# to appear on a later line (`: $((1 << 2))` … a lone `2`) would close normally and silently
+# swallow every command in between, which is a bypass, not a cosmetic misparse.
+_ARITH_SPAN = re.compile(r"\$?\(\(.*?\)\)")
 
 
-def _strip_bare_comment(bare: str) -> str:
-    """Cut a line's bare projection at an unquoted `#` that starts a word — the point where the
-    shell stops reading syntax. Without this, `echo ok # <<EOF` reads as opening a heredoc."""
+def _blank_arithmetic(bare: str) -> str:
+    """Blank arithmetic spans in a bare projection, preserving length (and so offsets)."""
 
-    for index, ch in enumerate(bare):
-        if ch == "#" and (index == 0 or bare[index - 1].isspace()):
-            return bare[:index]
-    return bare
+    return _ARITH_SPAN.sub(lambda m: " " * len(m.group(0)), bare)
+
+
+def _read_delimiter(text: str, pos: int) -> str | None:
+    """The heredoc delimiter WORD starting at `pos`, with shell quote-removal applied, or None
+    if no word is there.
+
+    A delimiter is one shell word, which may be assembled from adjacent quoted and unquoted
+    fragments: bash reads `<<E'OF'` as `EOF`. Reading only the first fragment would leave the
+    parser hunting for the wrong terminator, so the REAL terminator and every command after it
+    get swallowed as body — a bypass. An empty quoted delimiter (`<<''`) is valid and legal:
+    it terminates on a blank line, so "" must be distinguishable from "no delimiter"."""
+
+    i = pos
+    while i < len(text) and text[i] in " \t":
+        i += 1
+    word: list[str] = []
+    seen = False
+    while i < len(text):
+        ch = text[i]
+        if ch in "\"'":
+            close = text.find(ch, i + 1)
+            if close == -1:
+                break  # unbalanced quote: stop at what we have
+            word.append(text[i + 1:close])
+            seen = True
+            i = close + 1
+            continue
+        if ch == "\\" and i + 1 < len(text):
+            word.append(text[i + 1])  # `\E` is just `E` after quote removal
+            seen = True
+            i += 2
+            continue
+        if ch.isspace() or ch in ";&|<>()#":
+            break  # a shell metacharacter ends the word
+        word.append(ch)
+        seen = True
+        i += 1
+    return "".join(word) if seen else None
 
 
 def _heredoc_delimiters(text: str, bare: str) -> list[tuple[str, bool]]:
     """Every heredoc opened on one command line, in shell order, as (delimiter, strips_tabs).
 
-    Operators are located in `bare` (unquoted, comment-free) but the delimiter WORD is read
-    from `text`, whose quotes are intact — the two are offset-aligned by construction.
-    Scanning the raw line instead would let `echo 'not a redirect <<EOF'` open a heredoc and
-    swallow every following command as body text, which is a self-service bypass, not a
-    parsing nicety. A command may open SEVERAL heredocs (`cat <<A <<B`); their bodies follow
-    in the order the operators appear, so all of them are queued."""
+    Operators are located in `bare` (quoted text, comments and arithmetic already blanked) but
+    the delimiter WORD is read from `text`, whose quotes are intact — the two are offset-aligned
+    by construction. Scanning the raw line instead would let `echo 'not a redirect <<EOF'` open
+    a heredoc and swallow every following command as body text, which is a self-service bypass,
+    not a parsing nicety. A command may open SEVERAL heredocs (`cat <<A <<B`); their bodies
+    follow in the order the operators appear, so all of them are queued."""
 
-    code = _strip_bare_comment(bare)
+    code = _blank_arithmetic(bare)
     found: list[tuple[str, bool]] = []
     for op in _HEREDOC_OP.finditer(code):
-        delim = _HEREDOC_DELIM.match(text, op.end())
-        if delim:
-            word = delim.group("sq") or delim.group("dq") or delim.group("bare")
-            if word:
-                found.append((word, bool(op.group("dash"))))
+        word = _read_delimiter(text, op.end())
+        if word is not None:
+            found.append((word, bool(op.group("dash"))))
     return found
 
 
@@ -195,17 +222,26 @@ def _closes_heredoc(line: str, delim: str, strips_tabs: bool) -> bool:
 def _scan_line(line: str, quote: str | None) -> tuple[str, str, str | None, bool]:
     """Walk one physical line, tracking quote state.
 
-    Returns the line's text; its BARE projection (the same length, with every quoted or
-    backslash-escaped character blanked to a space, so what remains is only what the shell
-    reads as syntax); the quote state left open at end-of-line; and whether the line ended in
-    an unescaped backslash (a line continuation). A backslash escapes the next character
-    everywhere except inside single quotes, where the shell treats it literally."""
+    Returns the line's text; its BARE projection (the same length, with every quoted, escaped
+    or commented character blanked to a space, so what remains is only what the shell reads as
+    syntax); the quote state left open at end-of-line; and whether the line ended in an
+    unescaped backslash (a line continuation).
+
+    A backslash escapes the next character everywhere except inside single quotes. An unquoted
+    `#` starting a word begins a COMMENT, and scanning must stop dead there: a comment runs to
+    end-of-line, so bash neither continues on a trailing backslash inside one nor opens a quote
+    from one. Continuing to interpret it lets `: # ignored \\` splice the next line's real
+    command onto this one, hiding it from the command-head anchors."""
 
     out: list[str] = []
     bare: list[str] = []
     i = 0
     while i < len(line):
         ch = line[i]
+        if quote is None and ch == "#" and (i == 0 or line[i - 1].isspace()):
+            out.append(line[i:])
+            bare.append(" " * (len(line) - i))
+            return "".join(out), "".join(bare), quote, False
         if quote != "'" and ch == "\\":
             if i + 1 == len(line):
                 return "".join(out), "".join(bare), quote, True  # trailing `\` = continuation
@@ -243,10 +279,9 @@ def _split_unquoted_lines(command: str) -> list[str]:
     make `cat > ship.sh <<'EOF' / git commit -m x / EOF` look like a commit and hard-BLOCK a
     command that only writes a file.
 
-    An UNTERMINATED heredoc gives its lines back as commands rather than dropping them. That
-    keeps the one remaining way to misread an operator — an arithmetic shift such as
-    `$((a << b))`, which this does not distinguish from a redirection — failing CLOSED: a
-    body that never meets its delimiter was never a body.
+    An UNTERMINATED heredoc gives its lines back as commands rather than dropping them, so a
+    misread operator still fails CLOSED: a body that never meets its delimiter was never a
+    body.
 
     KNOWN GAP (pre-existing, not introduced by this parser): a body actually EXECUTED by a
     shell — `bash <<'EOF' / git commit -m x / EOF` — is dropped like any other, so a commit
