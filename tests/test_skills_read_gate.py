@@ -171,6 +171,30 @@ def test_real_work_action_after_a_heredoc_is_still_detected(tmp_path, monkeypatc
     assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
+@pytest.mark.parametrize("first_line", [
+    "echo 'not a redirect <<EOF'",
+    'echo "not a redirect <<EOF"',
+    "echo ok # <<EOF",
+])
+def test_heredoc_operator_only_counts_as_shell_syntax(tmp_path, monkeypatch, first_line):
+    """A `<<` inside a quoted argument or a comment opens NOTHING — matching it would swallow
+    every following command as body text, a self-service bypass."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    cmd = f"{first_line}\ngit commit -m x"
+    _run(cmd, monkeypatch, invoked=invoked, tier=tier)
+    out, _e, c = _run(cmd, monkeypatch, invoked=invoked, tier=tier)
+    assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_unterminated_heredoc_fails_closed(tmp_path, monkeypatch):
+    """A body that never meets its delimiter was never a body; its lines are commands."""
+    invoked, tier = tmp_path / "inv", tmp_path / "tier"
+    cmd = "cat <<EOF\ngit commit -m x"
+    _run(cmd, monkeypatch, invoked=invoked, tier=tier)
+    out, _e, c = _run(cmd, monkeypatch, invoked=invoked, tier=tier)
+    assert c == srg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
 def test_lone_carriage_return_is_not_a_separator(tmp_path, monkeypatch):
     """Only `\\r\\n` ends a line; a lone `\\r` is an ordinary character to a POSIX shell."""
     invoked, tier = tmp_path / "inv", tmp_path / "tier"

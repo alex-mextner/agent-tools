@@ -831,6 +831,66 @@ def test_herestring_is_not_a_heredoc(tmp_path, monkeypatch):
     assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
+@pytest.mark.parametrize("first_line", [
+    "echo 'not a redirect <<EOF'",
+    'echo "not a redirect <<EOF"',
+    "echo ok # <<EOF",
+])
+def test_heredoc_operator_only_counts_as_shell_syntax(tmp_path, monkeypatch, first_line):
+    """A `<<` inside a quoted argument or a comment opens NOTHING. Matching it would let the
+    parser swallow every following command as heredoc body — a self-service bypass: write
+    `echo '<<EOF'` on line 1 and the commit below it disappears from the gate entirely."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(f"{first_line}\ngit commit -m x", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_heredoc_terminator_must_match_exactly(tmp_path, monkeypatch):
+    """A plain `<<EOF` ends only on a line holding EXACTLY `EOF`. A space-indented `  EOF` is
+    still body, so the commit under it is data the shell never runs — ending the body early
+    would gate a commit that does not exist."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("cat <<EOF\n  EOF\ngit commit -m x\nEOF", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_dash_heredoc_terminator_strips_tabs_only(tmp_path, monkeypatch):
+    """`<<-` tolerates leading TABS on its terminator (never spaces), so a tab-indented `EOF`
+    really does close the body and the commit after it is a real command."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("cat <<-EOF\n\tEOF\ngit commit -m x", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_every_heredoc_on_a_command_is_tracked(tmp_path, monkeypatch):
+    """One command may open several heredocs; their bodies follow in order. Tracking only the
+    first would end body-skipping at `A` and read the SECOND body as commands."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("cat <<A <<B\nfirst\nA\ngit commit -m x\nB", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+    # ...and a commit after BOTH bodies close is a real command again
+    out2, _e2, c2 = _run("cat <<A <<B\nfirst\nA\nsecond\nB\ngit commit -m x", repo, monkeypatch,
+                         proof_dir=tmp_path / "proof")
+    assert c2 == vpg.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+@pytest.mark.parametrize("command", [
+    "cat <<EOF\ngit commit -m x",          # delimiter never arrives
+    "x=$((a << b))\ngit commit -m x",      # an arithmetic shift, not a redirection
+])
+def test_unterminated_heredoc_fails_closed(tmp_path, monkeypatch, command):
+    """A body that never meets its delimiter was never a body. Handing those lines back as
+    commands keeps the one remaining way to misread `<<` — an arithmetic shift — failing
+    CLOSED rather than silently dropping a real commit."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(command, repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
 def test_lone_carriage_return_is_not_a_separator(tmp_path, monkeypatch):
     """Only `\\r\\n` ends a line. A POSIX shell treats a LONE `\\r` as an ordinary character, so
     splitting on it would invent a command head inside a single `echo`."""

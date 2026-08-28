@@ -228,37 +228,91 @@ def _mandatory_skills(*, subagent: bool = False) -> list[str]:
 # SYNC: `_split_unquoted_lines` / `_shell_tokens` are mirrored verbatim in
 # visual-proof-gate/visual_proof_gate.py — same "each hook is a self-contained standalone script,
 # no shared import path" convention as the commit-segment parser below. Edit both copies together.
-# A heredoc redirection (`<<EOF`, `<<-'EOF'`, `<< "EOF"`), but NOT a herestring (`<<<`). The
-# BODY that follows is DATA fed to a command's stdin, never a sequence of commands, so
-# `_split_unquoted_lines` must not offer its lines to the command-head anchors.
-_HEREDOC_START = re.compile(r"""(?<!<)<<-?(?!<)[ \t]*(?P<q>['"]?)(?P<delim>[A-Za-z_]\w*)(?P=q)""")
+# A heredoc OPERATOR (`<<`, `<<-`), but not a herestring (`<<<`) and not the tail of one.
+# Matched against the line's BARE projection (see `_scan_line`) so a `<<` inside a quoted
+# argument or a comment is not mistaken for a redirection.
+_HEREDOC_OP = re.compile(r"(?<!<)<<(?P<dash>-?)(?!<)")
+# The delimiter word right after the operator, read from the RAW line so `<<'EOF'` / `<< "EOF"`
+# still yield `EOF` (the bare projection has blanked the quoted characters).
+_HEREDOC_DELIM = re.compile(r"""[ \t]*(?P<q>['"]?)(?P<delim>[A-Za-z_]\w*)(?P=q)""")
 
 
-def _scan_line(line: str, quote: str | None) -> tuple[str, str | None, bool]:
-    """Walk one physical line, tracking quote state. Returns its text, the quote state left
-    open at end-of-line, and whether the line ended in an unescaped backslash (a continuation).
+def _strip_bare_comment(bare: str) -> str:
+    """Cut a line's bare projection at an unquoted `#` that starts a word — the point where the
+    shell stops reading syntax. Without this, `echo ok # <<EOF` reads as opening a heredoc."""
 
-    A backslash escapes the next character everywhere except inside single quotes, where the
-    shell treats it literally."""
+    for index, ch in enumerate(bare):
+        if ch == "#" and (index == 0 or bare[index - 1].isspace()):
+            return bare[:index]
+    return bare
+
+
+def _heredoc_delimiters(text: str, bare: str) -> list[tuple[str, bool]]:
+    """Every heredoc opened on one command line, in shell order, as (delimiter, strips_tabs).
+
+    Operators are located in `bare` (unquoted, comment-free) but the delimiter WORD is read
+    from `text`, whose quotes are intact — the two are offset-aligned by construction.
+    Scanning the raw line instead would let `echo 'not a redirect <<EOF'` open a heredoc and
+    swallow every following command as body text, which is a self-service bypass, not a
+    parsing nicety. A command may open SEVERAL heredocs (`cat <<A <<B`); their bodies follow
+    in the order the operators appear, so all of them are queued."""
+
+    code = _strip_bare_comment(bare)
+    found: list[tuple[str, bool]] = []
+    for op in _HEREDOC_OP.finditer(code):
+        delim = _HEREDOC_DELIM.match(text, op.end())
+        if delim:
+            found.append((delim.group("delim"), bool(op.group("dash"))))
+    return found
+
+
+def _closes_heredoc(line: str, delim: str, strips_tabs: bool) -> bool:
+    """A heredoc ends on a line holding EXACTLY its delimiter. Only the `<<-` form tolerates
+    leading TABS (never spaces), so `  EOF` does not end a plain `<<EOF` — treating it as the
+    end would hand the shell's body text to the command-head anchors as if it were code."""
+
+    return (line.lstrip("\t") if strips_tabs else line) == delim
+
+
+def _scan_line(line: str, quote: str | None) -> tuple[str, str, str | None, bool]:
+    """Walk one physical line, tracking quote state.
+
+    Returns the line's text; its BARE projection (the same length, with every quoted or
+    backslash-escaped character blanked to a space, so what remains is only what the shell
+    reads as syntax); the quote state left open at end-of-line; and whether the line ended in
+    an unescaped backslash (a line continuation). A backslash escapes the next character
+    everywhere except inside single quotes, where the shell treats it literally."""
 
     out: list[str] = []
+    bare: list[str] = []
     i = 0
     while i < len(line):
         ch = line[i]
         if quote != "'" and ch == "\\":
             if i + 1 == len(line):
-                return "".join(out), quote, True  # trailing `\` = line continuation
+                return "".join(out), "".join(bare), quote, True  # trailing `\` = continuation
             out.append(ch)
-            out.append(line[i + 1])  # an escaped char is literal text, kept as-is
+            out.append(line[i + 1])
+            bare.append("  ")  # two blanks: `bare` stays offset-aligned with `text`
             i += 2
             continue
         if quote is None and ch in "\"'":
             quote = ch
         elif quote == ch:
             quote = None
+            out.append(ch)
+            bare.append(" ")
+            i += 1
+            continue
+        else:
+            out.append(ch)
+            bare.append(ch if quote is None else " ")
+            i += 1
+            continue
         out.append(ch)
+        bare.append(" ")
         i += 1
-    return "".join(out), quote, False
+    return "".join(out), "".join(bare), quote, False
 
 
 def _split_unquoted_lines(command: str) -> list[str]:
@@ -266,43 +320,55 @@ def _split_unquoted_lines(command: str) -> list[str]:
 
     Three kinds of newline are NOT separators: one inside quotes (a multi-line commit message
     is ordinary text), one escaped by a backslash (a line CONTINUATION, which splices the next
-    line onto this command), and every newline inside a HEREDOC BODY. The heredoc body is
-    dropped outright — it is stdin data for the command on the redirection line, so surfacing
-    its lines as commands would make `cat > ship.sh <<'EOF' / git commit -m x / EOF` look like
-    a commit and hard-BLOCK a command that only writes a file.
+    line onto this command), and every newline inside a HEREDOC BODY. A heredoc body is stdin
+    data for the command on the redirection line, so surfacing its lines as commands would
+    make `cat > ship.sh <<'EOF' / git commit -m x / EOF` look like a commit and hard-BLOCK a
+    command that only writes a file.
 
-    Best-effort, and deliberately so: this only has to be right often enough that the
-    command-head anchors see real command heads. KNOWN GAP (unchanged by this parser, it
-    predates it): a body actually EXECUTED by a shell — `bash <<'EOF' / git commit -m x / EOF`
-    — is also dropped, so a commit hidden that way is not detected. Closing that needs the
-    interpreter-vs-data distinction, which is a separate change."""
+    An UNTERMINATED heredoc gives its lines back as commands rather than dropping them. That
+    keeps the one remaining way to misread an operator — an arithmetic shift such as
+    `$((a << b))`, which this does not distinguish from a redirection — failing CLOSED: a
+    body that never meets its delimiter was never a body.
+
+    KNOWN GAP (pre-existing, not introduced by this parser): a body actually EXECUTED by a
+    shell — `bash <<'EOF' / git commit -m x / EOF` — is dropped like any other, so a commit
+    hidden that way is not detected. Closing that needs the interpreter-vs-data distinction."""
 
     segments: list[str] = []
     buf: list[str] = []
+    bare_buf: list[str] = []
+    orphans: list[str] = []
     quote: str | None = None
-    heredoc_delim: str | None = None
+    pending: list[tuple[str, bool]] = []
     for raw in command.split("\n"):
-        # Only `\r\n` is a line ending; a LONE `\r` is an ordinary character to a POSIX shell
-        # and must not split a command.
+        # Only `\r\n` ends a line; a LONE `\r` is an ordinary character to a POSIX shell and
+        # must not split a command.
         line = raw[:-1] if raw.endswith("\r") else raw
-        if heredoc_delim is not None:
-            if line.strip() == heredoc_delim:
-                heredoc_delim = None
-            continue  # body text is stdin data, never a command
-        text, quote, continued = _scan_line(line, quote)
+        if pending:
+            delim, strips_tabs = pending[0]
+            if _closes_heredoc(line, delim, strips_tabs):
+                pending.pop(0)
+                if not pending:
+                    orphans.clear()  # a closed body really was data — drop it for good
+            else:
+                orphans.append(line)
+            continue
+        text, bare, quote, continued = _scan_line(line, quote)
         buf.append(text)
+        bare_buf.append(bare)
         if continued:
             continue  # backslash-newline splices the next line onto this command
         if quote is not None:
             buf.append("\n")  # a newline inside a quoted string is ordinary text
+            bare_buf.append(" ")
             continue
-        segment = "".join(buf)
-        match = _HEREDOC_START.search(segment)
-        heredoc_delim = match.group("delim") if match else None
-        segments.append(segment)
+        segments.append("".join(buf))
+        pending = _heredoc_delimiters("".join(buf), "".join(bare_buf))
         buf = []
+        bare_buf = []
     if buf:
         segments.append("".join(buf))
+    segments.extend(orphans)  # an unterminated heredoc's lines are commands after all
     return segments
 
 
