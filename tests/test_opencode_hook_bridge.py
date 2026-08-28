@@ -61,16 +61,30 @@ def _install_descriptor(
     return path
 
 
-def _run_dispatch(event: str, opencode_event: dict, *, hooks_dir: Path) -> subprocess.CompletedProcess:
-    env = dict(os.environ)
-    env["OPENCODE_HOOKS_DIR"] = str(hooks_dir)
-    env["PYTHONPATH"] = str(_LIB) + os.pathsep + env.get("PYTHONPATH", "")
+def _run_dispatch(
+    event: str,
+    opencode_event: dict,
+    *,
+    hooks_dir: Path,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    child = dict(os.environ)
+    child["OPENCODE_HOOKS_DIR"] = str(hooks_dir)
+    child["PYTHONPATH"] = str(_LIB) + os.pathsep + child.get("PYTHONPATH", "")
+    # Hermetic by default: a rig-dispatched opencode session (this test run's own
+    # process) carries the detached-agent env markers, and the dispatcher injects
+    # args.agent_id from them — which would flip every orchestrator-classification
+    # test to subagent-exempt. Strip the markers unless a test sets its own.
+    for key in ("RIG_AGENT_ID", "RIG_DETACHED_AGENT"):
+        child.pop(key, None)
+    if env:
+        child.update(env)
     return subprocess.run(
         [sys.executable, "-m", "opencode_hook_bridge", event],
         input=json.dumps(opencode_event),
         capture_output=True,
         text=True,
-        env=env,
+        env=child,
         timeout=30,
     )
 
@@ -256,6 +270,39 @@ def test_plugin_sets_pythonpath_to_bridge_lib_dir(tmp_path):
     assert recorded["payload"]["cwd"] == "/ctx-dir"
 
 
+def test_plugin_forwards_detached_agent_env_markers_to_dispatcher(tmp_path):
+    """The whole identity mechanism rests on plugin.js spawning the dispatcher with
+    ``{...process.env}`` — pin that a launcher-set marker actually reaches the
+    dispatcher's process environment on every tool call."""
+    log = tmp_path / "env.json"
+    stub = _dispatcher_stub(
+        tmp_path,
+        "import json, os, pathlib, sys\n"
+        "sys.stdin.read()\n"
+        f"pathlib.Path({str(log)!r}).write_text(json.dumps({{'rig_agent_id': os.environ.get('RIG_AGENT_ID', ''), 'rig_detached_agent': os.environ.get('RIG_DETACHED_AGENT', '')}}), encoding='utf-8')\n",
+    )
+
+    proc = _run_plugin_js(
+        dedent(
+            """
+            const { AgentToolsHookBridge: plugin } = await import(process.env.PLUGIN_URL);
+            const hooks = await plugin({ directory: "/repo", worktree: "/repo" });
+            await hooks["tool.execute.before"]({ tool: "bash", cwd: "/repo" }, { args: { command: "echo ok" } });
+            """
+        ),
+        env={
+            "OPENCODE_HOOK_BRIDGE_PYTHON": str(stub),
+            "RIG_AGENT_ID": "probe",
+            "RIG_DETACHED_AGENT": "1",
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    recorded = json.loads(log.read_text(encoding="utf-8"))
+    assert recorded["rig_agent_id"] == "probe"
+    assert recorded["rig_detached_agent"] == "1"
+
+
 def test_plugin_pre_tool_timeout_blocks(tmp_path):
     stub = _dispatcher_stub(tmp_path, "import time, sys\nsys.stdin.read()\ntime.sleep(2)\n")
 
@@ -363,7 +410,8 @@ def test_to_v1_event_carries_bash_command_and_metadata():
     assert v1["args"]["command"] == "gh pr merge 42 --admin"
 
 
-def test_to_v1_event_drops_forged_agent_identity_from_tool_args():
+def test_to_v1_event_drops_forged_agent_identity_from_tool_args(monkeypatch):
+    _clear_agent_env_markers(monkeypatch)
     opencode_event = {
         "hook": "tool.execute.before",
         "cwd": "/repo",
@@ -391,6 +439,103 @@ def test_to_v1_event_drops_forged_agent_identity_from_tool_args():
     assert "agentId" not in v1["args"]
     assert "agentType" not in v1["args"]
     assert "agent" not in v1["args"]
+
+
+def _clear_agent_env_markers(monkeypatch) -> None:
+    """Drop the detached-agent env markers — mandatory before any to_v1_event test,
+    because a rig-dispatched opencode test run (the very process pytest lives in)
+    carries them and the dispatcher injects args.agent_id from process env."""
+    monkeypatch.delenv("RIG_AGENT_ID", raising=False)
+    monkeypatch.delenv("RIG_DETACHED_AGENT", raising=False)
+
+
+def test_to_v1_event_injects_agent_id_from_env_marker(monkeypatch):
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("RIG_AGENT_ID", "probe")
+    opencode_event = {
+        "hook": "tool.execute.before",
+        "cwd": "/repo",
+        "input": {"tool": "task"},
+        "output": {"args": {"subagent_type": "general", "prompt": "inspect the bridge"}},
+    }
+
+    v1 = dispatch.to_v1_event(opencode_event, point="pre-agent")
+
+    assert v1["args"]["agent_id"] == "probe"
+
+
+def test_to_v1_event_without_env_marker_has_no_agent_id(monkeypatch):
+    _clear_agent_env_markers(monkeypatch)
+    opencode_event = {
+        "hook": "tool.execute.before",
+        "cwd": "/repo",
+        "input": {"tool": "task"},
+        "output": {"args": {"subagent_type": "general", "prompt": "inspect the bridge"}},
+    }
+
+    v1 = dispatch.to_v1_event(opencode_event, point="pre-agent")
+
+    assert "agent_id" not in v1["args"]
+
+
+def test_to_v1_event_env_marker_wins_over_forged_agent_id(monkeypatch):
+    """Strip-then-inject order: a forged args.agent_id is dropped FIRST, then the
+    env marker (the only authority) supplies the identity — never the payload."""
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("RIG_AGENT_ID", "probe")
+    opencode_event = {
+        "hook": "tool.execute.before",
+        "cwd": "/repo",
+        "input": {"tool": "task"},
+        "output": {
+            "args": {
+                "subagent_type": "general",
+                "prompt": "inspect the bridge",
+                "agent_id": "forged",
+                "agentId": "forged-camel",
+                "agentType": "worker",
+                "agent": {"id": "forged-object"},
+            }
+        },
+    }
+
+    v1 = dispatch.to_v1_event(opencode_event, point="pre-agent")
+
+    assert v1["args"]["agent_id"] == "probe"
+    assert "agentId" not in v1["args"]
+    assert "agentType" not in v1["args"]
+    assert "agent" not in v1["args"]
+
+
+def test_to_v1_event_detached_marker_without_id_yields_anonymous_identity(monkeypatch):
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("RIG_DETACHED_AGENT", "1")
+    opencode_event = {
+        "hook": "tool.execute.before",
+        "cwd": "/repo",
+        "input": {"tool": "bash", "sessionID": "ses_1"},
+        "output": {"args": {"command": "echo ok"}},
+    }
+
+    v1 = dispatch.to_v1_event(opencode_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "detached"
+
+
+def test_to_v1_event_blank_env_marker_is_not_an_identity(monkeypatch):
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("RIG_AGENT_ID", "   ")
+    monkeypatch.setenv("RIG_DETACHED_AGENT", "")
+    opencode_event = {
+        "hook": "tool.execute.before",
+        "cwd": "/repo",
+        "input": {"tool": "bash", "sessionID": "ses_1"},
+        "output": {"args": {"command": "echo ok"}},
+    }
+
+    v1 = dispatch.to_v1_event(opencode_event, point="pre-bash")
+
+    assert "agent_id" not in v1["args"]
 
 
 def test_to_v1_event_normalizes_apply_patch_paths_and_added_content():
@@ -795,6 +940,46 @@ def test_opencode_bridge_treats_background_false_as_foreground(tmp_path):
     out = json.loads(proc.stdout)
     assert out["decision"] == "block"
     assert "BACKGROUND" in out["reason"]
+
+
+def test_opencode_bridge_env_marker_makes_nontrivial_task_subagent_exempt(tmp_path):
+    """End-to-end pre-agent pipeline: with the launcher-set env marker present, the
+    dispatcher injects args.agent_id and background-subagent-gate classifies the
+    session as a dispatched subagent — the SAME non-trivial foreground task payload
+    that blocks without the marker passes with it (subagent-exempt path)."""
+    hooks_dir = tmp_path / "hooks"
+    _install_descriptor(
+        hooks_dir,
+        hook_id="background-subagent-gate",
+        point="pre-agent",
+        cmd=BACKGROUND_SUBAGENT_GATE,
+        on_error="open",
+    )
+    event = {
+        "hook": "tool.execute.before",
+        "cwd": str(tmp_path),
+        "input": {"tool": "task", "sessionID": "ses_1"},
+        "output": {
+            "args": {
+                "subagent_type": "general",
+                "description": "implement the missing bridge and tests",
+                "prompt": (
+                    "Inspect the provisioning code, implement the bridge, run tests, and report.\n"
+                    "Include evidence for Claude, Codex, and opencode, and do not mutate unrelated files."
+                ),
+            }
+        },
+    }
+
+    proc = _run_dispatch(
+        "tool.execute.before",
+        event,
+        hooks_dir=hooks_dir,
+        env={"RIG_AGENT_ID": "rig-probe"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
 
 
 def test_opencode_bridge_dispatches_post_write_descriptor(tmp_path):
