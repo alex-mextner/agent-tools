@@ -141,19 +141,14 @@ def warn(msg: str) -> None:
 # Matched against the line's BARE projection (see `_scan_line`) so a `<<` inside a quoted
 # argument, a comment, or an arithmetic expansion cannot be mistaken for a redirection.
 _HEREDOC_OP = re.compile(r"(?<!<)<<(?P<dash>-?)(?!<)")
-# An arithmetic expansion/command — `$((a << b))`, `((a << b))`. Its `<<` is a SHIFT operator,
-# not a redirection.
-_ARITH_SPAN = re.compile(r"\$?\(\(.*?\)\)")
-# Shell syntax this parser does not model: any expansion (`$VAR`, `${...}`, `$(...)`) or command
-# substitution. Their text is not known until runtime, so a `<<` near them cannot be classified
-# — see `_heredoc_delimiters` for why that means "not a heredoc" rather than "guess".
-_UNMODELLED_EXPANSION = re.compile(r"[$`]")
-
-
-def _blank_arithmetic(bare: str) -> str:
-    """Blank arithmetic spans in a bare projection, preserving length (and so offsets)."""
-
-    return _ARITH_SPAN.sub(lambda m: " " * len(m.group(0)), bare)
+# Shell syntax this parser does not model, and will not guess at: any expansion or command
+# substitution (`$VAR`, `${...}`, `$(...)`, backticks), and any arithmetic context (`$((...))`,
+# `((...))`) whose `<<` is a SHIFT operator rather than a redirection. Matching these precisely
+# means matching nested parentheses and runtime text, neither of which a regex over one line
+# can do — every attempt to blank them span-wise left an exposed `<<` on some nesting depth.
+# Refusing to open a heredoc on such a line costs nothing but a rare false block, whereas
+# guessing wrong hides a commit; see `_heredoc_delimiters`.
+_UNMODELLED_EXPANSION = re.compile(r"[$`]|\(\(")
 
 
 def _read_delimiter(text: str, pos: int) -> str | None:
@@ -219,11 +214,7 @@ def _heredoc_delimiters(text: str, bare: str) -> list[tuple[str, bool]]:
 
     if _UNMODELLED_EXPANSION.search(bare):
         return []
-    # Checked BEFORE blanking, never after: `_ARITH_SPAN` is non-greedy, so on a NESTED
-    # expression (`$(( ((1)) << 2 ))`) it stops at the inner `))` and blanks away the very `$`
-    # that marks the line as unmodelled — leaving `<< 2` exposed and re-opening the bypass this
-    # guard exists to close. Blanking then only has to serve the `(( ))` form, which has no `$`.
-    code = _blank_arithmetic(bare)
+    code = bare
     found: list[tuple[str, bool]] = []
     for op in _HEREDOC_OP.finditer(code):
         word = _read_delimiter(text, op.end())

@@ -893,7 +893,8 @@ def test_every_heredoc_on_a_command_is_tracked(tmp_path, monkeypatch):
 @pytest.mark.parametrize("command", [
     ": $((1 << 2))\ngit commit -m bypass\n2",             # `$(( ))` arithmetic shift
     "(( 1 << 2 ))\ngit commit -m bypass\n2",              # `(( ))` arithmetic command
-    ": $(( ((1)) << 2 ))\ngit commit -m bypass\n2",       # NESTED — the blanker is non-greedy
+    ": $(( ((1)) << 2 ))\ngit commit -m bypass\n2",       # nested, with `$`
+    "(( ((1)) << 2 ))\ngit commit -m bypass\n2",          # nested, WITHOUT `$`
 ])
 def test_arithmetic_shift_is_not_a_heredoc(tmp_path, monkeypatch, command):
     """`<<` inside an arithmetic expansion is a SHIFT operator. Reading it as a redirection is
