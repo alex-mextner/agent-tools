@@ -277,8 +277,10 @@ def _read_delimiter(text: str, pos: int) -> str | None:
             continue
         if ch == "\\":
             return None  # an escaped delimiter character is not modelled
-        if ch.isspace() or ch in ";&|<>()#":
-            break  # a shell metacharacter ends the word
+        if ch in " \t" or ch in ";&|<>()":
+            break  # a blank or a shell metacharacter ends the word; `#` and CR do NOT —
+            # bash only starts a comment at a `#` that OPENS a word, so `<<EOF#1` is one
+            # delimiter, and a carriage return is an ordinary word character
         word.append(ch)
         seen = True
         i += 1
@@ -323,10 +325,14 @@ def _closes_heredoc(line: str, delim: str, strips_tabs: bool) -> bool:
     return (line.lstrip("\t") if strips_tabs else line) == delim
 
 
-# The operators after which a `#` still begins a comment. Bash starts a comment at a `#` that
+# The characters after which a `#` still begins a comment. Bash starts a comment at a `#` that
 # opens a WORD, which includes right after a control operator (`:;# note`) — not only at the
 # start of a line or after whitespace.
 _COMMENT_PRECEDERS = frozenset(" \t;&|()<>")
+# Stand-in emitted into a bare projection for a character that is ordinary WORD text: anything
+# quoted or backslash-escaped. It must not be a blank or an operator, so that a `#` after it is
+# correctly read as part of the word rather than as the start of a comment.
+_WORD_CHAR = "x"
 
 
 def _scan_line(line: str, quote: str | None) -> tuple[str, str, str | None, bool]:
@@ -346,19 +352,33 @@ def _scan_line(line: str, quote: str | None) -> tuple[str, str, str | None, bool
 
     out: list[str] = []
     bare: list[str] = []
+    prev = ""  # last BARE character emitted — see the `#` test below
     i = 0
     while i < len(line):
         ch = line[i]
-        if quote is None and ch == "#" and (i == 0 or line[i - 1] in _COMMENT_PRECEDERS):
-            out.append(line[i:])
-            bare.append(" " * (len(line) - i))
+        if quote is None and ch == "#" and (i == 0 or prev in _COMMENT_PRECEDERS):
+            # Tested against the BARE projection, not the raw line: bash starts a comment only
+            # at a `#` that OPENS a word, and an ESCAPED or QUOTED operator does not end one.
+            # In `: \\;# ignored ; git commit`, bash reads `;#` as an argument, so the later
+            # `;` really does separate commands — judging by the raw previous character would
+            # see `;`, call the rest a comment, and blank the commit away (agent-tools#472).
+            # Blanked in BOTH projections, keeping their lengths equal (the offset alignment
+            # `_heredoc_delimiters` relies on) and keeping the `#` away from `shlex`, whose own
+            # comment handling fires mid-word and so disagrees with bash — see `_shell_tokens`.
+            blank = " " * (len(line) - i)
+            out.append(blank)
+            bare.append(blank)
             return "".join(out), "".join(bare), quote, False
         if quote != "'" and ch == "\\":
             if i + 1 == len(line):
                 return "".join(out), "".join(bare), quote, True  # trailing `\` = continuation
             out.append(ch)
             out.append(line[i + 1])
-            bare.append("  ")  # two blanks: `bare` stays offset-aligned with `text`
+            # `WORD_CHAR` twice, not blanks: an escaped character is ordinary word text, so it
+            # neither opens a comment after it nor reads as an operator. Two of them keep
+            # `bare` offset-aligned with `text`.
+            bare.append(_WORD_CHAR * 2)
+            prev = _WORD_CHAR
             i += 2
             continue
         if quote is None and ch in "\"'":
@@ -366,16 +386,22 @@ def _scan_line(line: str, quote: str | None) -> tuple[str, str, str | None, bool
         elif quote == ch:
             quote = None
             out.append(ch)
-            bare.append(" ")
+            bare.append(_WORD_CHAR)
+            prev = _WORD_CHAR
             i += 1
             continue
         else:
             out.append(ch)
-            bare.append(ch if quote is None else " ")
+            # Inside quotes every character is word text — except `$`/backtick, which still
+            # expand within double quotes and must stay visible to the unmodelled-syntax guard.
+            emitted = ch if quote is None else (ch if (quote == '"' and ch in "$`") else _WORD_CHAR)
+            bare.append(emitted)
+            prev = emitted
             i += 1
             continue
         out.append(ch)
-        bare.append(" ")
+        bare.append(_WORD_CHAR)
+        prev = _WORD_CHAR
         i += 1
     return "".join(out), "".join(bare), quote, False
 
@@ -459,7 +485,11 @@ def _shell_tokens(command: str) -> list[str]:
 
     tokens: list[str] = []
     for line in _split_unquoted_lines(command):
-        line_tokens = shlex.split(line, comments=True)
+        # `comments=False`: comment removal already happened in `_scan_line`, which follows
+        # bash's rule that a `#` only opens a comment at the START of a word. `shlex`'s own
+        # handling fires on a `#` ANYWHERE, so it would silently eat the rest of a line after
+        # an ordinary word containing one (`: \;# ignored ; git commit`, `color=#fff`).
+        line_tokens = shlex.split(line, comments=False)
         if not line_tokens:
             continue  # a blank or comment-only line separates nothing
         if tokens and tokens[-1] not in _SHELL_SEP:

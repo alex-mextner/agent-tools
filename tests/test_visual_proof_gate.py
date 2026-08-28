@@ -955,6 +955,36 @@ def test_unbalanced_quote_fallback_still_sees_newlines(tmp_path, monkeypatch):
     assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
+def test_escaped_operator_does_not_open_a_comment(tmp_path, monkeypatch):
+    """Bash starts a comment only at a `#` that OPENS a word, and an ESCAPED operator does not
+    end one: in `: \\;# ignored ; git commit`, `;#` is an argument, so the LATER `;` really
+    does separate commands. Judging by the raw previous character sees `;`, calls the rest a
+    comment, and blanks the commit away."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(": \\;# ignored ; git commit -m bypass", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_hash_inside_a_word_is_not_a_comment(tmp_path, monkeypatch):
+    """`shlex`'s own comment handling fires on a `#` ANYWHERE, so it would eat the rest of the
+    line after an ordinary word containing one. Comment removal is done by `_scan_line`, which
+    follows bash's start-of-word rule, and shlex is called with comments disabled."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("echo 'abc'# nope\ngit commit -m x", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_heredoc_delimiter_may_contain_a_hash(tmp_path, monkeypatch):
+    """A `#` inside a word is ordinary text, so `<<EOF#1` is one delimiter. Truncating it at the
+    `#` would leave the parser hunting for the wrong terminator."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("cat <<EOF#1\ngit commit -m x\nEOF#1", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+
+
 def test_delimiter_word_is_assembled_from_adjacent_fragments(tmp_path, monkeypatch):
     """Bash quote-removes `<<E'OF'` to the single word `EOF`, so the heredoc closes on line 2
     and the commit runs. Reading only the first fragment (`E`) makes the parser hunt for the
