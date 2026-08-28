@@ -234,7 +234,14 @@ def _mandatory_skills(*, subagent: bool = False) -> list[str]:
 _HEREDOC_OP = re.compile(r"(?<!<)<<(?P<dash>-?)(?!<)")
 # The delimiter word right after the operator, read from the RAW line so `<<'EOF'` / `<< "EOF"`
 # still yield `EOF` (the bare projection has blanked the quoted characters).
-_HEREDOC_DELIM = re.compile(r"""[ \t]*(?P<q>['"]?)(?P<delim>[A-Za-z_]\w*)(?P=q)""")
+# A heredoc delimiter is any shell WORD, not just an identifier: `<<'EOF-1'`, `<<"end.txt"`
+# and `<<_v2` are all valid, and failing to recognise one exposes that heredoc's DATA lines to
+# the command-head anchors as if they were commands (a false block on a data-writing command).
+# Quoted forms take everything up to the closing quote; the unquoted form stops at whitespace
+# or a shell metacharacter, so it cannot swallow a following redirection or separator.
+_HEREDOC_DELIM = re.compile(
+    r"""[ \t]*(?:'(?P<sq>[^']*)'|"(?P<dq>[^"]*)"|(?P<bare>[^\s;&|<>()'"#]+))"""
+)
 
 
 def _strip_bare_comment(bare: str) -> str:
@@ -262,7 +269,9 @@ def _heredoc_delimiters(text: str, bare: str) -> list[tuple[str, bool]]:
     for op in _HEREDOC_OP.finditer(code):
         delim = _HEREDOC_DELIM.match(text, op.end())
         if delim:
-            found.append((delim.group("delim"), bool(op.group("dash"))))
+            word = delim.group("sq") or delim.group("dq") or delim.group("bare")
+            if word:
+                found.append((word, bool(op.group("dash"))))
     return found
 
 

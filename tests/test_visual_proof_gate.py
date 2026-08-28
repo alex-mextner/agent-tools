@@ -846,6 +846,18 @@ def test_heredoc_operator_only_counts_as_shell_syntax(tmp_path, monkeypatch, fir
     assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
+@pytest.mark.parametrize("delim", ["EOF-1", "'EOF-1'", '"end.txt"', "_v2", "'end of file'"])
+def test_heredoc_delimiter_may_be_any_shell_word(tmp_path, monkeypatch, delim):
+    """A delimiter is a shell WORD, not an identifier — `<<'EOF-1'`, `<<"end.txt"`, `<<_v2` are
+    all valid. Failing to recognise one exposes that heredoc's DATA to the command-head
+    anchors as if it were a command, and blocks a `cat` that only writes a file."""
+    bare = delim.strip("\"'")
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(f"cat > f <<{delim}\ngit commit -m x\n{bare}", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+
+
 def test_heredoc_terminator_must_match_exactly(tmp_path, monkeypatch):
     """A plain `<<EOF` ends only on a line holding EXACTLY `EOF`. A space-indented `  EOF` is
     still body, so the commit under it is data the shell never runs — ending the body early
