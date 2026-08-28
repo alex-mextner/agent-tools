@@ -282,57 +282,107 @@ def _split_chain(command: str) -> list[tuple[str | None, str]]:
     Single quotes need no closing-escape handling — POSIX single quotes are fully literal,
     backslash has no special meaning inside them, so the existing generic "close on matching
     quote char" branch is already correct for closing one; OPENING one is still escape-checked
-    (`\\'` outside quotes is equally a literal character, not a region opener)."""
+    (`\\'` outside quotes is equally a literal character, not a region opener).
+
+    Two more escape/comment-awareness fixes (Codex review, PR agent-tools#469, round 3):
+
+    - A backslash-escaped chain-operator character OUTSIDE any quoted region (`\\;`, `\\&`, `\\|`)
+      is a LITERAL character passed as a plain argument, not a real operator. `echo \\; cd
+      /feature; npm run dev` in a real shell is `echo` given the literal argument tokens `;`,
+      `cd`, `/feature` (`\\;` never separates anything) — the command is just `echo ; cd
+      /feature`, printed, and `cd` never actually runs; only the trailing UNESCAPED `;` really
+      separates that whole `echo ...` command from `npm run dev`. Splitting on the escaped `;`
+      anyway (an earlier version of this function did) makes `cd /feature` look like its own,
+      unconditionally-reached segment — the hook then wrongly moves `effective_cwd` to
+      `/feature` for a `cd` that never actually executes, and judges the real `npm run dev`
+      (which really launches in the ORIGINAL, still-protected checkout) against the wrong,
+      harmless directory instead.
+    - An unquoted, unescaped `#` at the START OF A WORD (buf is empty, or its last character is
+      a space/tab — i.e. not partway through an existing token, matching real shell comment
+      syntax) begins a shell COMMENT that runs to the next real newline; nothing inside it —
+      including what LOOKS like a chain operator — is real shell syntax. `: # comment ; cd
+      /feature` + newline + `npm run dev` is bash's no-op command `:`, then a comment consuming
+      the rest of the line (the `;` and `cd /feature` inside it are just comment TEXT, `cd` never
+      runs), then a real newline separates it from the always-run `npm run dev` — which launches
+      in the ORIGINAL, still-protected checkout. Treating the commented `;` as a real operator
+      (an earlier version of this function did) again wrongly tracks a `cd` that never executes."""
+    _WORD_START_CHARS = (" ", "\t")
+
+    def _escaped(buf: list[str]) -> bool:
+        bs = 0
+        j = len(buf) - 1
+        while j >= 0 and buf[j] == "\\":
+            bs += 1
+            j -= 1
+        return bs % 2 == 1  # odd trailing run — the character about to be read is escaped
+
     segs: list[tuple[str | None, str]] = []
     buf: list[str] = []
     quote: str | None = None
     pending_op: str | None = None
+    in_comment = False
     i, n = 0, len(command)
     while i < n:
         c = command[i]
         prev = command[i - 1] if i > 0 else ""
         nxt = command[i + 1] if i + 1 < n else ""
-        if quote == '"' and c == '"':
-            bs = 0
-            j = len(buf) - 1
-            while j >= 0 and buf[j] == "\\":
-                bs += 1
-                j -= 1
+        if in_comment:
+            i += 1
+            if c == "\n":
+                in_comment = False
+                segs.append((pending_op, "".join(buf)))
+                pending_op = "\n"
+                buf = []
+            # comment text itself is discarded, not appended to buf — it is not real shell
+            # syntax and could otherwise confuse the later shlex.split of this segment (e.g. an
+            # unbalanced quote inside human-written comment text).
+        elif quote == '"' and c == '"':
+            # Handled fully here whether escaped or not — must NOT fall through to the generic
+            # `quote is not None` branch below, which closes unconditionally on any matching
+            # quote char: that would silently undo the escape-awareness this branch exists for.
+            closes = not _escaped(buf)
             buf.append(c)
             i += 1
-            if bs % 2 == 0:  # not escaped — an even (incl. zero) run of backslashes
+            if closes:
                 quote = None
         elif quote is not None:
             buf.append(c)
             if c == quote:
                 quote = None
             i += 1
-        elif c in ("'", '"'):
-            # Regression (Codex review, PR agent-tools#469): a backslash-escaped quote OUTSIDE
-            # any quoted region (`echo \" && npm run dev`) is a literal character in a real
-            # shell, not the start of a new quoted region. Opening a quote here anyway would
-            # swallow the rest of the command — including its real `&&` — into an "unterminated
-            # string", hiding a `npm run dev` member from ever being split out and classified.
-            bs = 0
-            j = len(buf) - 1
-            while j >= 0 and buf[j] == "\\":
-                bs += 1
-                j -= 1
+        elif c in ("'", '"') and not _escaped(buf):
             buf.append(c)
             i += 1
-            if bs % 2 == 0:  # not escaped — an even (incl. zero) run of backslashes
-                quote = c
-        elif command[i:i + 2] in ("&&", "||"):
+            quote = c
+        elif c == "#" and not _escaped(buf) and (not buf or buf[-1] in _WORD_START_CHARS):
+            in_comment = True
+            i += 1
+        elif command[i:i + 2] in ("&&", "||") and not _escaped(buf):
             segs.append((pending_op, "".join(buf)))
             pending_op = command[i:i + 2]
             buf = []
             i += 2
-        elif c == "&" and prev not in ("&", ">") and nxt not in ("&", ">"):
+        elif c == "&" and prev not in ("&", ">") and nxt not in ("&", ">") and not _escaped(buf):
             segs.append((pending_op, "".join(buf)))
             pending_op = "&"
             buf = []
             i += 1
-        elif c in (";", "|", "\n"):
+        elif c == "\n":
+            # ALWAYS a real separator here, unconditionally — NOT escape-gated like `;`/`|`
+            # below. A real `\<newline>` line continuation is a DIFFERENT bash mechanism (removes
+            # both characters entirely) already fully resolved by `_normalize_line_continuations`
+            # before this function ever runs; by the time a `\n` reaches this scanner, any real
+            # continuation has already been folded away, and what backslash(es) remain
+            # immediately before a surviving `\n` (from an EVEN run — see that function's own
+            # docstring) are literal characters already accounted for in `buf`, not an escape of
+            # THIS newline. Re-checking `_escaped(buf)` here double-applies the same backslash
+            # and wrongly treats a genuine separator newline as escaped, silently merging two
+            # real, separate commands into one segment.
+            segs.append((pending_op, "".join(buf)))
+            pending_op = c
+            buf = []
+            i += 1
+        elif c in (";", "|") and not _escaped(buf):
             segs.append((pending_op, "".join(buf)))
             pending_op = c
             buf = []
@@ -519,6 +569,14 @@ _PM_SKIP_VALUE_FLAGS = frozenset({"--filter", "-F", "--workspace", "-w"})
 # A flag recognized specifically between `run` and the script name (`npm run --if-present dev`)
 # — valueless, so no pairing needed, just skipped in that one position.
 _RUN_FLAGS = frozenset({"--if-present", "--silent", "-s"})
+# A VALUE-TAKING flag recognized specifically between `run` and the script name (`npm run
+# --workspace web dev`, `npm run --script-shell /bin/bash dev`) — checked against npm 11.4.2's
+# own `npm run --help` (Codex review, PR agent-tools#469, round 3): consumed as a flag+value
+# PAIR, split or `=`-joined, same treatment `_peel_dir_flag` already gives `_PM_SKIP_VALUE_FLAGS`
+# in the run's own GLOBAL-OPTIONS region. Missing this made `npm run --workspace web dev` stop
+# scanning at `web` (not `-`-prefixed) and misread it as the script-name position — an
+# under-block, the real `dev` script never gets recognized.
+_RUN_VALUE_FLAGS = frozenset({"--workspace", "-w", "--script-shell"})
 # `npx`/`bunx`-equivalent subcommands recognized on npm/yarn/pnpm ("run a package once"), so
 # `npm exec vite` / `pnpm dlx vite` are classified exactly like `npx vite`.
 _PM_EXEC_SUBCOMMANDS = frozenset({"exec", "dlx"})
@@ -588,6 +646,30 @@ def _peel_dir_flag(rest: list[str]) -> tuple[list[str], str | None]:
     return rest[i:], override
 
 
+def _peel_run_flags(script_toks: list[str]) -> list[str]:
+    """Consume every leading flag recognized in the `run [flags] <script>` position — both the
+    valueless `_RUN_FLAGS` (`--if-present`, `--silent`) and the value-taking `_RUN_VALUE_FLAGS`
+    (`--workspace`/`-w`, `--script-shell`), split OR `=`-joined for the latter — stopping at the
+    first token that is neither, which is the script name itself. Shared between npm/yarn/pnpm's
+    `_classify_pm_segment` and bun's `_classify_bun_segment`'s own `run` branch (Codex review, PR
+    agent-tools#469, round 3) so both agree on the same recognized-flags set."""
+    i = 0
+    while i < len(script_toks):
+        tok = script_toks[i]
+        flag, eq, _value = tok.partition("=")
+        if flag in _RUN_FLAGS:
+            i += 1
+            continue
+        if flag in _RUN_VALUE_FLAGS and eq:  # `--workspace=web` — one token
+            i += 1
+            continue
+        if flag in _RUN_VALUE_FLAGS and not eq and i + 1 < len(script_toks):  # `--workspace web`
+            i += 2
+            continue
+        break
+    return script_toks[i:]
+
+
 def _skip_flags(toks: list[str]) -> int:
     """Index of the first non-flag token in ``toks`` (flag VALUES are not skipped — good enough
     for the narrow `npx`/`bunx [flags] <tool> [subcommand]` shape this hook targets)."""
@@ -602,15 +684,14 @@ def _classify_pm_segment(head: str, rest: list[str]) -> tuple[str, str | None] |
     <tool>` (the package-manager equivalent of `npx`/`bunx`). Returns ``(label, cwd_override)``."""
     rest, cwd_override = _peel_dir_flag(rest)
     if rest[:1] == ["run"]:
-        script_toks = rest[1:]
-        # Consume EVERY leading `_RUN_FLAGS` token, not just one (Codex review, PR
-        # agent-tools#469): `npm run --silent --if-present dev` stopping after `--silent` reads
-        # `--if-present` as the script-name position and misses `dev` entirely — a real
-        # under-block (the launch is allowed on the protected default branch), not the safe
-        # over-block direction, since combining two valid, independently-documented `npm run`
-        # flags is ordinary usage, not an edge case.
-        while script_toks[:1] and script_toks[0] in _RUN_FLAGS:
-            script_toks = script_toks[1:]
+        # Consume EVERY leading `_RUN_FLAGS`/`_RUN_VALUE_FLAGS` token, not just one, and not
+        # just the valueless ones (Codex review, PR agent-tools#469, two rounds): `npm run
+        # --silent --if-present dev` stopping after `--silent` reads `--if-present` as the
+        # script-name position and misses `dev`; `npm run --workspace web dev` similarly stops
+        # at `web` (not `-`-prefixed) without consuming its value. Both are a real under-block
+        # (the launch is allowed on the protected default branch), not the safe over-block
+        # direction — these are ordinary, independently-documented `npm run` usages.
+        script_toks = _peel_run_flags(rest[1:])
         if script_toks and _is_dev_script(script_toks[0]):
             return f"{head} run {script_toks[0]}", cwd_override
         return None
@@ -742,6 +823,9 @@ def _classify_devserver_segment(toks: list[str]) -> tuple[str, str | None] | Non
     return None
 
 
+_TRAILING_BACKSLASH_RUN_RE = re.compile(r"\\+\n")
+
+
 def _normalize_line_continuations(command: str) -> str:
     """Fold a literal `\\<newline>` shell line continuation into a single space before chain
     splitting — mirrors the exact normalization `agenttools_hatch_escalation` already applies
@@ -749,9 +833,27 @@ def _normalize_line_continuations(command: str) -> str:
     command such as ``npm run dev \\`` + newline + ``--host 3000`` is split by `_split_chain`
     (which treats a bare newline as a separator) into TWO segments — a trailing-backslash
     segment `shlex` cannot tokenize, and a flags-only segment with no head token — silently
-    missing the launch entirely. Only the literal `\\<newline>` continuation is folded; a plain,
-    unescaped newline (the separator `_split_chain` itself splits on) is left untouched."""
-    return command.replace("\\\n", " ")
+    missing the launch entirely.
+
+    Only an ODD run of backslashes immediately before the newline is a real continuation —
+    parity-checked (Codex review, PR agent-tools#469): two backslashes before a newline is one
+    escaped, LITERAL backslash followed by a real, unescaped newline in a real shell (each pair
+    of `\\\\` collapses to one literal `\\`), so the line does NOT continue and the newline still
+    separates two real commands. `echo \\\\` + newline + ``npm run dev`` is `echo \\` (printing a
+    literal backslash) as its own command, then `npm run dev` as a SEPARATE, real launch on the
+    next line — folding it into one `echo`-headed segment anyway (an even-backslash-blind
+    version of this function did) hides that real launch from ever being split out and
+    classified. A single backslash (odd run) is the ordinary continuation case and folds as
+    before; three backslashes is again odd (one literal pair + one real continuation) and folds;
+    the parity check, not a fixed count, is what's correct in general."""
+
+    def _fold(m: re.Match[str]) -> str:
+        n_backslashes = len(m.group()) - 1  # exclude the trailing \n itself
+        if n_backslashes % 2 == 1:  # odd — real continuation, (n-1)/2 literal backslashes remain
+            return "\\" * ((n_backslashes - 1) // 2) + " "
+        return "\\" * (n_backslashes // 2) + "\n"  # even — no continuation, newline stays real
+
+    return _TRAILING_BACKSLASH_RUN_RE.sub(_fold, command)
 
 
 def _resolve_gate(effective_cwd: str, cache: dict[str, str | None]) -> str | None:
@@ -823,14 +925,17 @@ def _decide_block(cwd: str, branch: str, label: str, full_command: str) -> int:
 
 # Real commands rarely chain more than a couple of conditional `cd`s; without a cap, N
 # conditional `cd`s to N distinct new targets could branch the candidate set to up to 2**N.
-# Once the cap is hit, `_apply_cd_to_candidates` stops adding NEW branches (existing candidates,
-# including any already-branched ones, are kept) — pathological input degrades to "stop tracking
-# further branching", not a hang or a memory blowup.
+# Once the cap is hit, `_apply_cd_to_candidates` stops adding new NON-GATED branches — see its
+# own docstring for why a gated branch is NEVER dropped regardless of the cap.
 _MAX_CANDIDATE_CWDS = 8
 
 
 def _apply_cd_to_candidates(
-    candidates: set[str], toks: list[str], op: str | None, following_op: str | None,
+    candidates: set[str],
+    toks: list[str],
+    op: str | None,
+    following_op: str | None,
+    gate_cache: dict[str, str | None],
 ) -> set[str]:
     """Given the current set of POSSIBLE `effective_cwd` states — see `main()`'s docstring for
     why there can be more than one — apply one `cd` segment's tokens and return the updated set.
@@ -853,16 +958,29 @@ def _apply_cd_to_candidates(
       needs "didn't run" to correctly BLOCK (the launch stays in the protected checkout), but
       `true && cd /protected-main; npm run dev` from a feature worktree needs "did run" to
       correctly BLOCK (the launch reaches the protected checkout) — the same fixed assumption
-      gets one of the two wrong. Tracking both keeps both correct."""
+      gets one of the two wrong. Tracking both keeps both correct.
+
+    Cap handling (Codex review, PR agent-tools#469, round 3): the ORIGINAL cap simply stopped
+    adding new branch targets once ``_MAX_CANDIDATE_CWDS`` was reached — silently DROPPING any
+    further conditional-`cd` target, including one that is itself gated. From a feature
+    worktree, a chain with 7 harmless conditional branches ending in `true && cd
+    /protected-main; npm run dev` would have its gated 8th target dropped purely by ARRIVAL
+    ORDER, wrongly allowing a launch that really does reach the protected checkout. A dropped
+    candidate must never be one that would have caused a BLOCK — so once the cap is reached,
+    each new target is checked against the gate BEFORE being considered for dropping: a target
+    that resolves to a gate is added REGARDLESS of the cap (a real, if rare, potential to exceed
+    ``_MAX_CANDIDATE_CWDS`` by a bounded amount — one over-cap slot per already-processed `cd`
+    segment, still finite and small in practice); only a target that is CONFIRMED SAFE
+    (`_resolve_gate` returns ``None``) is ever dropped for being over the cap."""
     if following_op in _ISOLATING_OPS or op == "|":
         return candidates
     if op in _CONDITIONAL_OPS:
         branched = set(candidates)
         for c in candidates:
-            if len(branched) >= _MAX_CANDIDATE_CWDS:
-                break
             target = _resolve_cd_target(toks, c)
-            if target is not None:
+            if target is None or target in branched:
+                continue
+            if len(branched) < _MAX_CANDIDATE_CWDS or _resolve_gate(target, gate_cache) is not None:
                 branched.add(target)
         return branched
     return {_resolve_cd_target(toks, c) or c for c in candidates}
@@ -918,7 +1036,9 @@ def main() -> int:
 
         if toks and toks[0] == "cd":
             following_op = segments[idx + 1][0] if idx + 1 < len(segments) else None
-            candidate_cwds = _apply_cd_to_candidates(candidate_cwds, toks, op, following_op)
+            candidate_cwds = _apply_cd_to_candidates(
+                candidate_cwds, toks, op, following_op, gate_cache,
+            )
             continue
 
         # `cd` is never a wrapper head, so peeling here is a no-op for the `cd` branch above —

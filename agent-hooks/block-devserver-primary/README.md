@@ -104,10 +104,22 @@ need requests a one-time Telegram approval with a written justification in
   common strings inside documentation and scripts. Not yet worked around — if this causes a
   real false positive, either special-case `<<`/`<<-` markers in `_split_chain` or accept the
   Telegram hatch as the escape hatch.
-- A literal `\`-newline continuation is folded before chain-splitting (see
-  `_normalize_line_continuations`), but this only recognizes the exact `\` immediately followed
-  by a newline — any other multi-line shape (heredocs above, an unescaped newline meant as
-  free-form text inside an unclosed quote that `shlex` itself already rejects) is unaffected.
+- A line continuation is folded before chain-splitting (see `_normalize_line_continuations`),
+  PARITY-checked (Codex review, PR agent-tools#469, round 3) — an ODD run of backslashes
+  immediately before a newline is a real continuation and folds; an EVEN run collapses to that
+  many literal backslashes with the newline left as a REAL separator (two backslashes before a
+  newline is one literal `\` in a real shell, not a continuation). Any other multi-line shape
+  (heredocs above, an unescaped newline meant as free-form text inside an unclosed quote that
+  `shlex` itself already rejects) is unaffected.
+- ~~Shell comments and backslash-escaped chain-operator characters were not recognized.~~ —
+  **fixed** (Codex review, PR agent-tools#469, round 3). `_split_chain` now tracks an unquoted,
+  unescaped `#` at the start of a word as opening a shell comment (consumed verbatim to the next
+  real newline — nothing inside it, including what looks like a chain operator, is real syntax),
+  and treats a backslash-escaped `;`/`|`/`&`/`&&`/`||` as the LITERAL character it is in a real
+  shell, not a real operator. Both were real bypasses: `: # comment ; cd /feature` + newline +
+  `npm run dev`, and `echo \; cd /feature; npm run dev`, both previously tracked a `cd` that
+  never actually executes and could wrongly ALLOW a launch that really happens in the original,
+  still-protected checkout.
 - **A COMMAND WRAPPER — `nohup`, `env`, `sudo`, `time`, `nice`, `setsid`, `exec`, `command`, `bash
   -c`/`sh -c` — is not unwrapped before classification.** `nohup npm run dev &` (the classic
   "leave the dev server running and detach" shape — arguably the MOST realistic way an agent
@@ -137,6 +149,18 @@ need requests a one-time Telegram approval with a written justification in
   fixed assumption in either direction gets one of the two wrong; tracking both keeps both
   correct. `_split_chain` is no longer a byte-identical copy of `pin-primary-worktree`'s — see
   that function's own module comment.
+- ~~The candidate-cap could silently drop a gated branch once full.~~ — **fixed** (Codex review,
+  PR agent-tools#469, round 3). A candidate is only ever dropped for being over
+  `_MAX_CANDIDATE_CWDS` once it's CONFIRMED SAFE (`_resolve_gate` returns `None`) — a new
+  candidate that resolves to a gate is always added regardless of the cap, at the cost of a
+  small, bounded amount of possible over-cap growth (see `_apply_cd_to_candidates`'s own
+  docstring). The original version dropped whichever target arrived once the cap was full,
+  including one that was itself gated — order-dependent, not correctness-dependent.
+- ~~`npm run`'s value-taking flags (`--workspace`/`-w`, `--script-shell`) weren't consumed.~~ —
+  **fixed** (Codex review, PR agent-tools#469, round 3). `_peel_run_flags` (shared by
+  `_classify_pm_segment`'s `run` branch) now consumes both the valueless `_RUN_FLAGS` and the
+  value-taking `_RUN_VALUE_FLAGS`, split or `=`-joined, before testing for the script name —
+  `npm run --workspace web dev` previously stopped at `web` and missed `dev` entirely.
 - **The one-line form of this hook's OWN recommended remediation is over-blocked.** `MESSAGE`
   tells an agent to run `git worktree add ../wt-<feature> ...` and then, as a SEPARATE command,
   `cd ../wt-<feature> && <command>` — that two-step form works fine (the `cd` there is the first

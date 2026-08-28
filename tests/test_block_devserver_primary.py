@@ -836,6 +836,90 @@ def test_pnpm_dlx_consumes_flags_before_tool(tmp_path, monkeypatch):
     assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
+# ── Codex review round 3 (PR agent-tools#469): comments, escaped ops, cap overflow, run flags ──
+
+def test_shell_comment_hides_operators_and_cd(tmp_path, monkeypatch):
+    """Regression (Codex P1, round 3): `: # comment ; cd /feature` + newline + `npm run dev` from
+    a protected checkout. Bash discards everything from an unquoted `#` (at the start of a word)
+    to the next real newline as a comment — the `;` and `cd /feature` inside it are just comment
+    TEXT, `cd` never runs. The real newline then separates that whole (no-op) first command from
+    the unconditional `npm run dev`, which launches in the ORIGINAL, still-protected checkout.
+    Treating the commented `;` as a real chain operator wrongly tracks a `cd` that never executes
+    and would ALLOW. Must BLOCK."""
+    protected = _make_repo(tmp_path, branch="main")
+    feat = tmp_path / "feat-worktree"
+    feat.mkdir()
+    command = f": # comment ; cd {feat}\nnpm run dev"
+    out, code = _run(protected, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_escaped_semicolon_does_not_split_and_hide_real_cd(tmp_path, monkeypatch):
+    """Regression (Codex P1, round 3): `echo \\; cd /feature; npm run dev` from a protected
+    checkout. `\\;` is a LITERAL semicolon passed as an argument to `echo`, not a real chain
+    operator — the whole `echo \\; cd /feature` is ONE command (printing text), `cd` never
+    actually runs. Only the trailing UNESCAPED `;` really separates it from `npm run dev`, which
+    launches in the ORIGINAL, still-protected checkout. Splitting on the escaped `;` anyway makes
+    `cd /feature` look like its own unconditionally-reached segment and would wrongly ALLOW.
+    Must BLOCK."""
+    protected = _make_repo(tmp_path, branch="main")
+    feat = tmp_path / "feat-worktree"
+    feat.mkdir()
+    command = f"echo \\; cd {feat}; npm run dev"
+    out, code = _run(protected, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_candidate_cap_never_drops_a_gated_target(tmp_path, monkeypatch):
+    """Regression (Codex P2, round 3): from a feature worktree, 8 harmless conditional `cd`
+    branches (filling the candidate cap) followed by a 9th conditional `cd` INTO the protected
+    checkout, then an unconditional `npm run dev`. The original cap implementation dropped any
+    target once the cap was full purely by arrival order — including a target that is itself
+    gated. A dropped candidate must never be one that would cause a BLOCK; the 9th, gated target
+    must still be tracked even though the cap was already full. Must BLOCK."""
+    feat = tmp_path / "feat-worktree"
+    feat.mkdir()
+    protected = _make_repo(tmp_path, branch="main")
+    harmless_branches = " && ".join(f"cd /tmp/does-not-exist-{i}" for i in range(8))
+    command = f"{harmless_branches}; true && cd {protected}; npm run dev"
+    out, code = _run(feat, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_pm_run_workspace_flag_consumed_before_script(tmp_path, monkeypatch):
+    """Regression (Codex P2, round 3): `npm run --workspace web dev` — `--workspace`/`-w` is a
+    documented VALUE-TAKING `npm run` option (npm 11.4.2 `--help`). Stopping at `web` (not
+    `-`-prefixed) without consuming it as the flag's value misreads it as the script-name
+    position and misses `dev` entirely. Must BLOCK."""
+    repo = _make_repo(tmp_path, branch="main")
+    command = "npm run --workspace web dev"
+    out, code = _run(repo, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_even_backslash_before_newline_is_not_a_continuation(tmp_path, monkeypatch):
+    """Regression (Codex P2, round 3): two backslashes immediately before a newline collapse to
+    ONE literal backslash in a real shell — the newline that follows is a REAL separator, not
+    consumed by a continuation. `echo \\\\` + newline + `npm run dev` is `echo \\` (printing a
+    literal backslash) as its own command, then `npm run dev` as a genuinely SEPARATE launch on
+    the next line. Folding this into one `echo`-headed segment (parity-blind continuation
+    handling) hides the real launch. Must BLOCK."""
+    repo = _make_repo(tmp_path, branch="main")
+    command = "echo \\\\\nnpm run dev"
+    out, code = _run(repo, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_odd_backslash_before_newline_still_folds_as_continuation(tmp_path, monkeypatch):
+    """The parity fix must not regress the ordinary, already-covered case: ONE backslash before a
+    newline (odd run) is a genuine line continuation and must still fold into a single segment,
+    same as `test_backslash_newline_continuation_denies` already covers."""
+    repo = _make_repo(tmp_path, branch="main")
+    command = "npm run dev \\\n--host 3000"
+    out, code = _run(repo, monkeypatch, command, {"RIG_WORKTREE_ONLY": "1"})
+    assert code == bdp.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
 # ── unit: segment classification ────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("segment,expected_matched", [
