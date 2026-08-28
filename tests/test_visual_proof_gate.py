@@ -904,13 +904,51 @@ def test_arithmetic_shift_is_not_a_heredoc(tmp_path, monkeypatch, command):
     assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-@pytest.mark.parametrize("first_line", [": # ignored \\", ": # it's fine"])
+@pytest.mark.parametrize("first_line", [
+    ": # ignored \\",
+    ":;# ignored \\",   # `#` opens a word right after a control operator too
+    ": # it's fine",
+])
 def test_comment_stops_syntax_interpretation(tmp_path, monkeypatch, first_line):
     """A comment runs to end-of-line, so bash neither continues on a trailing backslash inside
     one nor opens a quote from one. Interpreting comment text as syntax splices the next
     line's real command onto this one, hiding it from the command-head anchors."""
     repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
     out, _e, c = _run(f"{first_line}\ngit commit -m bypass", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("command", [
+    ": ${x:-1 << 2}\ngit commit -m bypass\n2}",     # parameter expansion, not a redirection
+    ': <<"t\\"rue"\ngit commit -m bypass\nt"rue',      # escape rules inside the delimiter
+])
+def test_unmodelled_shell_syntax_opens_no_heredoc(tmp_path, monkeypatch, command):
+    """Recognising a heredoc is the only thing that DROPS lines, so it is the only thing that
+    can hide a commit. A line carrying an expansion, or a delimiter whose quote-removal this
+    parser does not model exactly, is therefore not trusted to open one — its successors stay
+    commands. Refusing to guess is the fail-closed direction."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(command, repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_carriage_return_is_left_in_the_text(tmp_path, monkeypatch):
+    """A carriage return is an ordinary character to a POSIX shell, so `cd /tmp/B\r` targets a
+    directory whose name ends in CR — it fails, and the commit still runs where it started.
+    Stripping the CR would make `effective_cwd` resolve a directory bash never reached."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("cd /tmp/B\r\ngit commit -m x", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_unbalanced_quote_fallback_still_sees_newlines(tmp_path, monkeypatch):
+    """When tokenizing fails, the fallback must still surface newlines as separators. Returning
+    the raw command reinstates the original bug: one stray quote anywhere would hide every
+    commit below line 1 again."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run('echo "oops\ngit commit -m x', repo, monkeypatch,
                       proof_dir=tmp_path / "proof")
     assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
 

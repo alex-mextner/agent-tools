@@ -233,10 +233,12 @@ def _mandatory_skills(*, subagent: bool = False) -> list[str]:
 # argument, a comment, or an arithmetic expansion cannot be mistaken for a redirection.
 _HEREDOC_OP = re.compile(r"(?<!<)<<(?P<dash>-?)(?!<)")
 # An arithmetic expansion/command — `$((a << b))`, `((a << b))`. Its `<<` is a SHIFT operator,
-# not a redirection. Blanked before operator detection: a false heredoc whose delimiter happens
-# to appear on a later line (`: $((1 << 2))` … a lone `2`) would close normally and silently
-# swallow every command in between, which is a bypass, not a cosmetic misparse.
+# not a redirection.
 _ARITH_SPAN = re.compile(r"\$?\(\(.*?\)\)")
+# Shell syntax this parser does not model: any expansion (`$VAR`, `${...}`, `$(...)`) or command
+# substitution. Their text is not known until runtime, so a `<<` near them cannot be classified
+# — see `_heredoc_delimiters` for why that means "not a heredoc" rather than "guess".
+_UNMODELLED_EXPANSION = re.compile(r"[$`]")
 
 
 def _blank_arithmetic(bare: str) -> str:
@@ -246,14 +248,19 @@ def _blank_arithmetic(bare: str) -> str:
 
 
 def _read_delimiter(text: str, pos: int) -> str | None:
-    """The heredoc delimiter WORD starting at `pos`, with shell quote-removal applied, or None
-    if no word is there.
+    """The heredoc delimiter WORD starting at `pos` with shell quote-removal applied, or None
+    when it cannot be determined EXACTLY.
 
-    A delimiter is one shell word, which may be assembled from adjacent quoted and unquoted
+    A delimiter is one shell word, possibly assembled from adjacent quoted and unquoted
     fragments: bash reads `<<E'OF'` as `EOF`. Reading only the first fragment would leave the
-    parser hunting for the wrong terminator, so the REAL terminator and every command after it
-    get swallowed as body — a bypass. An empty quoted delimiter (`<<''`) is valid and legal:
-    it terminates on a blank line, so "" must be distinguishable from "no delimiter"."""
+    parser hunting for the wrong terminator, so the real terminator — and every command after
+    it — would be swallowed as body.
+
+    Returns None rather than a guess for anything whose quote-removal this does not model
+    exactly (a backslash escape, an unbalanced quote). Refusing is the SAFE direction: an
+    unrecognised opener means the following lines stay commands, which can only over-report a
+    commit, whereas a wrong delimiter hides one. An empty quoted delimiter (`<<''`) is legal
+    and terminates on a blank line, so "" must stay distinguishable from None."""
 
     i = pos
     while i < len(text) and text[i] in " \t":
@@ -265,16 +272,16 @@ def _read_delimiter(text: str, pos: int) -> str | None:
         if ch in "\"'":
             close = text.find(ch, i + 1)
             if close == -1:
-                break  # unbalanced quote: stop at what we have
-            word.append(text[i + 1:close])
+                return None  # unbalanced quote — cannot resolve the word
+            fragment = text[i + 1:close]
+            if "\\" in fragment:
+                return None  # escape rules inside quotes are not modelled here
+            word.append(fragment)
             seen = True
             i = close + 1
             continue
-        if ch == "\\" and i + 1 < len(text):
-            word.append(text[i + 1])  # `\E` is just `E` after quote removal
-            seen = True
-            i += 2
-            continue
+        if ch == "\\":
+            return None  # an escaped delimiter character is not modelled
         if ch.isspace() or ch in ";&|<>()#":
             break  # a shell metacharacter ends the word
         word.append(ch)
@@ -289,16 +296,27 @@ def _heredoc_delimiters(text: str, bare: str) -> list[tuple[str, bool]]:
     Operators are located in `bare` (quoted text, comments and arithmetic already blanked) but
     the delimiter WORD is read from `text`, whose quotes are intact — the two are offset-aligned
     by construction. Scanning the raw line instead would let `echo 'not a redirect <<EOF'` open
-    a heredoc and swallow every following command as body text, which is a self-service bypass,
-    not a parsing nicety. A command may open SEVERAL heredocs (`cat <<A <<B`); their bodies
-    follow in the order the operators appear, so all of them are queued."""
+    a heredoc and swallow every following command as body text. A command may open SEVERAL
+    heredocs (`cat <<A <<B`); their bodies follow in operator order, so all are queued.
+
+    DOCTRINE — recognising a heredoc is the only thing here that can DROP lines, so it is the
+    only thing that can hide a commit; every other misparse merely over-reports one. Therefore
+    a body is skipped ONLY when this line is unambiguous. A line carrying an expansion or
+    command substitution (`: ${x:-1 << 2}`) is not: its runtime text is unknown, `<<` inside it
+    may be literal, and a stray later line matching the guessed delimiter would close a heredoc
+    that never existed and swallow the commands in between. Such a line opens NOTHING and its
+    successors stay commands — fail-closed. Same for a delimiter `_read_delimiter` will not
+    resolve exactly."""
 
     code = _blank_arithmetic(bare)
+    if _UNMODELLED_EXPANSION.search(code):
+        return []
     found: list[tuple[str, bool]] = []
     for op in _HEREDOC_OP.finditer(code):
         word = _read_delimiter(text, op.end())
-        if word is not None:
-            found.append((word, bool(op.group("dash"))))
+        if word is None:
+            return []  # one unresolvable delimiter makes the whole line untrustworthy
+        found.append((word, bool(op.group("dash"))))
     return found
 
 
@@ -310,6 +328,12 @@ def _closes_heredoc(line: str, delim: str, strips_tabs: bool) -> bool:
     return (line.lstrip("\t") if strips_tabs else line) == delim
 
 
+# The operators after which a `#` still begins a comment. Bash starts a comment at a `#` that
+# opens a WORD, which includes right after a control operator (`:;# note`) — not only at the
+# start of a line or after whitespace.
+_COMMENT_PRECEDERS = frozenset(" \t;&|()<>")
+
+
 def _scan_line(line: str, quote: str | None) -> tuple[str, str, str | None, bool]:
     """Walk one physical line, tracking quote state.
 
@@ -319,17 +343,18 @@ def _scan_line(line: str, quote: str | None) -> tuple[str, str, str | None, bool
     unescaped backslash (a line continuation).
 
     A backslash escapes the next character everywhere except inside single quotes. An unquoted
-    `#` starting a word begins a COMMENT, and scanning must stop dead there: a comment runs to
-    end-of-line, so bash neither continues on a trailing backslash inside one nor opens a quote
-    from one. Continuing to interpret it lets `: # ignored \\` splice the next line's real
-    command onto this one, hiding it from the command-head anchors."""
+    `#` that OPENS A WORD begins a comment — at the line start, after whitespace, or directly
+    after a control operator (`:;# note`) — and scanning must stop dead there: a comment runs
+    to end-of-line, so bash neither continues on a trailing backslash inside one nor opens a
+    quote from one. Interpreting it lets `: # ignored \\` splice the next line's real command
+    onto this one, hiding it from the command-head anchors."""
 
     out: list[str] = []
     bare: list[str] = []
     i = 0
     while i < len(line):
         ch = line[i]
-        if quote is None and ch == "#" and (i == 0 or line[i - 1].isspace()):
+        if quote is None and ch == "#" and (i == 0 or line[i - 1] in _COMMENT_PRECEDERS):
             out.append(line[i:])
             bare.append(" " * (len(line) - i))
             return "".join(out), "".join(bare), quote, False
@@ -370,6 +395,11 @@ def _split_unquoted_lines(command: str) -> list[str]:
     make `cat > ship.sh <<'EOF' / git commit -m x / EOF` look like a commit and hard-BLOCK a
     command that only writes a file.
 
+    ONLY `\n` separates. A carriage return is an ordinary character to a POSIX shell — it is
+    left in the text rather than stripped, so a CRLF command behaves here as it does in bash
+    (`cd /tmp/B\r` targets a directory whose name ends in CR, i.e. it fails, and the following
+    command still runs where it started).
+
     An UNTERMINATED heredoc gives its lines back as commands rather than dropping them, so a
     misread operator still fails CLOSED: a body that never meets its delimiter was never a
     body.
@@ -384,10 +414,7 @@ def _split_unquoted_lines(command: str) -> list[str]:
     orphans: list[str] = []
     quote: str | None = None
     pending: list[tuple[str, bool]] = []
-    for raw in command.split("\n"):
-        # Only `\r\n` ends a line; a LONE `\r` is an ordinary character to a POSIX shell and
-        # must not split a command.
-        line = raw[:-1] if raw.endswith("\r") else raw
+    for line in command.split("\n"):
         if pending:
             delim, strips_tabs = pending[0]
             if _closes_heredoc(line, delim, strips_tabs):
@@ -453,12 +480,17 @@ def _strip_shell_comment(command: str) -> str:
 
     Only an UNQUOTED `#` that starts a word begins a comment, so a `#` inside a quoted commit
     message (`-m 'fix #42'`) is preserved. Newlines survive as `;` separators (see
-    `_shell_tokens`). Best-effort: on a tokenization failure the raw command is returned
-    unchanged."""
+    `_shell_tokens`). Best-effort: on a tokenization failure the command is returned with its
+    newlines turned into `;` separators."""
     try:
         return " ".join(_shell_tokens(command))
     except ValueError:
-        return command
+        # Best-effort fallback. It must STILL surface newlines as separators: returning the
+        # raw command here reinstates exactly the bug this parser exists to fix, because the
+        # command-head anchors cannot cross a newline. One unbalanced quote anywhere (a stray
+        # `"` on a later line) would otherwise hide every commit below line 1 again
+        # (agent-tools#472). Over-splitting a malformed command can only over-report a commit.
+        return " ; ".join(command.split("\n"))
 
 
 # SYNC: the commit-segment parser below (_segments / _commit_flags / is_skip_commit) is mirrored
