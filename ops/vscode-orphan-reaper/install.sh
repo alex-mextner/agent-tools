@@ -32,8 +32,23 @@ fi
 
 command -v python3 >/dev/null 2>&1 || { echo "install.sh: python3 not found on PATH" >&2; exit 1; }
 PYTHON3="$(command -v python3)"
-SCRIPT_PATH="${SCRIPT_DIR}/reap_vscode_orphans.py"
-[[ -f "$SCRIPT_PATH" ]] || { echo "install.sh: missing ${SCRIPT_PATH}" >&2; exit 1; }
+SOURCE_SCRIPT_PATH="${SCRIPT_DIR}/reap_vscode_orphans.py"
+[[ -f "$SOURCE_SCRIPT_PATH" ]] || { echo "install.sh: missing ${SOURCE_SCRIPT_PATH}" >&2; exit 1; }
+
+# Copy the script to a STABLE, machine-level location before pointing the
+# plist at it (review-caught P2): if install.sh runs from the required fresh
+# feature worktree (see this repo's worktree-isolation policy), SCRIPT_DIR is
+# inside that worktree. Normal post-merge cleanup deletes the worktree and
+# its branch, which would leave every subsequent 15-min launchd interval
+# targeting a now-nonexistent path — a silent, permanent stop with no error
+# surfaced anywhere. Re-running install.sh (e.g. after an update) re-copies,
+# so this stays in sync with whatever worktree/checkout you installed from
+# last, same as the plist itself.
+STABLE_DIR="$HOME/.local/share/agent-tools/vscode-orphan-reaper"
+mkdir -p "$STABLE_DIR"
+SCRIPT_PATH="${STABLE_DIR}/reap_vscode_orphans.py"
+cp "$SOURCE_SCRIPT_PATH" "$SCRIPT_PATH"
+chmod +x "$SCRIPT_PATH"
 
 mkdir -p "$LOG_DIR"
 mkdir -p "$(dirname "$PLIST_DST")"
@@ -52,9 +67,26 @@ xml_escape() {
   s="${s//>/&gt;}"
   printf '%s' "$s"
 }
-PYTHON3_ESC="$(xml_escape "$PYTHON3")"
-SCRIPT_PATH_ESC="$(xml_escape "$SCRIPT_PATH")"
-LOG_PATH_ESC="$(xml_escape "$LOG_PATH")"
+# sed's REPLACEMENT side treats an unescaped '&' as "the whole matched text"
+# and '\' as an escape introducer (review-caught P2): xml_escape's OWN output
+# for a literal '&' is the string "&amp;", which itself contains an
+# unescaped '&' — fed straight into `sed -e "s#...#${VALUE}#"`, sed expands
+# that '&' to the matched placeholder text (e.g. "__PYTHON3__") instead of
+# emitting a literal character, corrupting the substitution while still
+# passing `plutil -lint` (the result is valid-looking but wrong XML/text).
+# Apply this SECOND, after xml_escape, so both escaping layers compose
+# correctly: XML rules for the plist's own syntax, sed rules for how sed
+# treats the replacement text it's given.
+sed_replacement_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//&/\\&}"
+  s="${s//#/\\#}"  # '#' is this script's sed delimiter (s#...#...#)
+  printf '%s' "$s"
+}
+PYTHON3_ESC="$(sed_replacement_escape "$(xml_escape "$PYTHON3")")"
+SCRIPT_PATH_ESC="$(sed_replacement_escape "$(xml_escape "$SCRIPT_PATH")")"
+LOG_PATH_ESC="$(sed_replacement_escape "$(xml_escape "$LOG_PATH")")"
 
 TMP_PLIST="$(mktemp "${TMPDIR:-/tmp}/vscode-orphan-reaper-plist.XXXXXX")"
 trap 'rm -f "$TMP_PLIST"' EXIT

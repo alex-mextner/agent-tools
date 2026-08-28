@@ -22,16 +22,18 @@ launch whose teardown never ran, i.e. a launch whose kill-the-process-tree step
 also never ran. This script is the OS-level backstop for the residual case: a
 periodic launchd job that sweeps regardless of whether anything is about to launch.
 
-DELIBERATE COUPLING (documented, not hidden): the `hvsc-<n>-<uuid>` naming
-convention and the `--extensionDevelopmentPath` argv marker are OWNED by
-`ext-test-projects/e2e/setup/electron-app.ts` — this script duplicates that
-positive-match predicate (NOT the inverse-match `killStrayVSCodeProcesses` uses)
-rather than importing it, because this script must run as a standalone OS process
-(launchd has no access to that repo's TypeScript toolchain) and must keep working
-even if that repo is temporarily unavailable/moved. If the naming convention ever
-changes there, this script's `_ISOLATED_MARKERS` / positive-match logic must change
-here too — there is no automated drift guard between the two today (a real gap;
-see this directory's README for the tracked follow-up).
+DELIBERATE COUPLING (documented, not hidden — and NOT env-var-configurable,
+see `_ISOLATED_MARKERS`'s own comment for why a configurable version was tried
+and reverted for safety): the `hvsc-<n>-<uuid>` naming convention and the
+`--extensionDevelopmentPath` argv marker are OWNED by
+`ext-test-projects/e2e/setup/electron-app.ts` in the `hyperide` repo. This
+script duplicates that positive-match predicate (NOT the inverse-match
+`killStrayVSCodeProcesses` uses) rather than importing it from that repo,
+because this script must run as a standalone OS process (launchd has
+no access to a TypeScript toolchain) and must keep working even if that repo is
+temporarily unavailable/moved. There is still no automated drift guard between
+this default and hyperide's actual convention if that one changes — a real gap,
+see this directory's README for the tracked follow-up.
 
 SAFETY — same two-tier age gate as the pre-launch sweep, and for the same reason
 (never kill a live matrix run or long capture script out from under itself):
@@ -85,6 +87,22 @@ REPARENTED_MIN_AGE_S = 15 * 60  # 15 min, only when ppid == 1
 STALE_MIN_AGE_S = 90 * 60  # 90 min, regardless of parent
 
 _ELECTRON_PATTERN = "Visual Studio Code.app/Contents/MacOS/Electron"
+# NOT configurable via env var (reverted after a review-round safety finding —
+# see this directory's README "Documented coupling" section and the tracked
+# follow-up ticket there for the full analysis). A prior version accepted
+# VSCODE_ORPHAN_REAPER_USERDATADIR_MARKER as an arbitrary substring, validated
+# only by length. That was demonstrably unsafe: a real, running VS Code
+# session's argv legitimately contains `--user-data-dir=/Users/.../Application
+# Support/Code` (verified live on this machine), so a marker as plausible as
+# "Code" would match ANY real session's userDataDir value -- including an
+# actively-debugged extension-development window (which also legitimately
+# carries `--extensionDevelopmentPath`, the OTHER required marker) older than
+# 90 minutes, and get it SIGKILLed. No length/scope heuristic closes this for
+# an arbitrary string; a safe version would need to require a structural
+# pattern (e.g. a numeric worker-id path segment, matching this convention's
+# own shape), not a raw substring -- that's real, non-trivial follow-up work,
+# not something to guess at here. Hardcoded to hyperide's actual, current
+# convention in the meantime.
 _ISOLATED_MARKERS = ("/hvsc-", "--extensionDevelopmentPath")
 _USER_DATA_DIR_RE = re.compile(r"--user-data-dir=(\S+)")
 

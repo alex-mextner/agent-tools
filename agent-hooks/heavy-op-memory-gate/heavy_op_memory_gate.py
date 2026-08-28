@@ -142,8 +142,22 @@ def classify_heavy_operation(command: str) -> Optional[str]:
 
     Kept as a pure function (no I/O) so it's directly unit-testable without
     mocking subprocess/sysctl. Token-based: a heavy-operation word trapped
-    inside a QUOTED argument (a commit message, a `--title`) is one shlex
-    token and never matches a bare-word check — see module docstring.
+    inside a MULTI-WORD quoted argument (a commit message, a `--title`) is one
+    shlex token and never matches a bare-word check — see module docstring. A
+    SINGLE-WORD quoted argument (`git commit -m "pytest"`) is NOT distinguishable
+    from a real bare invocation after shlex strips its quotes — that ambiguity,
+    AND the analogous ambiguity for an unrelated command's PATH ARGUMENT that
+    happens to share a runner's basename (`git add ./vitest`), are documented,
+    accepted trade-offs (same posture as `echo review diff`, see
+    `test_bare_unquoted_tokens_are_still_flagged_documented_edge_case`), not bugs
+    this function tries to close. A stricter, command-position-aware version
+    was tried and reverted after review found it traded this false-positive
+    class for a worse false-NEGATIVE class (`cd /repo && pnpm test`, `sudo
+    pytest`, `env CI=1 npm test`, `npm --prefix x test` all stopped matching) —
+    for a hard-block memory-safety gate, silently ALLOWING a genuinely heavy
+    operation is the more dangerous failure direction than an occasional
+    unnecessary block, so the loose-membership version is the deliberate choice
+    here, not an oversight.
     """
     tokens = _tokenize(command)
     basenames = [_basename(t) for t in tokens]
@@ -154,13 +168,24 @@ def classify_heavy_operation(command: str) -> Optional[str]:
         if _basename(tok) == "vsce" and tokens[i + 1] == "package":
             return "VS Code extension rebuild/package"
     for i, tok in enumerate(tokens[:-1]):
-        if tok == "review" and tokens[i + 1] in _REVIEW_HEAVY_SUBCOMMANDS:
+        if _basename(tok) == "review" and tokens[i + 1] in _REVIEW_HEAVY_SUBCOMMANDS:
             return "multi-model review-cli pass"
 
-    token_set = set(tokens)
-    if token_set & _SUITE_RUNNERS and token_set & _SUITE_SUBCOMMANDS:
+    # Match on BASENAMES, not raw tokens (review-caught P2): the earlier
+    # `set(tokens) & _SUITE_RUNNERS` / `& _DIRECT_TEST_RUNNERS` held only bare
+    # names ("npm", "vitest", ...), so a path-qualified real invocation like
+    # `/usr/bin/npm test` or `./node_modules/.bin/vitest run` never matched and
+    # silently bypassed the gate entirely — a false NEGATIVE, the dangerous
+    # direction (a genuinely heavy op runs unthrottled), unlike the accepted
+    # false-positive ambiguity documented above. Kept as membership over ALL
+    # basenames (not anchored to a resolved executable position) so wrapper
+    # invocations `npx <tool>` / `pnpm dlx <tool>` / `npm run <script>` /
+    # `sudo <tool>` / `cd x && <tool>` — where the real runner/subcommand isn't
+    # in position 0 or 1 — still match, same as before this fix.
+    basename_set = set(basenames)
+    if basename_set & _SUITE_RUNNERS and basename_set & _SUITE_SUBCOMMANDS:
         return "build/test suite"
-    if token_set & _DIRECT_TEST_RUNNERS:
+    if basename_set & _DIRECT_TEST_RUNNERS:
         return "test-suite runner"
     return None
 
