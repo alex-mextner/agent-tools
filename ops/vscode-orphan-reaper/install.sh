@@ -79,6 +79,22 @@ elif command -v python3 >/dev/null 2>&1; then
     echo "install.sh: the only python3 found (${PYTHON3}) lives inside this checkout/worktree -- it will break once this worktree is removed. Install a system/Homebrew python3 (outside any worktree) and re-run." >&2
     exit 1
   fi
+  # Also reject an interpreter from an ACTIVE $VIRTUAL_ENV-style virtualenv
+  # (stdlib venv / virtualenv / poetry / uv), not just one inside THIS
+  # checkout (review-caught P2, agent-tools#477 round 8-review): the check
+  # above only compares against SCRIPT_DIR's own repo root, so a DIFFERENT
+  # worktree's (or any other project's) activated virtualenv -- $VIRTUAL_ENV
+  # pointing anywhere else entirely -- would still pass it, and is exactly
+  # as ephemeral once THAT worktree/venv gets cleaned up. NOT a complete
+  # fix for every environment-manager shape: conda/pyenv-virtualenv only
+  # mutate PATH (no $VIRTUAL_ENV), and a hand-prepended PATH entry with no
+  # activation at all slips through identically -- those remain open,
+  # fail-open exactly like before this check existed.
+  VIRTUAL_ENV_NO_TRAILING_SLASH="${VIRTUAL_ENV%/}"
+  if [[ -n "${VIRTUAL_ENV_NO_TRAILING_SLASH:-}" && "$PYTHON3" == "$VIRTUAL_ENV_NO_TRAILING_SLASH"/* ]]; then
+    echo "install.sh: the only python3 found (${PYTHON3}) is inside the currently active virtualenv (\$VIRTUAL_ENV=${VIRTUAL_ENV}) -- it will break once that environment is removed. Deactivate it, install a system/Homebrew python3, and re-run." >&2
+    exit 1
+  fi
 else
   echo "install.sh: python3 not found (neither /usr/bin/python3 nor on PATH)" >&2
   exit 1

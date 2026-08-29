@@ -314,10 +314,12 @@ def _run_ps(run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.
 
 def _parse_ps_rows(stdout: str) -> list[ProcessInfo]:
     out: list[ProcessInfo] = []
+    nonempty_line_count = 0
     for line in stdout.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
+        nonempty_line_count += 1
         m = _PS_ROW.match(stripped)
         if not m:
             continue
@@ -329,6 +331,17 @@ def _parse_ps_rows(stdout: str) -> list[ProcessInfo]:
             out.append(ProcessInfo(pid=int(pid_s), ppid=int(ppid_s), age_s=age_s, args=args))
         except ValueError:
             continue
+    # Warn on the exact silent-inert shape this file has already shipped once
+    # (review-caught P2, agent-tools#477 round 8-review): `ps` can exit 0 with
+    # real, non-empty output that STILL parses to zero rows -- e.g. the
+    # historical `etimes=` vs `etime=` column-name bug (see this file's own
+    # module docstring), or any future macOS `ps` shape drift. `_run_ps`'s
+    # returncode check can't see this: `ps` succeeded, the failure is purely
+    # in row-shape parsing. Without this, the periodic sweep silently reports
+    # "0 orphans" forever while doing no real work, with nothing in the log
+    # to say why.
+    if nonempty_line_count and not out:
+        _warn(f"ps produced {nonempty_line_count} non-empty line(s) but NONE matched the expected row shape (pid ppid etime args) -- every candidate process was silently dropped this sweep. If this persists, macOS's ps output shape may have changed.")
     return out
 
 

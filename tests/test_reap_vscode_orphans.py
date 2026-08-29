@@ -516,6 +516,44 @@ def test_list_electron_processes_returns_empty_when_ps_raises(capsys):
     assert "WARNING" in capsys.readouterr().err
 
 
+def test_parse_ps_rows_warns_when_ps_succeeds_but_nothing_parses(capsys):
+    """Review-caught P2 (agent-tools#477 round 8): `ps` can exit 0 with real,
+    non-empty output that STILL parses to zero rows (e.g. the historical
+    etimes=/etime= column-name bug this file already shipped once). _run_ps's
+    returncode check can't see this -- the failure is purely in row-shape
+    parsing, and without a warning the periodic sweep silently does nothing
+    forever with no diagnostic."""
+    garbage_output = "this is not a ps row at all\nneither is this\n"
+    result = reaper._parse_ps_rows(garbage_output)
+    assert result == []
+    assert "WARNING" in capsys.readouterr().err
+
+
+def test_parse_ps_rows_no_warning_when_everything_parses(capsys):
+    ps_output = f"  100     1  00:15:00 {ISOLATED_ARGS}\n"
+    result = reaper._parse_ps_rows(ps_output)
+    assert len(result) == 1
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_parse_ps_rows_no_warning_on_a_partial_drop_one_good_row_one_bad(capsys):
+    """The warning is deliberately scoped to a TOTAL drop (zero rows parse),
+    not a partial one -- a single unparseable row alongside a valid one is
+    the already-accepted, expected skip (see
+    test_list_electron_processes_skips_a_row_with_an_unparseable_etime_column).
+    A future change that warns on ANY dropped row (not just a total wipeout)
+    would make this chronically noisy on real macOS ps quirks."""
+    ps_output = f"  100     1  00:15:00 {ISOLATED_ARGS}\n  200     1  garbage {REAL_EDITOR_ARGS}\n"
+    result = reaper._parse_ps_rows(ps_output)
+    assert len(result) == 1
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_parse_ps_rows_no_warning_on_genuinely_empty_output(capsys):
+    assert reaper._parse_ps_rows("") == []
+    assert "WARNING" not in capsys.readouterr().err
+
+
 # ── _pids_sharing_user_data_dir / _reread_args ────────────────────────────────
 
 def test_pids_sharing_user_data_dir_matches_helpers_too():
