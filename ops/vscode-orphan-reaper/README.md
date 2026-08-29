@@ -14,8 +14,9 @@ consuming memory until something else notices it.
 See `reap_vscode_orphans.py`'s own module docstring for the full incident
 writeup, the safety reasoning (two-tier age gate: `ppid == 1` + 15 min, or any
 parent + 90 min — never kill a live matrix run out from under itself), and why
-the kill predicate is a POSITIVE match only (`/hvsc-` + `--extensionDevelopmentPath`
-in argv), never the absence of markers — it can never touch the user's real
+the kill predicate is a POSITIVE match only (a structurally valid hvsc-shaped
+`--user-data-dir=` value + an actual, token-boundary `--extensionDevelopmentPath`
+flag), never the absence of markers — it can never touch the user's real
 editor or an unrelated Electron app.
 
 ## Status: manually installed, NOT yet wired into `rig apply`
@@ -49,7 +50,7 @@ script duplicates that positive-match predicate in Python rather than
 importing it — a standalone OS process under launchd has no access to that
 repo's TypeScript toolchain, and this script needs to keep working even if
 that repo is temporarily unavailable. If the naming convention ever changes
-there, `_ISOLATED_MARKERS` must change here too, by hand. There is currently
+there, `_USER_DATA_DIR_RE` and `_EXTENSION_DEV_PATH_RE` must change here too, by hand. There is currently
 no automated test or CI check that would catch the two drifting apart — a
 real gap, part of the follow-up ticket above.
 

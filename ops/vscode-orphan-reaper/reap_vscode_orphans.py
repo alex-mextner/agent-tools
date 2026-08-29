@@ -23,7 +23,7 @@ also never ran. This script is the OS-level backstop for the residual case: a
 periodic launchd job that sweeps regardless of whether anything is about to launch.
 
 DELIBERATE COUPLING (documented, not hidden — and NOT env-var-configurable,
-see `_ISOLATED_MARKERS`'s own comment for why a configurable version was tried
+see `_USER_DATA_DIR_RE`'s own comment for why a configurable version was tried
 and reverted for safety): the `hvsc-<n>-<uuid>` naming convention and the
 `--extensionDevelopmentPath` argv marker are OWNED by
 `ext-test-projects/e2e/setup/electron-app.ts` in the `hyperide` repo. This
@@ -42,7 +42,9 @@ SAFETY — same two-tier age gate as the pre-launch sweep, and for the same reas
   - ANY isolated instance, regardless of parent, is reaped once elapsed >=
     STALE_MIN_AGE_S (a generous bar past any real matrix run).
 Never matches on the ABSENCE of markers — only a confirmed positive match
-(`/hvsc-` AND `--extensionDevelopmentPath` in argv) is ever a candidate. The
+(a structurally valid hvsc-shaped `--user-data-dir=` value AND an actual,
+token-boundary `--extensionDevelopmentPath` flag — see `_has_isolation_markers`)
+is ever a candidate. The
 distinguishing test is NOT the binary name (verified live on this machine: the
 real installed editor really does run as `.../MacOS/Code`, distinct from the
 `.../MacOS/Electron` this greps for, contrary to an earlier review comment that
@@ -103,7 +105,17 @@ _ELECTRON_PATTERN = "Visual Studio Code.app/Contents/MacOS/Electron"
 # own shape), not a raw substring -- that's real, non-trivial follow-up work,
 # not something to guess at here. Hardcoded to hyperide's actual, current
 # convention in the meantime.
-_ISOLATED_MARKERS = ("/hvsc-", "--extensionDevelopmentPath")
+# No `_ISOLATED_MARKERS` constant (review-caught, agent-tools#477 rounds 5-6):
+# an earlier version kept a `("/hvsc-", "--extensionDevelopmentPath")` tuple
+# and checked membership via `all(marker in args for marker in _ISOLATED_MARKERS)`
+# -- a raw substring scan that let a real window's own --extensionDevelopmentPath
+# VALUE coincidentally containing "/hvsc-" (round 5), or an unrelated argument's
+# value coincidentally containing the literal text "--extensionDevelopmentPath"
+# (round 6), satisfy the markers on their own. The two markers are now each
+# enforced by their own ANCHORED check (`_extract_user_data_dir` /
+# `_EXTENSION_DEV_PATH_RE`) inside the single `_has_isolation_markers`
+# predicate below -- removed the unused tuple rather than leave a
+# do-not-use-this-as-a-substring-scan footgun sitting next to dead code.
 # Anchored to a TOKEN BOUNDARY (start-of-string or preceding whitespace),
 # not a bare substring (review-caught P1, agent-tools#477 round 2): argv is
 # `ps`-joined by single spaces, so a real `--user-data-dir=` FLAG always
@@ -132,6 +144,19 @@ _ISOLATED_MARKERS = ("/hvsc-", "--extensionDevelopmentPath")
 # already describes duplicating that predicate; this brings the two back in
 # sync on this specific case too.
 _USER_DATA_DIR_RE = re.compile(r"(?:^|\s)--user-data-dir=(\S*/hvsc-\d+-\S*)")
+
+# Same token-boundary anchoring as _USER_DATA_DIR_RE, applied to the SECOND
+# isolation marker (review-caught P1, agent-tools#477 round 6): an unanchored
+# `"--extensionDevelopmentPath" in args` substring check matches that literal
+# text occurring inside an UNRELATED argument's own value -- e.g. a single
+# argv token `--note=--extensionDevelopmentPath` -- letting a process with a
+# real, valid hvsc-shaped --user-data-dir= (e.g. a genuine helper process, or
+# any process whose --user-data-dir= happens to be hvsc-shaped) but NO actual
+# --extensionDevelopmentPath flag satisfy both markers anyway. `(?:=|\s|$)`
+# after the flag name additionally rejects a longer flag name that merely
+# starts with this text (defense in depth; not the reported vector but the
+# same anchoring principle).
+_EXTENSION_DEV_PATH_RE = re.compile(r"(?:^|\s)--extensionDevelopmentPath(?:=|\s|$)")
 
 # `ps -o pid=,ppid=,etime=,args=` row shape: pid, ppid, a NO-SPACE elapsed-time
 # field (`[[dd-]hh:]mm:ss`), then args (may itself contain spaces).
@@ -200,12 +225,45 @@ class ReapReport:
 def is_orphaned_isolated_instance(args: str, ppid: int, age_s: float) -> bool:
     """Pure predicate — see module docstring's SAFETY section. Mirrors
     `isOrphanedIsolatedInstance` in `ext-test-projects/e2e/setup/electron-app.ts`
-    (kept in sync by hand; no shared source between the two languages/repos)."""
-    if not all(marker in args for marker in _ISOLATED_MARKERS):
+    (kept in sync by hand; no shared source between the two languages/repos).
+
+    Requires a STRUCTURALLY VALID hvsc-shaped `--user-data-dir=` value (via
+    `_extract_user_data_dir`), not a raw `/hvsc-` substring anywhere in the
+    full argv (review-caught P1, agent-tools#477 round 5): a real, live VS
+    Code window's `--extensionDevelopmentPath` value can itself legitimately
+    contain the text "/hvsc-" (e.g. an extension author testing against a
+    fixture project named with that string) with a completely normal or
+    absent `--user-data-dir=`. Checking `/hvsc-` as a bare substring across
+    the WHOLE args string let that one argument satisfy the marker on its
+    own; past the 90-minute stale-regardless bar, this would classify a real,
+    unrelated, live window as an orphan and SIGKILL it -- the exact
+    wrongful-kill class every other fix in this file exists to prevent. The
+    `--extensionDevelopmentPath` marker is ALSO a token-boundary anchored
+    check, not a bare substring (review-caught P1, agent-tools#477 round 6 --
+    the same literal-text-embedded-in-an-unrelated-value vector applies to
+    either marker; see `_EXTENSION_DEV_PATH_RE`)."""
+    if not _has_isolation_markers(args):
         return False
     reparented = ppid == 1 and age_s >= REPARENTED_MIN_AGE_S
     stale_regardless = age_s >= STALE_MIN_AGE_S
     return reparented or stale_regardless
+
+
+def _has_isolation_markers(args: str) -> bool:
+    """True when `args` carries BOTH isolation markers this convention
+    requires: a structurally valid hvsc-shaped `--user-data-dir=` value (not
+    a bare `/hvsc-` substring anywhere in argv — see
+    `is_orphaned_isolated_instance`'s docstring) and an actual, token-boundary
+    `--extensionDevelopmentPath` flag (not that literal text occurring inside
+    an unrelated argument's own value — review-caught P1, agent-tools#477
+    round 6, same anchoring principle as `_USER_DATA_DIR_RE`). The ONLY
+    marker check either `is_orphaned_isolated_instance` (kill decision) or
+    `sweep`'s "skipped, still within age grace" reporting branch uses — both
+    must route through this single function so the two can't silently
+    diverge (a stricter kill-decision predicate with a looser reporting
+    predicate would still be kill-safe, but would misreport a non-isolated
+    process as a "skipped isolated instance")."""
+    return _extract_user_data_dir(args) is not None and _EXTENSION_DEV_PATH_RE.search(args) is not None
 
 
 def _extract_user_data_dir(args: str) -> Optional[str]:
@@ -230,9 +288,21 @@ def _carries_user_data_dir(args: str, user_data_dir: str) -> bool:
 
 def _run_ps(run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run) -> Optional[str]:
     """Raw `ps -eo pid=,ppid=,etime=,args=` stdout for EVERY process, or None
-    on failure (never `[]`-shaped success — see `_warn`'s docstring note)."""
+    on failure (never `[]`-shaped success — see `_warn`'s docstring note).
+
+    `-ww` (review-caught P1, agent-tools#477 round 5): BSD `ps` truncates the
+    displayed command line to terminal width unless wide output is
+    requested; a real VS Code Electron argv (many flags) can exceed that,
+    silently cutting off `--user-data-dir=` or `--extensionDevelopmentPath`
+    before this ever sees them. The row still parses fine -- candidate
+    discovery just silently misses the orphan (false-negative direction,
+    same fail-safe posture as everything else in this file, but still a
+    real functional gap this reaper exists to close). `ps -ww` is this
+    repo's existing documented fix for the identical truncation class
+    elsewhere (see ROADMAP.md's "#35 -- daemon: read full cmdline via
+    ps -ww"); this call and `_reread_args` below now match that pattern."""
     try:
-        proc = run(["ps", "-eo", "pid=,ppid=,etime=,args="], capture_output=True, text=True, timeout=10)
+        proc = run(["ps", "-eo", "pid=,ppid=,etime=,args=", "-ww"], capture_output=True, text=True, timeout=10)
     except Exception as exc:
         _warn(f"ps invocation failed: {exc}")
         return None
@@ -306,9 +376,14 @@ def _reread_args(pid: int, run: Callable[..., "subprocess.CompletedProcess[str]"
     exited and been recycled by an unrelated process by the time we get
     around to signalling it. Returns None when the pid no longer exists
     (`ps -p` exits non-zero) or on any read failure — the caller must treat
-    that as "do not kill", not as "assume it's still the same process"."""
+    that as "do not kill", not as "assume it's still the same process".
+
+    `-ww` (review-caught P1, agent-tools#477 round 5, same as `_run_ps`
+    above): without it, a truncated re-read could falsely report "no
+    --user-data-dir= value" for a genuinely still-matching process, refusing
+    a legitimate kill -- fail-safe direction, but still wrong."""
     try:
-        proc = run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+        proc = run(["ps", "-o", "args=", "-p", str(pid), "-ww"], capture_output=True, text=True, timeout=5)
     except Exception:
         return None
     if proc.returncode != 0:
@@ -398,7 +473,7 @@ def sweep(
             # Includes both "not isolated at all" (never touched — positive-match
             # only) and "isolated but still within its age grace" (reported as
             # skipped so `main()`'s summary distinguishes the two).
-            if all(marker in info.args for marker in _ISOLATED_MARKERS):
+            if _has_isolation_markers(info.args):
                 report.skipped.append(info)
             continue
         if dry_run:

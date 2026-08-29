@@ -87,6 +87,72 @@ def test_never_reaps_missing_isolation_markers():
     assert reaper.is_orphaned_isolated_instance(REAL_EDITOR_ARGS, ppid=1, age_s=reaper.STALE_MIN_AGE_S * 10) is False
 
 
+def test_never_reaps_a_real_window_whose_extension_dev_path_merely_mentions_hvsc():
+    """Review-caught P1 (agent-tools#477 round 5): a REAL, live VS Code
+    window's --extensionDevelopmentPath value can legitimately contain the
+    text "/hvsc-" (e.g. testing against a fixture project named with that
+    string) while its own --user-data-dir= is a normal, non-isolated path.
+    The old raw-substring marker check (`/hvsc-` anywhere in the whole argv)
+    let this single argument satisfy BOTH markers on its own; past the
+    stale-regardless bar this would classify a real window as an orphan and
+    SIGKILL it -- the exact wrongful-kill class this whole file exists to
+    prevent. Must require the hvsc- shape specifically within
+    --user-data-dir=."""
+    args = (
+        "/Applications/Visual Studio Code.app/Contents/MacOS/Electron "
+        "--user-data-dir=/Users/ultra/Library/Application Support/Code "
+        "--extensionDevelopmentPath=/Users/ultra/work/hvsc-test-fixture"
+    )
+    assert reaper.is_orphaned_isolated_instance(args, ppid=1, age_s=reaper.STALE_MIN_AGE_S * 10) is False
+
+
+def test_has_isolation_markers_matches_is_orphaned_isolated_instance_marker_check():
+    """The reporting predicate (used by sweep()'s 'skipped, still within age
+    grace' branch) must use the SAME marker rule as the kill-decision
+    predicate, not a looser one -- otherwise a non-isolated process could be
+    misreported as a 'skipped isolated instance'. Asserted as a genuine
+    differential check through BOTH predicates (review-caught, agent-tools#477
+    round 6-review) -- with age forced to the stale-regardless bar,
+    is_orphaned_isolated_instance reduces to exactly the marker check, so a
+    future edit that reintroduces a looser gate in ONE of the two functions
+    (not both) fails this test, not just a fixed-input assertion on one of
+    them alone."""
+    real_window_with_hvsc_in_ext_path = (
+        "/Applications/Visual Studio Code.app/Contents/MacOS/Electron "
+        "--user-data-dir=/Users/ultra/Library/Application Support/Code "
+        "--extensionDevelopmentPath=/Users/ultra/work/hvsc-test-fixture"
+    )
+    for args in (real_window_with_hvsc_in_ext_path, ISOLATED_ARGS, REAL_EDITOR_ARGS):
+        assert reaper.is_orphaned_isolated_instance(args, ppid=1, age_s=reaper.STALE_MIN_AGE_S) == (
+            reaper._has_isolation_markers(args)
+        )
+    assert reaper._has_isolation_markers(real_window_with_hvsc_in_ext_path) is False
+    assert reaper._has_isolation_markers(ISOLATED_ARGS) is True
+
+
+def test_never_reaps_a_process_where_extensiondevpath_text_is_embedded_in_another_value():
+    """Review-caught P1 (agent-tools#477 round 6): the second marker check
+    must also be token-boundary anchored, not a bare substring -- a process
+    with a real, valid hvsc-shaped --user-data-dir= but the literal text
+    "--extensionDevelopmentPath" only embedded inside an UNRELATED
+    argument's own value (not as its own real flag) must not satisfy the
+    marker."""
+    args = (
+        "/Applications/Visual Studio Code.app/Contents/MacOS/Electron "
+        "--user-data-dir=/tmp/hvsc-42-personal --note=--extensionDevelopmentPath"
+    )
+    assert reaper._has_isolation_markers(args) is False
+    assert reaper.is_orphaned_isolated_instance(args, ppid=1, age_s=reaper.STALE_MIN_AGE_S * 10) is False
+
+
+def test_has_isolation_markers_false_when_user_data_dir_valid_but_no_ext_dev_path():
+    """Both conjuncts of _has_isolation_markers must independently matter --
+    a valid hvsc-shaped --user-data-dir= alone, with no
+    --extensionDevelopmentPath at all, must not satisfy the marker check."""
+    args = "/Applications/Visual Studio Code.app/Contents/MacOS/Electron --user-data-dir=/tmp/hvsc-2-deadbeef"
+    assert reaper._has_isolation_markers(args) is False
+
+
 def test_young_reparented_instance_gets_grace():
     assert reaper.is_orphaned_isolated_instance(ISOLATED_ARGS, ppid=1, age_s=reaper.REPARENTED_MIN_AGE_S - 1) is False
 
@@ -384,6 +450,33 @@ class _FakeCompletedProcess:
         self.stdout = stdout
         self.returncode = returncode
         self.stderr = stderr
+
+
+def test_run_ps_requests_unlimited_width():
+    """Review-caught P1 (agent-tools#477 round 5): without -ww, BSD ps
+    truncates the displayed command line to terminal width, which can cut
+    off --user-data-dir=/--extensionDevelopmentPath on a real VS Code argv
+    before this reaper ever sees them (silent false-negative candidate
+    discovery)."""
+    captured_argv = []
+
+    def fake_run(argv, **kwargs):
+        captured_argv.append(argv)
+        return _FakeCompletedProcess("")
+
+    reaper._run_ps(run=fake_run)
+    assert "-ww" in captured_argv[0]
+
+
+def test_reread_args_requests_unlimited_width():
+    captured_argv = []
+
+    def fake_run(argv, **kwargs):
+        captured_argv.append(argv)
+        return _FakeCompletedProcess("some args\n")
+
+    reaper._reread_args(123, run=fake_run)
+    assert "-ww" in captured_argv[0]
 
 
 def test_list_electron_processes_parses_real_bsd_etime_shape_and_filters_non_electron():

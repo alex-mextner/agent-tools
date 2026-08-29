@@ -30,8 +30,34 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-command -v python3 >/dev/null 2>&1 || { echo "install.sh: python3 not found on PATH" >&2; exit 1; }
-PYTHON3="$(command -v python3)"
+# Prefer the SYSTEM python3, not `command -v python3` (review-caught P2,
+# agent-tools#477 round 5): this script is normally run from the required
+# fresh feature worktree, and if that worktree has a local virtualenv
+# activated at install time, `command -v python3` resolves to
+# `<worktree>/.venv/bin/python3` -- baked permanently into the plist even
+# though the reaper script itself is now copied to stable storage (the
+# earlier P2 fix above). Worktree removal then breaks the interpreter path
+# for every future launchd interval, same failure shape the stable-script-
+# path fix already closed for the script itself. The reaper's own module
+# docstring already documents the assumption this fixes: "Stdlib only -- no
+# third-party deps, so it can run standalone under launchd's bare
+# /usr/bin/python3 without a virtualenv." `-x` alone only proves the path is
+# an executable FILE, not a WORKING interpreter (review-caught, agent-tools#477
+# round 6): on a macOS machine without Xcode Command Line Tools installed,
+# /usr/bin/python3 is a real, executable STUB that fails on every invocation
+# (or pops a "install command line developer tools" GUI prompt) -- `-x`
+# alone would still pick it, silently baking a permanently broken
+# interpreter into the plist. Actually running it is the only way to tell.
+# `command -v python3` is kept as the fallback for that case (and for an
+# unusual system missing /usr/bin/python3 entirely).
+if [[ -x /usr/bin/python3 ]] && /usr/bin/python3 -c '' >/dev/null 2>&1; then
+  PYTHON3=/usr/bin/python3
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON3="$(command -v python3)"
+else
+  echo "install.sh: python3 not found (neither /usr/bin/python3 nor on PATH)" >&2
+  exit 1
+fi
 SOURCE_SCRIPT_PATH="${SCRIPT_DIR}/reap_vscode_orphans.py"
 [[ -f "$SOURCE_SCRIPT_PATH" ]] || { echo "install.sh: missing ${SOURCE_SCRIPT_PATH}" >&2; exit 1; }
 
