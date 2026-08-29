@@ -7887,6 +7887,30 @@ def test_staleness_gate_skipped_when_self_hosting(repo_with_agent_tools_checkout
     assert "Refusing:" not in r.stderr, r.stderr
 
 
+def test_staleness_gate_not_exempted_when_repo_flag_targets_a_foreign_repo(
+    repo_with_agent_tools_checkout, tmp_path,
+):
+    """Review-cli finding (GH-470, P2): ROOT-equality alone is not a valid self-hosting
+    signal for `cd "$AGENT_TOOLS_ROOT" && gh ship 123 --repo owner/other-repo` — $ROOT
+    (derived from cwd) equals the staleness-check root there even though PR 123 belongs to
+    a completely different repo than the one this checkout pushes to. A stale checkout must
+    still be caught in that shape, not silently exempted the way the plain self-hosting test
+    above is (that test has NO --repo at all). Same genuine ci/ship/ drift + same
+    SHIP_STALENESS_CHECK_ROOT==pr_main setup as the self-hosting test, but with an explicit
+    --repo naming a target this checkout's own origin can't be confirmed to be — must REFUSE."""
+    pr_main, pr_wt, pr_origin, at_checkout, at_origin = repo_with_agent_tools_checkout
+    _advance_origin_repo(pr_origin, tmp_path, touch_ship=True, tag="foreign-repo-drift")
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship_repo(pr_main, bindir, ("--repo", "owner/other-repo"), {
+        "SHIP_STALENESS_CHECK": "1",
+        "SHIP_STALENESS_CHECK_ROOT": str(pr_main),
+    })
+
+    assert r.returncode != 0, f"expected refusal for a foreign --repo target\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "Refusing:" in r.stderr and "ci/ship/" in r.stderr, r.stderr
+
+
 def test_staleness_gate_fails_open_on_unreachable_origin(repo_with_agent_tools_checkout, tmp_path):
     """A checkout whose origin can't be fetched (offline, bad remote) must never block a
     merge over a freshness hint it cannot actually determine."""

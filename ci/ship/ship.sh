@@ -445,6 +445,18 @@ command -v gh >/dev/null 2>&1 || { echo "gh CLI not found" >&2; exit 1; }
 # shipping a ci/ship/ PR from a feature branch there): in that case the checked-out branch
 # IS the code intentionally under test, not stale.
 #
+# The self-hosting check is ROOT-equality alone, which is not sufficient on its own: for
+# `cd "$AGENT_TOOLS_ROOT" && gh ship 123 --repo owner/other-repo`, $ROOT equals $_AT_ROOT (both
+# resolve to the agent-tools checkout from cwd) even though PR 123 belongs to an unrelated repo
+# named by --repo — a stale agent-tools checkout would wrongly skip the gate for a target that
+# ISN'T self-hosted at all (review-cli finding, GH-470). So self-hosting additionally requires
+# EITHER no --repo override, OR a --repo value that resolves to this same checkout's own origin
+# (a redundant-but-legitimate explicit self-ship). This duplicates a few lines of the origin-URL
+# parse the "cross-repo (--repo) support" block below does more fully (_CWD_ORIGIN_REPO) —
+# duplicated rather than reordered because that block runs after PR-state resolution further
+# down and hoisting it here would widen this change's blast radius; keep both derivations in
+# sync if the github.com URL parsing ever changes.
+#
 # Three-tier response, proportionate to what's actually at risk:
 #   - the checkout isn't on `main` (parked on a feature branch, or detached): REFUSE with a
 #     distinct message — this is the exact incident that motivated this gate (an agent-tools
@@ -468,10 +480,25 @@ if [ "${SHIP_STALENESS_CHECK:-1}" != "0" ]; then
   _AT_ROOT=""
   [ -n "$_AT_ROOT_RAW" ] && _AT_ROOT="$(cd "$_AT_ROOT_RAW" 2>/dev/null && pwd -P || true)"
   _ROOT_PHYS="$(cd "$ROOT" 2>/dev/null && pwd -P || echo "$ROOT")"
+  # Self-hosting exemption: ROOT-equality alone is not enough (see comment above) — also
+  # require that this invocation doesn't --repo-target a DIFFERENT repo than the one this
+  # checkout actually pushes to.
+  _AT_SELF_HOST_EXEMPT=0
+  if [ -n "$_AT_ROOT" ] && [ "$_AT_ROOT" = "$_ROOT_PHYS" ]; then
+    if [ -z "$REPO_FLAG" ]; then
+      _AT_SELF_HOST_EXEMPT=1
+    else
+      _AT_CWD_ORIGIN_URL=$(git remote get-url origin 2>/dev/null) || true
+      _AT_CWD_ORIGIN_REPO=$(printf '%s' "$_AT_CWD_ORIGIN_URL" \
+        | sed 's|.*github\.com[:/]\(.*\)\.git$|\1|;s|.*github\.com[:/]\(.*\)$|\1|')
+      case "$_AT_CWD_ORIGIN_REPO" in *@*|*:*|""|*/*/*) _AT_CWD_ORIGIN_REPO="" ;; esac
+      [ -n "$_AT_CWD_ORIGIN_REPO" ] && [ "$REPO_FLAG" = "$_AT_CWD_ORIGIN_REPO" ] && _AT_SELF_HOST_EXEMPT=1
+    fi
+  fi
   # `git rev-parse --is-inside-work-tree` (NOT `-d "$_AT_ROOT/.git"`) so a LINKED worktree
   # checkout — where .git is a FILE, not a directory — is still recognized. agent-tools'
   # own checkouts routinely live under .worktrees/, so this is not a theoretical case.
-  if [ -n "$_AT_ROOT" ] && [ "$_AT_ROOT" != "$_ROOT_PHYS" ] \
+  if [ -n "$_AT_ROOT" ] && [ "$_AT_SELF_HOST_EXEMPT" != "1" ] \
      && [ "$(git -C "$_AT_ROOT" rev-parse --is-inside-work-tree 2>/dev/null || true)" = "true" ]; then
     # timeout(1) is GNU coreutils — absent from a stock macOS PATH (a launchd LaunchAgent's
     # minimal /usr/bin:/bin:/usr/sbin:/sbin has neither `timeout` nor Homebrew's `gtimeout`

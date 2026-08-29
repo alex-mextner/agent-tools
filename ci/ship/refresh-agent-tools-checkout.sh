@@ -127,17 +127,21 @@ _guards_ok() {
 # about to start tracking — checked via `-e || -L` instead.
 #
 # Builds both path lists with ONE `git` spawn each (not one `check-ignore` spawn per changed
-# path — a checkout behind a large merge can have hundreds of changed paths) and does the
-# collision check as plain in-shell array membership; portable to bash 3.2 (no associative
-# arrays / readarray), which matters because macOS ships bash 3.2 as /bin/bash.
-_in_array() {  # $1 = needle, rest = haystack
-  local needle="$1" x; shift
-  for x in "$@"; do [ "$x" = "$needle" ] && return 0; done
-  return 1
-}
-
+# path — a checkout behind a large merge can have hundreds of changed paths); portable to
+# bash 3.2 (no associative arrays / readarray), which matters because macOS ships bash 3.2 as
+# /bin/bash.
+#
+# A collision is not just PATH EQUALITY — an ancestor/descendant relationship also collides
+# (review-cli finding, GH-470, reproduced): an incoming tracked file `cache` replacing an
+# ignored DIRECTORY containing `cache/x` (`cache` is a prefix of the ignored path) is a real
+# collision even though "cache" != "cache/x" — a plain equality check misses it and --ff-only
+# silently deletes `cache/x` to make room. Same the other direction: an incoming tracked path
+# `foo/bar` where `foo` itself is currently an ignored file/symlink (`foo` is a prefix of the
+# changed path) also collides — git must clobber the ignored `foo` to create the `foo/`
+# directory the merge needs. So each changed path is checked against every ignored path for
+# equality OR either being a path-prefix of the other, not `_in_array` exact membership alone.
 _ignored_collision() {
-  local root="$1" p
+  local root="$1" p ig
   local -a changed=() ignored=()
   while IFS= read -r -d '' p; do changed+=("$p"); done \
     < <(git -C "$root" -c core.quotePath=false diff --name-only -z HEAD..origin/main 2>/dev/null)
@@ -146,10 +150,29 @@ _ignored_collision() {
     < <(git -C "$root" -c core.quotePath=false ls-files -oi --exclude-standard -z 2>/dev/null)
   [ "${#ignored[@]}" -gt 0 ] || return 0
   for p in "${changed[@]}"; do
-    if { [ -e "$root/$p" ] || [ -L "$root/$p" ]; } && _in_array "$p" "${ignored[@]}"; then
-      printf '%s\n' "$p"
-      return 0
-    fi
+    for ig in "${ignored[@]}"; do
+      # Exact match, or the changed path is an ancestor of the ignored path (a directory
+      # about to be replaced) — anchor the existence check on the CHANGED path (that's what's
+      # on disk today as the thing about to be overwritten).
+      case "$ig" in
+        "$p"|"$p"/*)
+          if { [ -e "$root/$p" ] || [ -L "$root/$p" ]; }; then
+            printf '%s\n' "$p"
+            return 0
+          fi
+          ;;
+      esac
+      # The changed path is a descendant of the ignored path (an ignored file/symlink about
+      # to be replaced by a directory) — anchor the existence check on the IGNORED path.
+      case "$p" in
+        "$ig"/*)
+          if { [ -e "$root/$ig" ] || [ -L "$root/$ig" ]; }; then
+            printf '%s\n' "$p"
+            return 0
+          fi
+          ;;
+      esac
+    done
   done
   return 0
 }

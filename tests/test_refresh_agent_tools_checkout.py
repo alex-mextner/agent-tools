@@ -347,5 +347,112 @@ def test_ignored_file_collision_skips_pull(tmp_path):
     assert head != origin_head, "checkout fast-forwarded despite the ignored-file collision"
 
 
+def test_ignored_dir_collision_with_incoming_file_skips_pull(tmp_path):
+    """Ancestor-direction collision (review-cli finding, GH-470): the incoming commit tracks
+    a FILE at a path that is currently a directory locally, containing ignored content one
+    level down (e.g. incoming file `cache` vs. locally ignored `cache/x`). Exact-path
+    equality between the changed path and the ignored path never matches here (`cache` !=
+    `cache/x`), so a collision check that only does array membership on exact paths misses
+    it entirely — reproduced against the pre-fix code: `git merge --ff-only` silently
+    deleted `cache/x` to make room for the incoming file. The fix checks prefix/ancestor
+    relationships in both directions, not just equality."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _git("init", "-q", "-b", "main", cwd=checkout)
+    _git("config", "user.email", "t@t", cwd=checkout)
+    _git("config", "user.name", "t", cwd=checkout)
+    _git("remote", "add", "origin", str(origin), cwd=checkout)
+    (checkout / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    (checkout / "README.md").write_text("# x\n", encoding="utf-8")
+    _git("add", "-A", cwd=checkout)
+    _git("commit", "-qm", "init", cwd=checkout)
+    _git("push", "-q", "-u", "origin", "main", cwd=checkout)
+
+    # Local, gitignored directory-with-content the script must never destroy.
+    (checkout / "cache").mkdir()
+    (checkout / "cache" / "x").write_text("IGNORED LOCAL CONTENT\n", encoding="utf-8")
+    assert _git("status", "--porcelain", cwd=checkout).stdout == "", (
+        "fixture invariant: an ignored directory must not appear in plain `status --porcelain`"
+    )
+
+    # origin/main starts tracking a FILE (not a dir) at the same path the ignored dir occupies.
+    pusher = tmp_path / "pusher-dir-collision"
+    _sh("git", "clone", "-q", str(origin), str(pusher), cwd=tmp_path)
+    _git("config", "user.email", "t@t", cwd=pusher)
+    _git("config", "user.name", "t", cwd=pusher)
+    (pusher / "cache").write_text("NEW TRACKED FILE FROM ORIGIN\n", encoding="utf-8")
+    _git("add", "-f", "-A", cwd=pusher)
+    _git("commit", "-qm", "start tracking cache as a file", cwd=pusher)
+    _git("push", "-q", "origin", "main", cwd=pusher)
+
+    r = _run_refresh(checkout)
+
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    content = (checkout / "cache" / "x").read_text(encoding="utf-8")
+    assert content == "IGNORED LOCAL CONTENT\n", (
+        f"local ignored content under the directory was overwritten by the pull: {content!r}"
+    )
+    head = _git("rev-parse", "HEAD", cwd=checkout).stdout.strip()
+    origin_head = _git("rev-parse", "origin/main", cwd=checkout).stdout.strip()
+    assert head != origin_head, "checkout fast-forwarded despite the ignored-dir collision"
+
+
+def test_ignored_file_collision_with_incoming_nested_path_skips_pull(tmp_path):
+    """Descendant-direction collision (review-cli finding, GH-470): the incoming commit
+    tracks a NESTED path (`foo/bar`) where the parent (`foo`) is currently an ignored FILE
+    locally — the opposite direction from the ancestor case above. `foo/bar` never equals
+    `foo`, so exact-path membership misses this too; a `foo/bar` ff-merge needs `foo` to
+    become a directory, clobbering the ignored file at `foo`."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _git("init", "-q", "-b", "main", cwd=checkout)
+    _git("config", "user.email", "t@t", cwd=checkout)
+    _git("config", "user.name", "t", cwd=checkout)
+    _git("remote", "add", "origin", str(origin), cwd=checkout)
+    (checkout / ".gitignore").write_text("foo\n", encoding="utf-8")
+    (checkout / "README.md").write_text("# x\n", encoding="utf-8")
+    _git("add", "-A", cwd=checkout)
+    _git("commit", "-qm", "init", cwd=checkout)
+    _git("push", "-q", "-u", "origin", "main", cwd=checkout)
+
+    # Local, gitignored FILE the script must never destroy.
+    (checkout / "foo").write_text("IGNORED LOCAL CONTENT\n", encoding="utf-8")
+    assert _git("status", "--porcelain", cwd=checkout).stdout == "", (
+        "fixture invariant: an ignored file must not appear in plain `status --porcelain`"
+    )
+
+    # origin/main starts tracking a NESTED path under what is locally an ignored file.
+    pusher = tmp_path / "pusher-nested-collision"
+    _sh("git", "clone", "-q", str(origin), str(pusher), cwd=tmp_path)
+    _git("config", "user.email", "t@t", cwd=pusher)
+    _git("config", "user.name", "t", cwd=pusher)
+    (pusher / "foo").mkdir()
+    (pusher / "foo" / "bar").write_text("NEW TRACKED CONTENT FROM ORIGIN\n", encoding="utf-8")
+    _git("add", "-f", "-A", cwd=pusher)
+    _git("commit", "-qm", "start tracking foo/bar", cwd=pusher)
+    _git("push", "-q", "origin", "main", cwd=pusher)
+
+    r = _run_refresh(checkout)
+
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    content = (checkout / "foo").read_text(encoding="utf-8")
+    assert content == "IGNORED LOCAL CONTENT\n", (
+        f"local ignored file was overwritten by the pull: {content!r}"
+    )
+    head = _git("rev-parse", "HEAD", cwd=checkout).stdout.strip()
+    origin_head = _git("rev-parse", "origin/main", cwd=checkout).stdout.strip()
+    assert head != origin_head, "checkout fast-forwarded despite the ignored-file collision"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
