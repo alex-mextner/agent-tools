@@ -8284,6 +8284,29 @@ def test_staleness_gate_not_exempted_when_repo_flag_targets_a_foreign_repo(
     assert "Refusing:" in r.stderr and "ci/ship/" in r.stderr, r.stderr
 
 
+def test_staleness_gate_not_exempted_when_gh_repo_env_targets_a_foreign_repo(
+    repo_with_agent_tools_checkout, tmp_path,
+):
+    """Review-cli finding (GH-470, second review round, P2): the FIRST --repo fix above still
+    left a gap — `gh` honours THREE ways to name a target repo (--repo, GH_SHIP_REPO, and an
+    ambient GH_REPO), and the self-hosting exemption originally only checked `REPO_FLAG`. A
+    foreign repo selected purely via the GH_REPO env var (no --repo flag at all) must be
+    caught exactly like the --repo case — the exemption now uses the same effective-target
+    precedence (--repo, else GH_SHIP_REPO, else GH_REPO) the cross-repo support block uses."""
+    pr_main, pr_wt, pr_origin, at_checkout, at_origin = repo_with_agent_tools_checkout
+    _advance_origin_repo(pr_origin, tmp_path, touch_ship=True, tag="foreign-repo-env-drift")
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(pr_main, bindir, env_extra={
+        "SHIP_STALENESS_CHECK": "1",
+        "SHIP_STALENESS_CHECK_ROOT": str(pr_main),
+        "GH_REPO": "owner/other-repo",
+    })
+
+    assert r.returncode != 0, f"expected refusal for a GH_REPO-only foreign target\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "Refusing:" in r.stderr and "ci/ship/" in r.stderr, r.stderr
+
+
 def test_staleness_gate_fails_open_on_unreachable_origin(repo_with_agent_tools_checkout, tmp_path):
     """A checkout whose origin can't be fetched (offline, bad remote) must never block a
     merge over a freshness hint it cannot actually determine."""

@@ -464,13 +464,16 @@ command -v gh >/dev/null 2>&1 || { echo "gh CLI not found" >&2; exit 1; }
 # `cd "$AGENT_TOOLS_ROOT" && gh ship 123 --repo owner/other-repo`, $ROOT equals $_AT_ROOT (both
 # resolve to the agent-tools checkout from cwd) even though PR 123 belongs to an unrelated repo
 # named by --repo — a stale agent-tools checkout would wrongly skip the gate for a target that
-# ISN'T self-hosted at all (review-cli finding, GH-470). So self-hosting additionally requires
-# EITHER no --repo override, OR a --repo value that resolves to this same checkout's own origin
-# (a redundant-but-legitimate explicit self-ship). This duplicates a few lines of the origin-URL
-# parse the "cross-repo (--repo) support" block below does more fully (_CWD_ORIGIN_REPO) —
-# duplicated rather than reordered because that block runs after PR-state resolution further
-# down and hoisting it here would widen this change's blast radius; keep both derivations in
-# sync if the github.com URL parsing ever changes.
+# ISN'T self-hosted at all (review-cli finding, GH-470). A target can be named THREE ways, not
+# just --repo (same GH-470 review, second round): GH_SHIP_REPO and an ambient GH_REPO env var
+# select a foreign repo just as effectively — checking REPO_FLAG alone left both open. So
+# self-hosting additionally requires EITHER no effective target (--repo, else GH_SHIP_REPO,
+# else GH_REPO — same precedence _EFFECTIVE_TARGET uses below), OR one that resolves to this
+# same checkout's own origin (a redundant-but-legitimate explicit self-ship). This duplicates a
+# few lines of the origin-URL parse the "cross-repo (--repo) support" block below does more
+# fully (_CWD_ORIGIN_REPO) — duplicated rather than reordered because that block runs after
+# PR-state resolution further down and hoisting it here would widen this change's blast radius;
+# keep both derivations in sync if the github.com URL parsing ever changes.
 #
 # Residual, accepted: the origin-URL parse only recognizes a `github.com` URL. A checkout
 # whose origin is a non-github remote (or an SSH/URL form the sed doesn't match) resolves
@@ -508,18 +511,24 @@ if [ "${SHIP_STALENESS_CHECK:-1}" != "0" ]; then
   [ -n "$_AT_ROOT_RAW" ] && _AT_ROOT="$(cd "$_AT_ROOT_RAW" 2>/dev/null && pwd -P || true)"
   _ROOT_PHYS="$(cd "$ROOT" 2>/dev/null && pwd -P || echo "$ROOT")"
   # Self-hosting exemption: ROOT-equality alone is not enough (see comment above) — also
-  # require that this invocation doesn't --repo-target a DIFFERENT repo than the one this
-  # checkout actually pushes to.
+  # require that this invocation doesn't target a DIFFERENT repo than the one this checkout
+  # actually pushes to. A target can be named THREE ways, not just --repo (review-cli
+  # finding, GH-470 second round): `gh` also honours GH_SHIP_REPO and an ambient GH_REPO —
+  # either env var alone naming a foreign repo would leave REPO_FLAG empty and wrongly grant
+  # the exemption. Same precedence as _EFFECTIVE_TARGET further below (--repo, else
+  # GH_SHIP_REPO, else GH_REPO) — computed locally here too since that variable isn't
+  # assigned until after this gate (see the earlier duplication note).
+  _AT_EFFECTIVE_TARGET="${REPO_FLAG:-${GH_SHIP_REPO:-${GH_REPO:-}}}"
   _AT_SELF_HOST_EXEMPT=0
   if [ -n "$_AT_ROOT" ] && [ "$_AT_ROOT" = "$_ROOT_PHYS" ]; then
-    if [ -z "$REPO_FLAG" ]; then
+    if [ -z "$_AT_EFFECTIVE_TARGET" ]; then
       _AT_SELF_HOST_EXEMPT=1
     else
       _AT_CWD_ORIGIN_URL=$(git remote get-url origin 2>/dev/null) || true
       _AT_CWD_ORIGIN_REPO=$(printf '%s' "$_AT_CWD_ORIGIN_URL" \
         | sed 's|.*github\.com[:/]\(.*\)\.git$|\1|;s|.*github\.com[:/]\(.*\)$|\1|')
       case "$_AT_CWD_ORIGIN_REPO" in *@*|*:*|""|*/*/*) _AT_CWD_ORIGIN_REPO="" ;; esac
-      [ -n "$_AT_CWD_ORIGIN_REPO" ] && [ "$REPO_FLAG" = "$_AT_CWD_ORIGIN_REPO" ] && _AT_SELF_HOST_EXEMPT=1
+      [ -n "$_AT_CWD_ORIGIN_REPO" ] && [ "$_AT_EFFECTIVE_TARGET" = "$_AT_CWD_ORIGIN_REPO" ] && _AT_SELF_HOST_EXEMPT=1
     fi
   fi
   # `git rev-parse --is-inside-work-tree` (NOT `-d "$_AT_ROOT/.git"`) so a LINKED worktree
