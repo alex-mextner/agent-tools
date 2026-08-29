@@ -58,10 +58,22 @@ fi
 # this whole section exists to close, just relocated to the fallback branch
 # instead of fixed there too. Refuses rather than silently accepting a path
 # that will break the moment this worktree/branch is cleaned up.
-if [[ -x /usr/bin/python3 ]] && /usr/bin/python3 -c '' >/dev/null 2>&1; then
+#
+# _python3_runs: the one "actually run it, don't just check -x" predicate
+# both branches below need (review-caught, agent-tools#477 rounds 6 and
+# 7-review both independently found a branch skipping this check) -- named
+# once so it can't drift into two silently-different inline copies as this
+# block keeps accruing review-round patches.
+_python3_runs() { "$1" -c '' >/dev/null 2>&1; }
+
+if [[ -x /usr/bin/python3 ]] && _python3_runs /usr/bin/python3; then
   PYTHON3=/usr/bin/python3
 elif command -v python3 >/dev/null 2>&1; then
   PYTHON3="$(command -v python3)"
+  if ! _python3_runs "$PYTHON3"; then
+    echo "install.sh: the only python3 found (${PYTHON3}) does not run (likely the CLT-less macOS stub) -- install real developer tools or a Homebrew python3 and re-run." >&2
+    exit 1
+  fi
   REPO_ROOT_FOR_CHECK="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
   if [[ -n "$REPO_ROOT_FOR_CHECK" && "$PYTHON3" == "$REPO_ROOT_FOR_CHECK"/* ]]; then
     echo "install.sh: the only python3 found (${PYTHON3}) lives inside this checkout/worktree -- it will break once this worktree is removed. Install a system/Homebrew python3 (outside any worktree) and re-run." >&2
