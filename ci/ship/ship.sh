@@ -472,6 +472,18 @@ command -v gh >/dev/null 2>&1 || { echo "gh CLI not found" >&2; exit 1; }
 # down and hoisting it here would widen this change's blast radius; keep both derivations in
 # sync if the github.com URL parsing ever changes.
 #
+# Residual, accepted: the origin-URL parse only recognizes a `github.com` URL. A checkout
+# whose origin is a non-github remote (or an SSH/URL form the sed doesn't match) resolves
+# `_AT_CWD_ORIGIN_REPO` empty, so ANY explicit `--repo` value there is treated as foreign —
+# including `--repo owner/agent-tools` typed for a genuinely self-hosted ship. This narrows
+# self-hosting exemption for that shape (previously always exempted on ROOT-equality alone);
+# the safe direction (an extra staleness check on a real self-ship is a false-positive
+# refusal, not a missed one). Not covered by an automated test: this suite is deliberately
+# hermetic (real local git repos only, no network — see test file docstrings), and testing
+# the positive github.com-match path would need either a real `github.com` remote (breaks
+# hermeticity, risks a hung/flaky test on a sandboxed CI runner) or a stubbed URL parse this
+# code doesn't have. Verified only by direct reasoning about the sed pattern above.
+#
 # Three-tier response, proportionate to what's actually at risk:
 #   - the checkout isn't on `main` (parked on a feature branch, or detached): REFUSE with a
 #     distinct message — this is the exact incident that motivated this gate (an agent-tools

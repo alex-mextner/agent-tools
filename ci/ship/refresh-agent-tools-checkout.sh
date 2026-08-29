@@ -192,6 +192,11 @@ _ship_running() {
 
 [ -n "$ROOT" ] || exit 0
 _guards_ok "$ROOT" || exit 0
+# Only checked ONCE, here, before the fetch below — not rechecked immediately before the
+# merge further down. The fetch can take up to 30s (or be unbounded with no timeout binary
+# on PATH), so a `gh ship` that starts during that window is not caught. Known, accepted
+# residual (review-cli finding, GH-470 P2, deferred to agent-tools#486 rather than fixed
+# here): narrow, latent (this script isn't installed via launchd/cron anywhere yet).
 _ship_running "$ROOT" && exit 0
 
 GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=10 \
