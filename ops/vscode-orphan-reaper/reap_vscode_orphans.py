@@ -104,7 +104,34 @@ _ELECTRON_PATTERN = "Visual Studio Code.app/Contents/MacOS/Electron"
 # not something to guess at here. Hardcoded to hyperide's actual, current
 # convention in the meantime.
 _ISOLATED_MARKERS = ("/hvsc-", "--extensionDevelopmentPath")
-_USER_DATA_DIR_RE = re.compile(r"--user-data-dir=(\S+)")
+# Anchored to a TOKEN BOUNDARY (start-of-string or preceding whitespace),
+# not a bare substring (review-caught P1, agent-tools#477 round 2): argv is
+# `ps`-joined by single spaces, so a real `--user-data-dir=` FLAG always
+# starts right after a space or at position 0. Without this anchor,
+# `re.search` also matches the literal text "--user-data-dir=" occurring
+# INSIDE an unrelated argument's own VALUE -- e.g. a single argv token
+# `--note=--user-data-dir=/tmp/hvsc-2-deadbeef` (some other flag whose value
+# happens to embed that string) would extract the target directory and let
+# that unrelated process be treated as sharing it, defeating the exact-value
+# match fix below (`_extract_user_data_dir` equality in
+# `_pids_sharing_user_data_dir` / `_kill_tree`) with a different bypass.
+#
+# The captured VALUE itself is required to look like an isolated instance's
+# own `hvsc-<n>-...` path, not just any `--user-data-dir=` value (review-
+# caught P1, agent-tools#477 round 3): `re.search` (not `finditer`) stops at
+# the FIRST match, so a process with TWO `--user-data-dir=` flags -- a real
+# profile first, an isolated `hvsc-*` override second, the exact shape a
+# wrapper script that appends an override flag produces -- would otherwise
+# extract the REAL profile's path from the first occurrence. That value then
+# gets used to find/kill every OTHER process sharing it (`_carries_user_data_dir`
+# in `_pids_sharing_user_data_dir` / `_kill_tree`) -- which could be the
+# actual live VS Code session running that real profile. Mirrors the
+# equivalent fix already shipped on the TypeScript side
+# (`extractUserDataDirValue` in `ext-test-projects/e2e/setup/electron-app.ts`,
+# same rationale, same anchor shape) -- this script's own module docstring
+# already describes duplicating that predicate; this brings the two back in
+# sync on this specific case too.
+_USER_DATA_DIR_RE = re.compile(r"(?:^|\s)--user-data-dir=(\S*/hvsc-\d+-\S*)")
 
 # `ps -o pid=,ppid=,etime=,args=` row shape: pid, ppid, a NO-SPACE elapsed-time
 # field (`[[dd-]hh:]mm:ss`), then args (may itself contain spaces).
@@ -186,6 +213,21 @@ def _extract_user_data_dir(args: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _carries_user_data_dir(args: str, user_data_dir: str) -> bool:
+    """True when `args` carry `user_data_dir` as their OWN `--user-data-dir=`
+    value (exact flag-value equality via `_extract_user_data_dir`, not a
+    substring mention — review-caught P2, agent-tools#477). The ONLY
+    predicate either `_pids_sharing_user_data_dir` (listing) or `_kill_tree`
+    (re-verify-before-kill) uses to decide "does this process belong to the
+    same isolated instance" — both MUST route through this single function,
+    not duplicate the comparison, so a future edit to the matching rule
+    can't tighten one call site and silently leave the other looser (listed
+    as a candidate, then skipped at kill time defeats the tree-kill; or
+    listed loosely and NOT re-verified strictly would defeat the PID-reuse
+    guard)."""
+    return _extract_user_data_dir(args) == user_data_dir
+
+
 def _run_ps(run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run) -> Optional[str]:
     """Raw `ps -eo pid=,ppid=,etime=,args=` stdout for EVERY process, or None
     on failure (never `[]`-shaped success — see `_warn`'s docstring note)."""
@@ -237,16 +279,25 @@ def _pids_sharing_user_data_dir(
     user_data_dir: str, run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run
 ) -> list[int]:
     """Every pid (main + renderer/GPU/extension-host helpers) whose argv
-    contains the exact `--user-data-dir=` value, from a FRESH `ps` call.
-    Returns `[]` (not the anchor) on a `ps` failure — the caller falls back
-    to the anchor pid alone rather than treating failure as "found nothing to
-    add", which would silently narrow a tree-kill to a single-pid kill
-    without any visible signal (the failure itself is already warned by
-    `_run_ps`)."""
+    contains an EXACT `--user-data-dir=<value>` match, from a FRESH `ps`
+    call. Returns `[]` (not the anchor) on a `ps` failure — the caller falls
+    back to the anchor pid alone rather than treating failure as "found
+    nothing to add", which would silently narrow a tree-kill to a
+    single-pid kill without any visible signal (the failure itself is
+    already warned by `_run_ps`).
+
+    Uses `_carries_user_data_dir` (exact flag-value equality — review-caught
+    P2), not a raw substring test (`user_data_dir in p.args`): a bare
+    substring test matches any process whose argv merely MENTIONS the
+    orphan's directory as a path fragment — a concurrent `du
+    /tmp/hvsc-1-abc…` sweep, another `--user-data-dir=` whose value has this
+    one as a prefix (`/tmp/hvsc-1-abc` inside `/tmp/hvsc-1-abcdef`) — and
+    would SIGKILL an unrelated process.
+    """
     stdout = _run_ps(run)
     if stdout is None:
         return []
-    return [p.pid for p in _parse_ps_rows(stdout) if user_data_dir in p.args]
+    return [p.pid for p in _parse_ps_rows(stdout) if _carries_user_data_dir(p.args, user_data_dir)]
 
 
 def _reread_args(pid: int, run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run) -> Optional[str]:
@@ -287,7 +338,13 @@ def _kill_tree(
         current_args = reread_args(pid)
         if current_args is None:
             continue  # already gone — not an error, just nothing left to do
-        if user_data_dir is not None and user_data_dir not in current_args:
+        # `_carries_user_data_dir` on the RE-READ process's own argv (exact
+        # match, review-caught P2, same predicate as
+        # `_pids_sharing_user_data_dir` above — see that function's
+        # docstring for why a substring test here would let a pid recycled
+        # into an unrelated process sail through the PID-reuse guard and get
+        # SIGKILLed, defeating the whole point of re-reading before killing).
+        if user_data_dir is not None and not _carries_user_data_dir(current_args, user_data_dir):
             continue  # PID reused by an unrelated process since listing — do NOT kill
         try:
             kill(pid)

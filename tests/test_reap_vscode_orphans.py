@@ -113,6 +113,56 @@ def test_extract_user_data_dir_none_when_absent():
     assert reaper._extract_user_data_dir("some other args with no marker") is None
 
 
+def test_extract_user_data_dir_ignores_the_flag_embedded_in_an_unrelated_arguments_value():
+    """Review-caught P1 (agent-tools#477 round 2): a real `--user-data-dir=`
+    flag always starts at a token boundary (`ps` joins argv with spaces), so
+    the regex must not match the literal text "--user-data-dir=" occurring
+    INSIDE another argument's own value -- e.g. some unrelated flag whose
+    value happens to embed that exact string as one argv token."""
+    assert reaper._extract_user_data_dir(
+        "/usr/bin/unrelated --note=--user-data-dir=/tmp/hvsc-2-deadbeef"
+    ) is None
+
+
+def test_extract_user_data_dir_matches_at_start_of_string():
+    assert reaper._extract_user_data_dir("--user-data-dir=/tmp/hvsc-2-deadbeef --flag") == "/tmp/hvsc-2-deadbeef"
+
+
+def test_extract_user_data_dir_skips_a_real_profile_flag_to_find_the_hvsc_one():
+    """Review-caught P1 (agent-tools#477 round 3): a process with TWO
+    --user-data-dir= flags -- a real profile first, an isolated hvsc-*
+    override second (the shape a wrapper script that appends an override
+    flag produces) -- must extract the hvsc-* value, not the first
+    occurrence. `re.search` alone (no value-shape requirement) would return
+    the real profile's path, and every OTHER process sharing THAT path
+    (i.e. a live real VS Code session) would then look like a match. Mirrors
+    the equivalent fix on the TypeScript side (extractUserDataDirValue)."""
+    args = (
+        "/Applications/Visual Studio Code.app/Contents/MacOS/Electron "
+        "--user-data-dir=/Users/ultra/Library/Application Support/Code "
+        "--user-data-dir=/tmp/hvsc-2-deadbeef --extensionDevelopmentPath=/ext/path"
+    )
+    assert reaper._extract_user_data_dir(args) == "/tmp/hvsc-2-deadbeef"
+
+
+def test_extract_user_data_dir_none_for_a_non_hvsc_value_even_if_present():
+    """A --user-data-dir= value that doesn't look like this convention's
+    hvsc-<n>-... shape is not extracted at all -- e.g. a real editor session
+    with no isolated flag anywhere has nothing for this function to find."""
+    assert reaper._extract_user_data_dir(REAL_EDITOR_ARGS) is None
+
+
+# ── _carries_user_data_dir ──────────────────────────────────────────────────
+
+def test_carries_user_data_dir_true_for_exact_match():
+    assert reaper._carries_user_data_dir(ISOLATED_ARGS, "/tmp/hvsc-2-deadbeef") is True
+
+
+def test_carries_user_data_dir_false_for_embedded_mention():
+    args = "/usr/bin/unrelated --note=--user-data-dir=/tmp/hvsc-2-deadbeef"
+    assert reaper._carries_user_data_dir(args, "/tmp/hvsc-2-deadbeef") is False
+
+
 # ── _kill_tree — tree kill + PID-reuse re-verification ────────────────────────
 
 def _anchor(pid=100, ppid=1, age_s=None, args=ISOLATED_ARGS):
@@ -160,6 +210,30 @@ def test_kill_tree_refuses_to_kill_a_pid_whose_reread_args_no_longer_matches():
         if pid == 100:
             return ISOLATED_ARGS
         return "some totally unrelated process --flag=x"  # pid 101 was reused
+
+    killed = []
+    result = reaper._kill_tree(
+        anchor,
+        list_by_user_data_dir=lambda udd: [100, 101],
+        reread_args=reread,
+        kill=lambda pid: killed.append(pid),
+    )
+    assert result == [100]
+    assert killed == [100]
+
+
+def test_kill_tree_refuses_to_kill_a_pid_reused_by_a_process_that_merely_mentions_the_path():
+    """Same P2, the PID-reuse re-verification side: pid 101 is recycled into
+    an unrelated `du`/cleanup process whose argv happens to CONTAIN the
+    target directory as a substring (not its own --user-data-dir= value). A
+    substring re-check here would wave it through and SIGKILL it despite the
+    PID-reuse guard existing for exactly this purpose."""
+    anchor = _anchor(pid=100)
+
+    def reread(pid):
+        if pid == 100:
+            return ISOLATED_ARGS
+        return "/usr/bin/du -sh /tmp/hvsc-2-deadbeef"  # pid 101 reused by an unrelated du
 
     killed = []
     result = reaper._kill_tree(
@@ -344,6 +418,53 @@ def test_pids_sharing_user_data_dir_matches_helpers_too():
         "/tmp/hvsc-2-deadbeef", run=lambda *a, **k: _FakeCompletedProcess(ps_output)
     )
     assert sorted(result) == [100, 101]
+
+
+def test_pids_sharing_user_data_dir_excludes_a_process_that_merely_mentions_the_path():
+    """Review-caught P2 (agent-tools#477): a substring test on the raw argv
+    string matches ANY process whose args happen to mention the target
+    directory as a path fragment — a concurrent `du`/`rm -rf` sweep of it,
+    for example — not just processes that ACTUALLY carry it as their own
+    `--user-data-dir=` value. Must match on the exact flag value only."""
+    ps_output = (
+        f"  100     1  00:15:00 {ISOLATED_ARGS}\n"
+        "  200     1  00:15:00 /usr/bin/du -sh /tmp/hvsc-2-deadbeef\n"
+        "  201     1  00:15:00 /bin/rm -rf /tmp/hvsc-2-deadbeef\n"
+    )
+    result = reaper._pids_sharing_user_data_dir(
+        "/tmp/hvsc-2-deadbeef", run=lambda *a, **k: _FakeCompletedProcess(ps_output)
+    )
+    assert result == [100]
+
+
+def test_pids_sharing_user_data_dir_excludes_a_process_with_the_flag_embedded_in_another_value():
+    """Review-caught P1 (agent-tools#477 round 2): the SAME class of bug one
+    level up the call stack -- a process whose argv embeds the literal text
+    "--user-data-dir=<target>" inside an unrelated flag's own value (not as
+    its own real flag) must not be treated as sharing the directory."""
+    ps_output = (
+        f"  100     1  00:15:00 {ISOLATED_ARGS}\n"
+        "  400     1  00:15:00 /usr/bin/unrelated --note=--user-data-dir=/tmp/hvsc-2-deadbeef\n"
+    )
+    result = reaper._pids_sharing_user_data_dir(
+        "/tmp/hvsc-2-deadbeef", run=lambda *a, **k: _FakeCompletedProcess(ps_output)
+    )
+    assert result == [100]
+
+
+def test_pids_sharing_user_data_dir_excludes_a_value_with_this_path_as_a_prefix():
+    """Same P2: another isolated instance's --user-data-dir= value that has
+    the target directory as a STRING PREFIX (`/tmp/hvsc-2-deadbeef` inside
+    `/tmp/hvsc-2-deadbeefxyz`) must not be swept in as a sibling."""
+    ps_output = (
+        f"  100     1  00:15:00 {ISOLATED_ARGS}\n"
+        "  300     1  00:15:00 /Applications/Visual Studio Code.app/Contents/MacOS/Electron "
+        "--user-data-dir=/tmp/hvsc-2-deadbeefxyz --extensionDevelopmentPath=/ext/path\n"
+    )
+    result = reaper._pids_sharing_user_data_dir(
+        "/tmp/hvsc-2-deadbeef", run=lambda *a, **k: _FakeCompletedProcess(ps_output)
+    )
+    assert result == [100]
 
 
 def test_pids_sharing_user_data_dir_empty_on_ps_failure(capsys):
