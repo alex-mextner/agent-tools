@@ -119,8 +119,8 @@ The shipped hooks and their points:
 | Point | Hooks |
 | --- | --- |
 | `pre-agent` **(live in CC and opencode once rig registers their matchers; NOT mapped in Codex yet)** | `background-subagent-gate` (orchestration doctrine: block a non-trivial FOREGROUND subagent dispatch; subagent-exempt) |
-| `pre-bash` | `block-no-verify` (fail-closed), `block-raw-pr-merge`, `block-reset-hard` (fail-closed: blocks `git reset --hard` and `git clean -f...`/`-fd`/`-fdx` — irreversible working-tree wipes with no undo; deny-by-default, no self-service bypass — an optional repo-owner `agent_hooks.approval_cmd` in rig.yaml is the only override, Alex tg#6554), `pkill-guard` (fail-closed: blocks a PATTERN-based kill — `pkill -f`/`killall`/`kill $(pgrep ...)`/`pgrep | xargs kill` — of a shared/ambiguous process name like `node`/`codex`/`review diff`; allows `kill <pid>` and any session-scoped pattern; deny-by-default, `RIG_HATCH_REQUEST_PKILL_GUARD` Telegram hatch only; retrospective gap G-5), `require-review-before-commit`, `require-ticket-before-commit`, `enforce-timeout-on-bash`, `orchestrator-stays-thin` (impl-bash, warn→block, subagent-exempt), `no-long-inline-process` (review/--watch/build-test/long-sleep, subagent-exempt), `subagent-no-bg-longproc` (the INVERSE: block a SUBAGENT from BACKGROUNDING a long process — `run_in_background:true`/`&`/`setsid` on review/--watch/build-test/long-sleep — since a subagent is never re-invoked by a background-completion notification and would wedge forever; subagent-ONLY), `no-shell-file-edit` (block `sed -i`/`perl -i`/`gawk -i inplace` or a `> file` redirect editing a tracked source file; parsed not raw-matched; NOT subagent-exempt), `skills-read-gate` (mandatory skills before work, warn→block), `visual-proof-gate` (block a UI commit with no looked-at screenshot), `decision-request-format` (ADVISORY, never blocks: on a `tg --tag decision` send, self-check the body for Context/Options/Recommendation per the `decision-request-discipline` skill; parsed not raw-matched; NOT subagent-exempt) |
-| `pre-write` | `block-secrets-write`, `block-raw-process-env`, `orchestrator-stays-thin` (non-docs code Edit/Write, warn→block, subagent-exempt) |
+| `pre-bash` | `block-no-verify` (fail-closed), `block-raw-pr-merge`, `block-reset-hard` (fail-closed: blocks `git reset --hard` and `git clean -f...`/`-fd`/`-fdx` — irreversible working-tree wipes with no undo; deny-by-default, no self-service bypass — an optional repo-owner `agent_hooks.approval_cmd` in rig.yaml is the only override, Alex tg#6554), `pkill-guard` (fail-closed: blocks a PATTERN-based kill — `pkill -f`/`killall`/`kill $(pgrep ...)`/`pgrep | xargs kill` — of a shared/ambiguous process name like `node`/`codex`/`review diff`; allows `kill <pid>` and any session-scoped pattern; deny-by-default, `RIG_HATCH_REQUEST_PKILL_GUARD` Telegram hatch only; retrospective gap G-5), `pin-primary-worktree` (per-repo `worktree_only` opt-in: blocks a `git checkout`/`switch` that would move the repo's PRIMARY worktree off its default branch — the pre-bash complement to `worktree-only-writes` below; deny-by-default, `RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE` Telegram hatch only), `block-devserver-primary` (same `worktree_only` opt-in: blocks launching a dev server / dev-watch process — `npm run dev`, `vite`, `next dev`, ... — while the effective cwd sits on an enrolled repo's default branch; a dev server's own writes bypass Edit/Write entirely, so this is the Bash-launch counterpart neither `worktree-only-writes` nor `pin-primary-worktree` can see; deny-by-default, `RIG_HATCH_REQUEST_BLOCK_DEVSERVER_PRIMARY` Telegram hatch only), `require-review-before-commit`, `require-ticket-before-commit`, `enforce-timeout-on-bash`, `orchestrator-stays-thin` (impl-bash, warn→block, subagent-exempt), `no-long-inline-process` (review/--watch/build-test/long-sleep, subagent-exempt), `subagent-no-bg-longproc` (the INVERSE: block a SUBAGENT from BACKGROUNDING a long process — `run_in_background:true`/`&`/`setsid` on review/--watch/build-test/long-sleep — since a subagent is never re-invoked by a background-completion notification and would wedge forever; subagent-ONLY), `no-shell-file-edit` (block `sed -i`/`perl -i`/`gawk -i inplace` or a `> file` redirect editing a tracked source file; parsed not raw-matched; NOT subagent-exempt), `skills-read-gate` (mandatory skills before work, warn→block), `visual-proof-gate` (block a UI commit with no looked-at screenshot), `decision-request-format` (ADVISORY, never blocks: on a `tg --tag decision` send, self-check the body for Context/Options/Recommendation per the `decision-request-discipline` skill; parsed not raw-matched; NOT subagent-exempt) |
+| `pre-write` | `block-secrets-write`, `block-raw-process-env`, `orchestrator-stays-thin` (non-docs code Edit/Write, warn→block, subagent-exempt), `worktree-only-writes` (per-repo `worktree_only` opt-in: blocks an Edit/Write while the checkout sits on the repo's default branch, redirecting to a separate worktree; deny-by-default, `RIG_HATCH_REQUEST_WORKTREE_ONLY_WRITES` Telegram hatch only) |
 | `pre-skill` **(live in CC once rig registers the `Skill` matcher; NOT mapped in Codex/opencode yet)** | `skills-marker-writer` (touches the freshness marker `skills-read-gate` reads — ADVISORY, never blocks) |
 | `post-write` | `format-on-write`, `lint-on-write` (react to the completed write; exit-10 is feedback because the write already landed) |
 | `stop` | `stop-completion-selfcheck` |
@@ -188,6 +188,14 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   `SHIP_RESOLVE_ADDRESSED_THREADS=1`) to let ship first auto-close the threads that are safe without
   a human (unresolved + outdated = addressed by a later commit + authored entirely by bots); a human
   or still-unaddressed thread is never touched and still blocks (#268);
+- the PR has **at least one GitHub-side review** — `gh pr view --json reviews` must be
+  non-empty (any state, any author; existence is the signal, not the verdict). Closes a gap
+  the unresolved-threads check above cannot: zero reviews means zero threads, which is
+  vacuously "clean". Real incident: hyperide/hyper-saas PR #764 merged with zero reviews on
+  Guard-B alone. Disable with `SHIP_EXTERNAL_REVIEW_ENABLED=0` (or the shorter
+  `SHIP_EXTERNAL_REVIEW=0`); no self-service override — a one-time bypass is
+  `RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW="<justification>"` (same shared hatch lib as
+  `--skip-ci`/review-quorum; see `ci/ship/external_review_hatch.py`);
 - a UI-touching PR carries an embedded **screenshot** (override with `--no-screenshot-ok
   <reason>`);
 - a PR that changes **shippable source** (not docs/test/CI) has **bumped the declared
@@ -220,14 +228,16 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
   var carrying a value — blank, bare-flag, denied, or approved — appends one JSON line to
   `overrides.log` (default `<real-home>/.config/agent-tools/overrides.log`,
   `default_overrides_log_path()`), closing gap G-8 from the 2026-07-01 agent-ecosystem retrospective
-  (`docs/specs/…` in hyperide, section 5.2.3 item 3: "escape hatches have no audit sink"). One
-  pre-existing exception: `ci/ship/skip_ci_hatch.py` denies a blank/bare
-  `RIG_HATCH_REQUEST_SHIP_SKIP_CI` LOCALLY (a deliberate, lib-version-independent guard, unrelated
-  to this feature) before ever calling the shared lib, so that specific blank/bare case is recorded
-  only in `SHIP_AUDIT_FILE` on the non-dry-run path — and in NEITHER file on `--dry-run` (its local
-  guard denies without calling `_audit`, and `ship.sh`'s own dry-run audit helper prints the
-  would-be line without writing it). Every other outcome (denied/approved, and the review-quorum
-  hatch's own blank/bare case) routes through the lib as described above. A `rig
+  (`docs/specs/…` in hyperide, section 5.2.3 item 3: "escape hatches have no audit sink"). Two
+  pre-existing exceptions, same shape: `ci/ship/skip_ci_hatch.py` (for
+  `RIG_HATCH_REQUEST_SHIP_SKIP_CI`) and `ci/ship/external_review_hatch.py` (for
+  `RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW`) each deny a blank/bare value LOCALLY (a deliberate,
+  lib-version-independent guard, unrelated to this feature) before ever calling the shared lib, so
+  that specific blank/bare case is recorded only in `SHIP_AUDIT_FILE` on the non-dry-run path — and
+  in NEITHER file on `--dry-run` (the local guard denies without calling `_audit`, and `ship.sh`'s
+  own dry-run audit helper prints the would-be line without writing it). Every other outcome
+  (denied/approved, and the review-quorum hatch's own blank/bare case) routes through the lib as
+  described above. A `rig
   status` "overrides this week" section and a weekly tg digest reading this file are tracked as
   follow-up work, not yet built;
 - the local branch has **no unpushed/diverged commits** and a **clean worktree**.

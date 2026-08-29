@@ -335,6 +335,7 @@ _AGENT_HOOKS_DIR = Path(__file__).resolve().parents[1] / "agent-hooks"
 @pytest.mark.parametrize(
     "descriptor",
     [
+        _AGENT_HOOKS_DIR / "block-devserver-primary" / "block-devserver-primary.pre-bash.json",
         _AGENT_HOOKS_DIR / "block-reset-hard" / "block-reset-hard.pre-bash.json",
         _AGENT_HOOKS_DIR / "pin-primary-worktree" / "pin-primary-worktree.pre-bash.json",
         _AGENT_HOOKS_DIR / "block-raw-pr-merge" / "block-raw-pr-merge.pre-bash.json",
