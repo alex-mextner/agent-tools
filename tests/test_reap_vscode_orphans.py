@@ -200,6 +200,25 @@ def test_kill_tree_falls_back_to_anchor_only_when_no_user_data_dir_extractable()
     assert killed == [100]
 
 
+def test_kill_tree_anchor_only_fallback_refuses_a_pid_reused_since_listing():
+    """Review-caught P2 (agent-tools#477 round 4): the anchor-only fallback
+    (no --user-data-dir= value extractable) has no shared value to compare
+    against, but that must NOT mean skipping PID-reuse verification
+    entirely -- falls back to exact identity against the ORIGINAL anchor
+    argv. Without this, a pid recycled into ANY unrelated process between
+    listing and kill would sail through unconditionally in this branch."""
+    anchor = _anchor(pid=100, args="Electron --extensionDevelopmentPath=/x (no user-data-dir flag)")
+    killed = []
+    result = reaper._kill_tree(
+        anchor,
+        list_by_user_data_dir=lambda udd: [999],  # must never be called with no value
+        reread_args=lambda pid: "some totally unrelated process --flag=x",  # pid 100 was reused
+        kill=lambda pid: killed.append(pid),
+    )
+    assert result == []
+    assert killed == []
+
+
 def test_kill_tree_refuses_to_kill_a_pid_whose_reread_args_no_longer_matches():
     """PID-reuse race guard: pid 101 was in the token-scan snapshot, but by
     the time we re-read it right before killing, its argv no longer carries

@@ -344,7 +344,21 @@ def _kill_tree(
         # docstring for why a substring test here would let a pid recycled
         # into an unrelated process sail through the PID-reuse guard and get
         # SIGKILLed, defeating the whole point of re-reading before killing).
-        if user_data_dir is not None and not _carries_user_data_dir(current_args, user_data_dir):
+        #
+        # No `user_data_dir` extracted (review-caught P2, agent-tools#477
+        # round 4): this is the anchor-only fallback (malformed/unexpected
+        # argv shape) — `candidates` is just `[anchor.pid]` here, nothing to
+        # compare a shared value against. Falling through with NO check at
+        # all would defeat the PID-reuse guard entirely for this branch: if
+        # the anchor exited and its pid got reused by an unrelated process
+        # between listing and this re-read, that process would be killed
+        # unconditionally. Falls back to exact identity against the
+        # ORIGINAL anchor argv instead — the strongest re-verification
+        # available without a partial value to key on.
+        if user_data_dir is not None:
+            if not _carries_user_data_dir(current_args, user_data_dir):
+                continue  # PID reused by an unrelated process since listing — do NOT kill
+        elif current_args != anchor.args:
             continue  # PID reused by an unrelated process since listing — do NOT kill
         try:
             kill(pid)
