@@ -90,9 +90,18 @@ elif command -v python3 >/dev/null 2>&1; then
   # mutate PATH (no $VIRTUAL_ENV), and a hand-prepended PATH entry with no
   # activation at all slips through identically -- those remain open,
   # fail-open exactly like before this check existed.
-  VIRTUAL_ENV_NO_TRAILING_SLASH="${VIRTUAL_ENV%/}"
-  if [[ -n "${VIRTUAL_ENV_NO_TRAILING_SLASH:-}" && "$PYTHON3" == "$VIRTUAL_ENV_NO_TRAILING_SLASH"/* ]]; then
-    echo "install.sh: the only python3 found (${PYTHON3}) is inside the currently active virtualenv (\$VIRTUAL_ENV=${VIRTUAL_ENV}) -- it will break once that environment is removed. Deactivate it, install a system/Homebrew python3, and re-run." >&2
+  # `${VIRTUAL_ENV:-}` FIRST, THEN strip the trailing slash on that already-
+  # defaulted value (review-caught P2, agent-tools#477 round 9-review): under
+  # this script's `set -euo pipefail`, `${VIRTUAL_ENV%/}` alone dereferences
+  # VIRTUAL_ENV directly -- on the intended fallback path's NORMAL case (no
+  # virtualenv active at all, a valid interpreter found), that is an unset
+  # variable and `set -u` aborts the whole install right here, before ever
+  # reaching plist rendering. A genuinely unset var must default to empty
+  # BEFORE any further expansion is applied to it, not after.
+  VIRTUAL_ENV_NO_TRAILING_SLASH="${VIRTUAL_ENV:-}"
+  VIRTUAL_ENV_NO_TRAILING_SLASH="${VIRTUAL_ENV_NO_TRAILING_SLASH%/}"
+  if [[ -n "$VIRTUAL_ENV_NO_TRAILING_SLASH" && "$PYTHON3" == "$VIRTUAL_ENV_NO_TRAILING_SLASH"/* ]]; then
+    echo "install.sh: the only python3 found (${PYTHON3}) is inside the currently active virtualenv (\$VIRTUAL_ENV=${VIRTUAL_ENV:-}) -- it will break once that environment is removed. Deactivate it, install a system/Homebrew python3, and re-run." >&2
     exit 1
   fi
 else
