@@ -49,11 +49,24 @@ fi
 # alone would still pick it, silently baking a permanently broken
 # interpreter into the plist. Actually running it is the only way to tell.
 # `command -v python3` is kept as the fallback for that case (and for an
-# unusual system missing /usr/bin/python3 entirely).
+# unusual system missing /usr/bin/python3 entirely). The `command -v`
+# FALLBACK itself must also reject an interpreter living inside THIS
+# checkout/worktree (review-caught P2, agent-tools#477 round 6-review): if
+# it's reached (CLT-less machine) with a worktree-local virtualenv
+# activated, `command -v python3` resolves to
+# `<this-worktree>/.venv/bin/python3` -- the exact ephemeral-path failure
+# this whole section exists to close, just relocated to the fallback branch
+# instead of fixed there too. Refuses rather than silently accepting a path
+# that will break the moment this worktree/branch is cleaned up.
 if [[ -x /usr/bin/python3 ]] && /usr/bin/python3 -c '' >/dev/null 2>&1; then
   PYTHON3=/usr/bin/python3
 elif command -v python3 >/dev/null 2>&1; then
   PYTHON3="$(command -v python3)"
+  REPO_ROOT_FOR_CHECK="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$REPO_ROOT_FOR_CHECK" && "$PYTHON3" == "$REPO_ROOT_FOR_CHECK"/* ]]; then
+    echo "install.sh: the only python3 found (${PYTHON3}) lives inside this checkout/worktree -- it will break once this worktree is removed. Install a system/Homebrew python3 (outside any worktree) and re-run." >&2
+    exit 1
+  fi
 else
   echo "install.sh: python3 not found (neither /usr/bin/python3 nor on PATH)" >&2
   exit 1
