@@ -74,8 +74,15 @@ def _run_dispatch(
     # Hermetic by default: a rig-dispatched opencode session (this test run's own
     # process) carries the detached-agent env markers, and the dispatcher injects
     # args.agent_id from them — which would flip every orchestrator-classification
-    # test to subagent-exempt. Strip the markers unless a test sets its own.
-    for key in ("RIG_AGENT_ID", "RIG_DETACHED_AGENT"):
+    # test to subagent-exempt. Strip the markers unless a test sets its own. The
+    # opencode experimental flags are stripped for the same reason: the background
+    # field mapping must be opt-in per test, never inherited from the host session.
+    for key in (
+        "RIG_AGENT_ID",
+        "RIG_DETACHED_AGENT",
+        "OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS",
+        "OPENCODE_EXPERIMENTAL",
+    ):
         child.pop(key, None)
     if env:
         child.update(env)
@@ -818,13 +825,67 @@ def test_opencode_bridge_allows_background_nontrivial_task(tmp_path):
         },
     }
 
-    proc = _run_dispatch("tool.execute.before", event, hooks_dir=hooks_dir)
+    proc = _run_dispatch(
+        "tool.execute.before",
+        event,
+        hooks_dir=hooks_dir,
+        env={"OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS": "true"},
+    )
 
     assert proc.returncode == 0
     assert proc.stdout == ""
 
 
-def test_opencode_bridge_keeps_run_in_background_precedence():
+def test_opencode_bridge_default_build_background_arg_still_blocks(tmp_path):
+    """A DEFAULT opencode build (no experimental flag) hides the native background field
+    and rejects it at execute time ("Background subagents require
+    OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true") — so the bridge must NOT present a
+    smuggled background: true to the gates as a live background signal: the dispatch
+    still blocks and the reminder steers to the sanctioned detached launcher."""
+    hooks_dir = tmp_path / "hooks"
+    _install_descriptor(
+        hooks_dir,
+        hook_id="background-subagent-gate",
+        point="pre-agent",
+        cmd=BACKGROUND_SUBAGENT_GATE,
+        on_error="open",
+    )
+    event = {
+        "hook": "tool.execute.before",
+        "cwd": str(tmp_path),
+        "input": {"tool": "task", "sessionID": "ses_1"},
+        "output": {
+            "args": {
+                "subagent_type": "general",
+                "description": "implement the missing bridge and tests",
+                "prompt": (
+                    "Inspect the provisioning code, implement the bridge, run tests, and report.\n"
+                    "Include evidence for Claude, Codex, and opencode, and do not mutate unrelated files."
+                ),
+                "background": True,
+            }
+        },
+    }
+
+    proc = _run_dispatch("tool.execute.before", event, hooks_dir=hooks_dir)
+
+    assert proc.returncode == 0
+    out = json.loads(proc.stdout)
+    assert out["decision"] == "block"
+    assert "bin/rig-detached-opencode" in out["reason"]
+
+
+def _clear_background_env_flags(monkeypatch) -> None:
+    """Drop the opencode experimental flags — mandatory before any background-mapping
+    test, because the mapping is gated on them (a default build has them unset, and the
+    host session must never leak an opt-in into a test)."""
+    monkeypatch.delenv("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS", raising=False)
+    monkeypatch.delenv("OPENCODE_EXPERIMENTAL", raising=False)
+
+
+def test_opencode_bridge_keeps_run_in_background_precedence(monkeypatch):
+    _clear_background_env_flags(monkeypatch)
+    monkeypatch.setenv("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS", "true")
     args = {"run_in_background": False, "background": True}
 
     dispatch._normalize_task_args(args)
@@ -833,7 +894,9 @@ def test_opencode_bridge_keeps_run_in_background_precedence():
     assert args["background"] is True
 
 
-def test_opencode_bridge_maps_background_when_native_flag_is_null():
+def test_opencode_bridge_maps_background_when_native_flag_is_null(monkeypatch):
+    _clear_background_env_flags(monkeypatch)
+    monkeypatch.setenv("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS", "true")
     args = {"run_in_background": None, "background": True}
 
     dispatch._normalize_task_args(args)
@@ -841,7 +904,9 @@ def test_opencode_bridge_maps_background_when_native_flag_is_null():
     assert args["run_in_background"] is True
 
 
-def test_opencode_bridge_maps_background_when_native_flag_is_not_boolean():
+def test_opencode_bridge_maps_background_when_native_flag_is_not_boolean(monkeypatch):
+    _clear_background_env_flags(monkeypatch)
+    monkeypatch.setenv("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS", "true")
     true_args = {"run_in_background": "true", "background": True}
     false_args = {"run_in_background": "1", "background": False}
 
@@ -852,7 +917,46 @@ def test_opencode_bridge_maps_background_when_native_flag_is_not_boolean():
     assert false_args["run_in_background"] is False
 
 
-def test_opencode_bridge_ignores_non_boolean_background_values():
+def test_opencode_bridge_maps_background_under_broad_experimental_flag(monkeypatch):
+    """RuntimeFlags.enabledByExperimental: the broad OPENCODE_EXPERIMENTAL flag turns
+    background subagents on too, without the specific env var being set."""
+    _clear_background_env_flags(monkeypatch)
+    monkeypatch.setenv("OPENCODE_EXPERIMENTAL", "1")
+    args = {"background": True}
+
+    dispatch._normalize_task_args(args)
+
+    assert args["run_in_background"] is True
+
+
+def test_opencode_bridge_skips_background_mapping_in_default_build(monkeypatch):
+    """No experimental flag -> opencode 1.18.20's task tool hides the native background
+    field and rejects it at execute time, so a smuggled boolean must NOT become a
+    run_in_background background signal the gates would trust."""
+    _clear_background_env_flags(monkeypatch)
+    args = {"background": True}
+
+    dispatch._normalize_task_args(args)
+
+    assert "run_in_background" not in args
+    assert args["background"] is True
+
+
+def test_opencode_bridge_treats_unparseable_experimental_flag_as_off(monkeypatch):
+    """A value Effect's Config.boolean cannot parse must read as OFF (the safe
+    direction), never as an opt-in."""
+    _clear_background_env_flags(monkeypatch)
+    monkeypatch.setenv("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS", "maybe")
+    args = {"background": True}
+
+    dispatch._normalize_task_args(args)
+
+    assert "run_in_background" not in args
+
+
+def test_opencode_bridge_ignores_non_boolean_background_values(monkeypatch):
+    _clear_background_env_flags(monkeypatch)
+    monkeypatch.setenv("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS", "true")
     args = {"background": "true"}
 
     dispatch._normalize_task_args(args)
@@ -860,7 +964,9 @@ def test_opencode_bridge_ignores_non_boolean_background_values():
     assert "run_in_background" not in args
 
 
-def test_opencode_bridge_ignores_null_background_value():
+def test_opencode_bridge_ignores_null_background_value(monkeypatch):
+    _clear_background_env_flags(monkeypatch)
+    monkeypatch.setenv("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS", "true")
     args = {"background": None}
 
     dispatch._normalize_task_args(args)
@@ -868,7 +974,8 @@ def test_opencode_bridge_ignores_null_background_value():
     assert "run_in_background" not in args
 
 
-def test_opencode_bridge_leaves_missing_background_flag_absent():
+def test_opencode_bridge_leaves_missing_background_flag_absent(monkeypatch):
+    _clear_background_env_flags(monkeypatch)
     args = {"description": "inspect the bridge"}
 
     dispatch._normalize_task_args(args)
@@ -934,7 +1041,12 @@ def test_opencode_bridge_treats_background_false_as_foreground(tmp_path):
         },
     }
 
-    proc = _run_dispatch("tool.execute.before", event, hooks_dir=hooks_dir)
+    proc = _run_dispatch(
+        "tool.execute.before",
+        event,
+        hooks_dir=hooks_dir,
+        env={"OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS": "true"},
+    )
 
     assert proc.returncode == 0
     out = json.loads(proc.stdout)

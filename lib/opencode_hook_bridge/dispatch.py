@@ -271,11 +271,43 @@ def _event_id(event: dict) -> str:
     return ""
 
 
+_TRUTHY_ENV_FLAG = frozenset({"1", "true", "yes", "on"})
+
+
+def _background_subagents_enabled() -> bool:
+    """True when the opencode process hosting this bridge honors background subagents.
+
+    opencode 1.18.20's task tool carries a native ``background`` boolean (verified against
+    the v1.18.20 source, ``packages/opencode/src/tool/task.ts``), but it is EXPERIMENTAL:
+    the field is only advertised in the model-facing schema — and only honored at execute
+    time — when the server runs with ``OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=<truthy>``
+    or the broad ``OPENCODE_EXPERIMENTAL=<truthy>`` (``RuntimeFlags.enabledByExperimental``).
+    A default build both hides the field and fails a task that sets it anyway ("Background
+    subagents require OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true"). plugin.js spawns
+    this dispatcher with ``{...process.env}``, so the env of the hosting opencode process
+    is visible here. Truthiness accepts Effect ``Config.boolean`` spellings; anything else
+    reads as off (the safe direction: an unproven field is not a background signal).
+    """
+    def on(env: str) -> bool:
+        return os.environ.get(env, "").strip().lower() in _TRUTHY_ENV_FLAG
+
+    return on("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS") or on("OPENCODE_EXPERIMENTAL")
+
+
 def _normalize_task_args(args: dict) -> None:
+    """Normalize opencode task-tool spellings into the CC-shaped keys the gates read.
+
+    ``background`` -> ``run_in_background`` maps opencode's NATIVE task-tool field — which
+    exists only behind the experimental flag (see ``_background_subagents_enabled``). The
+    mapping is applied only in that configuration, so a default build's task tool (which
+    would reject ``background: true`` with an error) never gets presented to the gates as
+    a live background signal it does not actually have.
+    """
     if "subagent_type" not in args and isinstance(args.get("subagentType"), str):
         args["subagent_type"] = args["subagentType"]
     if not isinstance(args.get("run_in_background"), bool) and isinstance(args.get("background"), bool):
-        args["run_in_background"] = args["background"]
+        if _background_subagents_enabled():
+            args["run_in_background"] = args["background"]
 
 
 def _write_path(args: dict) -> str:
