@@ -140,6 +140,19 @@ def test_plain_nontrivial_dispatch_without_fork_or_remote_still_blocks(monkeypat
     assert "NOT a real field" in message
 
 
+def test_reminder_states_the_opencode_truth(monkeypatch):
+    """The opencode line of the reminder must match the verified 1.18.20 facts (#476):
+    no background field in a default build, the native field only behind
+    OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS, and the canonical detached launcher as
+    the sanctioned mechanism — never the old false 'set its native background: true'."""
+    out, _err, _code = _run({"args": {"prompt": _LONG}}, monkeypatch)
+    message = json.loads(out)["message"]
+    assert "NO background field" in message
+    assert "OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS" in message
+    assert "bin/rig-detached-opencode" in message
+    assert "set its native background: true flag" not in message
+
+
 def test_allow_trivial_one_liner(monkeypatch):
     out, _err, code = _run({"args": {"prompt": "rename foo to bar in one file"}}, monkeypatch)
     assert code == 0

@@ -15,11 +15,18 @@ Lets through:
 - `isolation: "remote"` — CC's own tool description states this always runs in background
 - a dispatch already marked `run_in_background: true` — kept for forward-compat with any
   harness/carrier that exposes such a field. CC's own `Agent` tool schema, as of 2.1.177,
-  carries no such property, so this path is dead for CC specifically — but **opencode's**
-  bridge (`lib/opencode_hook_bridge/dispatch.py`) normalizes its own `background: true/false`
-  field into `run_in_background` before this hook ever runs, so for an opencode-driven
-  orchestrator (which has no `fork`/`isolation` concept) this IS the live, only background
-  signal
+  carries no such property, so this path is dead for CC specifically. **opencode** (1.18.20)
+  advertises no background field either: its task tool's model-facing schema is only
+  `description`/`prompt`/`subagent_type`/`task_id`/`command`. Its native `background`
+  boolean exists ONLY behind the experimental runtime flag
+  `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` (or the broad `OPENCODE_EXPERIMENTAL`),
+  and the bridge (`lib/opencode_hook_bridge/dispatch.py`) maps that field into
+  `run_in_background` only when the hosting opencode process carries the flag — so this
+  allow path is live exactly when opencode would actually honor it (a default build
+  rejects `background: true` with a task error). For a default opencode build the
+  sanctioned background mechanism is the canonical detached launcher
+  `bin/rig-detached-opencode` (RIG_AGENT_ID/RIG_DETACHED_AGENT markers → the bridge
+  injects `agent_id` → the detached child session is subagent-exempt)
 - a **trivial** one-liner dispatch (prompt/description `< 200` chars and single-line)
 - a dispatch made **by a subagent itself** (subagent-exempt — `agent_id` present): a worker
   may fan out further, and this gate governs the orchestrator, not the workers
@@ -116,7 +123,8 @@ echo '{"args":{"isolation":"worktree","subagent_type":"fork","prompt":"'"$LONG"'
 rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (worktree is IGNORED, not a block signal — fork still wins)
 
 echo '{"args":{"run_in_background":true,"prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
-rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (forward-compat path; the live signal for opencode)
+rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (forward-compat path; for opencode live
+                          #   only with OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true)
 
 echo '{"args":{"agent_id":"sub-1","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
 rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (subagent-exempt — checked before triviality, so

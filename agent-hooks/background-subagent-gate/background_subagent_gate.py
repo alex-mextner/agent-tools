@@ -12,11 +12,17 @@ Allowed (let through):
     background... you get a completion notification", so it is inherently the desired shape
   - ``isolation: "remote"`` — CC's own tool description states this "always runs in
     background"
-  - a dispatch already marked ``run_in_background: true`` — dead on CC (see NOTE below), but
-    LIVE for opencode: its bridge (`lib/opencode_hook_bridge/dispatch.py`) normalizes its own
-    native `background: true/false` field into `run_in_background` before this hook runs, so
-    for an opencode-driven orchestrator (no fork/isolation concept) this is the only real
-    background signal
+  - a dispatch already marked ``run_in_background: true`` — dead on CC (see NOTE below), and
+    NOT a signal a default opencode build can produce either: opencode 1.18.20's task tool
+    advertises only description/prompt/subagent_type/task_id/command (no background field).
+    Its native ``background`` boolean exists ONLY behind the experimental runtime flag
+    ``OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true``, and the bridge
+    (`lib/opencode_hook_bridge/dispatch.py`) maps that field into ``run_in_background`` only
+    when the hosting opencode process carries the flag — so this allow path is live exactly
+    when opencode would actually honor it. For a default opencode build the sanctioned
+    background mechanism is the canonical detached launcher `bin/rig-detached-opencode`
+    (RIG_AGENT_ID/RIG_DETACHED_AGENT markers -> bridge injects agent_id -> the detached
+    child session is subagent-exempt, not a foreground dispatch at all)
   - a TRIVIAL one-liner dispatch (short, single-line prompt) — cheap enough to run inline
   - a dispatch made BY a subagent itself (subagent-exempt: ``agent_id`` present) — a subagent
     may fan out further, and this gate governs the orchestrator, not the workers
@@ -109,7 +115,11 @@ REMINDER = (
     "Claude Code: subagent_type=\"fork\" or isolation=\"remote\" (both background per CC's "
     "tool contract), or a dynamic Workflow. run_in_background is NOT a real field on CC's "
     "Agent tool — it does nothing.\n"
-    "opencode: set its native background: true flag.\n"
+    "opencode: its task tool has NO background field in a default build (1.18.20: only\n"
+    "description/prompt/subagent_type/task_id/command). The native background: true exists\n"
+    "only behind OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true; otherwise dispatch via the\n"
+    "canonical detached launcher bin/rig-detached-opencode (RIG_AGENT_ID markers make the\n"
+    "child session subagent-exempt).\n"
     "No self-service bypass — ask the human, or request one-time Telegram approval via "
     "RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE=\"<justification>\" (deny-by-default; bare "
     "\"1\" rejected)."
@@ -144,8 +154,9 @@ def _is_background(args: dict) -> bool:
     non-background fork or a non-background `isolation: "remote"` would need this hook updated
     too — acceptable given on_error=open (an orchestration-discipline gate, not a security one).
 
-    `run_in_background: true` is also honored — dead for a real CC dispatch, LIVE for opencode
-    (see the module docstring's "Allowed" list for why).
+    `run_in_background: true` is also honored — dead for a real CC dispatch, and for opencode
+    live only in the experimental configuration (see the module docstring's "Allowed" list:
+    the bridge maps the native `background` field only when the hosting opencode enables it).
     """
     if args.get("subagent_type") == "fork":
         return True
