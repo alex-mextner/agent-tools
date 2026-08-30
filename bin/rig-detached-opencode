@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# rig-detached-opencode — the canonical rig-owned detached-agent launcher for opencode.
+#
+# Usage: rig-detached-opencode <name> <brief-file> [workdir]
+#
+# Launches a DETACHED `opencode run` session carrying the subagent identity
+# markers RIG_AGENT_ID=<name> and RIG_DETACHED_AGENT=1. The opencode hook
+# bridge (lib/opencode_hook_bridge/dispatch.py) injects args.agent_id from
+# those markers on every tool call, so every agents-hooks/v1 delegation gate
+# (orchestrator-stays-thin, background-subagent-gate, no-long-inline-process,
+# subagent-no-bg-longproc) classifies the child session as a dispatched
+# subagent instead of the orchestrator.
+#
+# Why the process env is the sanctioned identity source: a running orchestrator
+# cannot retroactively mutate its own process environment — it can only set
+# these vars for a CHILD process, which is exactly the sanctioned act of
+# dispatching a subagent. Model-controlled tool args can never self-exempt (the
+# bridge strips forged agent_id keys before the env injection).
+#
+# Conventions:
+#   - <brief-file> is a UTF-8 markdown brief: the mission, acceptance criteria,
+#     and the HANDOFF FILE PATH the child must write before exiting (the
+#     orchestrator polls that file to collect the result).
+#   - stdout/stderr of the child append to /tmp/agent-logs/<name>.log.
+#   - The launcher RETURNS immediately (child is nohup-detached): dispatching
+#     must not block the calling shell — that is the whole point of detaching.
+#
+# Minimal by design: no manifest, no registry, no status tracking — the log
+# file and the handoff file named in the brief are the contract.
+
+set -euo pipefail
+
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+    echo "usage: $0 <name> <brief-file> [workdir]" >&2
+    exit 2
+fi
+
+name="$1"
+brief="$2"
+workdir="${3:-$PWD}"
+
+if ! [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "rig-detached-opencode: invalid agent name '$name' (letters, digits, '.', '_', '-' only)" >&2
+    exit 2
+fi
+if [ ! -f "$brief" ] || [ ! -s "$brief" ]; then
+    echo "rig-detached-opencode: brief file '$brief' missing or empty" >&2
+    exit 2
+fi
+if [ ! -d "$workdir" ]; then
+    echo "rig-detached-opencode: workdir '$workdir' is not a directory" >&2
+    exit 2
+fi
+if ! command -v opencode >/dev/null 2>&1; then
+    echo "rig-detached-opencode: 'opencode' not found on PATH" >&2
+    exit 127
+fi
+
+log_dir="/tmp/agent-logs"
+mkdir -p "$log_dir"
+log="$log_dir/$name.log"
+
+cd "$workdir"
+export RIG_AGENT_ID="$name"
+export RIG_DETACHED_AGENT=1
+
+{
+    echo "--- $(date -u '+%Y-%m-%dT%H:%M:%SZ') launching detached agent '$name' in '$workdir'"
+} >>"$log"
+
+nohup opencode run --title "$name" "$(cat "$brief")" >>"$log" 2>&1 &
+pid=$!
+
+echo "detached agent '$name' launched (pid $pid, log $log, workdir $workdir)"
+exit 0
