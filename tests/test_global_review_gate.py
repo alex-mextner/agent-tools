@@ -63,7 +63,11 @@ def test_review_skip_env_does_not_bypass_global_review_gate(tmp_path):
 
     assert proc.returncode == 1
     assert "staged changes have not been reviewed" in proc.stderr
-    assert "review diff --staged" in proc.stderr
+    # The FULL runnable command, not a prefix of one: `review diff --staged` alone
+    # exits 2 (no --task/REVIEW_TASK_CODE), reviewing nothing and leaving the commit
+    # blocked — a gate that prints an unrunnable fix is how an agent wedges.
+    assert "review diff --staged --task <CODE>" in proc.stderr
+    assert "REVIEW_TASK_CODE" in proc.stderr
     assert "no-verify bypasses this and all other hooks" in proc.stderr
 
 
@@ -230,7 +234,11 @@ def test_review_gate_blocks_stale_review_stamp(tmp_path):
     proc = _run(str(_REVIEW_GATE), cwd=repo)
 
     assert proc.returncode == 1
-    assert "review diff --staged" in proc.stderr
+    # The FULL runnable command, not a prefix of one: `review diff --staged` alone
+    # exits 2 (no --task/REVIEW_TASK_CODE), reviewing nothing and leaving the commit
+    # blocked — a gate that prints an unrunnable fix is how an agent wedges.
+    assert "review diff --staged --task <CODE>" in proc.stderr
+    assert "REVIEW_TASK_CODE" in proc.stderr
 
 
 def test_review_gate_allows_empty_staged_diff(tmp_path):

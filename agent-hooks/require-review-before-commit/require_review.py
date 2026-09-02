@@ -2,13 +2,31 @@
 """agents-hooks/v1 pre-bash hook — require an AI review before a commit.
 
 When the agent is about to `git commit`, this checks that an AI code review ran for
-the current uncommitted state, by looking for a fresh marker file that the review
-tool writes when it runs (and whose mtime is at least as new as the last change to
-the index/working tree). If no review marker is found, it blocks with a reminder.
+the current uncommitted state, by looking for a marker file that the review tool writes
+when it runs and stat'ing its mtime against a freshness window (REVIEW_FRESH_WINDOW_S,
+default 1h). If no fresh review marker is found, it blocks with a reminder.
 
-Wiring: have your review tool `touch` the marker on a successful run, e.g.
-  review --uncommitted && touch "$REVIEW_MARKER"
-The marker path is configurable via the REVIEW_MARKER env var; default below.
+That window is the WHOLE check — this hook does not compare the marker against the
+index's own mtime, and it cannot tell whether the reviewed diff is the diff being
+committed (an earlier version of this docstring claimed the former; it never did it).
+Not mutating the index between the review and the commit is what keeps the gap closed in
+practice; see README.md.
+
+Wiring: the review tool writes the marker ITSELF at the end of a review that passed, and
+this hook never invokes, imports, or inspects that tool — it stats a path, and that is
+the entire coupling. Nobody `touch`es the marker by hand: a hand-written marker certifies
+a review that never happened. The path is configurable via REVIEW_MARKER (review-cli
+reads the same variable); default below.
+
+The CODE stays tool-agnostic; the user-facing TEXT does not, deliberately. A stuck agent
+reading the block message needs a command it can actually run, and the abstract version
+of that message is what caused the incident this file was hardened for: it named
+`review --uncommitted`, a form that no longer exists, and two detached agents followed it
+into a wall. So the message names the default wiring — review-cli — from the single
+constant `_REVIEW_CLI_INVOCATION` below, and says in the same breath what to do if this
+repo is wired to something else. One copy, in text, replaceable without touching logic;
+review-cli's actual contract (which shapes of run write the marker, why an unstaged or
+oversized one does not) belongs in README.md and is documented there, not restated here.
 
 What is NOT gated (so the reminder stays honest and unobtrusive):
   - Anything that is not a real `git commit` SEGMENT — `git stash`, `git worktree`,
@@ -37,11 +55,13 @@ discipline reminder, not a security boundary. (Contrast block-no-verify, fail-cl
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import os
 import re
 import shlex
+import stat as stat_module
 import subprocess  # noqa: S404 — listing staged files is the whole job
 import sys
 import time
@@ -153,7 +173,14 @@ def warn(msg: str) -> None:
 
 
 def marker_path() -> Path:
-    return Path(os.path.expanduser(os.environ.get("REVIEW_MARKER", DEFAULT_MARKER)))
+    # `or DEFAULT_MARKER`, not a plain `get(..., DEFAULT_MARKER)`: an EXPORTED-BUT-EMPTY
+    # `REVIEW_MARKER=` (a shell variable that never got its value, a CI matrix cell with a
+    # blank entry) otherwise becomes `Path("")` — the process's current directory. Then
+    # this gate stats a DIRECTORY whose mtime any unrelated file creation bumps, so a
+    # freshly-touched checkout waves through commits nobody reviewed, while the review
+    # tool went on writing its own default path. A variable that is set to nothing means
+    # the same as one that is not set (codex finding, agent-tools#506).
+    return Path(os.path.expanduser(os.environ.get("REVIEW_MARKER") or DEFAULT_MARKER))
 
 
 # ── argv parsing — scope skip/env/message detection to the real `git commit` segment ─────────
@@ -711,25 +738,105 @@ def commit_extends_index(argv: list[str]) -> bool:
 # ── skip resolution + marker freshness ───────────────────────────────────────────────────────
 
 
+# errnos that mean "no regular file can exist at this path", as opposed to "I could not
+# find out". They are answers, so they block; everything else fails open. ELOOP is a
+# symlink loop; ENAMETOOLONG is a path the filesystem will never accept.
+_PATH_CANNOT_HOLD_A_MARKER = frozenset({errno.ELOOP, errno.ENAMETOOLONG})
+
+
 def _marker_is_fresh() -> bool | None:
-    """True/False if the review marker exists-and-is-fresh; None if it could not be stat'd."""
+    """True/False if the review marker exists-and-is-fresh; None if it could not be stat'd.
+
+    A REGULAR FILE, not merely an existing path: a directory at the marker path would
+    otherwise satisfy this gate, and a directory's mtime is bumped by any unrelated file
+    created inside it — so a misconfigured `REVIEW_MARKER` pointing at a busy directory
+    reads as "a review just ran" more or less permanently. review-cli refuses to treat a
+    non-regular marker target as written (review-cli#350), and the two must agree: a
+    marker the tool says it could not write must not be one this gate accepts (codex
+    finding — both directions of that disagreement land somewhere bad).
+
+    The check goes through an explicit `stat()` rather than `Path.is_file()` on purpose.
+    `is_file()` swallows every OSError and answers False, which would turn a marker that
+    merely could not be READ (a permission change on its parent) into a hard block — this
+    hook is `on_error: open`, so an unanswerable question must allow the commit, not deny
+    it. Missing and not-a-regular-file are ANSWERS, and they block; a failure to ask is
+    not, and it fails open.
+
+    That rule LOOSENS one case, and the loosening is deliberate rather than incidental
+    (Fable finding): an unreadable marker path — `chmod 000` on the parent of
+    `~/.cache/agent-tools/` — used to block, because the old `Path.exists()` swallowed the
+    EACCES and answered "no marker". Under the explicit stat it raises, so it now allows
+    the commit with a warning. A permission problem on a cache directory is a broken
+    environment, not evidence about whether a review ran, and `on_error: open` says a
+    hook that cannot tell must not be the thing standing between someone and their
+    commit."""
     marker = marker_path()
     try:
-        if marker.exists() and (time.time() - marker.stat().st_mtime) <= FRESH_WINDOW_S:
-            return True
+        st = marker.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        # Both are definitive "no marker can be here" answers, so both block. The second
+        # one is `REVIEW_MARKER=/some/regular/file/marker` — a path whose parent is a FILE
+        # — which is the same class of misconfiguration as the empty value and the
+        # directory target handled above. Left in the generic OSError branch it would have
+        # failed OPEN, waving every commit through on a typo (Fable finding).
+        return False
     except OSError as exc:
+        if exc.errno in _PATH_CANNOT_HOLD_A_MARKER:
+            # Same class again: a symlink loop is not "I could not check", it is "no file
+            # can ever exist here" — and no review tool could write one either. Splitting
+            # it from the fail-open branch keeps this function consistent with the rule its
+            # docstring states, rather than blocking on one typo and waving through
+            # another (Fable finding, iteration 9).
+            warn(f"review marker {marker} cannot exist ({exc}) — treating as no review")
+            return False
         warn(f"could not stat review marker {marker}: {exc} — allowing (fail-open)")
         return None
-    return False
+    if not stat_module.S_ISREG(st.st_mode):
+        warn(f"review marker {marker} is not a regular file — treating as no review")
+        return False
+    return (time.time() - st.st_mtime) <= FRESH_WINDOW_S
+
+
+# review-cli's pre-commit invocation, as this hook's block message prints it. It appears
+# in a user-facing message only (see the module docstring on why the text names a concrete
+# tool while the code stays agnostic). `--task` is not optional: `review diff` exits 2
+# without it or an exported REVIEW_TASK_CODE, reviewing nothing and leaving the commit
+# blocked.
+#
+# It is NOT the only copy in this repo, and pretending otherwise is how the original
+# incident happened — a stale command left in one file that an agent obeyed. A shell hook
+# cannot import a Python constant and prose cannot interpolate one, so the same string
+# also lives in:
+#   * git-hooks/global-dispatcher/hooks/review-gate      (the global git-hook gate)
+#   * agent-hooks/require-review-before-commit/README.md (this hook's own docs)
+#   * skills/universal/anti-wedge-review/SKILL.md        (what agents read first)
+#   * AGENTS.md                                          (the repo-level guide)
+# `tests/test_review_invocation_is_consistent.py` fails if any of them drifts from this
+# constant, so changing review-cli's surface means changing this line and watching that
+# test point at every file that still disagrees.
+# `-C <repo>` is NOT part of the canonical core: the in-repo git-hook gate runs inside
+# the repo already and would be wrong to print it, while the pre-bash hook fires from
+# an agent that may be anywhere and appends it below. The core is what every caller
+# must agree on.
+_REVIEW_CLI_INVOCATION = "review diff --staged --task <CODE>"
 
 
 def _block(prefix: str | None = None) -> int:
     marker = marker_path()
     body = (
-        "No recent AI code review found for this change. Run a review on the "
-        "uncommitted diff (e.g. `review` / `codex exec review --uncommitted`) and "
-        f"address its findings before committing. (Set/touch {marker} on a successful "
-        "review, or set REVIEW_MARKER. A PURE-docs commit auto-allows — but only the simple "
+        "No recent AI code review found for this change. Stage exactly the files you "
+        "are committing (not `git add -A`), run your review tool over the STAGED diff, "
+        "and address its findings before committing. With review-cli (the default "
+        f"wiring) that is `{_REVIEW_CLI_INVOCATION} -C <repo>`, where <CODE> is this "
+        "change's task "
+        "code — an UNSTAGED `review diff` does not satisfy this gate, and `review diff` "
+        "refuses to run at all without --task (or REVIEW_TASK_CODE). If this repo is "
+        "wired to a different review tool, run THAT tool's staged review instead; see "
+        "the hook's README for how such a tool writes the marker. A passing review "
+        f"writes {marker} itself — do NOT `touch` it by hand, which certifies a review "
+        "that never ran (and under a headless agent runner is rejected outright). "
+        "Use REVIEW_MARKER to point both tools at another path. "
+        "(A PURE-docs commit auto-allows — but only the simple "
         "form: `git commit -a`/`-am`, a trailing pathspec, or a preceding `git add` of other "
         "files FORFEITS that fast-path (the commit may include un-reviewed non-docs changes), "
         "so a docs-only diff can still land here — stage just the docs and `git commit` them "

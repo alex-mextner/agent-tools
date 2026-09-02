@@ -53,18 +53,106 @@ takes precedence over an inline one.
 
 ## How it knows a review ran
 
-It looks for a **marker file** that your review tool touches on a successful run, and
-checks the marker is fresh (within a window, default 1h). Wire it up like:
+It looks for a **marker file** that your review tool writes on a successful run, and
+checks the marker is fresh (within a window, default 1h).
+
+**The review tool writes the marker; you never `touch` it.** review-cli writes it from
+exactly one shape of run — a COMPLETED `review diff --staged --task <CODE>` whose diff
+came from the real index AND was small enough to reach every reviewer in full:
 
 ```bash
-review --uncommitted && touch "${REVIEW_MARKER:-$HOME/.cache/agent-tools/last-review}"
-# or
-codex exec review --uncommitted && touch "$REVIEW_MARKER"
+git add <exactly the files you are committing>   # NOT `git add -A`: see the caveats below
+review diff --staged --task <CODE> -C <repo>     # passes -> writes the marker -> commit allowed
 ```
+
+`--task <CODE>` is not decoration: `review diff` REQUIRES it (or an exported
+`REVIEW_TASK_CODE`) and exits 2 without dispatching anything, which writes no marker and
+leaves the commit blocked with a review that never ran. It is what files the run in
+review-cli's iteration history; it has no effect on this gate beyond that.
+
+"Completed" is the precise word, and the distinction matters: review-cli writes the marker
+when every seat produced a usable verdict and the board did not degrade — REPORTED
+FINDINGS DO NOT WITHHOLD IT. A review that comes back with a P1 still satisfies this gate.
+That is deliberate, and it is why this hook is process discipline rather than a quality
+bar: it enforces that a review HAPPENED, and reading the findings is on you. What does
+withhold the marker is a review that could not be trusted to have covered the change — a
+failed or degraded board, an unstaged or piped diff, a diff too big to reach the seats.
+
+Stage exactly what you intend to commit, not `-A`. Two reasons: a docs-only commit that
+sweeps in other staged files forfeits the docs-only fast path described above, and this
+check is **mtime-based, not content-based** — it confirms that *a* review ran recently,
+not that it reviewed the diff you are committing. So
+`git add X; review diff --staged --task <CODE>; git commit -a` passes the gate with `Y`
+never reviewed.
+
+Staging exactly the commit's contents narrows that gap; it does not close it. The
+invariant this gate actually needs is **do not mutate the index between the review and
+the commit** — stage `Y` while the review of `X` is still running, and the marker written
+at the end is fresh enough to wave `Y` through. A single agent working in sequence
+satisfies that invariant for free; two agents sharing one checkout do not. Closing it for
+real needs a diff-scoped stamp rather than an mtime, which is what the review-stamp in
+the global git hook does and what agent-tools#507 tracks for this hook.
+
+An unstaged `review diff`, a diff piped in on stdin, a diff truncated for dispatch, or a
+failed review deliberately does NOT write the marker. From review-cli#350 onward it says
+so on stderr instead of leaving it a mystery — including the case where the write itself
+failed; older builds skip all of those silently, which is what this pairing fixes. Read
+that line: each reason has its own fix, and only some of them are "re-run it `--staged`".
+An oversized diff in particular is NOT fixed by re-running — it truncates again — so the
+answer there is to split the change into smaller staged commits (or raise
+`$REVIEW_DIFF_MAX_BYTES`) and review each part.
+
+Hand-`touch`ing the marker is not a supported workaround: it certifies a review that
+never happened, and for a headless agent it does not even work. An earlier version of
+this README recommended exactly that `touch`, and two detached agents died obeying it.
+
+Why the naive `touch` fails is worth being precise about, because "the agent cannot write
+there" and "review-cli cannot write there" would otherwise contradict each other. The
+restriction is on the AGENT's own actions, not on the filesystem: an agent runner such as
+opencode screens the commands and file writes the agent itself issues, and its
+`external_directory` policy rejects a write to `~/.cache/agent-tools/` outside the project
+it was given. It does not follow a permitted command into the processes that command
+spawns — `review …` is on the allow-list, so review-cli runs and writes the marker from
+inside its own process without ever being screened. Same file, same permissions, different
+actor.
+
+That explains why the one-liner an agent reaches for first dies; it is NOT a guarantee
+that self-certification is impossible, and this hook is not the place to look for one. A
+determined caller can point `REVIEW_MARKER` at a path inside the project, or have a
+committed script do the write — both are permitted writes, and neither is screened. This
+hook is `on_error: open` process discipline, not a security boundary (see below): it makes
+the honest path the easy one and the dishonest path an explicit, visible choice.
+
+### Wiring a review tool that is not review-cli
+
+This hook only stats a path, so any tool can satisfy it. The contract it actually
+enforces is narrow — "a marker file whose mtime is within the freshness window" — and the
+rest is on the tool: write that marker ONLY at the end of a review that actually passed,
+and only for the staged diff. review-cli does exactly that. For any other tool, put the
+marker write in the TOOL or in a wrapper script it runs on success — not in the agent's
+own command line:
+
+```bash
+# a wrapper script on PATH, invoked by the agent as one command
+your-review-tool --staged "$@" || exit $?
+marker="${REVIEW_MARKER:-$HOME/.cache/agent-tools/last-review}"
+mkdir -p "$(dirname "$marker")"   # the default dir does not exist on a fresh machine
+: > "$marker"
+```
+
+The distinction is not cosmetic: a marker write inside a passing run is the tool
+certifying its own work, while a `&& touch` the agent types is the agent certifying
+itself — the shape this hook exists to make visible, and the one a headless permission
+policy happens to stop outright.
 
 Configure via env:
 
-- `REVIEW_MARKER` — marker file path (default `~/.cache/agent-tools/last-review`)
+- `REVIEW_MARKER` — marker file path (default `~/.cache/agent-tools/last-review`).
+  Exported-but-empty counts as unset, on both sides, so a blank value can't quietly point
+  this gate at the current directory while the review tool writes its default path. The
+  target must be a REGULAR FILE: a directory there is rejected rather than accepted, since
+  a directory's mtime is refreshed by any unrelated file created in it and would keep the
+  gate satisfied indefinitely.
 - `REVIEW_FRESH_WINDOW_S` — how recent the marker must be, in seconds (default `3600`)
 
 ## Why an agent-hook
@@ -82,6 +170,9 @@ check must never make committing impossible. (Contrast `block-no-verify` and
 recent review ran.
 
 ## Test
+
+(The `touch` in the manual test recipe at the bottom of this file is the one exception:
+it is a hook-level unit test of the freshness check, not a way to get a commit through.)
 
 ```bash
 chmod +x require_review.py
