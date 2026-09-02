@@ -326,7 +326,9 @@ present) runs `tg` freely regardless of this predicate — it was never gated fo
 
 The **first** offense in the TTL window **WARNs** (allow + message); a **repeat** in the
 window **BLOCKs**. The tier is a marker file keyed by a hash of `(cwd, point)`, so `pre-write`
-and `pre-bash` tier **independently** — a write WARN does not prime a bash BLOCK (or vice versa):
+and `pre-bash` tier **independently** — a write WARN does not prime a bash BLOCK (or vice versa).
+A BLOCK does **not** refresh the marker mtime: the 900s window is measured from the original
+WARN, so a wedged retry loop cannot pin the orchestrator in BLOCK forever.
 
 - `ORCH_THIN_MARKER_DIR` — marker dir (default `~/.cache/agent-tools/orchestrator-thin`)
 - `ORCH_THIN_TTL_S` — warn-suppression window in seconds (default `900`)

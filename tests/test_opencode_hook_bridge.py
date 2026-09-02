@@ -614,7 +614,7 @@ def test_opencode_bridge_blocks_raw_pr_merge_with_real_descriptor(tmp_path):
     assert "gh ship" in out["reason"]
 
 
-def test_opencode_bridge_blocks_foreground_nontrivial_task(tmp_path):
+def test_opencode_bridge_allows_inherently_async_general_task(tmp_path):
     hooks_dir = tmp_path / "hooks"
     _install_descriptor(
         hooks_dir,
@@ -642,9 +642,38 @@ def test_opencode_bridge_blocks_foreground_nontrivial_task(tmp_path):
     proc = _run_dispatch("tool.execute.before", event, hooks_dir=hooks_dir)
 
     assert proc.returncode == 0
-    out = json.loads(proc.stdout)
-    assert out["decision"] == "block"
-    assert "BACKGROUND" in out["reason"]
+    assert proc.stdout == ""
+
+
+def test_opencode_bridge_allows_inherently_async_explore_task(tmp_path):
+    hooks_dir = tmp_path / "hooks"
+    _install_descriptor(
+        hooks_dir,
+        hook_id="background-subagent-gate",
+        point="pre-agent",
+        cmd=BACKGROUND_SUBAGENT_GATE,
+        on_error="open",
+    )
+    event = {
+        "hook": "tool.execute.before",
+        "cwd": str(tmp_path),
+        "input": {"tool": "task", "sessionID": "ses_1"},
+        "output": {
+            "args": {
+                "subagent_type": "explore",
+                "description": "inspect the repo and report findings",
+                "prompt": (
+                    "Inspect the provisioning code, implement the bridge, run tests, and report.\n"
+                    "Include evidence for Claude, Codex, and opencode, and do not mutate unrelated files."
+                ),
+            }
+        },
+    }
+
+    proc = _run_dispatch("tool.execute.before", event, hooks_dir=hooks_dir)
+
+    assert proc.returncode == 0
+    assert proc.stdout == ""
 
 
 def test_opencode_bridge_allows_background_nontrivial_task(tmp_path):

@@ -425,6 +425,26 @@ def test_pre_agent_foreground_dispatch_is_blocked(tmp_path):
     assert "BACKGROUND" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 
+def test_pre_agent_cc_task_explore_foreground_still_blocked(tmp_path):
+    """CC's Task tool name is `Task` (capital T). The opencode allow is keyed on exact
+    lowercase `task`, so a CC Explore dispatch through the real bridge must still BLOCK
+    — if the bridge ever lowercased tool_name, this would start allowing."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="background-subagent-gate", point="pre-agent",
+                        cmd=BACKGROUND_SUBAGENT_GATE, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Task",
+        "tool_input": {"subagent_type": "Explore", "prompt": "implement the feature: " + "x" * 220},
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
+
+
 def test_pre_agent_background_dispatch_passes(tmp_path):
     """The same gate, but a `run_in_background: true` dispatch is NOT blocked."""
     home = tmp_path / "home"

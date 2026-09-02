@@ -5,21 +5,24 @@
 Fires when the **main thread** dispatches a subagent (the CC `Agent`/`Task` tool). A
 non-trivial subagent run in the **foreground** blocks the orchestrator until it finishes —
 which defeats fanning work out. This gate **blocks** such a dispatch and tells the
-orchestrator to use `subagent_type: "fork"` or `isolation: "remote"` (or model the work as a
-dynamic Workflow).
+orchestrator to use `subagent_type: "fork"` or `isolation: "remote"` on Claude Code, or
+opencode Task with `subagent_type` `general`/`explore` (inherently async), or a
+dynamic Workflow.
 
 Lets through:
 
 - `subagent_type: "fork"` — CC's own `Agent` tool description states a fork runs in the
   background and reports back via a completion notification
 - `isolation: "remote"` — CC's own tool description states this always runs in background
+- an opencode `tool: "task"` dispatch with `subagent_type` `general` or `explore` —
+  opencode's Task tool is inherently async and its JSON schema has no `background` field
+  (`additionalProperties: false` rejects one). Demanding that flag deadlocked every
+  opencode dispatch. The discriminator is the exact lowercase tool name `task`; CC uses
+  `Agent`/`Task` and still needs fork/remote. An explicit `run_in_background: false`
+  (if a carrier ever sends one) still counts as foreground.
 - a dispatch already marked `run_in_background: true` — kept for forward-compat with any
   harness/carrier that exposes such a field. CC's own `Agent` tool schema, as of 2.1.177,
-  carries no such property, so this path is dead for CC specifically — but **opencode's**
-  bridge (`lib/opencode_hook_bridge/dispatch.py`) normalizes its own `background: true/false`
-  field into `run_in_background` before this hook ever runs, so for an opencode-driven
-  orchestrator (which has no `fork`/`isolation` concept) this IS the live, only background
-  signal
+  carries no such property, so this path is dead for CC specifically
 - a **trivial** one-liner dispatch (prompt/description `< 200` chars and single-line)
 - a dispatch made **by a subagent itself** (subagent-exempt — `agent_id` present): a worker
   may fan out further, and this gate governs the orchestrator, not the workers
@@ -115,8 +118,14 @@ rc=$?; echo "exit=$rc"   # → decision":"block ...  exit=10  (worktree isolatio
 echo '{"args":{"isolation":"worktree","subagent_type":"fork","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
 rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (worktree is IGNORED, not a block signal — fork still wins)
 
+echo '{"tool":"task","args":{"subagent_type":"general","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
+rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (opencode Task is inherently async)
+
+echo '{"tool":"task","args":{"subagent_type":"explore","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
+rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0
+
 echo '{"args":{"run_in_background":true,"prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
-rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (forward-compat path; the live signal for opencode)
+rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (forward-compat path)
 
 echo '{"args":{"agent_id":"sub-1","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
 rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (subagent-exempt — checked before triviality, so

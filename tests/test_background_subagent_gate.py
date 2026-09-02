@@ -1,7 +1,7 @@
 """Tests for the background-subagent-gate agent-hook (pre-agent).
 
 Covers the doctrine's four cases: BLOCK (non-trivial foreground dispatch), ALLOW
-(run_in_background true / trivial one-liner), SUBAGENT-EXEMPT (agent_id present), and the
+(run_in_background true / trivial one-liner / opencode Task general|explore), SUBAGENT-EXEMPT (agent_id present), and the
 deny-by-default Telegram hatch escalation (the old ALLOW_FOREGROUND_SUBAGENT self-service env
 is DEAD; RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE with a written justification asks tg-ctl and
 allows only on exit 0, a bare `1` denies).
@@ -103,6 +103,29 @@ def test_allow_isolation_remote_with_realistic_subagent_type(monkeypatch):
     assert _decision(out) == "allow"
 
 
+def test_explicit_false_overrides_fork_and_still_blocks(monkeypatch):
+    """An explicit `run_in_background: false` must win over the fork inference — a carrier
+    that sends both is telling us the usual background guarantee does not apply this time.
+    Regression for a bug found by review (2026-09-02, PR #499): the fork check ran before the
+    explicit-false check, so this shape was wrongly allowed."""
+    out, _err, code = _run(
+        {"args": {"subagent_type": "fork", "run_in_background": False, "prompt": _LONG}},
+        monkeypatch,
+    )
+    assert code == 10
+    assert _decision(out) == "block"
+
+
+def test_explicit_string_false_overrides_isolation_remote_and_still_blocks(monkeypatch):
+    """Same regression, `isolation: "remote"` + the string form of the explicit flag."""
+    out, _err, code = _run(
+        {"args": {"isolation": "remote", "run_in_background": "false", "prompt": _LONG}},
+        monkeypatch,
+    )
+    assert code == 10
+    assert _decision(out) == "block"
+
+
 def test_isolation_worktree_alone_still_blocks(monkeypatch):
     """`isolation: "worktree"` is workspace isolation, not background execution — unlike
     `isolation: "remote"`, it must NOT exempt a non-trivial dispatch on its own."""
@@ -138,6 +161,70 @@ def test_plain_nontrivial_dispatch_without_fork_or_remote_still_blocks(monkeypat
     assert _decision(out) == "block"
     assert "fork" in message
     assert "NOT a real field" in message
+    assert "inherently async" in message
+
+
+@pytest.mark.parametrize("kind", ["general", "explore", "General", "Explore"])
+def test_allow_opencode_task_general_explore_without_background(kind, monkeypatch):
+    """opencode Task has no background field (schema additionalProperties:false). The
+    tool is inherently async, so general/explore must pass without a fake flag. The
+    carrier discriminator is the exact lowercase tool name ``task`` (CC uses ``Agent``
+    / ``Task``). https://github.com/alex-mextner/agent-tools/issues/495."""
+    out, _err, code = _run(
+        {"tool": "task", "args": {"subagent_type": kind, "prompt": _LONG}},
+        monkeypatch,
+    )
+    assert code == 0
+    assert _decision(out) == "allow"
+
+
+def test_opencode_task_general_without_tool_field_still_blocks(monkeypatch):
+    """``general`` is not a CC background shape. Without the opencode ``tool: task``
+    discriminator it must still block, or a CC-shaped event that happens to use the
+    same type name would be waved through."""
+    out, _err, code = _run(
+        {"args": {"subagent_type": "general", "prompt": _LONG}}, monkeypatch
+    )
+    assert code == gate.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize("tool", ["Agent", "Task"])
+def test_cc_explore_foreground_still_blocks(tool, monkeypatch):
+    """CC's Explore agent is NOT inherently background. The opencode allow is keyed
+    on exact ``tool == "task"`` so a CC ``Agent``/``Task`` Explore dispatch still
+    needs fork/remote/run_in_background."""
+    out, _err, code = _run(
+        {"tool": tool, "args": {"subagent_type": "Explore", "prompt": _LONG}},
+        monkeypatch,
+    )
+    assert code == gate.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+@pytest.mark.parametrize("flag", [False, "false"])
+def test_explicit_foreground_beats_opencode_async_type(flag, monkeypatch):
+    """An explicit run_in_background false (bool or string) stays foreground even
+    on opencode Task general — the documented precedence, not the missing-field
+    allow."""
+    out, _err, code = _run(
+        {"tool": "task", "args": {"subagent_type": "general",
+                                  "run_in_background": flag, "prompt": _LONG}},
+        monkeypatch,
+    )
+    assert code == gate.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
+
+
+def test_opencode_task_unknown_type_without_background_still_blocks(monkeypatch):
+    """Only general/explore are the opencode-native async types. A custom Task
+    type with no background flag still blocks, so the allow is not 'any task'."""
+    out, _err, code = _run(
+        {"tool": "task", "args": {"subagent_type": "custom-worker", "prompt": _LONG}},
+        monkeypatch,
+    )
+    assert code == gate.BLOCK_EXIT_CODE
+    assert _decision(out) == "block"
 
 
 def test_allow_trivial_one_liner(monkeypatch):
