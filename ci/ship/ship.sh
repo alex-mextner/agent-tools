@@ -498,7 +498,15 @@ if [ -n "$_EFFECTIVE_TARGET" ] && [ "$_EFFECTIVE_TARGET" != "$_CWD_ORIGIN_REPO" 
   _FOREIGN_REPO_INVOKE=1
 fi
 
-MAIN_CHECKOUT="${SHIP_MAIN_CHECKOUT:-$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')}"
+# HYP-1392: a plain `awk '{print $2; exit}'` reader closes the pipe as soon as it has its
+# match. With enough worktrees for `git worktree list --porcelain`'s output to exceed the OS
+# pipe buffer, git is still blocked mid-write when that happens and gets killed by SIGPIPE
+# (141), which `set -euo pipefail` then propagates, aborting ship.sh before any diagnostic.
+# Dropping the early `exit` makes awk consume the whole stream instead, so git always reaches
+# real EOF regardless of worktree count — no SIGPIPE by construction, no extra `cat` sink
+# needed. `substr($0,10)` (not `$2`, which splits on whitespace) matches the sibling worktree
+# parser below so a main-checkout path containing a space still resolves in full.
+MAIN_CHECKOUT="${SHIP_MAIN_CHECKOUT:-$(git worktree list --porcelain | awk '/^worktree / && !found {print substr($0,10); found=1}')}"
 # Guard the MAIN checkout NOW — ship's post-merge refresh runs git ops against it (checkout /
 # fetch / pull), which would fail opaquely under core.bare. Firing before the merge means a
 # hard abort here is safe: nothing is merged yet.

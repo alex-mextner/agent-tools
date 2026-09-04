@@ -233,6 +233,135 @@ def test_merge_reported_even_if_cleanup_cannot_remove_branch(repo_with_two_workt
     )
 
 
+def test_main_checkout_derivation_survives_many_worktrees(tmp_path):
+    """HYP-1392 regression. MAIN_CHECKOUT is auto-derived (no SHIP_MAIN_CHECKOUT override)
+    via `git worktree list --porcelain | awk ...`. An early-exiting awk used to close the
+    pipe right after its first match, which used to kill `git` with SIGPIPE (141, propagated
+    by `set -euo pipefail`) whenever there were enough worktrees for the porcelain output to
+    still be mid-write — a real 400+-line reproduction on a heavily-worktreed repo. Reproduced
+    here deterministically (no dependency on OS pipe-buffer size or hundreds of real
+    worktrees): a fake `git` answers `worktree list --porcelain` with the real main-checkout
+    entry FIRST (so MAIN_CHECKOUT still resolves correctly), then ~100 padding entries written
+    with a small sleep between each, guaranteeing an early-exiting awk would already be gone
+    (after the first, real entry) while the fake git is still mid-write on the rest.
+
+    The interception is scoped to fire ONCE per test run (a marker file, deleted on first
+    use) — ship.sh calls `git worktree list --porcelain` more than once in a single run (the
+    worktree-collection awk further down uses it too), and leaving the padding unscoped would
+    leak 100 nonexistent `/fake/padding-wt*` entries into that unrelated code path as well,
+    coupling this SIGPIPE regression to whatever ship.sh's cleanup logic does with worktree
+    paths that don't exist on disk.
+    """
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+
+    main = tmp_path / "main"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", "feat", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+
+    bindir = _fake_gh_dir(tmp_path)
+    real_git = shutil.which("git")
+    fake_git = bindir / "git"
+    marker = tmp_path / "pad-once"
+    marker.write_text("1", encoding="utf-8")
+    fake_git.write_text(
+        "#!/usr/bin/env bash\n"
+        f'if [ "$1" = "worktree" ] && [ "$2" = "list" ] && [ "$3" = "--porcelain" ] && [ -e "{marker}" ]; then\n'
+        f'  rm -f "{marker}"\n'
+        f'  "{real_git}" worktree list --porcelain\n'
+        "  for i in $(seq 1 100); do\n"
+        "    printf 'worktree /fake/padding-wt%03d\\n' \"$i\"\n"
+        "    printf 'HEAD 0123456789abcdef0123456789abcdef01234567\\n'\n"
+        "    printf 'branch refs/heads/padding%03d\\n' \"$i\"\n"
+        "    printf '\\n'\n"
+        "    sleep 0.005\n"
+        "  done\n"
+        "  exit 0\n"
+        "fi\n"
+        f'exec "{real_git}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    # Deliberately NOT setting SHIP_MAIN_CHECKOUT — this is the one test in the file that
+    # exercises the real auto-derivation line instead of bypassing it.
+    r = _sh(
+        "bash", str(_SHIP), "1", "--no-screenshot-ok", "test",
+        cwd=main, env=env,
+    )
+
+    assert r.returncode != 141, (
+        f"MAIN_CHECKOUT derivation SIGPIPE'd (HYP-1392 regressed): "
+        f"rc={r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_main_checkout_derivation_handles_spaced_path(tmp_path):
+    """HYP-1392 follow-up: the auto-derivation awk must parse the FULL porcelain path via
+    `substr($0,10)`, not `$2` (which splits on whitespace) — otherwise a primary checkout at
+    e.g. `/repos/client work/main` resolves to the truncated `/repos/client`, and the
+    post-merge refresh silently operates on a nonexistent path instead of the real main
+    checkout. Puts the primary checkout itself at a spaced path, ships from a LINKED worktree
+    (forcing the real auto-derivation line to run, no `SHIP_MAIN_CHECKOUT` override), and
+    confirms the merge actually landed in that real spaced-path checkout."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    origin = tmp_path / "origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=tmp_path)
+
+    main = tmp_path / "primary checkout"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@t", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    _git("remote", "add", "origin", str(origin), cwd=main)
+    (main / "README.md").write_text("# x\n", encoding="utf-8")
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    _git("push", "-q", "origin", "main", cwd=main)
+    _git("branch", "feat", cwd=main)
+    _git("push", "-q", "origin", "feat", cwd=main)
+
+    wt = tmp_path / "wt"
+    _git("worktree", "add", "-q", str(wt), "feat", cwd=main)
+
+    bindir = _fake_gh_dir(tmp_path)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["SHIP_TEST_BRANCH"] = "feat"
+    env["SHIP_DEFAULT_BRANCH"] = "main"
+    # Deliberately NOT setting SHIP_MAIN_CHECKOUT — must auto-derive MAIN_CHECKOUT from the
+    # real (spaced) primary checkout path via `git worktree list --porcelain`.
+    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", cwd=wt, env=env)
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "merged #1" in r.stdout, r.stdout
+    # Proof MAIN_CHECKOUT resolved to the full spaced path, not a `$2`-truncated prefix: the
+    # real primary checkout's own worktree list must no longer show the now-shipped worktree
+    # (the post-merge refresh/cleanup only reaches it if MAIN_CHECKOUT pointed at the right dir).
+    remaining = _sh("git", "worktree", "list", "--porcelain", cwd=main).stdout
+    assert str(wt) not in remaining, f"post-merge cleanup did not reach the real main checkout:\n{remaining}"
+
+
 def test_worktree_path_with_space_is_collected(tmp_path):
     """The fix swapped awk `$2` (splits on whitespace) for `substr($0,10)` so a worktree
     whose path contains a space is parsed whole. With `$2` the path was truncated and the
