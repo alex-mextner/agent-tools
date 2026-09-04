@@ -2046,6 +2046,9 @@ _review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing
   if [ -n "$m" ]; then printf '%s' "$m" | LC_ALL=C tr '[:lower:]' '[:upper:]'; return 0; fi
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z]+-[0-9]+' | head -1 || true)
   if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
+  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z0-9]*(-[A-Z0-9]+)*' \
+        | LC_ALL=C grep -xE '[A-Z][A-Z]+(-[A-Z][A-Z]+){2,}' | head -1 || true)
+  if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
   # GitHub issue reference (`Fixes #105`, `Refs #105`) — for repos (like conloca-landing) that
   # track work as GitHub issues rather than Linear/JIRA-style codes. Returned LITERAL, not
   # normalized: task-cli's own `_route_id_to_project` (tasklib/cli.py) routes a bare GitHub id
@@ -2069,19 +2072,29 @@ _review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing
   #     authority — unlike a wrongly-derived HYP/PROJ token, a referenced GitHub issue routinely
   #     HAS a record in an issue-tracked repo, so the "fail-closed anyway" reasoning above does
   #     not hold here.
-  # This arm runs AFTER the generic PREFIX-<n> arm so a `Fixes #45` aside never shadows a real
-  # `PROJ-123` ticket in the same body. The keyword itself must not be the TAIL of a repo path
-  # (`org/hot-fix#5`, `org/fix#5`, `org/my.fix#5` are all qualified refs), so the char before it
-  # may not be a repo-name char (`-`/`.`) or `/` either; the digits must end at a non-word
-  # boundary (`#123abc` is not an issue ref). Trade-off, accepted: a bare `#105` with no keyword
-  # (a `fix/#105` branch name, a `#105 widget` title) is NOT derived — pass $REVIEW_TASK_CODE.
+  # This arm is the LAST fallback — after the generic PREFIX-<n> arm AND the descriptive
+  # ALL-CAPS arm above — so a `Fixes #45` aside never shadows a real `PROJ-123` or
+  # `SME-ROADMAP-WORKTREE-NOTE` code in the same body (for a descriptive-code repo that aside
+  # would otherwise be the very borrowing path described above). The keyword itself must not be
+  # the TAIL of a repo path (`org/hot-fix#5`, `org/fix#5`, `org/my.fix#5` are all qualified refs),
+  # so the char before it may not be a repo-name char (`-`/`.`) or `/` either; the digits must end
+  # at a non-word boundary (`#123abc` is not an issue ref). Two DISTINCT anchored refs in one text
+  # (`Partially fixes #12 ... Closes #200`) are an ambiguous task code: every other branch of this
+  # gate is fail-closed, so nothing is derived and ship refuses instead of silently taking the
+  # first in document order. The match may swallow at most ONE trailing WORD char (to reject
+  # `#123abc` below) and never the non-word char after the digits: `grep -o` matches don't
+  # overlap, so consuming a `,` in `closes #12,fixes #200` would eat the second ref's leading
+  # boundary and hide the ambiguity. Known limit (POSIX ERE has no lookahead): the guard sees
+  # honest ambiguity with realistic separators (space, `,`, `;`, `.`+space, newline); a second
+  # ref glued on by a word char (`#34xrefs #56`) or by a `/`/`.`/`-` (`#12/fixes #200`) keeps no
+  # admissible leading boundary and stays hidden — an author who can craft that could as well
+  # omit the ref, so it is not defended against. Trade-off, accepted: a bare `#105` with no
+  # keyword (a `fix/#105` branch name, a `#105 widget` title) is NOT derived either — pass
+  # $REVIEW_TASK_CODE.
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE \
-      '(^|[^A-Za-z0-9_./-])(close[sd]?|fix(e[sd])?|resolve[sd]?|refs?|references?)[[:space:]]*:?[[:space:]]*#[0-9]+($|[^A-Za-z0-9_])' \
-      | head -1 | LC_ALL=C grep -oE '#[0-9]+' || true)
-  if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
-  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z0-9]*(-[A-Z0-9]+)*' \
-        | LC_ALL=C grep -xE '[A-Z][A-Z]+(-[A-Z][A-Z]+){2,}' | head -1 || true)
-  printf '%s' "$m"
+      '(^|[^A-Za-z0-9_./-])(close[sd]?|fix(e[sd])?|resolve[sd]?|refs?|references?)[[:space:]]*:?[[:space:]]*#[0-9]+[A-Za-z0-9_]?' \
+      | LC_ALL=C grep -oE '#[0-9]+[A-Za-z0-9_]?$' | LC_ALL=C grep -xE '#[0-9]+' | LC_ALL=C sort -u || true)
+  if [ "$(printf '%s\n' "$m" | LC_ALL=C grep -c '#')" -eq 1 ]; then printf '%s' "$m"; fi
   return 0
 }
 

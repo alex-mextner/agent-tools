@@ -5944,6 +5944,74 @@ def test_review_quorum_prefixed_ticket_takes_precedence_over_github_issue_ref(tm
     assert "#45" not in r.stdout, r.stdout
 
 
+def test_review_quorum_descriptive_code_takes_precedence_over_github_issue_ref(tmp_path):
+    """A descriptive ALL-CAPS code in the body wins over an `also fixes #N` aside too — the
+    GitHub-issue arm is the LAST fallback, so a descriptive-code repo keeps deriving its own
+    code (no regression) and the aside can never borrow an already-shipped issue's record."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "SHIP_TEST_PR_BODY": "SME-ROADMAP-WORKTREE-NOTE — reword the note. Also fixes #12.",
+        },
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "SME-ROADMAP-WORKTREE-NOTE" in r.stdout, r.stdout
+    assert "#12" not in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Partially fixes #12 as a side effect.\n\nCloses #200\n",
+        # no whitespace between the refs: the first match must not swallow the `,`/`;` that is
+        # the second keyword's leading boundary, or the ambiguity would go undetected
+        "closes #12,fixes #200",
+        "Fixes #12;Refs: #200.",
+    ],
+)
+def test_review_quorum_refuses_two_distinct_anchored_github_issue_refs(tmp_path, body):
+    """Two DISTINCT keyword-anchored refs (`Partially fixes #12 ... Closes #200`) are an
+    ambiguous task code. Every other branch of the gate is fail-closed, so ship derives nothing
+    and refuses rather than silently taking the first ref in document order."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": body})
+    assert r.returncode != 0, f"{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_same_github_issue_ref_twice_is_not_ambiguous(tmp_path):
+    """The SAME issue anchored twice (`Fixes #105 ... Refs #105`) is one task code, not two."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"SHIP_TEST_PR_BODY": "Fixes #105.\n\nRefs #105 for the follow-up notes.\n"},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "#105" in r.stdout, r.stdout
+
+
+def test_review_quorum_invalid_github_issue_ref_does_not_count_toward_ambiguity(tmp_path):
+    """`Fixes #12abc` is not an issue ref (digits must end at a non-word boundary), so next to a
+    real `Closes #200` it neither derives `#12` nor makes the body ambiguous — `#200` wins."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": "Fixes #12abc Closes #200"},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "#200" in r.stdout, r.stdout
+    assert "#12" not in r.stdout.replace("#12abc", ""), r.stdout
+
+
 def test_review_quorum_derives_descriptive_code_from_pr_body(tmp_path):
     """No $REVIEW_TASK_CODE and no ticket in the branch name -> ship also derives a purely
     descriptive (non-numeric) review-cli task code from the PR body — the real-world #384
