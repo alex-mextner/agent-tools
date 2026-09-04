@@ -2003,9 +2003,11 @@ fi
 # Runs independently of --skip-ci, same posture as the review-dwell gate above.
 
 # Prints the first ticket-like token found in $1, or nothing. Tries the repo's own HYP-<n>
-# convention first (case-insensitive, normalized to uppercase), then a generic
-# UPPERCASE-PREFIX-<n> ticket token (2+ uppercase letters, a hyphen, digits) so other repos'
-# conventions (JIRA-style PROJ-123, etc.) are also picked up, then a purely descriptive
+# convention first (case-insensitive, normalized to uppercase), then a bare GitHub issue
+# reference (`#105`) returned literal for repos that track work as plain GitHub issues rather
+# than a lettered ticket prefix, then a generic UPPERCASE-PREFIX-<n> ticket token (2+
+# uppercase letters, a hyphen, digits) so other repos' conventions (JIRA-style PROJ-123, etc.)
+# are also picked up, then a purely descriptive
 # review-cli task code (2+ uppercase letters, then 2-OR-MORE hyphen-joined 2+-letter uppercase
 # segments -- 3+ segments total, no digits) so hand-picked codes like `SME-ROADMAP-WORKTREE-NOTE`
 # or `WT-GITIGNORE-EXCLUDE` -- real task codes review-cli's own run-stats log records fine, just
@@ -2042,6 +2044,19 @@ _review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing
   local text="$1" m
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE 'HYP-[0-9]+' | head -1 || true)
   if [ -n "$m" ]; then printf '%s' "$m" | LC_ALL=C tr '[:lower:]' '[:upper:]'; return 0; fi
+  # Plain GitHub issue reference (`#105`, `Fixes #105`) — for repos (like conloca-landing) that
+  # track work as GitHub issues rather than Linear/JIRA-style codes. Returned LITERAL, not
+  # normalized: task-cli's own `_route_id_to_project` (tasklib/cli.py) routes a bare GitHub id
+  # by checking `tid.startswith("#")` first — a `GH-<n>`-style rewrite doesn't match that check,
+  # falls through to the Linear-team-prefix branch instead, and `task mark-shipped` fails with
+  # an unroutable-id error. review-cli's own `normalize_task_code` (reviewlib/stats.py) accepts
+  # any non-whitespace, non-control-character token — `#105` passes it unchanged, so there is no
+  # downstream reason to rewrite it. Known, accepted residual (same class as the HYP/generic
+  # arms' own documented false-positive trade-offs): a stray `#123456`-shaped hex colour in prose
+  # would also match — acceptable here, since a real hex colour essentially never appears in a
+  # branch name or PR body.
+  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '#[0-9]+' | head -1 || true)
+  if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z]+-[0-9]+' | head -1 || true)
   if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z0-9]*(-[A-Z0-9]+)*' \
