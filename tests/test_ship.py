@@ -5889,26 +5889,59 @@ def test_review_quorum_derives_literal_github_issue_ref_from_pr_body(tmp_path):
     assert "GH-105" not in r.stdout, r.stdout
 
 
-def test_review_quorum_ignores_qualified_cross_repo_issue_ref(tmp_path):
-    """GitHub's qualified cross-repo syntax (`other-org/other-repo#123`) names an issue in
-    ANOTHER repo — the helper also feeds `task mark-shipped`, so extracting `#123` from it would
-    mark an unrelated local issue shipped. It must NOT be derived; with nothing else in the body
-    ship refuses fail-closed."""
+def test_review_quorum_derives_refs_keyword_issue_ref_from_pr_body(tmp_path):
+    """`Refs #N` (the non-auto-closing reference form) anchors an issue ref just like GitHub's
+    closing keywords do; keyword matching is case-insensitive and tolerates a colon."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": "refs: #77 -- widget follow-up."},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "#77" in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # qualified cross-repo refs (incl. repo names ending in `-`/`.`) name ANOTHER repo's issue
+        "Fixes other-org/other-repo#123; closes org/trailing-#124; resolves org/dotted.#125.",
+        # a repo NAME/path ending in a keyword is still a qualified ref, not a keyword anchor
+        "Mirrors org/hot-fix#5, org/fix#6 and org/my.fix#7 upstream.",
+        # a URL fragment / Markdown anchor is not an issue reference
+        "See https://example.org/docs/#105 and the notes at #L245-L250.",
+        # an incidental prose mention of an (already-shipped) issue must not borrow its record
+        "Follow-up tidy-up for #12, reverts (#268). Not a fix for #123abc.",
+    ],
+)
+def test_review_quorum_ignores_non_anchored_github_issue_refs(tmp_path, body):
+    """Only a keyword-anchored local ref (`Fixes #N` / `Refs #N`) is a task code. The helper also
+    feeds the post-merge `task mark-shipped` call and the quorum-record lookup, so a cross-repo
+    ref, a URL fragment, or a bare prose mention of a shipped issue must NOT be derived — with
+    nothing else in the body ship refuses fail-closed."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": body})
+    assert r.returncode != 0, f"must not derive a task code from {body!r}\n{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_prefixed_ticket_takes_precedence_over_github_issue_ref(tmp_path):
+    """A lettered PREFIX-<n> ticket in the body wins over a `Fixes #N` aside in the same body —
+    the GitHub-issue arm runs AFTER the generic numeric arm so it never shadows a real ticket."""
     main, _wt = _make_repo_with_branch(tmp_path, "feat")
     gh = _fake_gh_quorum_dir(tmp_path)
     rv = _fake_review_dir(tmp_path)
     r = _run_ship_quorum(
         main, gh, rv,
-        env_extra={
-            "SHIP_TEST_PR_BODY": (
-                "Mirrors other-org/other-repo#123 and org/trailing-#124, org/dotted.#125; "
-                "see also #123abc."
-            ),
-        },
+        env_extra={"SHIP_TEST_PR_BODY": "Fixes #45 as part of PROJ-123 (see the epic)."},
     )
-    assert r.returncode != 0, f"cross-repo ref must not derive a task code\n{r.stdout}\n{r.stderr}"
-    assert "could not derive a task code" in r.stderr, r.stderr
-    assert "[fake gh] merged" not in r.stdout
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "PROJ-123" in r.stdout, r.stdout
+    assert "#45" not in r.stdout, r.stdout
 
 
 def test_review_quorum_derives_descriptive_code_from_pr_body(tmp_path):

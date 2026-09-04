@@ -264,6 +264,25 @@ def test_notify_falls_back_to_pr_body_when_branch_and_title_have_no_code(repo_wi
     assert "mark-shipped HYP-931" in calls[0]
 
 
+def test_notify_passes_github_issue_ref_literal_to_mark_shipped(repo_with_pr_worktree, tmp_path):
+    """A `Fixes #105` PR body (a repo that tracks work as plain GitHub issues) reaches
+    `task mark-shipped` as the LITERAL `#105`, never a `GH-105` rewrite: task-cli routes a
+    GitHub id by its leading `#` (`_route_id_to_project` checks `tid.startswith("#")` first), so
+    a rewritten code would fall through to the Linear-prefix branch and be unroutable."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _bindir(tmp_path, with_task=True)
+
+    r, calls = _run_ship(
+        main, bindir, tmp_path, branch="fix-the-thing",
+        extra_env={"SHIP_TEST_PR_TITLE": "fix the thing", "SHIP_TEST_PR_BODY": "Fixes #105 for real."},
+    )
+
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert len(calls) == 1, calls
+    assert "mark-shipped #105" in calls[0]
+    assert "GH-105" not in calls[0]
+
+
 def test_notify_skips_when_no_code_derivable_anywhere(repo_with_pr_worktree, tmp_path):
     main, _wt = repo_with_pr_worktree
     bindir = _bindir(tmp_path, with_task=True)
