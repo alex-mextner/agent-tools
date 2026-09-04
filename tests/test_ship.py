@@ -5874,6 +5874,43 @@ def test_review_quorum_derives_code_from_pr_body(tmp_path):
     assert "AUTHORITY CONFIRMED" in r.stdout and "HYP-999" in r.stdout, r.stdout
 
 
+def test_review_quorum_derives_literal_github_issue_ref_from_pr_body(tmp_path):
+    """A bare GitHub issue reference (`Fixes #105`) is a task code too, returned LITERAL
+    (`#105`, not `GH-105`): task-cli routes a GitHub id by its leading `#`, so a rewrite
+    would make the post-merge `task mark-shipped` unroutable."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": "Fixes #105 for the widget regression."},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "#105" in r.stdout, r.stdout
+    assert "GH-105" not in r.stdout, r.stdout
+
+
+def test_review_quorum_ignores_qualified_cross_repo_issue_ref(tmp_path):
+    """GitHub's qualified cross-repo syntax (`other-org/other-repo#123`) names an issue in
+    ANOTHER repo — the helper also feeds `task mark-shipped`, so extracting `#123` from it would
+    mark an unrelated local issue shipped. It must NOT be derived; with nothing else in the body
+    ship refuses fail-closed."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "SHIP_TEST_PR_BODY": (
+                "Mirrors other-org/other-repo#123 and org/trailing-#124, org/dotted.#125; "
+                "see also #123abc."
+            ),
+        },
+    )
+    assert r.returncode != 0, f"cross-repo ref must not derive a task code\n{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
 def test_review_quorum_derives_descriptive_code_from_pr_body(tmp_path):
     """No $REVIEW_TASK_CODE and no ticket in the branch name -> ship also derives a purely
     descriptive (non-numeric) review-cli task code from the PR body — the real-world #384

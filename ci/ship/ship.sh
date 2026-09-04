@@ -2051,11 +2051,21 @@ _review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing
   # falls through to the Linear-team-prefix branch instead, and `task mark-shipped` fails with
   # an unroutable-id error. review-cli's own `normalize_task_code` (reviewlib/stats.py) accepts
   # any non-whitespace, non-control-character token — `#105` passes it unchanged, so there is no
-  # downstream reason to rewrite it. Known, accepted residual (same class as the HYP/generic
-  # arms' own documented false-positive trade-offs): a stray `#123456`-shaped hex colour in prose
-  # would also match — acceptable here, since a real hex colour essentially never appears in a
-  # branch name or PR body.
-  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '#[0-9]+' | head -1 || true)
+  # downstream reason to rewrite it. Only a LOCAL reference qualifies: GitHub's qualified
+  # cross-repo syntax (`other-org/other-repo#123`) names an issue in ANOTHER repo, and because
+  # this same helper feeds the post-merge `task mark-shipped` call, extracting its `#123` would
+  # mark an unrelated local issue shipped (and query the wrong review record with quorum on).
+  # POSIX ERE has no lookbehind, so the `#` must be preceded by start-of-text or a char that
+  # cannot END a GitHub repository name — repo names are `[A-Za-z0-9_.-]+`, and GitHub allows a
+  # trailing `-`/`.` (`other-repo-#123` is a qualified ref, not a local one) — and the digits
+  # must end at a non-word boundary (`#123abc` is not an issue ref); the boundary chars are then
+  # stripped by the second grep. A `/` right before `#` stays allowed (`fix/#105` is a plausible
+  # branch name; `owner/#123` is not a valid qualified ref). Known, accepted residual (same class
+  # as the HYP/generic arms' own documented false-positive trade-offs): a stray `#123456`-shaped
+  # hex colour in prose would also match — acceptable here, since a real hex colour essentially
+  # never appears in a branch name or PR body.
+  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '(^|[^A-Za-z0-9_.-])#[0-9]+($|[^A-Za-z0-9_])' \
+      | head -1 | LC_ALL=C grep -oE '#[0-9]+' || true)
   if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z]+-[0-9]+' | head -1 || true)
   if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
