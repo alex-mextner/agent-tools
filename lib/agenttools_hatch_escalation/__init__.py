@@ -19,6 +19,7 @@ import re
 import shlex
 import signal
 import subprocess  # noqa: S404 - runs an already-resolved absolute tg-ctl path
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -141,7 +142,9 @@ def _split_command_segments(command: str) -> list[list[str]] | None:
     """
 
     normalized = command.replace("\\\n", " ").replace("\n", ";")
-    lexer = shlex.shlex(normalized, posix=True, punctuation_chars="".join(_SEPARATOR_CHARS))
+    lexer = shlex.shlex(
+        normalized, posix=True, punctuation_chars="".join(_SEPARATOR_CHARS)
+    )
     lexer.whitespace_split = True
     try:
         tokens = list(lexer)
@@ -302,13 +305,37 @@ def _request_present_hatch_approval(
 
     effective_timeout = _bounded_timeout(timeout_s)
     question = _question(hook_id, justification, context, cwd)
-    argv = [str(tg_ctl), "ask", question, "--timeout", _format_seconds(effective_timeout)]
+    # `tg-ctl ask` is the internal hook client documented in its own usage text as
+    # "reads a ButtonRequest JSON from stdin" — it is NOT a generic "ask a plain-text
+    # question" CLI. It takes no positional question argument and no `--timeout` flag
+    # (verified against features/tg-ctl/hook-normalize.ts and tg-ctl's own argv
+    # parsing, which only recognises `--agent`); its request/response protocol is a
+    # single JSON object on stdin and a JSON reply on stdout. `normalizeHookPayload`
+    # has an explicit "already a normalized ButtonRequest (back-compat / manual
+    # callers)" branch (hook-normalize.ts) that trusts a payload carrying `requestId`
+    # + `question` + `kind` directly — that is the sanctioned path for a manual
+    # caller like this one, not synthesizing a fake harness hook_event payload.
+    #
+    # The daemon's own per-ask deadline is a hard-coded 115s (ASK_TOTAL_TIMEOUT_MS in
+    # tg-ctl) regardless of what is requested here; `effective_timeout` still bounds
+    # how long THIS process waits for tg-ctl to give up and exit.
+    request_id = f"hatch-{hook_id}-{uuid.uuid4().hex[:12]}"
+    button_request = {
+        "requestId": request_id,
+        "agent": "claude",
+        "kind": "permission",
+        "question": question,
+        "title": f"Hatch: {hook_id}",
+        "decisionLabels": {"allow": "Approve", "deny": "Deny"},
+    }
+    stdin_payload = json.dumps(button_request)
+    argv = [str(tg_ctl), "ask", "--agent", "claude"]
     proc_timeout = effective_timeout + max(process_margin_s, 0.0)
 
     try:
         proc = subprocess.Popen(  # noqa: S603 - argv[0] is an absolute, executable tg-ctl path
             argv,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -326,7 +353,7 @@ def _request_present_hatch_approval(
             tg_ctl_path=str(tg_ctl),
         )
     try:
-        out, err = proc.communicate(timeout=proc_timeout)
+        out, err = proc.communicate(input=stdin_payload, timeout=proc_timeout)
     except subprocess.TimeoutExpired:
         _kill_process_group(proc)
         return HatchApprovalResult(
@@ -349,6 +376,18 @@ def _request_present_hatch_approval(
         )
 
     detail = ((out or "").strip() or (err or "").strip())[:_DETAIL_CAP]
+
+    # SECURITY: `tg-ctl ask` exits 0 unconditionally (its own dispatcher does
+    # `process.exit(0)` after `askDaemon()` regardless of outcome) — a clean exit is
+    # NOT evidence of approval. A declined, timed-out, or unreachable-daemon request
+    # ALSO exits 0 with empty stdout (askDaemon returns early and only logs to
+    # stderr). The only trustworthy signal is a well-formed hookSpecificOutput reply
+    # on stdout whose decision is explicitly "allow" — anything else (empty output,
+    # unparseable JSON, an explicit "deny", a nonzero exit) must deny. This was
+    # previously inverted (nonzero exit -> deny, EVERYTHING else -> approve), which
+    # silently self-approved on stdin/argv protocol mismatches with zero Telegram
+    # round trip (found via ~/.config/tg-cli/tg-ctl.*.log showing no daemon activity
+    # at the "approved" timestamps in ~/.config/agent-tools/ship-audit.jsonl).
     if proc.returncode != 0:
         reason = f"tg-ctl ask denied (exit {proc.returncode})"
         if detail:
@@ -362,10 +401,62 @@ def _request_present_hatch_approval(
             tg_ctl_path=str(tg_ctl),
         )
 
+    stdout_text = (out or "").strip()
+    if not stdout_text:
+        reason = (
+            "tg-ctl ask returned no reply (declined, timed out, or daemon unreachable)"
+        )
+        if detail:
+            reason = f"{reason}: {detail}"
+        return HatchApprovalResult(
+            requested=True,
+            approved=False,
+            reason=reason,
+            env_var=env_var,
+            env_present=True,
+            tg_ctl_path=str(tg_ctl),
+        )
+
+    try:
+        reply = json.loads(stdout_text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return HatchApprovalResult(
+            requested=True,
+            approved=False,
+            reason=f"tg-ctl ask returned unparseable reply: {stdout_text[:_DETAIL_CAP]}",
+            env_var=env_var,
+            env_present=True,
+            tg_ctl_path=str(tg_ctl),
+        )
+
+    hook_output = reply.get("hookSpecificOutput") if isinstance(reply, dict) else None
+    behavior: str | None = None
+    if isinstance(hook_output, dict):
+        # PreToolUse shape: {"hookEventName": "PreToolUse", "permissionDecision": "allow"|"deny"}
+        if isinstance(hook_output.get("permissionDecision"), str):
+            behavior = hook_output["permissionDecision"]
+        # PermissionRequest shape (default for a manual/back-compat ButtonRequest):
+        # {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"|"deny"}}
+        elif isinstance(hook_output.get("decision"), dict) and isinstance(
+            hook_output["decision"].get("behavior"), str
+        ):
+            behavior = hook_output["decision"]["behavior"]
+
+    if behavior != "allow":
+        reason = f"tg-ctl ask decision was {behavior!r} (expected 'allow')"
+        return HatchApprovalResult(
+            requested=True,
+            approved=False,
+            reason=reason,
+            env_var=env_var,
+            env_present=True,
+            tg_ctl_path=str(tg_ctl),
+        )
+
     return HatchApprovalResult(
         requested=True,
         approved=True,
-        reason=detail or "approved by tg-ctl ask",
+        reason=f"approved by tg-ctl ask (request {request_id})",
         env_var=env_var,
         env_present=True,
         tg_ctl_path=str(tg_ctl),
@@ -500,7 +591,9 @@ def default_overrides_log_path() -> Path | None:
     return _resolve_overrides_log_path(None)
 
 
-def _resolve_session_id(context: Mapping[str, object], env_map: Mapping[str, str]) -> str:
+def _resolve_session_id(
+    context: Mapping[str, object], env_map: Mapping[str, str]
+) -> str:
     """Best-effort session/agent identifier for the audit line.
 
     No existing call site threads a real session id into `context` today (every hook passes only
@@ -533,12 +626,6 @@ def _bounded_timeout(timeout_s: float) -> float:
     if value <= 0:
         return DEFAULT_TG_CTL_TIMEOUT_S
     return min(value, MAX_TG_CTL_TIMEOUT_S)
-
-
-def _format_seconds(timeout_s: float) -> str:
-    if timeout_s.is_integer():
-        return str(int(timeout_s))
-    return str(timeout_s)
 
 
 def resolve_home() -> str | None:
