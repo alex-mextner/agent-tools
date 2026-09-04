@@ -29,6 +29,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -654,6 +655,106 @@ def test_fail_open_when_cwd_is_not_a_git_repo_blocks_only_on_missing_marker(tmp_
     not_a_repo.mkdir()
     out, _e, c = _run("git commit -m x", not_a_repo, monkeypatch, marker=tmp_path / "m")
     assert c == rr.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_marker_that_is_a_directory_does_not_satisfy_the_gate(tmp_path, monkeypatch):
+    """A DIRECTORY at the marker path must not count as a review. Its mtime is bumped by
+    any unrelated file created inside it, so accepting one turns a busy directory into a
+    permanently-fresh marker; review-cli refuses to write such a target at all
+    (review-cli#350), and a gate that accepted what the tool refuses to write would let a
+    misconfiguration pass commits nobody reviewed."""
+    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
+    as_dir = tmp_path / "marker-dir"
+    as_dir.mkdir()
+    monkeypatch.setenv("REVIEW_MARKER", str(as_dir))
+    out, err = io.StringIO(), io.StringIO()
+    event = {"cwd": str(repo), "args": {"command": "git commit -m x"}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    monkeypatch.delenv("REVIEW_SKIP", raising=False)
+    rr.main()
+    assert _decision(out.getvalue()) == "block"
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores directory permission bits, so chmod 000 cannot produce the "
+    "EACCES this test needs — it would 'allow' for the wrong reason and then fail on "
+    "the missing warning, reading as a regression when it is an environment artifact",
+)
+def test_unreadable_marker_parent_fails_open(tmp_path, monkeypatch):
+    """An unreadable marker path is a broken ENVIRONMENT, not evidence about whether a
+    review ran, so `on_error: open` applies and the commit is allowed with a warning.
+    Pinned because it is a deliberate LOOSENING: the old `Path.exists()` swallowed the
+    EACCES and blocked. Contrast the loop/parent-file cases above, which are definitive
+    answers and still block."""
+    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    marker = locked / "last-review"
+    marker.write_text("", encoding="utf-8")
+    locked.chmod(0o000)
+    monkeypatch.setenv("REVIEW_MARKER", str(marker))
+    out, err = io.StringIO(), io.StringIO()
+    event = {"cwd": str(repo), "args": {"command": "git commit -m x"}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    monkeypatch.delenv("REVIEW_SKIP", raising=False)
+    try:
+        rr.main()
+        assert _decision(out.getvalue()) == "allow"
+        assert "fail-open" in err.getvalue(), err.getvalue()
+    finally:
+        locked.chmod(0o700)  # or the tmp_path teardown cannot remove it
+
+
+def test_symlink_loop_marker_blocks_instead_of_failing_open(tmp_path, monkeypatch):
+    """A `REVIEW_MARKER` pointing into a symlink loop cannot ever hold a file — no review
+    tool could write one there — so it is an ANSWER ("no review"), not an unanswerable
+    question. Landing it in the fail-open branch would wave every commit through on a
+    typo, while the neighbouring typo (`/a/regular/file/marker`) blocks: the same
+    misconfiguration getting opposite outcomes."""
+    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    monkeypatch.setenv("REVIEW_MARKER", str(loop))
+    out, err = io.StringIO(), io.StringIO()
+    event = {"cwd": str(repo), "args": {"command": "git commit -m x"}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    monkeypatch.delenv("REVIEW_SKIP", raising=False)
+    rr.main()
+    assert _decision(out.getvalue()) == "block"
+
+
+def test_marker_under_a_regular_file_blocks_instead_of_failing_open(tmp_path, monkeypatch):
+    """`REVIEW_MARKER=<a regular file>/marker` raises NotADirectoryError. Same class as
+    the loop above, same required outcome."""
+    repo = _mk_repo_with_staged(tmp_path, "src/util.py")
+    blocker = tmp_path / "iamafile"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setenv("REVIEW_MARKER", str(blocker / "marker"))
+    out, err = io.StringIO(), io.StringIO()
+    event = {"cwd": str(repo), "args": {"command": "git commit -m x"}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    monkeypatch.delenv("REVIEW_SKIP", raising=False)
+    rr.main()
+    assert _decision(out.getvalue()) == "block"
+
+
+def test_empty_review_marker_env_falls_back_to_the_default_path(monkeypatch):
+    """An exported-but-EMPTY `REVIEW_MARKER=` must mean the same as unset. Read naively it
+    becomes `Path("")` — the current directory — so this gate would stat a directory whose
+    mtime any file creation refreshes, while review-cli went on writing its own default
+    path: the gate and the tool silently watching two different things (codex finding)."""
+    monkeypatch.setenv("REVIEW_MARKER", "")
+    assert rr.marker_path() == Path(os.path.expanduser(rr.DEFAULT_MARKER))
+    assert str(rr.marker_path()) not in (".", "")
 
 
 def test_marker_stat_error_fails_open(tmp_path, monkeypatch):

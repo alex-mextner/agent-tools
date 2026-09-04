@@ -28,8 +28,12 @@
 #                    review is advisory, it should not hard-block a merge). Default: 0.
 #
 # The built-in defaults review the DIFF THIS SCRIPT COMPUTES (base...head) — so they work in
-# CI where the PR is already committed. For LOCAL review of UNCOMMITTED work, set e.g.
-# AI_REVIEW_CMD='codex exec review --uncommitted'.
+# CI where the PR is already committed. For LOCAL review of UNCOMMITTED work, point
+# AI_REVIEW_CMD at a reviewer that reads the working tree itself.
+#
+# This is NOT the pre-commit path: the computed diff is empty while your work is only
+# staged, and nothing here writes the require-review-before-commit marker. Before a local
+# commit run `review diff --staged --task <CODE> -C <repo>` instead.
 #
 # Usage:
 #   sh ci/ai-review/ai-review.sh                          # codex reviews the PR diff
@@ -71,9 +75,11 @@ fi
 
 # Pick the command. The built-in defaults review the DIFF THIS SCRIPT COMPUTED (read from
 # STDIN / a file), NOT the working tree — so they work in CI where the PR is already
-# committed (a `--uncommitted` review would see nothing). For LOCAL pre-commit review of
-# UNCOMMITTED changes instead, set AI_REVIEW_CMD explicitly, e.g.
-#   AI_REVIEW_CMD='codex exec review --uncommitted'
+# committed (a working-tree review would see nothing). For LOCAL review of work in
+# progress instead, set AI_REVIEW_CMD to a reviewer that reads the working tree, e.g.
+#   AI_REVIEW_CMD='my-reviewer --uncommitted'
+# For the pre-commit gate specifically, none of this applies: run
+# `review diff --staged --task <CODE> -C <repo>`, the run that writes the gate's marker.
 CMD="${AI_REVIEW_CMD:-}"
 if [ -z "$CMD" ]; then
   case "$AI_REVIEW_TOOL" in

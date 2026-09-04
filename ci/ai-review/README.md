@@ -38,16 +38,26 @@ sh ci/ai-review/ai-review.sh
 AI_REVIEW_CMD='my-reviewer --diff {DIFF_FILE}' sh ci/ai-review/ai-review.sh
 
 # local review of UNCOMMITTED work instead of the committed diff:
-AI_REVIEW_CMD='codex exec review --uncommitted' sh ci/ai-review/ai-review.sh
+AI_REVIEW_CMD='my-reviewer --uncommitted' sh ci/ai-review/ai-review.sh
 ```
+
+This script is for CI: it reviews the diff it computes (`base...head`), which is empty
+when your work is only staged, and it never writes the commit-gate marker. It is NOT the
+way to satisfy `require-review-before-commit` before a local commit — for that, stage the
+change and run `review diff --staged --task <CODE> -C <repo>`, which reviews the real
+index and writes the marker itself. (The example here used to name a `codex exec` flag
+that no longer exists; two detached agents died following that same dead command where
+another file gave it as gate advice.)
 
 ## Reviews the computed diff (works in CI)
 
 The script computes the PR diff (`base...head`) and feeds **that** to the reviewer (via
 STDIN or `{DIFF_FILE}`). This matters: in CI the PR is already **committed**, so a
 "review my uncommitted changes" command would see nothing. The built-in `codex` default
-pipes the computed diff in, so it reviews the actual PR. For local pre-commit review of
-*uncommitted* work, set `AI_REVIEW_CMD='codex exec review --uncommitted'`.
+pipes the computed diff in, so it reviews the actual PR. For local review of work in
+progress, point `AI_REVIEW_CMD` at a reviewer that reads the working tree itself — and
+for the pre-commit gate specifically, use `review diff --staged --task <CODE> -C <repo>`,
+which is the run that writes the gate's marker.
 
 ## Knobs
 

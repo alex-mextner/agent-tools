@@ -158,7 +158,15 @@ so the precondition they check must already be satisfied. The clearest example i
 fresh** — it stats `REVIEW_MARKER` (default `~/.cache/agent-tools/last-review`) and passes
 only when its mtime is within `REVIEW_FRESH_WINDOW_S` (3600s) of now. So the workflow is two
 steps: **run the review and refresh the marker first, *then* `git commit`.** Committing first
-and reviewing after does not work — the gate has already fired. (This hook is `on_error: open`
+and reviewing after does not work — the gate has already fired. The marker is refreshed by
+the review TOOL, and review-cli refreshes it for exactly one shape of run: a COMPLETED
+`review diff --staged --task <CODE>` over the real index, whose diff was small enough to
+reach every reviewer in full (completed, not clean — reported findings do not withhold
+the marker; a failed or degraded board does) (stage what you are committing first; `--task CODE`, or an
+exported `REVIEW_TASK_CODE`, is REQUIRED — `review diff` exits 2 without it and reviews
+nothing). An unstaged `review diff` leaves the marker alone on purpose, and so does a
+truncated one; review-cli names the reason on stderr in every case. Nobody `touch`es the
+marker by hand — that certifies a review nobody ran. (This hook is `on_error: open`
 — a discipline reminder, not a security boundary; contrast `block-no-verify`, fail-closed.)
 
 ---
