@@ -608,7 +608,8 @@ def test_hatch_question_shows_full_command_not_just_label(tmp_path, monkeypatch)
     unclassified dev-server launch later in the same string would get silently waved through
     on an approval that only ever displayed the first, innocuous-looking launch."""
     capture = tmp_path / "captured-argv"
-    # `tg-ctl ask <question> --timeout <n>` — argv[2] (bash $2) is the question text.
+    # `tg-ctl ask` reads the ButtonRequest JSON (question included) on stdin — the fake
+    # captures that stream; there is no positional question argument.
     tg_ctl = _fake_tg_ctl(
         tmp_path / "tg-ctl", f'cat > "{capture}"\n' + _ALLOW_REPLY_SH
     )

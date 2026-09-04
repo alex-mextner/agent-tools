@@ -250,6 +250,100 @@ def test_real_justification_timeout_denies(tmp_path):
     assert "timed out" in result.reason
 
 
+def _ask(tmp_path: Path, tg_ctl_body: str):
+    """Run one hatch request against a fake tg-ctl with the given shell body."""
+    tg_ctl = _write_tg_ctl(tmp_path / "trusted" / "tg-ctl", tg_ctl_body)
+    repo = _repo_with_tg_ctl(tmp_path)
+    env_var = hatch_env_var("block-reset-hard")
+    return request_hatch_approval(
+        "block-reset-hard",
+        {"command": "git reset --hard"},
+        cwd=str(repo),
+        env={env_var: "Need to discard a disposable failed experiment."},
+        tg_ctl_candidates=[tg_ctl],
+        timeout_s=2,
+    )
+
+
+# The deny branches below are THE point of the stdin-JSON contract: real `tg-ctl ask` exits 0
+# no matter what happened (declined, timed out, daemon unreachable), so every "clean exit but no
+# explicit allow" shape must deny. Each branch gets its own test so a refactor that re-adds an
+# `exit 0 -> approve` shortcut cannot pass the suite.
+def test_exit0_with_empty_stdout_denies(tmp_path):
+    result = _ask(tmp_path, "exit 0\n")
+    assert result.requested is True
+    assert result.approved is False
+    assert "no reply" in result.reason
+
+
+def test_exit0_with_empty_stdout_and_stderr_detail_denies_with_detail(tmp_path):
+    result = _ask(tmp_path, "echo 'daemon unreachable' >&2\nexit 0\n")
+    assert result.approved is False
+    assert "no reply" in result.reason and "daemon unreachable" in result.reason
+
+
+def test_exit0_with_unparseable_stdout_denies(tmp_path):
+    # The pre-fix fakes printed exactly this and were treated as approval.
+    result = _ask(tmp_path, 'printf "approved\\n"\nexit 0\n')
+    assert result.approved is False
+    assert "unparseable" in result.reason and "approved" in result.reason
+
+
+@pytest.mark.parametrize("behavior", ["deny", "ask", "Allow", ""])
+def test_permission_request_reply_without_literal_allow_denies(tmp_path, behavior):
+    reply = json.dumps(
+        {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": behavior}}}
+    )
+    result = _ask(tmp_path, f"printf '%s' '{reply}'\nexit 0\n")
+    assert result.approved is False
+    assert f"decision was {behavior!r}" in result.reason
+
+
+def test_pretooluse_permission_decision_allow_approves(tmp_path):
+    reply = json.dumps(
+        {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}
+    )
+    result = _ask(tmp_path, f"printf '%s' '{reply}'\nexit 0\n")
+    assert result.approved is True
+    assert "approved by tg-ctl ask" in result.reason
+
+
+@pytest.mark.parametrize("decision", ["deny", "ask"])
+def test_pretooluse_permission_decision_other_than_allow_denies(tmp_path, decision):
+    reply = json.dumps(
+        {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision}}
+    )
+    result = _ask(tmp_path, f"printf '%s' '{reply}'\nexit 0\n")
+    assert result.approved is False
+    assert f"decision was {decision!r}" in result.reason
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        # a top-level decision is NOT the hook reply shape — it must not be trusted
+        ({"decision": "allow"}, None),
+        ({"decision": {"behavior": "allow"}}, None),
+        ({"hookSpecificOutput": "allow"}, None),
+        ({"hookSpecificOutput": {}}, None),
+        ({"hookSpecificOutput": {"decision": "allow"}}, None),
+        ({"hookSpecificOutput": {"decision": {"behavior": 1}}}, None),
+        ("allow", None),
+        ([], None),
+        ({"hookSpecificOutput": {"decision": {"behavior": "allow"}}}, "allow"),
+        ({"hookSpecificOutput": {"permissionDecision": "deny"}}, "deny"),
+        # the PreToolUse key wins when both are present — one reply never carries both, but the
+        # precedence is pinned so a future dual-shape reply cannot flip between readings
+        (
+            {"hookSpecificOutput": {"permissionDecision": "deny", "decision": {"behavior": "allow"}}},
+            "deny",
+        ),
+    ],
+)
+def test_parse_ask_decision_reads_only_the_two_hook_reply_shapes(reply, expected):
+    assert agenttools_hatch_escalation._parse_ask_decision(reply) == expected
+
+
 def test_path_shadowing_does_not_choose_fake_tg_ctl(tmp_path, monkeypatch):
     real_marker = tmp_path / "real-called"
     shadow_marker = tmp_path / "shadow-called"
