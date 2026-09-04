@@ -45,6 +45,10 @@ CANONICAL = rr._REVIEW_CLI_INVOCATION
 _CALLERS = (
     "git-hooks/global-dispatcher/hooks/review-gate",
     "agent-hooks/require-review-before-commit/README.md",
+    # The installed descriptor's `description` is catalog metadata a harness or a reader
+    # consults to learn what the gate wants; it carried "review the uncommitted diff" — an
+    # unstaged review writes no marker and leaves the commit blocked (codex finding on #510).
+    "agent-hooks/require-review-before-commit/require-review-before-commit.pre-bash.json",
     "skills/universal/anti-wedge-review/SKILL.md",
     "AGENTS.md",
     # The CI review script and its README are not gates, but they are read by someone
