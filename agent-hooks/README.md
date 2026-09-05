@@ -105,8 +105,11 @@ These are the *logical* points; map them to your harness's actual tool-use event
 > `pre-skill`/`pre-monitor`, PostToolUse for `post-write`, Stop for `stop`) and translates
 > the exit-10 BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`. Without
 > that bridge these hooks are inert in CC (agent-tools#18). `pre-monitor` is the newest of
-> these and, like `pre-agent`/`pre-skill` before it, needs its own rig-cli-side `Monitor`
-> matcher shipped before it actually fires — see the `pre-monitor` section below.
+> these, following the same two-repo staging `pre-agent`/`pre-skill` went through — its
+> rig-cli-side `Monitor` matcher (rig-cli#296) has now shipped, so `pre-monitor` is live once
+> rig has provisioned the bridge (same prerequisites as `pre-agent`/`pre-skill` below: a
+> `claude-code` harness block, `agent_hooks` enabled, `harness.hook_bridge` not opted out)
+> and `rig apply` has run on a given machine.
 
 > **Codex:** Codex also needs a carrier bridge. `lib/codex_hook_bridge` is the first
 > dispatcher for the confirmed Codex hooks contract: TOML hooks call it for `PreToolUse`
@@ -132,7 +135,7 @@ These are the *logical* points; map them to your harness's actual tool-use event
 | `pre-bash`     | before a shell command runs                  | block-devserver-primary, block-no-verify, block-raw-pr-merge, block-reset-hard, pin-primary-worktree, pkill-guard, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash, orchestrator-stays-thin, no-long-inline-process, subagent-no-bg-longproc, no-shell-file-edit, skills-read-gate, visual-proof-gate, decision-request-format, heavy-op-memory-gate |
 | `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env, orchestrator-stays-thin, worktree-only-writes |
 | `pre-skill` **(live in Claude Code when rig provisions the bridge; NOT mapped in Codex/opencode yet)** | before a Skill-tool invocation | skills-marker-writer |
-| `pre-monitor` **(mapped by the bridge; NOT yet wired to a rig-cli matcher — inert until that ships, see below)** | before a Monitor-tool call | subagent-no-monitor |
+| `pre-monitor` **(live in Claude Code when rig provisions the bridge; Codex/opencode have no Monitor-equivalent tool)** | before a Monitor-tool call | subagent-no-monitor |
 | `post-write`   | after a file write/edit has landed on disk   | format-on-write, lint-on-write          |
 | `stop`         | when the agent is about to end its turn      | stop-completion-selfcheck               |
 
@@ -167,12 +170,13 @@ consumer, `subagent-no-monitor`, blocks it **unconditionally** whenever `agent_i
 backgrounded Bash `run_in_background: true` command; see `agent-hooks/subagent-no-monitor/`'s
 own README for the empirically-verified distinction, tracked against `subagent-no-bg-longproc`'s
 broader stated rationale as agent-tools#546). The orchestrator's own Monitor use is unaffected.
-**Registration gap:** the
-point mapping lives in `lib/cc_hook_bridge/dispatch.py`, but CC only fires a `PreToolUse` hook
-for a tool it has an explicit `settings.json` matcher for — that matcher is written by
-rig-cli's `hook_bridge_entries` (a separate repo, same split `pre-agent`/`pre-skill` went
-through) and requires `rig apply` (or an equivalent manual edit) to take effect on a given
-machine.
+**Registration:** the point mapping lives in `lib/cc_hook_bridge/dispatch.py`; the
+`settings.json` `Monitor` matcher that makes CC actually fire it (written by rig-cli's
+`hook_bridge_entries`, same split `pre-agent`/`pre-skill` went through) has shipped
+(rig-cli#296) — `rig apply` on a given machine wires it in. A machine hasn't picked this up
+yet if its `~/.claude/settings.json` predates the last `rig apply` run after both halves
+merged, or if the harness process was started before that apply ran (CC reads its hook
+config at session start, not live) — re-run `rig apply` and start a fresh session to confirm.
 
 ### `post-write` — react to a *completed* write
 
