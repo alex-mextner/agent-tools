@@ -93,9 +93,9 @@ These are the *logical* points; map them to your harness's actual tool-use event
 > **Claude Code:** CC does NOT run these descriptors directly — it only runs hooks declared
 > in `settings.json`. The `lib/cc_hook_bridge` dispatcher is the carrier that makes them
 > fire: rig wires it into `settings.json` (PreToolUse for `pre-bash`/`pre-write`/`pre-agent`/
-> `pre-skill`, PostToolUse for `post-write`, Stop for `stop`) and translates the exit-10
-> BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`. Without that bridge
-> these hooks are inert in CC (agent-tools#18).
+> `pre-skill`/`pre-worktree-enter`, PostToolUse for `post-write`, Stop for `stop`) and
+> translates the exit-10 BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`.
+> Without that bridge these hooks are inert in CC (agent-tools#18).
 
 > **Codex:** Codex also needs a carrier bridge. `lib/codex_hook_bridge` is the first
 > dispatcher for the confirmed Codex hooks contract: TOML hooks call it for `PreToolUse`
@@ -121,6 +121,7 @@ These are the *logical* points; map them to your harness's actual tool-use event
 | `pre-bash`     | before a shell command runs                  | block-devserver-primary, block-no-verify, block-raw-pr-merge, block-reset-hard, pin-primary-worktree, pkill-guard, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash, orchestrator-stays-thin, no-long-inline-process, subagent-no-bg-longproc, no-shell-file-edit, skills-read-gate, visual-proof-gate, decision-request-format, heavy-op-memory-gate |
 | `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env, orchestrator-stays-thin, worktree-only-writes |
 | `pre-skill` **(live in Claude Code when rig provisions the bridge; NOT mapped in Codex/opencode yet)** | before a Skill-tool invocation | skills-marker-writer |
+| `pre-worktree-enter` **(mapped by the bridge; NOT yet wired to a rig-cli matcher — inert until that ships, see below)** | before an EnterWorktree tool call | enterworktree-foreign-guard |
 | `post-write`   | after a file write/edit has landed on disk   | format-on-write, lint-on-write          |
 | `stop`         | when the agent is about to end its turn      | stop-completion-selfcheck               |
 
@@ -144,6 +145,21 @@ session id, so one session invoking a skill can't satisfy another concurrent ses
 so `skills-read-gate`'s freshness check (on `pre-bash`) has something real to read. A
 `pre-skill` hook should never block — the point is a recording tap, not a gate — so hooks
 here should be `on_error: open` and always emit `allow`.
+
+### `pre-worktree-enter` — block entering a foreign agent's worktree
+
+`pre-worktree-enter` fires before CC's `EnterWorktree` tool call runs (CC's `PreToolUse` on
+`EnterWorktree`). Its one consumer, `enterworktree-foreign-guard`, blocks a `path`-based entry
+into an **existing** worktree whose name embeds a DIFFERENT agent's id
+(`.claude/worktrees/agent-<id>`, CC's own convention for a dispatched subagent's isolated
+worktree) than the calling agent's own. `EnterWorktree`'s own validation only confirms the
+path is a real, registered worktree of the repo (`git worktree list`) — never that the caller
+owns it — and reaching into a worktree a different agent created has repeatedly reported
+SUCCESS and then permanently bricked the calling agent's Bash tool for the rest of its
+session, with no recovery path (not even `ExitWorktree`). Creating a brand-new worktree (the
+`name` argument, no `path`) is untouched by this gate — that one is always the calling agent's
+own. See `agent-hooks/enterworktree-foreign-guard/README.md` for the full rule and the safe
+alternative (`gh pr checkout <N>`).
 
 ### `post-write` — react to a *completed* write
 

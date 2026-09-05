@@ -1,0 +1,194 @@
+# enterworktree-foreign-guard
+
+**Point:** `pre-worktree-enter` · **Fail policy:** `open` · **Priority:** 36
+
+Stops an agent (orchestrator or a dispatched subagent) from `EnterWorktree`-ing, via `path`,
+into a worktree a **DIFFERENT** agent created. Closes a recurring, confirmed harness bug: the
+call reports **SUCCESS**, and then **permanently bricks the calling agent's Bash tool** for
+the rest of that agent's session — every subsequent command, even `pwd`, gets refused, with
+no recovery path (`ExitWorktree` does not help). This hit the same project's session history
+at least four times, always in the same shape: an agent trying to resume or ship a PR/branch
+that a different, earlier agent built in its own worktree.
+
+## Why a hook, not just a documented rule
+
+A prior fix documented "never `EnterWorktree` into a worktree you didn't create; use
+`gh pr checkout <N>` instead" in `AGENTS.md`/`AGENTS-CORE.md` and the global
+`worktree-isolation` skill. That depends on every future agent happening to read and remember
+a rule buried in a docs file — it is not durable. This hook makes the failure mode
+structurally impossible instead: it intercepts the `EnterWorktree` call **before the tool
+ever runs** and refuses it outright when the target is foreign, rather than letting the tool
+report success and brick the session afterward.
+
+## How ownership is determined
+
+This hook presumes CC names a dispatched subagent's isolated worktree
+`.claude/worktrees/agent-<agent_id>` using the SAME id it forwards in the PreToolUse event's
+own `agent_id` field. `cc_hook_bridge` forwards the CALLING agent's own `agent_id` at the top
+level of the event **only** when the call fires inside a dispatched subagent, and — per
+`dispatch.py`'s T2 precedence — drops any copy forged inside `args`/`tool_input` whenever that
+top-level field is absent, so a forged `args.agent_id` can never fake ownership here.
+
+| `path` shape | own `agent_id` | Decision |
+| --- | --- | --- |
+| embeds `agent-<id>` | matches `<id>` | **ALLOW** — re-entering / switching into your own worktree |
+| embeds `agent-<id>` | absent (orchestrator) or a *different* id | **BLOCK** — foreign worktree |
+| does not embed `agent-<id>` at all | (any) | **ALLOW** — fail-open on an unfamiliar naming scheme, out of this guard's understood scope |
+| no `path` (creating a fresh worktree via `name`) | (any) | **ALLOW** — untouched, always the caller's own |
+
+The orchestrator is treated the same as a mismatched subagent: it never owns a dispatched
+subagent's worktree either, so any orchestrator `EnterWorktree(path=".../agent-<id>")` call is
+blocked just like a foreign subagent-to-subagent one would be.
+
+### ⚠️ UNVERIFIED ASSUMPTION — read before trusting this in production
+
+The `agent-<id>` == worktree-directory-name == event `agent_id` correlation above was
+**inferred, not independently confirmed**: every worktree directory observed on one project's
+machine matched that shape, cross-referenced against agent ids appearing in that project's own
+memory/task-history text — **not** from a captured, joined `(worktree-dir-name,
+live-event-agent_id)` pair for the SAME dispatch. CC's own docs
+(`code.claude.com/docs/en/worktrees`) describe a DIFFERENT naming scheme for the general case
+— an unnamed `--worktree` session gets a readable slug like `bright-running-fox`, not a hex id
+— so wherever the `agent-<hex>` convention comes from, it is either an undocumented
+Agent/Task-tool-dispatch internal, or imposed by something in that project's own tooling
+(rig-cli, task-cli, a custom subagent's `isolation: worktree` frontmatter, or similar).
+
+**If the assumption is wrong, the failure mode is not "weaker guard" — it inverts.**
+`own_agent_id` would then never equal `target_agent_id` for ANY worktree, so this hook would
+BLOCK **every** `EnterWorktree(path=...)` call, including a fully legitimate agent re-entering
+its own worktree, routing each one through Telegram hatch escalation. That is a machine-wide
+false-positive gate once `rig apply` activates it (see "Registration gap" below) — it does not
+manifest until activation, and does not affect anything before that.
+
+**Before treating this guard as trustworthy, verify the correlation directly** — cheapest to
+most invasive:
+
+1. Check whether any known dispatched agent's id (from a session transcript, a memory file, or
+   a fork/subagent-launch result) appears as a `.claude/worktrees/agent-<that-id>` directory on
+   disk. Circumstantial but free.
+2. Grep `~/.claude.json` / its rotating backups under `~/.claude/backups/` for a joined record
+   that ties a specific worktree path to an `agentId`-shaped field. Also circumstantial.
+3. **The decisive check**: install a temporary, LOGGING-ONLY `EnterWorktree` `PreToolUse`
+   matcher (dumps the raw stdin JSON to a file and exits 0 — never blocks, since `PreToolUse`
+   fires *before* the tool runs, so even a call the tool later rejects still yields a captured
+   event) and compare its `agent_id` field against the worktree directory name for a real
+   dispatch. This is the only source of ground truth. **It requires editing the live
+   `settings.json`, so ask the repo/machine owner before installing it — do not self-apply.**
+
+## The correct alternative
+
+From your **own** worktree, pull the other agent's branch into it instead of entering their
+directory:
+
+```bash
+gh pr checkout <N> --branch <local-name>
+# or, without a PR yet:
+git checkout -b <local-name> <their-branch>
+```
+
+## No self-service bypass — external Telegram approval only
+
+Same deny-by-default contract as the other subagent-facing gates in this catalog: no env-var
+self-grant. For a genuine exception, ASK the human, or request one-time Telegram approval:
+
+```bash
+RIG_HATCH_REQUEST_ENTERWORKTREE_FOREIGN_GUARD="resuming my own earlier worktree under a new agent id after a session restart"
+```
+
+Set in the process environment before the tool call — `EnterWorktree` has no shell `command`
+string whose leading `VAR=value` prefix a pre-worktree-enter hook could parse the way
+`pin-primary-worktree` does for Bash (it takes a `path`/`name` field, not an invoked
+executable line), so only the process-env source applies here, matching how the pre-write
+hooks read this var. If unset, no Telegram call is made and the call simply blocks. If present
+but blank/bare (`1`/`true`/`yes`), the hook denies without contacting Telegram.
+
+> **Claude Code outer timeout — a pre-existing, catalog-wide gap, not unique to this hook.**
+> This descriptor sets `timeout_ms: 960000` (960s: `tg-ctl ask`'s 900s cap plus a 30s cleanup
+> margin), but Claude Code's own command-hook `timeout` defaults to 600s. If a `settings.json`
+> matcher for `EnterWorktree` is registered WITHOUT an explicit `timeout` above 960s, CC can
+> kill the bridge process before a full Telegram hatch wait finishes — and because this hook is
+> `on_error: open`, that outer kill (decided by CC, not this script) becomes a SILENT ALLOW
+> instead of the intended deny. This is the identical gap `pin-primary-worktree`'s README
+> documents for its own hatch flow — every hatch-using hook in this catalog shares it, and it
+> is not resolved by this PR: fixing it needs a `timeout` field in rig-cli's
+> `hook_bridge_entries` matcher registration (or the live `settings.json` entry), tracked as
+> catalog-wide follow-up, not something to patch ad hoc for one matcher here.
+
+## Registration gap (read before assuming this fires)
+
+Mapping `EnterWorktree` → `pre-worktree-enter` in `lib/cc_hook_bridge/dispatch.py` is **not**,
+on its own, enough for CC to ever invoke the bridge for an `EnterWorktree` tool call — Claude
+Code only runs `PreToolUse` hooks it has an explicit **matcher** for in `settings.json`, and
+matchers are written by **rig-cli**'s `hook_bridge_entries` (a separate repo), not by this
+dispatcher. This is the identical two-repo split `pre-agent`/`pre-skill`/`pre-monitor` went
+through. Until rig-cli's `EnterWorktree` matcher change ships **and** `rig apply` (or an
+equivalent manual `settings.json` edit) runs on a given machine, this descriptor is installed
+but inert — CC never calls the bridge for `EnterWorktree` at all, so
+`enterworktree_foreign_guard.py` never runs.
+
+## What's unaffected
+
+- Creating a brand-new worktree (`EnterWorktree(name=...)`, no `path`) — always the caller's
+  own, never gated.
+- Re-entering / switching into a worktree the SAME agent (matching `agent_id`) already owns.
+- Any `path` that does not follow the `.claude/worktrees/agent-<id>` naming convention at all
+  (a manually created or differently-named worktree) — this guard understands exactly the one
+  shape every confirmed incident used, and fails open rather than guess beyond that.
+- `ExitWorktree` — already scoped to worktrees the CURRENT session's own `EnterWorktree` calls
+  created, and a no-op otherwise, per its own tool contract.
+
+## Known scope limits (heuristic, not a sandbox)
+
+- This hook trusts CC's own `agent-<id>` naming convention for a subagent's worktree
+  directory. If a worktree were created or renamed outside that convention (manually, or by a
+  future harness version with a different naming scheme), this guard would not recognize it
+  and fails open — it is a targeted fix for the confirmed incident shape, not a general
+  ownership-tracking system.
+- It does not (and cannot, from a stateless pre-tool hook) verify that the calling agent
+  itself created the specific worktree matching its own `agent_id` — it trusts CC's own
+  `agent_id` assignment as the source of truth for "whose worktree is this," the same trust
+  boundary `subagent-no-bg-longproc`/`subagent-no-monitor` place in CC's `agent_id` forwarding.
+- **Check-then-use race (TOCTOU), inherent to every pre-tool hook in this catalog, not unique
+  here.** This hook resolves `path` (including a symlink) once, decides, and returns; CC's own
+  `EnterWorktree` then resolves the path independently when it actually runs. A concurrent,
+  co-located process with local filesystem write access could in principle repoint a symlinked
+  `path` between this hook's check and the tool's own execution. Closing that would need
+  atomic check-and-use semantics this stateless hook script cannot provide (and `EnterWorktree`
+  itself has the same "must appear in `git worktree list`" check-then-act shape). The realistic
+  threat model this guard defends against — an agent's OWN tool call choosing a foreign path —
+  does not require winning a filesystem race; a hostile concurrent process is a different,
+  broader threat class this targeted hook does not attempt to solve, matching every other
+  path/command-based gate in this catalog (e.g. `block-raw-pr-merge`, `pkill-guard`).
+
+## Fail-open, on purpose
+
+`on_error: "open"`. A crash in this check must never wedge an agent's ability to call a
+legitimate `EnterWorktree`. An unparseable event and a `path` that doesn't match the
+understood naming convention both resolve to `allow`. This is otherwise a deny-by-default
+gate: an unset hatch env var does NOT resolve to `allow` — it simply means no Telegram call
+is made, and the plain `block` for a genuinely foreign worktree still stands (see "No
+self-service bypass" above).
+
+## Test
+
+```bash
+uv run --with pytest python -m pytest tests/test_enterworktree_foreign_guard.py -q
+```
+
+```bash
+chmod +x enterworktree_foreign_guard.py
+
+# a subagent enters a DIFFERENT agent's worktree → BLOCK
+echo '{"args":{"path":"/repo/.claude/worktrees/agent-deadbeef01","agent_id":"sub-1"}}' \
+  | ./enterworktree_foreign_guard.py
+rc=$?; echo "exit=$rc"   # → "decision":"block" ...  exit=10
+
+# a subagent re-enters its OWN worktree → allow
+echo '{"args":{"path":"/repo/.claude/worktrees/agent-deadbeef01","agent_id":"deadbeef01"}}' \
+  | ./enterworktree_foreign_guard.py
+rc=$?; echo "exit=$rc"   # → "decision":"allow"  exit=0
+
+# creating a brand-new worktree (name, no path) → allow
+echo '{"args":{"name":"my-new-worktree"}}' | ./enterworktree_foreign_guard.py
+rc=$?; echo "exit=$rc"   # → "decision":"allow"  exit=0
+```

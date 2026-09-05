@@ -60,6 +60,18 @@ _AGENT_TOOLS = frozenset({"Agent", "Task"})
 # note as `_AGENT_TOOLS` above applies: this half only maps the point, rig-cli's
 # `hook_bridge_entries` must register a `Skill` PreToolUse matcher for it to actually fire.
 _SKILL_TOOLS = frozenset({"Skill"})
+# CC's EnterWorktree tool (switch the session into a NEW git worktree, or into an EXISTING
+# one via its `path` argument). A PreToolUse on it maps to `pre-worktree-enter`, the point
+# `enterworktree-foreign-guard` uses to block `path`-based entry into a worktree a DIFFERENT
+# agent created: EnterWorktree's own validation only confirms the path is a real worktree of
+# the repo (`git worktree list`), never that the CALLER owns it, and entering a foreign one
+# has repeatedly (agent-tools ecosystem incident, 2026-08) reported SUCCESS and then bricked
+# the calling agent's Bash tool for the rest of its session with no recovery path. Creating a
+# NEW worktree (the `name` argument, no `path`) is unaffected — that is always the calling
+# agent's own. Same rig-cli follow-up note as `_AGENT_TOOLS`/`_SKILL_TOOLS` above applies: this
+# half only maps the point, rig-cli's `hook_bridge_entries` must register an `EnterWorktree`
+# PreToolUse matcher for it to actually fire.
+_WORKTREE_ENTER_TOOLS = frozenset({"EnterWorktree"})
 
 
 def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
@@ -75,6 +87,8 @@ def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
             return "pre-agent"
         if tool_name in _SKILL_TOOLS:
             return "pre-skill"
+        if tool_name in _WORKTREE_ENTER_TOOLS:
+            return "pre-worktree-enter"
     if hook_event_name == "PostToolUse" and tool_name in _WRITE_TOOLS:
         # The write already landed on disk → the REACTIVE point (format-on-write,
         # lint-on-write). A post-write hook's exit-10 is FEEDBACK to the model, not
