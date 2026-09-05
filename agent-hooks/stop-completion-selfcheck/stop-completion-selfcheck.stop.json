@@ -5,5 +5,5 @@
   "priority": 50,
   "timeout_ms": 3000,
   "on_error": "open",
-  "description": "Fires when the agent is about to end its turn. Injects the completion self-check prompt — (1) is everything from the request done, anything missed? (2) any concrete follow-ups to fix/improve/remove? — turning the textual ritual into an enforced reminder. Blocks the stop ONCE (exit 10 with the prompt) so the agent runs the check; a marker prevents an infinite loop. on_error=open."
+  "description": "Fires when the agent is about to end its turn. Reads the turn's own transcript (transcript_path, CC-forwarded at the event's top level) to pick one of three self-check prompts: HEDGE (the reply offered an action instead of doing it, no tool calls this turn — quotes the offer, says do it now), LIGHT (a pure text reply, no tool calls, no hedge — one relevant question instead of the full checklist), or FULL (tool calls happened — the original code/commits/deploy/cleanup checklist, unchanged). Falls back to FULL on any transcript read/parse failure. Blocks the stop ONCE (exit 10 with the prompt) so the agent runs the check; a marker prevents an infinite loop. on_error=open."
 }
