@@ -658,7 +658,13 @@ SHIP_AUTO_BUMP_COMMITTER_EMAIL='ship-auto-bump@noreply.agent-tools.local'
 # exactly those (common) BEHIND PRs: the CI grace stayed at the tight default right after a
 # fresh push, and the dwell gate refused on a commit nobody but ship authored.
 SHIP_KNOWN_OIDS=""
-_record_ship_oid() { [ -n "${1:-}" ] && SHIP_KNOWN_OIDS="${SHIP_KNOWN_OIDS} $1"; }
+# Always returns 0 (review finding, #518): an empty $1 made `[ -n ]` fail and the function's own
+# exit status become 1 — safe INSIDE the function (left of `&&`, `set -e` doesn't apply there),
+# but NOT at a bare caller statement like `_record_ship_oid "$new_head"`, called right after a
+# remote write already succeeded (a transient re-read of the new head oid is the only way $1
+# arrives empty here) — that bare non-zero killed the whole script mid-flight with no message,
+# the branch already mutated. This helper must never itself be a `set -e` trap.
+_record_ship_oid() { [ -n "${1:-}" ] && SHIP_KNOWN_OIDS="${SHIP_KNOWN_OIDS} $1"; return 0; }
 
 _auto_bump_enabled() {
   case "${SHIP_AUTO_BUMP:-}" in 0|false|no) return 1 ;; esac
@@ -1668,12 +1674,23 @@ version_line_bumped() {  # $1 = version file path; uses $PR_DIFF (full patch tex
 # NOTHING is pushed. Fail-closed on the push: a rejected API write refuses the ship with the
 # API's reason and nothing is merged; a red CI after the bump refuses in the green-CI gate
 # (the bump commit stays on the branch — a re-run sees the PR as already bumped).
-# Strict X.Y.Z only (the only shape ship can bump unambiguously). Prints "X Y Z" or fails.
+# Strict X.Y.Z only (the only shape ship can bump unambiguously). Prints "X Y Z" or fails. A
+# leading-zero component (`08`, `2026.08.09` CalVer-style) is rejected too (review finding,
+# #518): `_semver_next_patch` below bumps via bash `$(( ))` arithmetic, which parses a
+# leading-zero literal as OCTAL — `08`/`09` aren't valid octal digits and the arithmetic
+# errors, so a value THIS function accepted would still blow up one call later, after
+# `_auto_bump_decide`'s pre-write guard had already waved a remote update-branch write
+# through on the strength of this function's own "yes, that's a version" verdict. A bare `0`
+# component is still valid (semver's own rule: no leading zeros UNLESS the value is exactly 0).
 _semver_parts() {  # $1 = version
+  local _sp_part
   case "$1" in
     *[!0-9.]*|.*|*.|*..*|'') return 1 ;;
   esac
   local IFS=.; set -- $1; [ "$#" -eq 3 ] || return 1
+  for _sp_part in "$1" "$2" "$3"; do
+    case "$_sp_part" in 0?*) return 1 ;; esac
+  done
   printf '%s %s %s' "$1" "$2" "$3"
 }
 _semver_next_patch() {  # $1 = X.Y.Z -> prints X.Y.(Z+1), or fails on a non-X.Y.Z version

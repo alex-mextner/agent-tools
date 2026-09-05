@@ -61,7 +61,15 @@ case "$sub" in
           # PUT handler below), keep reporting the PRE-bump sha forever -- simulates GitHub
           # eventual-consistency lag outliving ship's own wait window (or another push racing
           # past it), independent of whether the real remote write actually succeeded.
-          if [ -n "${SHIP_TEST_STALL_HEAD_AFTER_BUMP:-}" ] && [ -f "$S/pre_bump_sha" ]; then
+          # SHIP_TEST_FAIL_HEADREFOID_CALL_N: fail exactly the Nth headRefOid call this run
+          # (1-based) with a transient error; every other call succeeds normally -- lets a test
+          # target one SPECIFIC read (e.g. the post-merge re-read inside
+          # behind_clear_pr_branch_via_update_api) without disturbing any other call site.
+          _n=$(( $(cat "$S/headrefoid_calls" 2>/dev/null || echo 0) + 1 ))
+          printf '%s' "$_n" > "$S/headrefoid_calls"
+          if [ -n "${SHIP_TEST_FAIL_HEADREFOID_CALL_N:-}" ] && [ "$_n" = "$SHIP_TEST_FAIL_HEADREFOID_CALL_N" ]; then
+            echo "fake gh: simulated transient headRefOid read failure (call $_n)" >&2; exit 1
+          elif [ -n "${SHIP_TEST_STALL_HEAD_AFTER_BUMP:-}" ] && [ -f "$S/pre_bump_sha" ]; then
             cat "$S/pre_bump_sha"
           else
             git_c fetch -q origin; git_c rev-parse "origin/$B"
@@ -791,6 +799,25 @@ def test_behind_mergestate_reread_failure_does_not_clobber_the_refusal(tmp_path)
     assert "[fake gh] merged" not in r.stdout
 
 
+def test_leading_zero_base_version_refuses_before_any_remote_write(tmp_path):
+    """Review finding, #518: a leading-zero component (`1.0.08`, CalVer-style `2026.08.09`) was
+    accepted by _semver_parts's shape check, so the pre-write guard waved it through -- only for
+    _semver_next_patch's bash `$(( ))` arithmetic to choke on it as an invalid octal literal one
+    step later, AFTER a real update-branch write had already landed. _semver_parts must reject
+    a leading-zero component itself, before any remote write is attempted."""
+    main, origin, state, bindir = _make_world(tmp_path)
+    wt = _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
+    _commit_file(main, "pyproject.toml", _PYPROJECT.replace("1.0.0", "1.0.08"), "chore(release): calver-ish")
+    _git("push", "-q", "origin", "main", cwd=main)
+
+    r = _run_ship(main, bindir, state, "feat")
+
+    assert r.returncode != 0, r.stdout
+    assert "is not a plain X.Y.Z — bump it by hand" in r.stderr, r.stderr
+    assert "PUT update-branch" not in _gh_log(state), _gh_log(state)
+    assert "PUT contents" not in _gh_log(state)
+
+
 def test_non_semver_base_version_refuses_before_any_remote_write(tmp_path):
     """Review finding, #518: when base's version has moved to something non-X.Y.Z, ship used to
     push the update-branch merge FIRST and only discover it couldn't finish the bump afterward
@@ -832,6 +859,30 @@ def test_behind_resolution_skipped_under_dry_run(tmp_path):
     assert "attempting to update it via the GitHub API" not in r.stderr, r.stderr
     assert "PUT update-branch" not in _gh_log(state)
     assert "head is BEHIND its base. Update it" in r.stderr, r.stderr
+
+
+def test_transient_headrefoid_read_failure_after_a_remote_write_does_not_crash(tmp_path):
+    """Review finding, #518: _record_ship_oid("") used to return 1, and a bare (untested) call
+    to it under `set -e` killed the whole script -- with no message -- the instant a transient
+    re-read of the just-moved head oid failed, even though the remote write it was recording
+    had already succeeded. Confirmed empirically against the OLD code: failing exactly the 5th
+    headRefOid call of this scenario (the one _auto_bump_update_branch feeds straight into
+    _record_ship_oid, right after its own _wait_pr_head_oid loop already succeeded) died with
+    returncode 1 and NO "Refusing:" text and no completed merge -- pure `set -e` silence. The
+    fix must let this same scenario complete the merge normally (the failed read only means
+    ship doesn't add that one oid to its known-ship-commits set for the dwell/CI-grace gates
+    later in THIS run -- not a reason to abort)."""
+    main, origin, state, bindir = _make_world(tmp_path)
+    _make_pr_branch(main, "feat-a", "src/a.py", "a = 1\n")
+    _make_pr_branch(main, "feat-b", "src/b.py", "b = 1\n")
+    ra = _run_ship(main, bindir, state, "feat-a")
+    assert ra.returncode == 0, f"{ra.stdout}\n{ra.stderr}"
+
+    rb = _run_ship(main, bindir, state, "feat-b", env_extra={"SHIP_TEST_FAIL_HEADREFOID_CALL_N": "5"})
+
+    assert rb.returncode == 0, f"{rb.stdout}\n{rb.stderr}"
+    assert "[fake gh] merged" in rb.stdout, rb.stdout
+    assert 'version = "1.0.2"' in _origin_file(origin, "main", "pyproject.toml")
 
 
 def test_fork_pr_is_never_written_to(tmp_path):
