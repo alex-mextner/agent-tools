@@ -705,6 +705,50 @@ behind_clear_pr_branch_via_update_api() {
 }
 
 
+
+# --- local branch sanity (no unpushed/diverged commits; clean worktree) ----------------
+# A branch can be checked out in MORE THAN ONE worktree (git permits it; a stray/leftover
+# tree often lingers). Collect ALL of them: feeding a single $WT that had concatenated two
+# paths to `git -C` / `git worktree remove` was the exit-128 bug this script had. Parse the
+# stable `--porcelain` line form (`worktree <path>` then `branch <ref>`); the `-z` variant
+# isn't available on older git (e.g. Apple git 2.39), so don't rely on it.
+# (bash 3.2 compatible — `#!/usr/bin/env bash` is 3.2 on stock macOS; guard every empty-array
+# expansion with the `${arr[@]+...}` idiom so `set -u` doesn't trip on an empty WTS.)
+# Sets the global WTS (every worktree on $BRANCH; cleanup() consumes it). Runs TWICE per ship:
+# once before the merge-time auto-bump pushes anything (a diverged local branch must refuse
+# BEFORE ship adds a remote commit it would then diverge from), and once after the dwell gate.
+local_branch_sanity_check() {
+  local wpath wt
+  WTS=()
+  while IFS= read -r wpath; do
+    [ -n "$wpath" ] && WTS+=("$wpath")
+  done < <(
+    git worktree list --porcelain 2>/dev/null \
+      | awk -v b="refs/heads/$BRANCH" '/^worktree /{w=substr($0,10)} $0=="branch "b{print w}'
+  )
+  for wt in ${WTS[@]+"${WTS[@]}"}; do
+    # Guard each linked PR worktree — this catches a REAL corruption the MAIN-checkout guard
+    # above misses: WORKTREE-SCOPED core.bare=true (extensions.worktreeConfig + `git -C "$wt"
+    # config --worktree core.bare true`). Plain core.bare on the MAIN config leaves linked
+    # worktrees healthy (each has its own gitdir + work tree, so they report not-bare), but the
+    # worktree-scoped form makes THIS worktree itself report rev-parse=bare with `status` failing.
+    # That matters because the dirty-check right below runs `git -C "$wt" status --short
+    # 2>/dev/null`: under the corruption it exits 128 and the fatal is swallowed, leaving empty
+    # output — so a worktree with unshipped changes would read as "clean" and could later be
+    # removed. Aborting here, before that fooled check, prevents losing unshipped work.
+    abort_if_core_bare "$wt" "PR worktree"
+    if [ -n "$(git -C "$wt" status --short 2>/dev/null)" ]; then
+      echo "Refusing: worktree $wt has uncommitted changes. Commit or discard first." >&2
+      git -C "$wt" status --short >&2; exit 1
+    fi
+  done
+  git fetch -q origin "$BRANCH" 2>/dev/null || true
+  if git show-ref --verify --quiet "refs/heads/$BRANCH" && git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+    AHEAD=$(git rev-list --count "origin/$BRANCH..$BRANCH" 2>/dev/null || echo 0)
+    [ "$AHEAD" = "0" ] || { echo "Refusing: local $BRANCH has $AHEAD unpushed commit(s). Push first." >&2; exit 1; }
+  fi
+}
+
 MAIN_CHECKOUT="${SHIP_MAIN_CHECKOUT:-$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')}"
 # Guard the MAIN checkout NOW — ship's post-merge refresh runs git ops against it (checkout /
 # fetch / pull), which would fail opaquely under core.bare. Firing before the merge means a
@@ -731,9 +775,18 @@ read -r BRANCH STATE MERGEABLE CROSS_REPO MERGE_STATE < <(gh pr view "$PR" \
 # invocation, ask GitHub to update the branch from its base BEFORE giving up on BEHIND.
 # A REAL content conflict in that update (not merely "behind") still refuses below, same
 # as before. Skipped entirely under --dry-run (a real remote write, not a local no-op).
+#
+# LOCAL SANITY FIRST (review finding, #518): a local worktree can be dirty, or hold an
+# unpushed commit, at the exact moment this fires. Writing to the remote branch BEFORE
+# checking that would leave local and remote diverged in a NEW way the later "push first"
+# guidance doesn't cover (the remote now carries a merge the local branch never saw). So
+# local_branch_sanity_check() — refuse-before-any-remote-write, same invariant the merge-time
+# auto-bump itself upholds — runs first; only a clean, non-diverged local branch reaches the
+# actual update-branch API call.
 if [ "${MERGE_STATE:-}" = "BEHIND" ] && [ "$DRY_RUN" != "1" ] \
    && [ "${_FOREIGN_REPO_INVOKE:-0}" != "1" ] && [ "${CROSS_REPO:-false}" != "true" ] \
    && _auto_bump_enabled; then
+  local_branch_sanity_check
   behind_clear_pr_branch_via_update_api
 fi
 if [ "${MERGE_STATE:-}" = "BEHIND" ]; then
@@ -1549,49 +1602,6 @@ version_line_bumped() {  # $1 = version file path; uses $PR_DIFF (full patch tex
   return 0
 }
 
-# --- local branch sanity (no unpushed/diverged commits; clean worktree) ----------------
-# A branch can be checked out in MORE THAN ONE worktree (git permits it; a stray/leftover
-# tree often lingers). Collect ALL of them: feeding a single $WT that had concatenated two
-# paths to `git -C` / `git worktree remove` was the exit-128 bug this script had. Parse the
-# stable `--porcelain` line form (`worktree <path>` then `branch <ref>`); the `-z` variant
-# isn't available on older git (e.g. Apple git 2.39), so don't rely on it.
-# (bash 3.2 compatible — `#!/usr/bin/env bash` is 3.2 on stock macOS; guard every empty-array
-# expansion with the `${arr[@]+...}` idiom so `set -u` doesn't trip on an empty WTS.)
-# Sets the global WTS (every worktree on $BRANCH; cleanup() consumes it). Runs TWICE per ship:
-# once before the merge-time auto-bump pushes anything (a diverged local branch must refuse
-# BEFORE ship adds a remote commit it would then diverge from), and once after the dwell gate.
-local_branch_sanity_check() {
-  local wpath wt
-  WTS=()
-  while IFS= read -r wpath; do
-    [ -n "$wpath" ] && WTS+=("$wpath")
-  done < <(
-    git worktree list --porcelain 2>/dev/null \
-      | awk -v b="refs/heads/$BRANCH" '/^worktree /{w=substr($0,10)} $0=="branch "b{print w}'
-  )
-  for wt in ${WTS[@]+"${WTS[@]}"}; do
-    # Guard each linked PR worktree — this catches a REAL corruption the MAIN-checkout guard
-    # above misses: WORKTREE-SCOPED core.bare=true (extensions.worktreeConfig + `git -C "$wt"
-    # config --worktree core.bare true`). Plain core.bare on the MAIN config leaves linked
-    # worktrees healthy (each has its own gitdir + work tree, so they report not-bare), but the
-    # worktree-scoped form makes THIS worktree itself report rev-parse=bare with `status` failing.
-    # That matters because the dirty-check right below runs `git -C "$wt" status --short
-    # 2>/dev/null`: under the corruption it exits 128 and the fatal is swallowed, leaving empty
-    # output — so a worktree with unshipped changes would read as "clean" and could later be
-    # removed. Aborting here, before that fooled check, prevents losing unshipped work.
-    abort_if_core_bare "$wt" "PR worktree"
-    if [ -n "$(git -C "$wt" status --short 2>/dev/null)" ]; then
-      echo "Refusing: worktree $wt has uncommitted changes. Commit or discard first." >&2
-      git -C "$wt" status --short >&2; exit 1
-    fi
-  done
-  git fetch -q origin "$BRANCH" 2>/dev/null || true
-  if git show-ref --verify --quiet "refs/heads/$BRANCH" && git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
-    AHEAD=$(git rev-list --count "origin/$BRANCH..$BRANCH" 2>/dev/null || echo 0)
-    [ "$AHEAD" = "0" ] || { echo "Refusing: local $BRANCH has $AHEAD unpushed commit(s). Push first." >&2; exit 1; }
-  fi
-}
-
 # --- merge-time version bump (#518) ----------------------------------------------------
 # WHY: the version-bump gate below makes every parallel PR bump the SAME line to the SAME next
 # version, so the second one to merge is CONFLICTING and needs a hand rebase + re-bump — a
@@ -1853,6 +1863,12 @@ run_merge_time_auto_bump() {
     AUTO_BUMP_PLANNED=1; _auto_bump_audit_log "version-bump:auto"; return 0
   fi
   _auto_bump_push "$AB_HEAD_BLOB"
+  # Audit IMMEDIATELY once the write is confirmed to exist (AUTO_BUMP_SHA is set only on a
+  # successful PUT) — not after the head-oid wait below. Review finding, #518: auditing only
+  # at the very end meant a real, already-committed remote bump could vanish from the audit
+  # trail entirely if the wait that follows timed out (or exit 1'd for any other reason) —
+  # the commit is durable on GitHub the moment the PUT returns; the record of it must be too.
+  _auto_bump_audit_log "version-bump:auto"
   if ! _wait_pr_head_oid eq "$AUTO_BUMP_SHA"; then
     echo "Refusing: the bump commit ${AUTO_BUMP_SHA} was pushed to ${BRANCH} but PR #$PR's head did not reflect it within ${SHIP_AUTO_BUMP_HEAD_WAIT:-90}s — re-run ship once it does (the PR is now bumped; no second bump will be made). Nothing was merged." >&2
     exit 1
@@ -1860,7 +1876,6 @@ run_merge_time_auto_bump() {
   AUTO_BUMP_DONE=1
   echo "[ship] auto-bump: ${AUTO_BUMP_FILE} ${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW} committed as ${AUTO_BUMP_SHA} on ${BRANCH}; CI will be waited on for that head."
   _auto_bump_ff_local
-  _auto_bump_audit_log "version-bump:auto"
 }
 
 run_merge_time_auto_bump

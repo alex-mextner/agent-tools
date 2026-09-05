@@ -54,7 +54,16 @@ case "$sub" in
           git_c fetch -q origin
           msg=$(git_c log -1 --format=%s "origin/$B")
           if [ -n "${SHIP_TEST_RED_AFTER_BUMP:-}" ] && grep -q 'ship auto-bump' <<<"$msg"; then echo "$red"; else echo "$green"; fi
-        elif grep -q headRefOid <<<"$argstr"; then git_c fetch -q origin; git_c rev-parse "origin/$B"
+        elif grep -q headRefOid <<<"$argstr"; then
+          # SHIP_TEST_STALL_HEAD_AFTER_BUMP: once the bump commit lands (marker written by the
+          # PUT handler below), keep reporting the PRE-bump sha forever -- simulates GitHub
+          # eventual-consistency lag outliving ship's own wait window (or another push racing
+          # past it), independent of whether the real remote write actually succeeded.
+          if [ -n "${SHIP_TEST_STALL_HEAD_AFTER_BUMP:-}" ] && [ -f "$S/pre_bump_sha" ]; then
+            cat "$S/pre_bump_sha"
+          else
+            git_c fetch -q origin; git_c rev-parse "origin/$B"
+          fi
         elif grep -q baseRefName <<<"$argstr"; then echo main
         elif grep -q -- '--json commits' <<<"$argstr"; then git_c fetch -q origin; git_c log -1 --format=%s "origin/$B"
         else echo '[]'; fi ;;
@@ -132,6 +141,7 @@ case "$sub" in
           [ -n "${SHIP_TEST_BUMP_PUT_FAIL:-}" ] && { echo "gh: Update is not a fast forward (HTTP 409)" >&2; exit 1; }
           cur=$(git_c rev-parse "origin/$F_branch:$file")
           [ "$cur" = "$F_sha" ] || { echo "gh: $file does not match $F_sha (HTTP 409)" >&2; exit 1; }
+          [ -n "${SHIP_TEST_STALL_HEAD_AFTER_BUMP:-}" ] && git_c rev-parse "origin/$F_branch" > "$S/pre_bump_sha"
           git_c checkout -q -B "$F_branch" "origin/$F_branch"
           printf '%s' "$F_content" | base64 -d > "$C/$file"
           git_c add -- "$file"
@@ -584,6 +594,28 @@ def test_audit_line_records_the_auto_bump(tmp_path):
     assert subject == "chore(release): bump version 1.0.0 -> 1.0.1 (ship auto-bump for #1)", subject
 
 
+def test_audit_line_survives_a_head_poll_timeout_after_a_successful_push(tmp_path):
+    """Review finding, #518: the audit line used to be written only after the head-oid wait
+    succeeded. If the Contents PUT itself succeeds (a real, durable remote commit) but the
+    wait that follows times out -- eventual-consistency lag, or another push racing past it --
+    the commit must still be audited: it is durable on GitHub the moment the PUT returns."""
+    main, origin, state, bindir = _make_world(tmp_path)
+    _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
+
+    r = _run_ship(main, bindir, state, "feat", env_extra={"SHIP_TEST_STALL_HEAD_AFTER_BUMP": "1"})
+
+    assert r.returncode != 0, r.stdout
+    assert "did not reflect it within" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+    # The commit is real (the PUT succeeded) even though ship refused on the stalled wait.
+    assert 'version = "1.0.1"' in _origin_file(origin, "feat", "pyproject.toml")
+    lines = [json.loads(l) for l in (state / "audit.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    bump = [l for l in lines if l.get("decision") == "version-bump:auto"]
+    assert len(bump) == 1, "the audit line must be written even though the wait timed out"
+    assert bump[0]["old"] == "1.0.0" and bump[0]["new"] == "1.0.1"
+    assert len(bump[0]["sha"]) == 40
+
+
 def test_diverged_local_branch_refuses_before_anything_is_pushed(tmp_path):
     """The branch-sanity check runs BEFORE the bump: a local commit that was never pushed must
     refuse the ship with nothing written to the remote (ship would otherwise diverge it further)."""
@@ -658,6 +690,23 @@ def test_behind_pr_with_a_real_conflict_still_refuses(tmp_path):
     assert "falling through to the BEHIND refusal" in r.stderr, r.stderr
     assert "head is BEHIND its base. Update it (gh pr update-branch" in r.stderr, r.stderr
     assert "[fake gh] merged" not in r.stdout
+
+
+def test_behind_with_unpushed_local_commit_refuses_before_any_remote_write(tmp_path):
+    """Local sanity runs BEFORE the BEHIND-clearing remote write (review finding, #518): an
+    unpushed local commit must refuse with the existing 'push first' guidance, and nothing on
+    the remote branch may be touched -- writing there first would leave local and remote
+    diverged in a NEW way that guidance doesn't cover."""
+    main, origin, state, bindir = _make_world(tmp_path)
+    wt = _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
+    _commit_file(wt, "src/b.py", "b = 1\n", "feat: unpushed")
+
+    r = _run_ship(main, bindir, state, "feat", env_extra={"SHIP_TEST_MERGE_STATE": "BEHIND"})
+
+    assert r.returncode != 0, r.stdout
+    assert "unpushed commit(s)" in r.stderr, r.stderr
+    assert "attempting to update it via the GitHub API" not in r.stderr, r.stderr
+    assert "PUT update-branch" not in _gh_log(state), _gh_log(state)
 
 
 def test_behind_resolution_skipped_when_auto_bump_opted_out(tmp_path):
