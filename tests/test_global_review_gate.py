@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -20,13 +21,56 @@ _SCRATCH_ROOT = _ROOT / ".test-repos"
 
 
 def _scratch_base(tmp_path: Path) -> Path:
+    # `tmp_path.name` is deterministic per test id (e.g. "test_foo0"), so a directory
+    # built by one run survives under this repo-relative path — pytest's own tmp-dir
+    # cleanup never reaches it, since it lives outside `tmp_path` on purpose (see the
+    # exemption note above). Without the rmtree below, a leftover `repo/` from a prior
+    # run makes `repo.mkdir()` raise `FileExistsError` on the very next invocation
+    # (#413). Clearing this specific directory right before (re)creating it makes each
+    # call idempotent regardless of what an earlier run left behind.
+    #
+    # Contract: call this at most once per `tmp_path` per test. It always hands back
+    # an empty directory, so a second call for the same `tmp_path` would delete
+    # whatever the first call's caller already built there.
+    #
+    # The rmtree is allowed to raise (unlike the old ignore_errors=True in an earlier
+    # revision of this fix): a real removal failure (e.g. permissions) should surface
+    # right here with a clear traceback, not get swallowed only to reappear a line
+    # later as a confusing `FileExistsError` from `mkdir()`.
     base = _SCRATCH_ROOT / tmp_path.name
+    if base.exists():
+        shutil.rmtree(base)
     base.mkdir(parents=True, exist_ok=True)
     return base
 
 
 def _run(*args: str, cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True, check=False)
+
+
+def test_scratch_base_clears_stale_directory_from_a_prior_run(tmp_path):
+    """Regression test for #413.
+
+    Seeds a leftover `repo/` directory exactly like the one a prior test run would
+    have left behind, then confirms `_scratch_base` hands back a clean, empty
+    directory instead of raising `FileExistsError` on the caller's subsequent
+    `repo.mkdir()`.
+    """
+    stale = _SCRATCH_ROOT / tmp_path.name
+    shutil.rmtree(stale, ignore_errors=True)  # self-heal if a prior interrupted run left this behind
+    stale_repo = stale / "repo"
+    stale_repo.mkdir(parents=True)
+    (stale_repo / "leftover.txt").write_text("from a previous run\n", encoding="utf-8")
+
+    try:
+        fresh = _scratch_base(tmp_path)
+
+        assert fresh == stale
+        assert list(fresh.iterdir()) == []
+        # The caller's own `repo.mkdir()` (no `exist_ok`) must not raise here.
+        (fresh / "repo").mkdir()
+    finally:
+        shutil.rmtree(stale, ignore_errors=True)
 
 
 def _repo_with_staged_change(tmp_path: Path, relpath: str = "x.txt") -> Path:
