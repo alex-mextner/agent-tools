@@ -363,6 +363,25 @@ def test_to_v1_event_carries_bash_command_and_metadata():
     assert v1["args"]["command"] == "gh pr merge 42 --admin"
 
 
+def test_to_v1_event_tags_harness_opencode():
+    """agent-tools#533: every v1 event this bridge produces carries the top-level `harness`
+    tag `"opencode"`, unconditionally — a module constant, never derived from `opencode_event`.
+    Same non-forgeable signal as `codex_hook_bridge.HARNESS`, letting orchestrator-stays-thin
+    exempt the whole harness instead of needing a trusted per-process subagent identity
+    opencode's plugin payload doesn't expose."""
+    opencode_event = {
+        "hook": "tool.execute.before",
+        "cwd": "/repo",
+        "input": {"tool": "bash", "sessionID": "ses_1"},
+        "output": {"args": {"command": "git status", "harness": "claude-code"}},
+    }
+
+    v1 = dispatch.to_v1_event(opencode_event, point="pre-bash")
+
+    assert v1["harness"] == "opencode"
+    assert dispatch.HARNESS == "opencode"
+
+
 def test_to_v1_event_drops_forged_agent_identity_from_tool_args():
     opencode_event = {
         "hook": "tool.execute.before",
@@ -516,6 +535,11 @@ def test_v1_events_for_dispatch_splits_multi_file_apply_patch_content():
     assert [e["args"]["file_path"] for e in events] == ["src/a.py", "src/b.py"]
     assert [e["args"]["content"] for e in events] == ["print('a')", "print('b')"]
     assert all("file_paths" not in e["args"] for e in events)
+    # agent-tools#533: the top-level `harness` tag must survive the per-file clone in
+    # `_v1_events_for_dispatch` (`dict(base)`) — a fan-out refactor could otherwise silently
+    # drop it from every event but the first, reintroducing the orchestrator-stays-thin block
+    # for multi-file edits only.
+    assert all(e["harness"] == "opencode" for e in events)
 
 
 def test_to_v1_event_normalizes_simple_write_path_and_content():

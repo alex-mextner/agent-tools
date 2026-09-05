@@ -37,6 +37,12 @@ import sys
 from pathlib import Path
 
 HOOK_API = "agents-hooks/v1"
+# The v1 event's `harness` tag for every event this bridge produces. A MODULE LITERAL, not
+# derived from any field of `cc_event` — so it cannot be forged by a model/tool_input value the
+# way `args.harness` could be. A hook that wants to scope itself to (or exempt) one harness reads
+# `event["harness"]`, never `args`. See orchestrator-stays-thin's EXEMPT_HARNESSES for the first
+# consumer (agent-tools#533).
+HARNESS = "claude-code"
 # CC events this bridge knows how to register/handle (typo guard in main()).
 _KNOWN_EVENTS = frozenset({"PreToolUse", "Stop", "PostToolUse"})
 
@@ -161,6 +167,7 @@ def to_v1_event(cc_event: dict, *, point: str) -> dict:
         "event_id": cc_event.get("session_id", ""),
         "tool": cc_event.get("tool_name"),
         "point": point,
+        "harness": HARNESS,
         "command": tool_input.get("command", ""),
         "cwd": cc_event.get("cwd", os.getcwd()),
         # CC's Stop payload carries this pointing at the session's own JSONL transcript

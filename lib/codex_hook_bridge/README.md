@@ -40,6 +40,13 @@ The bridge strips `agent_id` / `agent_type` from Codex `tool_input`. Those field
 trusted until Codex has a captured, non-forgeable subagent identity fixture. Until that
 exists, subagent-exempt `pre-bash` hooks treat Codex calls as main-thread calls.
 
+Every translated v1 event also carries a top-level `harness: "codex"` — a hardcoded module
+constant (`dispatch.HARNESS`), never derived from the Codex event, so it can't be forged via
+`tool_input`. A hook that needs to scope a policy to (or exempt) one harness reads
+`event["harness"]` directly (see `agent-hooks/orchestrator-stays-thin`'s harness-exempt list
+for the first consumer, agent-tools#533) instead of trying to reconstruct a trusted subagent
+identity from the fields above.
+
 Patch paths are extracted from patch text and are hints, not a trust boundary. Hook authors
 that use `args.file_path` / `args.path` for filesystem access must resolve and validate the
 path against the intended repository root before reading or writing.
