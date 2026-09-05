@@ -13,6 +13,12 @@ suite ever parsed a SKILL.md as YAML) and only surfaced live, at skill-load time
 a harness that actually parses the frontmatter (codex: "failed to load skill ...:
 invalid YAML: did not find expected key").
 
+A live review of this exact fix caught a SECOND, independent way a skill can be
+invalid despite parsing as perfectly valid YAML: decision-request-discipline's fixed
+description was 1107 characters, over the Agent Skills spec's 1024-character cap
+(enforced by the bundled `skill-creator` validator) — this module now checks length
+too, not just YAML syntax.
+
 PyYAML is an optional dependency in this repo. Per the documented house convention
 (see tests/test_review_threads_gate.py and tests/test_ci_gate_bugs_129.py), the
 `importorskip` is per-test, NOT module-level: a module-level skip would also skip
@@ -29,6 +35,14 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_FILES = sorted((REPO_ROOT / "skills").rglob("SKILL.md"))
+
+# The Agent Skills spec's own description-length cap, enforced by the bundled
+# skill-creator validator (`quick_validate.py`: "Check description length (max 1024
+# characters per spec)"). A description over this limit makes the skill invalid/
+# unloadable in that validator's eyes even when it is otherwise well-formed YAML —
+# a real, live gap this catalog hit (decision-request-discipline shipped at 1107
+# chars, undetected because nothing checked length, only YAML validity).
+MAX_DESCRIPTION_LENGTH = 1024
 
 
 def _frontmatter_text(path: Path) -> str | None:
@@ -62,6 +76,11 @@ def test_skill_frontmatter_is_valid_yaml(path: Path) -> None:
     assert isinstance(data, dict), f"{path}: frontmatter did not parse to a mapping"
     assert data.get("name"), f"{path}: frontmatter missing a non-empty 'name'"
     assert data.get("description"), f"{path}: frontmatter missing a non-empty 'description'"
+    description_length = len(str(data["description"]))
+    assert description_length <= MAX_DESCRIPTION_LENGTH, (
+        f"{path}: description is {description_length} characters, over the "
+        f"{MAX_DESCRIPTION_LENGTH}-character spec limit — shorten it"
+    )
     # The skill's directory name is its stable identity handle (rig.yaml and every harness
     # key off the path, not the frontmatter text) — a `name:` that drifts from the directory
     # it lives in breaks discovery silently, with no YAML error to catch it otherwise.
