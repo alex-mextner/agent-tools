@@ -436,6 +436,21 @@ def test_opt_out_via_env_restores_the_refusal(tmp_path):
     assert "[fake gh] merged" not in r.stdout
 
 
+@pytest.mark.parametrize("spelling", ["FALSE", "Off", "NO"])
+def test_opt_out_case_insensitive_spellings(tmp_path, spelling):
+    """Review finding, #518: a case-SENSITIVE `0|false|no` match left `SHIP_AUTO_BUMP=FALSE` /
+    `=OFF` reading as "not recognized" -> the feature stayed ON -- backwards from every natural
+    spelling of "off" an operator would reach for, on the one knob that gates remote writes."""
+    main, origin, state, bindir = _make_world(tmp_path)
+    _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
+
+    r = _run_ship(main, bindir, state, "feat", env_extra={"SHIP_AUTO_BUMP": spelling})
+
+    assert r.returncode != 0, r.stdout
+    assert "did not here because: SHIP_AUTO_BUMP=0" in r.stderr, r.stderr
+    assert "PUT contents" not in _gh_log(state), _gh_log(state)
+
+
 def test_opt_out_via_committed_ship_config(tmp_path):
     main, origin, state, bindir = _make_world(tmp_path)
     _commit_file(main, ".ship-config", "SHIP_AUTO_BUMP=0\n", "chore: opt out of auto-bump")

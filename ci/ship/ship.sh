@@ -657,6 +657,14 @@ SHIP_AUTO_BUMP_COMMITTER_EMAIL='ship-auto-bump@noreply.agent-tools.local'
 # the review-dwell skip on that flag alone left ship's OWN push mis-treated as a human one on
 # exactly those (common) BEHIND PRs: the CI grace stayed at the tight default right after a
 # fresh push, and the dwell gate refused on a commit nobody but ship authored.
+#
+# Invariant this relies on (review finding, #518, traced and found benign — not a live bug):
+# `_wait_pr_head_oid ne "$old"` only proves the head MOVED, not that it moved to ship's own
+# write — a human push landing in the async accept-then-poll window could in principle be the
+# one that gets recorded here instead. Every SURVIVABLE variant of that race is independently
+# caught downstream: a human's non-merge push there makes the standalone BEHIND path's re-read
+# still report BEHIND (refused before this matters), and makes the auto-bump path's own
+# version-equality check refuse too — so a mis-recorded oid never actually reaches a merge.
 SHIP_KNOWN_OIDS=""
 # Always returns 0 (review finding, #518): an empty $1 made `[ -n ]` fail and the function's own
 # exit status become 1 — safe INSIDE the function (left of `&&`, `set -e` doesn't apply there),
@@ -664,13 +672,32 @@ SHIP_KNOWN_OIDS=""
 # remote write already succeeded (a transient re-read of the new head oid is the only way $1
 # arrives empty here) — that bare non-zero killed the whole script mid-flight with no message,
 # the branch already mutated. This helper must never itself be a `set -e` trap.
-_record_ship_oid() { [ -n "${1:-}" ] && SHIP_KNOWN_OIDS="${SHIP_KNOWN_OIDS} $1"; return 0; }
+# Hex-validated HERE (review finding, #518) — the single choke point every caller relies on:
+# $1 comes straight from a `gh pr view --json headRefOid` read, not a value ship itself
+# computed. A degraded/misbehaving `gh` printing anything non-hex (a multi-line payload, a
+# stray quote) would otherwise flow, unescaped, into the DWELL_JQ program text this value is
+# later embedded into (as a literal jq array element) — a malformed value there breaks the jq
+# program's syntax, not ship's data; still worth refusing at the source rather than trusting
+# "every recorded oid is hex" as an invariant no code actually enforces.
+_record_ship_oid() {
+  case "${1:-}" in ''|*[!0-9a-f]*) return 0 ;; esac
+  SHIP_KNOWN_OIDS="${SHIP_KNOWN_OIDS} $1"
+}
 
 _auto_bump_enabled() {
-  case "${SHIP_AUTO_BUMP:-}" in 0|false|no) return 1 ;; esac
-  [ -n "${SHIP_AUTO_BUMP:-}" ] && return 0
+  # Case-INSENSITIVE (review finding, #518): the one knob that gates ship pushing commits to a
+  # remote branch must not silently mean the OPPOSITE of what an operator wrote. A bare
+  # case-sensitive `0|false|no` left `SHIP_AUTO_BUMP=FALSE`/`=OFF`/`.ship-config`'s
+  # `SHIP_AUTO_BUMP=False` reading as "not one of these" -> feature stays ON, exactly
+  # backwards from every natural spelling of "off" a human would reach for. `tr` lowercases
+  # portably (bash-3.2 safe — no `${var,,}`, which needs bash 4+).
+  local _ab_v
+  _ab_v=$(printf '%s' "${SHIP_AUTO_BUMP:-}" | tr '[:upper:]' '[:lower:]')
+  case "$_ab_v" in 0|false|no|off) return 1 ;; esac
+  [ -n "$_ab_v" ] && return 0
   _ship_config_load "$ROOT"
-  case "${SHIP_CFG_AUTO_BUMP:-}" in 0|false|no) return 1 ;; esac
+  _ab_v=$(printf '%s' "${SHIP_CFG_AUTO_BUMP:-}" | tr '[:upper:]' '[:lower:]')
+  case "$_ab_v" in 0|false|no|off) return 1 ;; esac
   return 0
 }
 
@@ -1945,6 +1972,18 @@ run_merge_time_auto_bump() {
   _auto_bump_ff_local
 }
 
+# Runs BEFORE the external-review, review-quorum, and review-dwell gates further down (review
+# finding, #518, "medium"): those three are all head-independent (dwell explicitly peels
+# ship's own commits; quorum keys off the task code, not the head; external-review only checks
+# review EXISTENCE) — only the green-CI gate right below actually needs the bump to have
+# already happened, so it is the only one this ordering is FOR. Accepted trade-off, not fixed
+# in this pass: a PR with zero reviews (or an unmet quorum bar) still gets a real ship-authored
+# bump commit pushed to its branch before those gates refuse — annoying (an extra, unwanted
+# commit on the branch) but not unsafe (the PR is never merged; a re-run after the real
+# blocker is addressed sees the PR as already bumped and proceeds normally). A full reorder
+# (moving the bump to run after those three gates but still before the CI wait, which itself
+# runs immediately after) would need restructuring the whole gate sequence — out of scope for
+# this pass; tracked as a known follow-up rather than attempted here at this point in review.
 run_merge_time_auto_bump
 
 # --- green-CI gate: CI must EXIST + be green; pending CI is WATCHED to completion -------
@@ -2404,6 +2443,14 @@ else
   done
   SHIP_KNOWN_OIDS_JSON="${SHIP_KNOWN_OIDS_JSON}]"
   DWELL_Q='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){createdAt commits(last:15){nodes{commit{oid message committedDate pushedDate committer{email}}}} timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{__typename ... on HeadRefForcePushedEvent{createdAt}}}}}}'
+  # peel's final fallback is `{}`, NOT the newest commit (review finding, #518): after ~8
+  # refused re-runs with no intervening human push, the last:15 window can be ENTIRELY ship's
+  # own merge/bump pairs -- peel then legitimately empties it. Falling back to the newest
+  # commit in that state would pick ship's OWN latest bump as the reference, measuring the
+  # dwell window from ship's own fresh push (a spurious "PR is only Ns old" refusal that only
+  # self-heals by waiting). An empty $c instead leaves pushedDate/committedDate both blank
+  # below, so the bash side's max(createdAt, pushedDate, committedDate, forcePushedAt) falls
+  # through to createdAt alone -- the PR's open time, never a fresher false floor.
   DWELL_JQ='def is_bump: ((.commit.committer.email // "") == "'"$SHIP_AUTO_BUMP_COMMITTER_EMAIL"'") or ((.commit.oid // "__none__") as $o | ('"$SHIP_KNOWN_OIDS_JSON"' | index($o))) != null;
     def is_merge: ((.commit.message // "") | test("^Merge (remote-tracking )?branch \\x27[^\\x27]+\\x27 into "));
     def peel:
@@ -2414,7 +2461,7 @@ else
       else . end;
     .data.repository.pullRequest
     | (.commits.nodes // []) as $n
-    | (($n | peel | last) // $n[-1] // {}) as $c
+    | (($n | peel | last) // {}) as $c
     | [.createdAt, ($c.commit.pushedDate // ""), ($c.commit.committedDate // ""), (.timelineItems.nodes[0].createdAt // "")] | @tsv'
   if DWELL_RAW=$(gh api graphql -F owner='{owner}' -F name='{repo}' -F pr="$PR" -f query="$DWELL_Q" \
        --jq "$DWELL_JQ" 2>/dev/null); then
