@@ -119,6 +119,24 @@ def test_to_v1_event_carries_bash_command_and_codex_metadata():
     assert v1["args"]["permission_mode"] == "auto"
 
 
+def test_to_v1_event_tags_harness_codex():
+    """agent-tools#533: every v1 event this bridge produces carries the top-level `harness`
+    tag `"codex"`, unconditionally — a module constant, never derived from `codex_event`. This
+    is what lets orchestrator-stays-thin (and future hooks) exempt the whole harness instead of
+    needing a trusted per-process subagent identity Codex doesn't expose."""
+    codex_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "git status", "harness": "claude-code"},
+        "cwd": "/repo",
+    }
+
+    v1 = dispatch.to_v1_event(codex_event, point="pre-bash")
+
+    assert v1["harness"] == "codex"
+    assert dispatch.HARNESS == "codex"
+
+
 def test_to_v1_event_top_level_metadata_overrides_tool_input():
     codex_event = {
         "hook_event_name": "PreToolUse",

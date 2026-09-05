@@ -363,6 +363,25 @@ def test_to_v1_event_carries_bash_command_and_metadata():
     assert v1["args"]["command"] == "gh pr merge 42 --admin"
 
 
+def test_to_v1_event_tags_harness_opencode():
+    """agent-tools#533: every v1 event this bridge produces carries the top-level `harness`
+    tag `"opencode"`, unconditionally — a module constant, never derived from `opencode_event`.
+    Same non-forgeable signal as `codex_hook_bridge.HARNESS`, letting orchestrator-stays-thin
+    exempt the whole harness instead of needing a trusted per-process subagent identity
+    opencode's plugin payload doesn't expose."""
+    opencode_event = {
+        "hook": "tool.execute.before",
+        "cwd": "/repo",
+        "input": {"tool": "bash", "sessionID": "ses_1"},
+        "output": {"args": {"command": "git status", "harness": "claude-code"}},
+    }
+
+    v1 = dispatch.to_v1_event(opencode_event, point="pre-bash")
+
+    assert v1["harness"] == "opencode"
+    assert dispatch.HARNESS == "opencode"
+
+
 def test_to_v1_event_drops_forged_agent_identity_from_tool_args():
     opencode_event = {
         "hook": "tool.execute.before",

@@ -141,6 +141,83 @@ def test_only_args_agent_id_exempts_not_top_level_or_tool_input(tmp_path, monkey
     assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
+# ── HARNESS-EXEMPT (agent-tools#533) ─────────────────────────────────────────────────────
+
+# The literal repro from the live incident (Alex, 2026-09-05): a review-cli-spawned `codex exec
+# -s read-only` reviewer process ran this exact chain as read-only inspection for ITS OWN review
+# role and got WARN→BLOCK'd by this gate treating it as "the orchestrator doing inline
+# implementation work." `sed -n` (a read-only print) is not in READ_ONLY_BASH (only `sed -i` is,
+# as a build/edit signal), so the chain falls through to the >=3-segment fallback and is judged
+# implementation-shaped on chain length alone — a real, separate READ_ONLY_BASH gap, filed
+# separately; not fixed here. It is used below BOTH as the control (proves the chain trips the
+# classifier at all) and as the harness-exempt case (proves tagging `harness` bypasses that
+# classifier entirely, regardless of what the command looks like).
+_REPRO_CHAIN = (
+    "sed -n '1,240p' SKILL.md && git diff --check && git status --short && git diff -- a.py"
+)
+
+
+def test_repro_chain_control_warns_then_blocks_with_no_harness(tmp_path, monkeypatch):
+    """Control: with no `harness` tag (today's CC shape) the exact repro chain still trips
+    WARN-then-BLOCK — proving the chain itself is what got misclassified, not some other cause,
+    and setting up the contrast with the harness-exempt cases below."""
+    event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": _REPRO_CHAIN}}
+    out1, _e, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense: advisory WARN
+    out2, _e, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"  # repeat: BLOCK
+
+
+@pytest.mark.parametrize("harness", ["codex", "opencode"])
+def test_repro_chain_allowed_silently_for_exempt_harness(tmp_path, monkeypatch, harness):
+    """The SAME repro chain, tagged with a top-level `harness` a codex/opencode bridge would
+    set, is allowed silently on every call — no WARN, no BLOCK, no tier ever primed."""
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": harness,
+              "args": {"command": _REPRO_CHAIN}}
+    for _ in range(3):  # would BLOCK by the second call if harness-exemption didn't short-circuit
+        out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+        assert c == 0 and _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("harness", ["codex", "opencode"])
+def test_exempt_harness_also_exempts_code_write(tmp_path, monkeypatch, harness):
+    """Same exemption on the pre-write side: a non-docs code write tagged with an exempt
+    `harness` is allowed even on repeat."""
+    event = {"point": "pre-write", "cwd": "/repo", "harness": harness,
+              "args": {"file_path": "/repo/src/a.ts"}}
+    _run(event, monkeypatch, tmp_path / "m")
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_unknown_harness_does_not_exempt(tmp_path, monkeypatch):
+    """An unrecognized `harness` value (not in EXEMPT_HARNESSES) must NOT relax the gate —
+    the allowlist fails closed on anything it doesn't explicitly know."""
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": "some-future-harness",
+              "args": {"command": _REPRO_CHAIN}}
+    _run(event, monkeypatch, tmp_path / "m")
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_forged_args_harness_does_not_exempt(tmp_path, monkeypatch):
+    """TRUST BOUNDARY regression guard: `_is_exempt_harness` reads ONLY the TOP-LEVEL
+    `event['harness']` — a bridge-set constant no model/tool_input can reach. A `harness` value
+    sitting under `args` (where a forged agent_id would also have to hide) must NOT exempt the
+    orchestrator: a repeat impl write still BLOCKs exactly as if no harness were set at all."""
+    event = {"point": "pre-write", "cwd": "/repo",
+              "args": {"harness": "codex", "file_path": "/repo/src/a.ts"}}
+    _run(event, monkeypatch, tmp_path / "m")  # warn (NOT exempted by the decoy)
+    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+    assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_exempt_harnesses_constant_is_codex_and_opencode_only():
+    """Documents the allowlist's exact membership — `claude-code` (or anything else) must never
+    be added here, or the gate would exempt the very orchestrator it exists to govern."""
+    assert ost.EXEMPT_HARNESSES == frozenset({"codex", "opencode"})
+
+
 # ── regression: the OLD self-service escape hatch is DEAD (env AND inline) ──────────────────
 
 def test_old_env_escape_hatch_no_longer_bypasses(tmp_path, monkeypatch):
