@@ -91,6 +91,9 @@ fi
 if [ "$1" = "done" ]; then
   exit "${SHIP_TEST_TASK_DONE_EXIT:-0}"
 fi
+if [ "$1" = "mark-shipped" ]; then
+  exit "${SHIP_TEST_TASK_MARK_SHIPPED_EXIT:-0}"
+fi
 exit 0
 """
 
@@ -334,6 +337,20 @@ def test_auto_close_runs_task_done_after_a_fully_accepted_merge(repo, tmp_path):
     lines = _audit(tmp_path, "acceptance")
     assert [l["decision"] for l in lines] == ["authorized", "auto-closed"]
     assert lines[-1]["task_code"] == "HYP-931"
+
+
+def test_auto_close_skipped_when_mark_shipped_itself_fails(repo, tmp_path):
+    """Codex finding (round 3, PR review): when `task mark-shipped` fails — an older task-cli
+    lacking the subcommand, a transient backend error — the merged PR/commit link never got
+    recorded on the ticket. Auto-closing anyway recreates the exact task/repository divergence
+    this notify step exists to prevent: a Done ticket with no record of what shipped it."""
+    r = _run(repo, tmp_path, env={"SHIP_TASK_NOTIFY_ENABLED": "1", "SHIP_TEST_TASK_MARK_SHIPPED_EXIT": "1"})
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "'task mark-shipped HYP-931' failed" in r.stderr
+    assert "closing it now" not in r.stdout
+    calls = _task_calls(tmp_path)
+    assert "done HYP-931" not in " ".join(calls)
+    assert calls == ["gate HYP-931 --json", "mark-shipped HYP-931 --pr https://github.com/acme/widgets/pull/1"]
 
 
 def test_auto_close_skipped_on_a_cancelled_ticket(repo, tmp_path):

@@ -3247,10 +3247,16 @@ _ship_notify_task_cli() {
   # effects, so scoping the `cd` around it too is safe.
   local -a mark_args=(mark-shipped "$code" --pr "$pr_url")
   [ -n "$merge_sha" ] && mark_args+=(--commit "$merge_sha")
-  if ! (cd "$ROOT" || { echo "[ship] WARNING: could not cd to $ROOT for task-cli notify." >&2; exit 1; }; run task "${mark_args[@]}"); then
+  if (cd "$ROOT" || { echo "[ship] WARNING: could not cd to $ROOT for task-cli notify." >&2; exit 1; }; run task "${mark_args[@]}"); then
+    # Only auto-close AFTER a successful mark-shipped (review finding, round 3, Codex): if
+    # mark-shipped itself failed — an older task-cli lacking the subcommand, a transient
+    # backend error — the merged PR/commit link never got recorded on the ticket. Closing it
+    # anyway via auto-close would recreate exactly the task/repository divergence this whole
+    # notify step exists to prevent: a Done ticket with no record of what shipped it.
+    _ship_auto_close_accepted_ticket "$code"
+  else
     echo "[ship] WARNING: 'task mark-shipped ${code}' failed — the ticket may be out of sync with this merge. Update it manually: task read ${code}" >&2
   fi
-  _ship_auto_close_accepted_ticket "$code"
 }
 
 # Close the "nobody remembered the extra step" gap (agent-tools#521 follow-up, tg-cli#301/#305
