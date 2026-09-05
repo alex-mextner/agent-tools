@@ -2753,6 +2753,44 @@ _ship_derive_task_code_for_notify() {
   return 0
 }
 
+# Rewrites a "GH-<n>" code (case-insensitive: "gh-105" too, matching
+# require-ticket-before-commit's `re.IGNORECASE` on the same pattern) into the literal "#<n>" form
+# task-cli's own id argument expects (task mark-shipped/done accept "#123" or "HYP-456", never
+# "GH-123" -- see the routing rationale on _review_quorum_extract_ticket's own comment, ~line
+# 2052). "GH-<n>" is a convention, not a task-cli id: agent-hooks' require-ticket-before-commit
+# recognizes it as a valid ticket reference (see
+# agent-hooks/require-ticket-before-commit/require_ticket_before_commit.py), and it's also the
+# shape review-quorum's own matcher used to SYNTHESIZE from a bare "Fixes #105" before #511
+# changed that one arm to return the literal "#105" instead.
+#
+# #511 only closed that SYNTHESIS path. A "GH-<n>" token typed LITERALLY into a branch name, PR
+# title, or PR body is still matched by the generic PREFIX-<n> arm (the same arm that matches this
+# repo's own HYP-<n> convention) and derived as-is -- e.g. a branch named "GH-105-fix-crash"
+# reaches here as "GH-105". The other way a "GH-<n>" code reaches here is $REVIEW_TASK_CODE set by
+# hand (or by another tool) following the convention above -- note this is $REVIEW_TASK_CODE
+# specifically, not a bare $TASK_CODE env var: the quorum gate (on by default) unconditionally
+# overwrites $TASK_CODE from $REVIEW_TASK_CODE at its own assignment above, so an inherited
+# $TASK_CODE only survives untouched as an external input when the gate is disabled
+# (SHIP_REVIEW_QUORUM=0) -- which is how this file's tests drive that path directly.
+#
+# Either way, this normalization is the one place every path funnels through before reaching
+# `task`; a rewrite is logged to stderr so a misrouted ticket (e.g. a repo whose task-cli Linear
+# team key happens to be literally "GH") is traceable from the ship transcript instead of silent.
+# Every other code shape (HYP-<n>, a descriptive all-caps review-cli code, an already-literal
+# "#<n>") does not match and passes through byte-for-byte unchanged.
+_ship_normalize_gh_code_for_task_cli() {  # $1 = candidate code -> prints the task-cli-safe code
+  # The digits are captured once (BASH_REMATCH), not independently re-derived by a second glob —
+  # a single source of truth for "what counts as the GH-<n> shape", so widening the regex later
+  # (review finding) can't silently desync from a stripping pattern that no longer matches it.
+  if [[ "$1" =~ ^[Gg][Hh]-([0-9]+)$ ]]; then
+    local rewritten="#${BASH_REMATCH[1]}"
+    echo "[ship] normalizing task-cli notify code: ${1} -> ${rewritten} (GitHub-issue convention)" >&2
+    printf '%s' "$rewritten"
+  else
+    printf '%s' "$1"
+  fi
+}
+
 # Call `task mark-shipped <code> --pr <url> [--commit <sha>]` for the just-merged PR. Skipped
 # (with a logged reason, never an error) when: the feature is disabled (SHIP_TASK_NOTIFY_ENABLED=0);
 # `task` isn't on PATH (task-cli not installed — ship must work in a repo that never adopted it);
@@ -2769,6 +2807,7 @@ _ship_notify_task_cli() {
     return 0
   fi
   local code; code=$(_ship_derive_task_code_for_notify)
+  code=$(_ship_normalize_gh_code_for_task_cli "$code")
   if [ -z "$code" ]; then
     echo "[ship] could not derive a task code for #$PR — skipping ticket notify (not every PR is tied to a tracked ticket; update it manually if this one is)." >&2
     return 0
