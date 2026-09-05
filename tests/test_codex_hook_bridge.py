@@ -119,6 +119,24 @@ def test_to_v1_event_carries_bash_command_and_codex_metadata():
     assert v1["args"]["permission_mode"] == "auto"
 
 
+def test_to_v1_event_tags_harness_codex():
+    """agent-tools#533: every v1 event this bridge produces carries the top-level `harness`
+    tag `"codex"`, unconditionally — a module constant, never derived from `codex_event`. This
+    is what lets orchestrator-stays-thin (and future hooks) exempt the whole harness instead of
+    needing a trusted per-process subagent identity Codex doesn't expose."""
+    codex_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "git status", "harness": "claude-code"},
+        "cwd": "/repo",
+    }
+
+    v1 = dispatch.to_v1_event(codex_event, point="pre-bash")
+
+    assert v1["harness"] == "codex"
+    assert dispatch.HARNESS == "codex"
+
+
 def test_to_v1_event_top_level_metadata_overrides_tool_input():
     codex_event = {
         "hook_event_name": "PreToolUse",
@@ -520,6 +538,39 @@ def test_move_apply_patch_dispatch_fans_out_source_and_target_content():
 
     assert [event["args"]["file_path"] for event in events] == ["src/old.py", "src/new.py"]
     assert [event["args"]["content"] for event in events] == ["", "new()"]
+
+
+def test_multi_file_dispatch_fan_out_keeps_harness_on_every_cloned_event():
+    """agent-tools#533: `_v1_events_for_dispatch` clones `base` per file path via `dict(base)`
+    for a multi-file patch. This pins that the top-level `harness` tag survives that clone —
+    without it, a fan-out refactor could silently drop `harness` from every event but the
+    first, reintroducing the original orchestrator-stays-thin block for multi-file edits only
+    (the single-file path, covered by `test_to_v1_event_tags_harness_codex`, would stay green)."""
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: src/a.py\n"
+        "@@\n"
+        "-old()\n"
+        "+new()\n"
+        "*** Update File: src/b.py\n"
+        "@@\n"
+        "-old2()\n"
+        "+new2()\n"
+        "*** End Patch\n"
+    )
+
+    events = dispatch._v1_events_for_dispatch(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"command": patch},
+            "cwd": "/repo",
+        },
+        point="pre-write",
+    )
+
+    assert len(events) == 2
+    assert all(event["harness"] == "codex" for event in events)
 
 
 def test_move_apply_patch_secret_blocks_on_target_content(tmp_path):

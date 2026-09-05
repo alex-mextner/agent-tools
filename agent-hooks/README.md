@@ -40,9 +40,18 @@ Hosts must execute hook scripts as separate subprocesses. Importing hook scripts
 a long-lived or multi-threaded host process is not part of the contract unless that host provides
 its own equivalent process/module isolation.
 
-- **stdin**: a JSON event — `{ hook_api, event_id, tool, point, command, cwd, args }`.
+- **stdin**: a JSON event — `{ hook_api, event_id, tool, point, harness, command, cwd, args }`.
   `args` carries the action-specific payload (e.g. the Bash command string, the file path
-  + content for a write).
+  + content for a write). `harness` is a bridge-set constant (`"claude-code"` / `"codex"` /
+  `"opencode"`) identifying which product's hook system dispatched the event — set from a
+  hardcoded module literal in each bridge, never derived from `args`/`tool_input`, so it cannot
+  be forged the way a same-named key sitting in `args` could be (agent-tools#533). A hook that
+  needs to scope itself to, or exempt, an entire harness reads `event["harness"]` directly; see
+  `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES` for the first consumer. **A hook
+  that RELAXES on `harness` must use a fail-closed allowlist** (`harness in {known-safe values}`),
+  never a `!=` exclusion: the field may be absent on an event from a bridge that predates it, or
+  from any future bridge that doesn't set one, and an absent/unrecognized value must stay
+  GOVERNED by default, exactly like this repo's `agent_id` subagent-exemption convention.
 - **stdout**: protocol JSON only — `{ "hook_api": "agents-hooks/v1", "decision": "allow"
   | "block", "message": "..." }`. Empty stdout = allow.
 - **stderr**: human logs (never parsed).

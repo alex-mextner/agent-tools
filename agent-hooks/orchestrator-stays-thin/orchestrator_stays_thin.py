@@ -51,6 +51,26 @@ the doctrine's "WARN then BLOCK" instead of a hard wall on the first inline edit
 Subagent-exempt: a dispatched subagent (``agent_id`` present) does the actual work, so it is
 always allowed — this gate governs the orchestrator only.
 
+Harness-exempt (agent-tools#533): this gate's whole premise — a main thread that must delegate
+implementation work to a CC ``Agent``/``Task`` subagent instead of doing it inline — is a Claude
+Code concept. Codex/opencode DO model a subagent lifecycle of their own (Codex's
+``SubagentStart``/``SubagentStop`` events, opencode's ``task`` tool) but NEITHER bridge exposes a
+TRUSTED per-tool-call subagent identity from it today — see ``lib/codex_hook_bridge`` and
+``lib/opencode_hook_bridge`` — so every Codex/opencode-sourced event used to look like "the
+orchestrator" to ``_is_subagent`` — including a bare Codex CLI session Alex runs directly (which
+is not a CC orchestrator refusing to delegate at all) and a Codex/opencode process spawned by
+another tool as a delegated worker (review-cli's read-only reviewer backend, a CC-dispatched
+subagent). Blocking either one is wrong, and the block message's remediation ("Dispatch a subagent
+... Agent tool with subagent_type: 'fork'") does not even apply outside Claude Code. So a v1 event
+tagged with a ``harness`` of ``codex`` or ``opencode`` specifically (set by the bridge, never by
+``args`` — see ``EXEMPT_HARNESSES``) is exempt from this gate entirely, same as a dispatched
+subagent. Deliberately an ALLOWLIST of the two known-safe values, not "any non-CC harness": a
+future bridge (``HARNESS = "gemini"``, say) is UNPROVEN here and stays governed until someone
+reviews and adds it — a present-but-unrecognized value is not automatically evidence the gate's
+CC-specific premise doesn't apply to it, only that nobody has confirmed that yet. If a
+Codex/opencode session is ever meant to BE the thin orchestrator in someone's setup, that needs an
+explicit config knob, not a change to this hardcoded exemption.
+
 Per-repo opt-out (Alex tg#5743): default ON; a repo that legitimately works inline on main
 (e.g. 3d-cli) sets `agent_hooks.orchestrator_only: false` in its rig.yaml, or exports
 RIG_ORCHESTRATOR_ONLY=0. Default ON means an un-enrolled repo keeps the current always-on
@@ -130,6 +150,12 @@ hatch_escalation = _load_hatch_escalation()
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
+
+# Harnesses whose events are NEVER subject to this gate (agent-tools#533) — see the module
+# docstring's "Harness-exempt" section. Deliberately an ALLOWLIST, not `!= "claude-code"`: an
+# event with no `harness` field (every fixture written before this change, and any future bridge
+# that doesn't set one) stays GOVERNED — the relax direction fails closed, same as `_is_subagent`.
+EXEMPT_HARNESSES = frozenset({"codex", "opencode"})
 
 MARKER_DIR = Path(os.path.expanduser(os.environ.get(
     "ORCH_THIN_MARKER_DIR", "~/.cache/agent-tools/orchestrator-thin")))
@@ -343,6 +369,28 @@ def _is_subagent(event: dict) -> bool:
     args = event.get("args") or {}
     aid = args.get("agent_id")
     return bool(aid and str(aid).strip())
+
+
+def _is_exempt_harness(event: dict) -> bool:
+    """True when the event came from a bridge whose harness this gate never governs
+    (agent-tools#533 — see the module docstring's "Harness-exempt" section).
+
+    TRUST BOUNDARY — read ONLY the TOP-LEVEL `event["harness"]`, never `args`. Each bridge
+    (lib/cc_hook_bridge, lib/codex_hook_bridge, lib/opencode_hook_bridge) sets this from a
+    hardcoded module constant (`HARNESS = "claude-code" | "codex" | "opencode"`) that is not
+    derived from ANY field of the underlying tool event — it cannot be forged by a model/
+    tool_input value the way a same-named key sitting in `args` could be. Which bridge actually
+    fires is decided by which harness's own hook system invoked it: a Claude Code session's Bash
+    call is dispatched by CC's own PreToolUse machinery straight into `cc_hook_bridge` and has no
+    way to reroute itself through `codex_hook_bridge` instead, so an orchestrator cannot dodge
+    this gate by claiming to be a different harness.
+
+    Deliberately an ALLOWLIST (`harness in EXEMPT_HARNESSES`), not `harness != "claude-code"`: a
+    missing/unrecognized `harness` (every event built before this change, and any future bridge
+    that doesn't set one) must stay GOVERNED — the relax direction fails closed, same as
+    `_is_subagent` above."""
+    harness = event.get("harness")
+    return bool(harness) and str(harness) in EXEMPT_HARNESSES
 
 
 def _marker(event: dict) -> Path:
@@ -1419,6 +1467,12 @@ def main() -> int:
 
     # Subagents do the actual work → always allowed.
     if _is_subagent(event):
+        emit("allow")
+        return 0
+
+    # Codex/opencode events → this gate's CC-specific orchestrator/subagent premise doesn't
+    # apply, and its remediation (CC's Agent tool) doesn't exist there either (agent-tools#533).
+    if _is_exempt_harness(event):
         emit("allow")
         return 0
 

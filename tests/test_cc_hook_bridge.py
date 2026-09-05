@@ -130,6 +130,18 @@ def test_to_v1_event_forwards_agent_id_and_type_for_pre_agent():
     assert v1["args"]["prompt"] == "do the thing"
 
 
+def test_to_v1_event_tags_harness_claude_code():
+    """agent-tools#533: every v1 event this bridge produces carries the top-level `harness`
+    tag `"claude-code"`, unconditionally — set from the bridge's own module constant, never
+    from `cc_event`. A forgeable `tool_input.harness` (if a hook ever misread `args`) must not
+    override it."""
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+          "tool_input": {"command": "ls", "harness": "codex"}, "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="pre-bash")
+    assert v1["harness"] == "claude-code"
+    assert dispatch.HARNESS == "claude-code"
+
+
 def test_to_v1_event_main_thread_has_no_agent_id():
     """A main-thread Agent dispatch carries NO agent_id (the signal is absent) → the gate
     treats it as the orchestrator, not a subagent."""

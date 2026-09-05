@@ -33,7 +33,8 @@ On each call it:
 3. enumerates the installed descriptors in `~/.claude/hooks/*.json` for that point
    (sorted by `priority`, then `id`);
 4. translates the CC event into the v1 event each hook script reads
-   (`{hook_api, event_id, tool, point, command, cwd, args}`) and runs each script;
+   (`{hook_api, event_id, tool, point, harness, command, cwd, args}` — `harness` is always
+   `"claude-code"` here, a module constant, not derived from the CC event) and runs each script;
 5. translates the v1 **exit-10 BLOCK** into CC's own block signal — **first block wins**,
    its reason is surfaced to the model.
 
