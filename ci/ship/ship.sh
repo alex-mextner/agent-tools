@@ -516,6 +516,195 @@ if [ -n "$_EFFECTIVE_TARGET" ] && [ "$_EFFECTIVE_TARGET" != "$_CWD_ORIGIN_REPO" 
   _FOREIGN_REPO_INVOKE=1
 fi
 
+# --- .ship-config: moved here (from its historical location further down) so the
+# merge-time auto-bump's BEHIND-clearing check below can consult SHIP_CFG_AUTO_BUMP before
+# the PR-state preflight runs; _ship_config_run/_dir_is_real_descendant_of_root (the local
+# CI-down test-runner machinery) stay where they were, they don't need to move.
+
+_ship_config_assign() {  # $1 = key, $2 = trimmed value
+  case "$1" in
+    SHIP_LOCAL_TEST_DIR) SHIP_CFG_DIR="$2" ;;
+    SHIP_LOCAL_TEST_CMD) SHIP_CFG_CMD="$2" ;;
+    SHIP_AUTO_BUMP) SHIP_CFG_AUTO_BUMP="$2" ;;
+  esac
+}
+
+_ship_config_load() {
+  local root="$1" content line key val
+  SHIP_CFG_DIR=""
+  SHIP_CFG_CMD=""
+  SHIP_CFG_AUTO_BUMP=""
+  if ! (cd "$root" && git show HEAD:.ship-config) >/dev/null 2>&1; then
+    [ -f "$root/.ship-config" ] && \
+      echo "[ship] local gate: .ship-config exists in the working tree but is not committed at HEAD — ignoring (uncommitted config is not audited)." >&2
+    return 0
+  fi
+  # HEAD:.ship-config must be a REGULAR FILE — mode 100644/100755, checked via `git ls-tree`,
+  # not merely `git cat-file -t` == blob. Two non-regular tree entries are ALSO type `blob`
+  # and would slip past a bare type check:
+  #   - A TREE (someone committed a `.ship-config/` directory): `git show`/`git cat-file -s`
+  #     both succeed on it and print a tree listing — tree entry names are plain filenames
+  #     that can legally contain `=` and spaces, so an entry literally named
+  #     `SHIP_LOCAL_TEST_CMD=<cmd>` would otherwise flow into the KEY=value parser below as
+  #     if it were committed file CONTENT.
+  #   - A SYMLINK (git mode 120000, e.g. `.ship-config -> /some/attacker/path`): its blob
+  #     content is the link TARGET STRING, not test-runner config — `git cat-file -t` reports
+  #     `blob` for symlinks too, so a type-only check would parse a target path as if it were
+  #     a committed KEY=value line.
+  # `git ls-tree` reports the tree ENTRY's mode (unlike `cat-file -t`, which resolves to the
+  # blob's own type and can't distinguish a symlink's blob from a regular file's blob).
+  local head_mode
+  head_mode=$(cd "$root" && git ls-tree HEAD -- .ship-config 2>/dev/null | awk '{print $1}')
+  case "$head_mode" in
+    100644|100755) ;;
+    *)
+      echo "[ship] local gate: .ship-config at HEAD is not a regular file (mode ${head_mode:-unknown}, not 100644/100755) — ignoring." >&2
+      return 0
+      ;;
+  esac
+  # NUL-byte guard: bash silently STRIPS NUL bytes when a command substitution's output
+  # becomes a variable's value (below), which could turn a byte sequence that never spells
+  # a whitelisted key in the actual committed bytes (e.g. `SHIP_LOCAL_TEST_C<NUL>MD=...`)
+  # into one that does once assigned to $content. Check the RAW git-show output (piped
+  # straight to grep, never touching a bash variable) for a NUL byte first and refuse to
+  # parse at all if found — a legitimate KEY=value text config never contains one. `grep -I`
+  # (without `-a`) treats a NUL-containing input as binary and reports NO match even against
+  # the empty pattern, while a plain-text input matches the (vacuously true) empty pattern —
+  # note this is NOT `grep -a $'\0'`: bash's ANSI-C quoting truncates at the first NUL, so
+  # that pattern silently becomes an EMPTY string and would match (and thus "reject") every
+  # normal file — a bug caught by this diff's own test suite before it shipped. A genuinely
+  # empty (0-byte) file ALSO fails `grep -I ''` (no lines to match at all) despite having no
+  # NUL byte, so that case is excluded via a blob-size check first. Deliberately NOT `-q`:
+  # under this script's `set -o pipefail`, `grep -q` can exit (and close its stdin pipe) as
+  # soon as it sees a match, which for a config larger than the OS pipe buffer would SIGPIPE
+  # the upstream `git show` and misreport a perfectly valid large text file as "binary" —
+  # without `-q`, grep must read every line to emit them all, so `git show` always completes.
+  local blob_size
+  blob_size=$(cd "$root" && git cat-file -s HEAD:.ship-config 2>/dev/null) || blob_size=0
+  if [ "$blob_size" -gt 0 ] && ! (cd "$root" && git show HEAD:.ship-config 2>/dev/null) | grep -I '' >/dev/null; then
+    echo "[ship] local gate: .ship-config committed content contains a NUL byte (binary/corrupt) — refusing to parse, ignoring." >&2
+    return 0
+  fi
+  content=$(cd "$root" && git show HEAD:.ship-config 2>/dev/null)
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    case "$line" in
+      ''|'#'*) continue ;;
+      SHIP_LOCAL_TEST_DIR=*|SHIP_LOCAL_TEST_CMD=*|SHIP_AUTO_BUMP=*)
+        key="${line%%=*}"
+        val="${line#*=}"
+        val="$(printf '%s' "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        _ship_config_assign "$key" "$val"
+        ;;
+      *)
+        echo "[ship] local gate: .ship-config: ignoring unrecognized line: $line" >&2 ;;
+    esac
+  done <<< "$content"
+  if [ -n "$SHIP_CFG_DIR" ] && ! _ship_config_dir_is_safe "$SHIP_CFG_DIR"; then
+    echo "[ship] local gate: .ship-config: SHIP_LOCAL_TEST_DIR '$SHIP_CFG_DIR' is not a safe repo-relative subdirectory (absolute, a '..' path component, or '.'/repo root itself — omit the key to mean root) — ignoring the whole file." >&2
+    SHIP_CFG_DIR=""
+    SHIP_CFG_CMD=""
+    SHIP_CFG_AUTO_BUMP=""
+  fi
+}
+
+# True (exit 0) if $1 is a safe repo-relative subdirectory reference: not absolute, no `..`
+# PATH COMPONENT (a component match, not a substring match — a dir legitimately named
+# `v1..2` or `foo..bar` must NOT be rejected), and does not resolve to "the repo root
+# itself" — every path component being `.` (or empty, from a trailing/duplicate slash),
+# e.g. `.`, `./`, `././.` — which would defeat the `mode="root"` pytest-args guarantee in
+# _local_test_try_dir if silently routed through non-root auto-detect. Omit the key
+# instead to scope to root.
+_ship_config_dir_is_safe() {
+  local p="$1" seg all_dot=1
+  local -a _ship_cfg_dir_segs
+  case "$p" in /*) return 1 ;; esac
+  IFS='/' read -ra _ship_cfg_dir_segs <<< "$p"
+  for seg in "${_ship_cfg_dir_segs[@]}"; do
+    [ "$seg" = ".." ] && return 1
+    [ "$seg" != "." ] && [ -n "$seg" ] && all_dot=0
+  done
+  [ "$all_dot" -eq 1 ] && return 1
+  return 0
+}
+
+AUTO_BUMP_DONE=0; AUTO_BUMP_PLANNED=0; AUTO_BUMP_FILE=""; AUTO_BUMP_OLD=""; AUTO_BUMP_NEW=""
+AUTO_BUMP_SHA=""; AUTO_BUMP_LINE=""; AUTO_BUMP_SKIP_REASON=""
+VB_OLDV=""; VB_NEWV=""
+# ERE anchored to the FULL headline ship writes (not a loose substring — an unanchored match
+# would also fire on a human commit that merely mentions the same words). Used by the
+# head-commit probe (_pr_head_is_ship_bump) to recognize a PR whose head is already ship's own
+# bump from an earlier run.
+SHIP_AUTO_BUMP_MSG_RE='^chore\(release\): bump version [^ ]+ -> [^ ]+ \(ship auto-bump for #[0-9]+\)$'
+# The committer email ship's own bump commit carries (set explicitly on the Contents API PUT,
+# see _auto_bump_push) — nothing else in this pipeline ever writes this identity. The
+# review-dwell gate's "was this commit ship's own" test (below) keys on THIS, not on message
+# text: a human's commit, however worded, carries their own git identity and cannot match it
+# without deliberately forging their local git config (out of scope — see the header comment's
+# accepted PATH-trust threat model).
+SHIP_AUTO_BUMP_COMMITTER_EMAIL='ship-auto-bump@noreply.agent-tools.local'
+
+_auto_bump_enabled() {
+  case "${SHIP_AUTO_BUMP:-}" in 0|false|no) return 1 ;; esac
+  [ -n "${SHIP_AUTO_BUMP:-}" ] && return 0
+  _ship_config_load "$ROOT"
+  case "${SHIP_CFG_AUTO_BUMP:-}" in 0|false|no) return 1 ;; esac
+  return 0
+}
+
+# --- BEHIND-clearing helper (#518) — used by both the early BEHIND preflight above and the
+# merge-time auto-bump further below. Kept here (with _auto_bump_enabled / the head-oid
+# primitives) so it is available BEFORE "resolve PR state" runs.
+_pr_head_oid() { gh pr view "$PR" --json headRefOid -q '.headRefOid' 2>/dev/null; }
+
+# Poll until the PR head oid satisfies the predicate: `eq <sha>` (equals) or `ne <sha>` (moved
+# off). GitHub reflects an API commit / an async update-branch merge with a small lag; a
+# caller must not read the OLD head's state as if it were the new commit's.
+_wait_pr_head_oid() {  # $1 = eq|ne, $2 = sha
+  local deadline now oid; deadline=$(( $(date +%s) + ${SHIP_AUTO_BUMP_HEAD_WAIT:-90} ))
+  while :; do
+    oid=$(_pr_head_oid) || oid=""
+    case "$1" in
+      eq) [ -n "$oid" ] && [ "$oid" = "$2" ] && return 0 ;;
+      ne) [ -n "$oid" ] && [ "$oid" != "$2" ] && return 0 ;;
+    esac
+    now=$(date +%s); [ "$now" -ge "$deadline" ] && return 1
+    sleep "${SHIP_AUTO_BUMP_HEAD_POLL:-3}"
+  done
+}
+
+# Generic BEHIND-clearing attempt: ask GitHub to merge the PR's base into its head, wait for
+# the head to move, then re-read mergeStateStatus. Leaves $MERGE_STATE updated on success;
+# a failed/conflicting update or an unreadable base/head leaves $MERGE_STATE untouched (still
+# BEHIND), and the caller's own refusal fires exactly as before. Never exits non-zero itself —
+# it only ever improves the odds of the refusal below not firing.
+behind_clear_pr_branch_via_update_api() {
+  echo "[ship] PR #$PR is BEHIND its base — attempting to update it via the GitHub API before refusing (#518) ..." >&2
+  local base head out
+  base=$(gh pr view "$PR" --json baseRefName -q '.baseRefName' 2>/dev/null) || base=""
+  case "$base" in ''|-*|*[!A-Za-z0-9._/-]*) base="" ;; esac
+  head=$(_pr_head_oid) || head=""
+  if [ -z "$base" ] || [ -z "$head" ]; then
+    echo "[ship] could not read PR #$PR's base/head to attempt the update — falling through to the BEHIND refusal." >&2
+    return 0
+  fi
+  if ! out=$(gh api -X PUT "repos/{owner}/{repo}/pulls/$PR/update-branch" -f expected_head_sha="$head" 2>&1); then
+    echo "[ship] could not update PR #$PR from ${base} (${out}) — falling through to the BEHIND refusal." >&2
+    return 0
+  fi
+  if ! _wait_pr_head_oid ne "$head"; then
+    echo "[ship] update-branch was accepted for PR #$PR but its head did not move within ${SHIP_AUTO_BUMP_HEAD_WAIT:-90}s — falling through to the BEHIND refusal." >&2
+    return 0
+  fi
+  MERGE_STATE=$(gh pr view "$PR" --json mergeStateStatus -q '.mergeStateStatus' 2>/dev/null) || true
+  if [ "$MERGE_STATE" = "BEHIND" ]; then
+    echo "[ship] updated PR #$PR from ${base} but it is still reported BEHIND — falling through to the refusal." >&2
+  else
+    echo "[ship] updated PR #$PR from ${base} — no longer BEHIND (mergeStateStatus=${MERGE_STATE:-unknown})." >&2
+  fi
+}
+
+
 MAIN_CHECKOUT="${SHIP_MAIN_CHECKOUT:-$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')}"
 # Guard the MAIN checkout NOW — ship's post-merge refresh runs git ops against it (checkout /
 # fetch / pull), which would fail opaquely under core.bare. Firing before the merge means a
@@ -529,6 +718,24 @@ read -r BRANCH STATE MERGEABLE CROSS_REPO MERGE_STATE < <(gh pr view "$PR" \
 [ -n "$BRANCH" ] || { echo "Could not resolve PR #$PR" >&2; exit 1; }
 [ "$STATE" = "OPEN" ] || { echo "Refusing: PR #$PR is $STATE, not OPEN." >&2; exit 1; }
 [ "$MERGEABLE" = "CONFLICTING" ] && { echo "Refusing: PR #$PR is CONFLICTING — resolve the conflict first." >&2; exit 1; }
+
+# --- BEHIND: try to catch the branch up via the GitHub API before refusing (#518) -------
+# `mergeStateStatus=BEHIND` fires whenever ANY prior merge moved base ahead under a
+# require-branches-to-be-up-to-date ruleset — not only when THIS PR's own version line
+# diverged (that narrower case is handled again, more specifically, by the merge-time
+# auto-bump below). Without this, #518's own acceptance criterion ("two PRs shipped back
+# to back both merge without a conflict") would still need a human `gh pr update-branch`
+# on any repo enforcing that ruleset the instant the FIRST of the two merges — silently
+# reintroducing exactly the manual-rebase chore #518 exists to remove, on its own headline
+# scenario. So: when the auto-bump is not opted out and this is a same-repo, non-fork
+# invocation, ask GitHub to update the branch from its base BEFORE giving up on BEHIND.
+# A REAL content conflict in that update (not merely "behind") still refuses below, same
+# as before. Skipped entirely under --dry-run (a real remote write, not a local no-op).
+if [ "${MERGE_STATE:-}" = "BEHIND" ] && [ "$DRY_RUN" != "1" ] \
+   && [ "${_FOREIGN_REPO_INVOKE:-0}" != "1" ] && [ "${CROSS_REPO:-false}" != "true" ] \
+   && _auto_bump_enabled; then
+  behind_clear_pr_branch_via_update_api
+fi
 if [ "${MERGE_STATE:-}" = "BEHIND" ]; then
   echo "Refusing: PR #$PR head is BEHIND its base. Update it (gh pr update-branch $PR --rebase), wait for CI, re-run." >&2
   exit 1
@@ -725,12 +932,12 @@ ci_appears_structurally_down() {
   return 0
 }
 
-# Parse the audited per-repo config file $root/.ship-config, if present. Sets two globals
+# Parse the audited per-repo config file $root/.ship-config, if present. Sets three globals
 # for the caller: SHIP_CFG_DIR, SHIP_CFG_CMD and SHIP_CFG_AUTO_BUMP (each "" when unset/absent/
-# rejected). Only whole-line `#` comments and the three whitelisted `KEY=value` keys are recognized — the file
-# is never eval'd itself. Any non-blank, non-comment line that doesn't match one of the two
-# keys is logged and ignored (not silently dropped) so a typo doesn't silently downgrade the
-# gate to auto-detection.
+# rejected). Only whole-line `#` comments and the three whitelisted `KEY=value` keys are
+# recognized — the file is never eval'd itself. Any non-blank, non-comment line that doesn't
+# match one of the three keys is logged and ignored (not silently dropped) so a typo doesn't
+# silently downgrade the gate to auto-detection.
 #
 # The file is read from the last COMMITTED content at HEAD (`git show HEAD:.ship-config`),
 # never the working tree — the "audited, committed" trust story in the header doc is an
@@ -742,7 +949,7 @@ ci_appears_structurally_down() {
 #
 # SHIP_LOCAL_TEST_DIR is rejected (logged) if it is an absolute path, contains a `..`
 # component, or resolves to the repo root itself (`.`, `./`, or any all-`.`-segments path).
-# Rejection invalidates the WHOLE file (both keys cleared), not just the DIR — a rejected
+# Rejection invalidates the WHOLE file (all three keys cleared), not just the DIR — a rejected
 # dir alongside a still-present SHIP_LOCAL_TEST_CMD must not silently relocate that command
 # to run from the repo root instead of the (rejected) directory the author asked for; that
 # would verify a different suite than intended. Detection then proceeds exactly as if the
@@ -756,113 +963,6 @@ ci_appears_structurally_down() {
 # eval'd shell regardless of DIR.
 # Route one whitelisted `.ship-config` key to its SHIP_CFG_* variable (the whitelist itself is
 # the `case` in _ship_config_load; an unlisted key never reaches here).
-_ship_config_assign() {  # $1 = key, $2 = trimmed value
-  case "$1" in
-    SHIP_LOCAL_TEST_DIR) SHIP_CFG_DIR="$2" ;;
-    SHIP_LOCAL_TEST_CMD) SHIP_CFG_CMD="$2" ;;
-    SHIP_AUTO_BUMP) SHIP_CFG_AUTO_BUMP="$2" ;;
-  esac
-}
-
-_ship_config_load() {
-  local root="$1" content line key val
-  SHIP_CFG_DIR=""
-  SHIP_CFG_CMD=""
-  SHIP_CFG_AUTO_BUMP=""
-  if ! (cd "$root" && git show HEAD:.ship-config) >/dev/null 2>&1; then
-    [ -f "$root/.ship-config" ] && \
-      echo "[ship] local gate: .ship-config exists in the working tree but is not committed at HEAD — ignoring (uncommitted config is not audited)." >&2
-    return 0
-  fi
-  # HEAD:.ship-config must be a REGULAR FILE — mode 100644/100755, checked via `git ls-tree`,
-  # not merely `git cat-file -t` == blob. Two non-regular tree entries are ALSO type `blob`
-  # and would slip past a bare type check:
-  #   - A TREE (someone committed a `.ship-config/` directory): `git show`/`git cat-file -s`
-  #     both succeed on it and print a tree listing — tree entry names are plain filenames
-  #     that can legally contain `=` and spaces, so an entry literally named
-  #     `SHIP_LOCAL_TEST_CMD=<cmd>` would otherwise flow into the KEY=value parser below as
-  #     if it were committed file CONTENT.
-  #   - A SYMLINK (git mode 120000, e.g. `.ship-config -> /some/attacker/path`): its blob
-  #     content is the link TARGET STRING, not test-runner config — `git cat-file -t` reports
-  #     `blob` for symlinks too, so a type-only check would parse a target path as if it were
-  #     a committed KEY=value line.
-  # `git ls-tree` reports the tree ENTRY's mode (unlike `cat-file -t`, which resolves to the
-  # blob's own type and can't distinguish a symlink's blob from a regular file's blob).
-  local head_mode
-  head_mode=$(cd "$root" && git ls-tree HEAD -- .ship-config 2>/dev/null | awk '{print $1}')
-  case "$head_mode" in
-    100644|100755) ;;
-    *)
-      echo "[ship] local gate: .ship-config at HEAD is not a regular file (mode ${head_mode:-unknown}, not 100644/100755) — ignoring." >&2
-      return 0
-      ;;
-  esac
-  # NUL-byte guard: bash silently STRIPS NUL bytes when a command substitution's output
-  # becomes a variable's value (below), which could turn a byte sequence that never spells
-  # a whitelisted key in the actual committed bytes (e.g. `SHIP_LOCAL_TEST_C<NUL>MD=...`)
-  # into one that does once assigned to $content. Check the RAW git-show output (piped
-  # straight to grep, never touching a bash variable) for a NUL byte first and refuse to
-  # parse at all if found — a legitimate KEY=value text config never contains one. `grep -I`
-  # (without `-a`) treats a NUL-containing input as binary and reports NO match even against
-  # the empty pattern, while a plain-text input matches the (vacuously true) empty pattern —
-  # note this is NOT `grep -a $'\0'`: bash's ANSI-C quoting truncates at the first NUL, so
-  # that pattern silently becomes an EMPTY string and would match (and thus "reject") every
-  # normal file — a bug caught by this diff's own test suite before it shipped. A genuinely
-  # empty (0-byte) file ALSO fails `grep -I ''` (no lines to match at all) despite having no
-  # NUL byte, so that case is excluded via a blob-size check first. Deliberately NOT `-q`:
-  # under this script's `set -o pipefail`, `grep -q` can exit (and close its stdin pipe) as
-  # soon as it sees a match, which for a config larger than the OS pipe buffer would SIGPIPE
-  # the upstream `git show` and misreport a perfectly valid large text file as "binary" —
-  # without `-q`, grep must read every line to emit them all, so `git show` always completes.
-  local blob_size
-  blob_size=$(cd "$root" && git cat-file -s HEAD:.ship-config 2>/dev/null) || blob_size=0
-  if [ "$blob_size" -gt 0 ] && ! (cd "$root" && git show HEAD:.ship-config 2>/dev/null) | grep -I '' >/dev/null; then
-    echo "[ship] local gate: .ship-config committed content contains a NUL byte (binary/corrupt) — refusing to parse, ignoring." >&2
-    return 0
-  fi
-  content=$(cd "$root" && git show HEAD:.ship-config 2>/dev/null)
-  while IFS= read -r line || [ -n "$line" ]; do
-    line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    case "$line" in
-      ''|'#'*) continue ;;
-      SHIP_LOCAL_TEST_DIR=*|SHIP_LOCAL_TEST_CMD=*|SHIP_AUTO_BUMP=*)
-        key="${line%%=*}"
-        val="${line#*=}"
-        val="$(printf '%s' "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-        _ship_config_assign "$key" "$val"
-        ;;
-      *)
-        echo "[ship] local gate: .ship-config: ignoring unrecognized line: $line" >&2 ;;
-    esac
-  done <<< "$content"
-  if [ -n "$SHIP_CFG_DIR" ] && ! _ship_config_dir_is_safe "$SHIP_CFG_DIR"; then
-    echo "[ship] local gate: .ship-config: SHIP_LOCAL_TEST_DIR '$SHIP_CFG_DIR' is not a safe repo-relative subdirectory (absolute, a '..' path component, or '.'/repo root itself — omit the key to mean root) — ignoring the whole file." >&2
-    SHIP_CFG_DIR=""
-    SHIP_CFG_CMD=""
-    SHIP_CFG_AUTO_BUMP=""
-  fi
-}
-
-# True (exit 0) if $1 is a safe repo-relative subdirectory reference: not absolute, no `..`
-# PATH COMPONENT (a component match, not a substring match — a dir legitimately named
-# `v1..2` or `foo..bar` must NOT be rejected), and does not resolve to "the repo root
-# itself" — every path component being `.` (or empty, from a trailing/duplicate slash),
-# e.g. `.`, `./`, `././.` — which would defeat the `mode="root"` pytest-args guarantee in
-# _local_test_try_dir if silently routed through non-root auto-detect. Omit the key
-# instead to scope to root.
-_ship_config_dir_is_safe() {
-  local p="$1" seg all_dot=1
-  local -a _ship_cfg_dir_segs
-  case "$p" in /*) return 1 ;; esac
-  IFS='/' read -ra _ship_cfg_dir_segs <<< "$p"
-  for seg in "${_ship_cfg_dir_segs[@]}"; do
-    [ "$seg" = ".." ] && return 1
-    [ "$seg" != "." ] && [ -n "$seg" ] && all_dot=0
-  done
-  [ "$all_dot" -eq 1 ] && return 1
-  return 0
-}
-
 # True (exit 0) if $2 (a real, existing directory) is a STRICT physical descendant of $1
 # (root) — i.e. inside it, but not equal to it — resolving symlinks on BOTH sides via
 # `cd ... && pwd -P`. _ship_config_dir_is_safe only checks the CONFIGURED string lexically
@@ -1521,20 +1621,6 @@ local_branch_sanity_check() {
 # NOTHING is pushed. Fail-closed on the push: a rejected API write refuses the ship with the
 # API's reason and nothing is merged; a red CI after the bump refuses in the green-CI gate
 # (the bump commit stays on the branch — a re-run sees the PR as already bumped).
-AUTO_BUMP_DONE=0; AUTO_BUMP_PLANNED=0; AUTO_BUMP_FILE=""; AUTO_BUMP_OLD=""; AUTO_BUMP_NEW=""
-AUTO_BUMP_SHA=""; AUTO_BUMP_LINE=""; AUTO_BUMP_SKIP_REASON=""
-VB_OLDV=""; VB_NEWV=""
-# ERE for the commit message ship writes; the dwell query and the head-commit probe key on it.
-SHIP_AUTO_BUMP_MSG_RE='\(ship auto-bump for #[0-9]+\)'
-
-_auto_bump_enabled() {
-  case "${SHIP_AUTO_BUMP:-}" in 0|false|no) return 1 ;; esac
-  [ -n "${SHIP_AUTO_BUMP:-}" ] && return 0
-  _ship_config_load "$ROOT"
-  case "${SHIP_CFG_AUTO_BUMP:-}" in 0|false|no) return 1 ;; esac
-  return 0
-}
-
 # Strict X.Y.Z only (the only shape ship can bump unambiguously). Prints "X Y Z" or fails.
 _semver_parts() {  # $1 = version
   case "$1" in
@@ -1583,26 +1669,11 @@ _remote_file_fetch() {  # $1 = path, $2 = ref
   raw=$(gh api "repos/{owner}/{repo}/contents/$1?ref=$2" --jq '.sha + " " + (.content | gsub("\n"; ""))' 2>/dev/null) || return 1
   RF_SHA=${raw%% *}; b64=${raw#* }
   [ -n "$RF_SHA" ] && [ "$RF_SHA" != "$raw" ] || return 1
-  RF_CONTENT=$(printf '%s' "$b64" | base64 -d 2>/dev/null && printf x) || return 1
+  # `-d` is GNU/modern-macOS base64; `-D` is the BSD form on macOS <= 12 (Monterey) — try both
+  # so this doesn't silently "skip" the whole feature with a misleading "could not read"
+  # reason on an older Mac (P3 review finding, #518).
+  RF_CONTENT=$( { printf '%s' "$b64" | base64 -d 2>/dev/null || printf '%s' "$b64" | base64 -D 2>/dev/null; } && printf x) || return 1
   RF_CONTENT=${RF_CONTENT%x}
-}
-
-_pr_head_oid() { gh pr view "$PR" --json headRefOid -q '.headRefOid' 2>/dev/null; }
-
-# Poll until the PR head oid satisfies the predicate: `eq <sha>` (equals) or `ne <sha>` (moved
-# off). GitHub reflects an API commit / an async update-branch merge with a small lag; the
-# green-CI gate must not read the OLD head's rollup as if it were the new commit's.
-_wait_pr_head_oid() {  # $1 = eq|ne, $2 = sha
-  local deadline now oid; deadline=$(( $(date +%s) + ${SHIP_AUTO_BUMP_HEAD_WAIT:-90} ))
-  while :; do
-    oid=$(_pr_head_oid) || oid=""
-    case "$1" in
-      eq) [ -n "$oid" ] && [ "$oid" = "$2" ] && return 0 ;;
-      ne) [ -n "$oid" ] && [ "$oid" != "$2" ] && return 0 ;;
-    esac
-    now=$(date +%s); [ "$now" -ge "$deadline" ] && return 1
-    sleep "${SHIP_AUTO_BUMP_HEAD_POLL:-3}"
-  done
 }
 
 # Merge the base branch into the PR head via GitHub (the "Update branch" button): a GitHub-made,
@@ -1630,8 +1701,15 @@ _auto_bump_push() {  # $1 = blob sha of the file at the current head; reads $AB_
   msg="chore(release): bump version ${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW} (ship auto-bump for #${PR})"
   b64=$(printf '%s' "$AB_NEW_CONTENT" | base64 | tr -d '\n')
   echo "[ship] auto-bump: committing ${AUTO_BUMP_FILE} ${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW} onto ${BRANCH} via the Contents API ..."
+  # author/committer are set explicitly (not left to the authenticated token's own identity) so
+  # the commit carries a fixed, recognizable identity nothing else in this pipeline ever writes —
+  # the review-dwell gate's "is this ship's own commit" test keys on committer.email, not on
+  # message text (see SHIP_AUTO_BUMP_COMMITTER_EMAIL's own comment for why that matters).
   if ! out=$(gh api -X PUT "repos/{owner}/{repo}/contents/${AUTO_BUMP_FILE}" \
-        -f message="$msg" -f content="$b64" -f sha="$1" -f branch="$BRANCH" --jq '.commit.sha' 2>&1); then
+        -f message="$msg" -f content="$b64" -f sha="$1" -f branch="$BRANCH" \
+        -f author[name]="ship (auto-bump)" -f author[email]="$SHIP_AUTO_BUMP_COMMITTER_EMAIL" \
+        -f committer[name]="ship (auto-bump)" -f committer[email]="$SHIP_AUTO_BUMP_COMMITTER_EMAIL" \
+        --jq '.commit.sha' 2>&1); then
     { echo "Refusing: the version-bump commit was REJECTED by GitHub (Contents API PUT on ${BRANCH}): ${out}"
       echo "  Nothing was merged. Fix the cause (branch moved? push permission? protected head branch?) and re-run ship, or bump ${AUTO_BUMP_FILE} by hand and push."; } >&2
     exit 1
@@ -1716,10 +1794,10 @@ _auto_bump_decide() {
   AB_BASE_REF=$(gh pr view "$PR" --json baseRefName -q '.baseRefName' 2>/dev/null) || AB_BASE_REF=""
   case "$AB_BASE_REF" in ''|-*|*[!A-Za-z0-9._/-]*) AB_BASE_REF="$DEFAULT_BRANCH" ;; esac
   _remote_file_fetch "$VFILE" "$AB_BASE_REF" || { AUTO_BUMP_SKIP_REASON="could not read $VFILE on $AB_BASE_REF through the GitHub API"; return 1; }
-  AB_BASEV=$(printf '%s' "$RF_CONTENT" | _version_value_of_content); AB_BASE_CONTENT="$RF_CONTENT"
+  AB_BASEV=$(printf '%s' "$RF_CONTENT" | _version_value_of_content) || true; AB_BASE_CONTENT="$RF_CONTENT"
   _remote_file_fetch "$VFILE" "$BRANCH" || { AUTO_BUMP_SKIP_REASON="could not read $VFILE on $BRANCH through the GitHub API"; return 1; }
   AB_HEAD_BLOB="$RF_SHA"; AB_HEAD_CONTENT="$RF_CONTENT"
-  AB_HEADV=$(printf '%s' "$RF_CONTENT" | _version_value_of_content)
+  AB_HEADV=$(printf '%s' "$RF_CONTENT" | _version_value_of_content) || true
   [ -n "$AB_BASEV" ] && [ -n "$AB_HEADV" ] || { AUTO_BUMP_SKIP_REASON="could not parse the version value of $VFILE on $AB_BASE_REF/$BRANCH"; return 1; }
   if [ -n "$VB_NEWV" ] && [ "$VB_NEWV" != "$VB_OLDV" ]; then
     # The PR bumps by hand. Past the base = a deliberate minor/major (or a patch nobody raced):
@@ -1755,7 +1833,7 @@ run_merge_time_auto_bump() {
       _auto_bump_update_branch "$head_oid" "$AB_BASE_REF"
       _remote_file_fetch "$VFILE" "$BRANCH" || { echo "Refusing: could not re-read $VFILE on $BRANCH after updating it from $AB_BASE_REF. Nothing was merged." >&2; exit 1; }
       AB_HEAD_BLOB="$RF_SHA"; AB_HEAD_CONTENT="$RF_CONTENT"
-      AB_HEADV=$(printf '%s' "$RF_CONTENT" | _version_value_of_content)
+      AB_HEADV=$(printf '%s' "$RF_CONTENT" | _version_value_of_content) || true
       [ "$AB_HEADV" = "$AB_BASEV" ] || { echo "Refusing: after updating ${BRANCH} from ${AB_BASE_REF}, $VFILE reads ${AB_HEADV:-<none>} there but ${AB_BASEV} on ${AB_BASE_REF} — not a state ship can bump safely. Nothing was merged." >&2; exit 1; }
     fi
   fi
@@ -1769,7 +1847,7 @@ run_merge_time_auto_bump() {
     AUTO_BUMP_SKIP_REASON="could not rewrite the version line of $VFILE (value '$AUTO_BUMP_OLD' not found on it) — bump it by hand"; AUTO_BUMP_FILE=""
     echo "[ship] auto-bump: skipped — ${AUTO_BUMP_SKIP_REASON}." >&2; return 0
   fi
-  AUTO_BUMP_LINE=$(printf '%s' "$AB_NEW_CONTENT" | _version_line_number_of_content)
+  AUTO_BUMP_LINE=$(printf '%s' "$AB_NEW_CONTENT" | _version_line_number_of_content) || true
   if [ "$DRY_RUN" = "1" ]; then
     echo "[dry-run] would bump ${AUTO_BUMP_FILE} ${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW} on ${BRANCH} via the GitHub Contents API (commit 'chore(release): bump version ${AUTO_BUMP_OLD} -> ${AUTO_BUMP_NEW} (ship auto-bump for #${PR})'); nothing pushed."
     AUTO_BUMP_PLANNED=1; _auto_bump_audit_log "version-bump:auto"; return 0
@@ -2066,21 +2144,31 @@ fi
 # nits on THEIR OWN code, which needs an opt-in; this closes a bot nit on a line SHIP wrote,
 # after the shipper had no chance to see it (the commit is made mid-ship) — leaving it to block
 # would make every auto-bumped ship refuse on a thread nobody authored and nobody can act on.
+# Eligibility reuses the SAME readable-body + high-severity-marker guards as
+# --resolve-addressed-threads (#285, RESOLVE_ELIGIBLE_JQ above) — a bot flagging "P1: this must
+# be a MAJOR bump, do not merge as patch" on the version line must still block, exactly as it
+# would under that flag; only the login/all-bot and path+line checks differ.
 _pr_head_is_ship_bump() {
   local headline
   headline=$(gh pr view "$PR" --json commits -q '.commits[-1].messageHeadline // ""' 2>/dev/null) || return 1
   printf '%s' "$headline" | grep -Eq "$SHIP_AUTO_BUMP_MSG_RE"
 }
-BUMP_THREAD_Q='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved path line originalLine comments(first:100){totalCount nodes{author{login}}}}}}}}'
+BUMP_THREAD_Q='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved path line originalLine comments(first:100){totalCount nodes{author{login} body}}}}}}}'
 _bump_line_eligible_jq() {  # $1 = version file path, $2 = version line number -> prints the jq filter
   local f; f=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')
-  printf '%s' '[.data.repository.pullRequest.reviewThreads.nodes[]
+  printf '%s' 'def readable_body:
+    if type == "string" then (gsub("[^[:alnum:]]"; "") | length) > 0 else false end;
+  def has_high_severity_marker:
+    test("(^|[^[:alnum:]])(p0|p1|critical|blocker|security)($|[^[:alnum:]])"; "i");
+  [.data.repository.pullRequest.reviewThreads.nodes[]
   | select(.isResolved == false)
   | select(.path == "'"$f"'")
   | select(.line == '"$2"' or .originalLine == '"$2"')
   | select((.comments.nodes | length) > 0)
   | select(.comments.totalCount != null and (.comments.nodes | length) >= .comments.totalCount)
   | select([.comments.nodes[].author.login // ""] | all(. as $l | ($l | endswith("[bot]")) or ($l == "chatgpt-codex-connector") or ($l == "codex-review-bot")))
+  | select([.comments.nodes[].body | readable_body] | all)
+  | select([.comments.nodes[].body | has_high_severity_marker] | any | not)
   | .id] | .[]'
 }
 resolve_bump_line_bot_threads() {
@@ -2089,7 +2177,7 @@ resolve_bump_line_bot_threads() {
     # Bump made by an earlier run: relocate the file + line from the current head content.
     file=$(locate_version_file) || return 0
     _remote_file_fetch "$file" "$BRANCH" || return 0
-    line=$(printf '%s' "$RF_CONTENT" | _version_line_number_of_content)
+    line=$(printf '%s' "$RF_CONTENT" | _version_line_number_of_content) || true
   fi
   case "$line" in ''|*[!0-9]*) return 0 ;; esac
   ids=$(gh api graphql --paginate -F owner='{owner}' -F name='{repo}' -F pr="$PR" \
@@ -2176,18 +2264,38 @@ else
   #
   # SHIP'S OWN COMMITS DO NOT RESET THE CLOCK (#518): the merge-time auto-bump adds a commit on
   # the head branch (and, when the base had moved, an update-branch merge commit right before
-  # it). Neither carries reviewable code from the PR author, so the window is measured from the
-  # last NON-ship push: the last 3 commits are fetched and a trailing `(ship auto-bump for #N)`
-  # commit — plus the `Merge branch '<base>' into <head>` commit immediately preceding it — is
-  # skipped. Only that exact trailing shape is skipped (a human's merge-from-base without a bump
-  # behind it still counts as a push: it may carry conflict resolutions a reviewer should see).
-  DWELL_Q='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){createdAt commits(last:3){nodes{commit{message committedDate pushedDate}}} timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{__typename ... on HeadRefForcePushedEvent{createdAt}}}}}}'
-  DWELL_JQ='def is_bump: ((.commit.message // "") | test("\\(ship auto-bump for #[0-9]+\\)"));
+  # it), possibly MORE THAN ONCE (a red-CI refusal leaves the bump on the branch; a later re-run
+  # can update-branch + re-bump again on top of it). Neither carries reviewable code from the PR
+  # author, so the window is measured from the last NON-ship push: fetch a generous lookback
+  # (last:15 — comfortably wider than any realistic stack of ship attempts) and, from the END,
+  # repeatedly peel a trailing commit ship itself authored, plus (each time) one immediately
+  # preceding merge-shaped commit, until the trailing commit is no longer ship's own.
+  #
+  # "Ship's own" is decided by COMMITTER IDENTITY, not message text (Opus/GLM review, #518): the
+  # Contents API PUT that authors the bump (see _auto_bump_push) sets an explicit, fixed
+  # committer email nothing else in this pipeline ever writes — a human's commit, however it is
+  # worded, carries THEIR OWN git identity and can only match this by deliberately forging their
+  # local git config, the same PATH-level trust this file's header already accepts as out of
+  # scope ("a shipper who fully controls the ship PROCESS's PATH can defeat ANY gate"). An
+  # earlier revision matched the BUMP COMMIT'S OWN MESSAGE substring instead — genuinely
+  # forgeable by an innocent human commit that happens to contain the same words, and (with a
+  # fixed depth-2 peel) either under- or over-skipped once ship had bumped a PR more than once.
+  # The MERGE commit peeled alongside a recognized bump is still matched by MESSAGE SHAPE only
+  # (GitHub's own update-branch merge commit message isn't otherwise distinguishable from a
+  # human's identically-worded `git merge <base>`) — a documented, narrow residual: a human's own
+  # conflict-resolution merge landing IMMEDIATELY before a ship re-bump is swept along with it.
+  DWELL_Q='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){createdAt commits(last:15){nodes{commit{message committedDate pushedDate committer{email}}}} timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{__typename ... on HeadRefForcePushedEvent{createdAt}}}}}}'
+  DWELL_JQ='def is_bump: ((.commit.committer.email // "") == "'"$SHIP_AUTO_BUMP_COMMITTER_EMAIL"'");
     def is_merge: ((.commit.message // "") | test("^Merge (remote-tracking )?branch \\x27[^\\x27]+\\x27 into "));
+    def peel:
+      if length == 0 then .
+      elif (.[-1] | is_bump) then
+        (.[:-1]) as $r1
+        | (if ($r1|length) > 0 and ($r1[-1] | is_merge) then ($r1[:-1] | peel) else ($r1 | peel) end)
+      else . end;
     .data.repository.pullRequest
-    | (.commits.nodes // []) as $n | ($n | length) as $L
-    | (if $L >= 1 and ($n[-1] | is_bump) then (if $L >= 2 and ($n[-2] | is_merge) then $n[:-2] else $n[:-1] end) else $n end) as $rest
-    | (($rest | last) // $n[-1] // {}) as $c
+    | (.commits.nodes // []) as $n
+    | (($n | peel | last) // $n[-1] // {}) as $c
     | [.createdAt, ($c.commit.pushedDate // ""), ($c.commit.committedDate // ""), (.timelineItems.nodes[0].createdAt // "")] | @tsv'
   if DWELL_RAW=$(gh api graphql -F owner='{owner}' -F name='{repo}' -F pr="$PR" -f query="$DWELL_Q" \
        --jq "$DWELL_JQ" 2>/dev/null); then
@@ -2287,7 +2395,6 @@ else
   fi
 fi
 
-# --- screenshot gate (optional uploader + UI-touching check) ---------------------------
 # --- screenshot gate (optional uploader + UI-touching check) ---------------------------
 # Compose the SHIP_IMAGE_UPLOAD_CMD template with `replacement` spliced in wherever `{FILE}`
 # appears — bare (`{FILE}`) or wrapped in its OWN dedicated matching quotes (`"{FILE}"` /

@@ -48,7 +48,8 @@ case "$sub" in
     case "$action" in
       view)
         if grep -q -- '--json reviews' <<<"$argstr"; then echo "${SHIP_TEST_REVIEW_COUNT:-1}"
-        elif grep -q headRefName <<<"$argstr"; then printf '%s\tOPEN\tMERGEABLE\t%s\tCLEAN\n' "$B" "${SHIP_TEST_CROSS_REPO:-false}"
+        elif grep -q -- '--json mergeStateStatus' <<<"$argstr"; then echo "${SHIP_TEST_MERGE_STATE_AFTER:-CLEAN}"
+        elif grep -q headRefName <<<"$argstr"; then printf '%s\tOPEN\tMERGEABLE\t%s\t%s\n' "$B" "${SHIP_TEST_CROSS_REPO:-false}" "${SHIP_TEST_MERGE_STATE:-CLEAN}"
         elif grep -q statusCheckRollup <<<"$argstr"; then
           git_c fetch -q origin
           msg=$(git_c log -1 --format=%s "origin/$B")
@@ -76,6 +77,7 @@ case "$sub" in
   api)
     method=GET; endpoint=""; jqexpr=""
     F_message=""; F_content=""; F_sha=""; F_branch=""; F_expected=""; F_query=""; F_id=""
+    F_committer_email=""; F_committer_name=""
     while [ $# -gt 0 ]; do
       case "$1" in
         -X) method="$2"; shift 2 ;;
@@ -83,6 +85,7 @@ case "$sub" in
           case "$k" in
             message) F_message="$v" ;; content) F_content="$v" ;; sha) F_sha="$v" ;; branch) F_branch="$v" ;;
             expected_head_sha) F_expected="$v" ;; query) F_query="$v" ;; id) F_id="$v" ;;
+            committer\[email\]) F_committer_email="$v" ;; committer\[name\]) F_committer_name="$v" ;;
           esac ;;
         --jq) jqexpr="$2"; shift 2 ;;
         -*) shift ;;
@@ -101,9 +104,18 @@ case "$sub" in
         elif grep -q committedDate <<<"$F_query"; then
           git_c fetch -q origin
           # A PR's commit list = commits reachable from head but not from base (a merge FROM base
-          # is in it; base's own commits are not), chronological; ship asks for the last 3.
-          nodes=$(TZ=UTC git_c log --reverse --date=format-local:%Y-%m-%dT%H:%M:%SZ --format='%s%x1f%cd' "origin/main..origin/$B" \
-            | tail -3 | jq -R -s 'split("\n") | map(select(length>0)) | map(split("") | {commit:{message:.[0], committedDate:.[1], pushedDate:null}})')
+          # is in it; base's own commits are not), chronological; ship asks for the last 15. Build
+          # each node's JSON via jq (one commit at a time) rather than a hand-rolled control-byte
+          # field separator in the git-log format string -- a literal separator byte embedded in a
+          # bash script is invisible and fragile (a real review finding on this file, #518).
+          nodes='[]'
+          for _sha in $(git_c log --reverse --format=%H "origin/main..origin/$B" | tail -15); do
+            _msg=$(git_c log -1 --format=%s "$_sha")
+            _cdate=$(TZ=UTC git_c log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd "$_sha")
+            _cemail=$(git_c log -1 --format=%ce "$_sha")
+            nodes=$(jq --arg msg "$_msg" --arg cd "$_cdate" --arg ce "$_cemail" \
+              '. + [{commit:{message:$msg, committedDate:$cd, pushedDate:null, committer:{email:$ce}}}]' <<<"$nodes")
+          done
           jq -n --argjson nodes "$nodes" --arg created "${SHIP_TEST_CREATED:-2020-01-01T00:00:00Z}" \
             '{data:{repository:{pullRequest:{createdAt:$created, commits:{nodes:$nodes}, timelineItems:{nodes:[]}}}}}' | jq -r "$jqexpr"
         else echo 0; fi ;;
@@ -122,7 +134,15 @@ case "$sub" in
           [ "$cur" = "$F_sha" ] || { echo "gh: $file does not match $F_sha (HTTP 409)" >&2; exit 1; }
           git_c checkout -q -B "$F_branch" "origin/$F_branch"
           printf '%s' "$F_content" | base64 -d > "$C/$file"
-          git_c add -- "$file"; git_c commit -q -m "$F_message"; git_c push -q origin "$F_branch"
+          git_c add -- "$file"
+          # Real GitHub Contents API honours an explicit author/committer object -- ship.sh
+          # (#518) always sends one so the review-dwell gate can recognize its own commit by
+          # COMMITTER IDENTITY rather than by message text (see SHIP_AUTO_BUMP_COMMITTER_EMAIL
+          # in ship.sh). GIT_COMMITTER_* env wins over the `-c user.email=` baked into git_c().
+          GIT_AUTHOR_NAME="${F_committer_name:-t}" GIT_AUTHOR_EMAIL="${F_committer_email:-t@t}" \
+          GIT_COMMITTER_NAME="${F_committer_name:-t}" GIT_COMMITTER_EMAIL="${F_committer_email:-t@t}" \
+          git_c commit -q -m "$F_message"
+          git_c push -q origin "$F_branch"
           jq -n --arg sha "$(git_c rev-parse HEAD)" '{commit:{sha:$sha}}' | jq -r "$jqexpr"
         fi ;;
       repos/*/pulls/*/update-branch)
@@ -590,6 +610,80 @@ def test_package_json_is_bumped_too(tmp_path):
     assert "auto-bump: package.json 2.3.9 -> 2.3.10 committed as" in r.stdout, r.stdout
     assert '"version": "2.3.10"' in _origin_file(origin, "main", "package.json")
     assert _origin_file(origin, "main", "package.json").endswith("}\n"), "byte layout preserved"
+
+
+# ---------------------------------------------------------------------------------------
+# Generic BEHIND-clearing (#518): mergeStateStatus=BEHIND fires whenever ANY prior merge
+# moved base ahead under a require-up-to-date-branches ruleset, independent of whether the
+# version file itself diverged — the acceptance criterion's own headline scenario ("two PRs
+# shipped back to back both merge without a conflict") would otherwise still need a human
+# `gh pr update-branch` the instant the first of the two merges, on such a repo.
+# ---------------------------------------------------------------------------------------
+
+def test_behind_pr_is_updated_and_merges_without_a_manual_rebase(tmp_path):
+    main, origin, state, bindir = _make_world(tmp_path)
+    _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
+    # main must genuinely advance past feat's merge-base -- otherwise update-branch's merge is
+    # a no-op ("already up to date", no new commit) and the head-oid wait below never sees a
+    # change, regardless of what mergeStateStatus the fake claims.
+    _commit_file(main, "src/other.py", "o = 1\n", "feat: unrelated change on main")
+    _git("push", "-q", "origin", "main", cwd=main)
+
+    r = _run_ship(main, bindir, state, "feat", env_extra={
+        "SHIP_TEST_MERGE_STATE": "BEHIND", "SHIP_TEST_MERGE_STATE_AFTER": "CLEAN",
+    })
+
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "PR #1 is BEHIND its base — attempting to update it via the GitHub API" in r.stderr, r.stderr
+    assert "no longer BEHIND" in r.stderr, r.stderr
+    assert "PUT update-branch" in _gh_log(state)
+    assert "[fake gh] merged" in r.stdout
+    assert "head is BEHIND its base. Update it" not in r.stderr
+
+
+def test_behind_pr_with_a_real_conflict_still_refuses(tmp_path):
+    """The update-branch attempt can genuinely conflict (base and the branch both edited the
+    same file differently) -- that still refuses with the original guidance, nothing merged."""
+    main, origin, state, bindir = _make_world(tmp_path)
+    wt = _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
+    _commit_file(wt, "src/a.py", "x = 2\n", "feat: change a.py differently")
+    _git("push", "-q", "-f", "origin", "feat", cwd=wt)
+    _commit_file(main, "src/a.py", "x = 3\n", "chore: conflicting change on main")
+    _git("push", "-q", "origin", "main", cwd=main)
+
+    r = _run_ship(main, bindir, state, "feat", env_extra={"SHIP_TEST_MERGE_STATE": "BEHIND"})
+
+    assert r.returncode != 0, r.stdout
+    assert "attempting to update it via the GitHub API" in r.stderr, r.stderr
+    assert "falling through to the BEHIND refusal" in r.stderr, r.stderr
+    assert "head is BEHIND its base. Update it (gh pr update-branch" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_behind_resolution_skipped_when_auto_bump_opted_out(tmp_path):
+    main, origin, state, bindir = _make_world(tmp_path)
+    _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
+
+    r = _run_ship(main, bindir, state, "feat", env_extra={
+        "SHIP_TEST_MERGE_STATE": "BEHIND", "SHIP_AUTO_BUMP": "0",
+    })
+
+    assert r.returncode != 0, r.stdout
+    assert "attempting to update it via the GitHub API" not in r.stderr, r.stderr
+    assert "PUT update-branch" not in _gh_log(state)
+    assert "head is BEHIND its base. Update it" in r.stderr, r.stderr
+
+
+def test_behind_resolution_skipped_under_dry_run(tmp_path):
+    main, origin, state, bindir = _make_world(tmp_path)
+    _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
+
+    r = _run_ship(main, bindir, state, "feat", "--dry-run", env_extra={"SHIP_TEST_MERGE_STATE": "BEHIND"})
+
+    assert r.returncode != 0, r.stdout
+    assert "attempting to update it via the GitHub API" not in r.stderr, r.stderr
+    assert "PUT update-branch" not in _gh_log(state)
+    assert "head is BEHIND its base. Update it" in r.stderr, r.stderr
 
 
 def test_fork_pr_is_never_written_to(tmp_path):
