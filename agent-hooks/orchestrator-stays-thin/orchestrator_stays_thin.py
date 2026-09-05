@@ -53,18 +53,23 @@ always allowed — this gate governs the orchestrator only.
 
 Harness-exempt (agent-tools#533): this gate's whole premise — a main thread that must delegate
 implementation work to a CC ``Agent``/``Task`` subagent instead of doing it inline — is a Claude
-Code concept. Codex and opencode have no such orchestrator/subagent distinction of their own (no
-trusted subagent identity reaches either bridge today — see ``lib/codex_hook_bridge`` and
-``lib/opencode_hook_bridge``), so every Codex/opencode-sourced event used to look like "the
+Code concept. Codex/opencode DO model a subagent lifecycle of their own (Codex's
+``SubagentStart``/``SubagentStop`` events, opencode's ``task`` tool) but NEITHER bridge exposes a
+TRUSTED per-tool-call subagent identity from it today — see ``lib/codex_hook_bridge`` and
+``lib/opencode_hook_bridge`` — so every Codex/opencode-sourced event used to look like "the
 orchestrator" to ``_is_subagent`` — including a bare Codex CLI session Alex runs directly (which
 is not a CC orchestrator refusing to delegate at all) and a Codex/opencode process spawned by
 another tool as a delegated worker (review-cli's read-only reviewer backend, a CC-dispatched
 subagent). Blocking either one is wrong, and the block message's remediation ("Dispatch a subagent
 ... Agent tool with subagent_type: 'fork'") does not even apply outside Claude Code. So a v1 event
-tagged with a non-CC ``harness`` (set by the bridge, never by ``args`` — see ``EXEMPT_HARNESSES``)
-is exempt from this gate entirely, same as a dispatched subagent. If a Codex/opencode session is
-ever meant to BE the thin orchestrator in someone's setup, that needs an explicit config knob, not
-this hardcoded exemption.
+tagged with a ``harness`` of ``codex`` or ``opencode`` specifically (set by the bridge, never by
+``args`` — see ``EXEMPT_HARNESSES``) is exempt from this gate entirely, same as a dispatched
+subagent. Deliberately an ALLOWLIST of the two known-safe values, not "any non-CC harness": a
+future bridge (``HARNESS = "gemini"``, say) is UNPROVEN here and stays governed until someone
+reviews and adds it — a present-but-unrecognized value is not automatically evidence the gate's
+CC-specific premise doesn't apply to it, only that nobody has confirmed that yet. If a
+Codex/opencode session is ever meant to BE the thin orchestrator in someone's setup, that needs an
+explicit config knob, not a change to this hardcoded exemption.
 
 Per-repo opt-out (Alex tg#5743): default ON; a repo that legitimately works inline on main
 (e.g. 3d-cli) sets `agent_hooks.orchestrator_only: false` in its rig.yaml, or exports

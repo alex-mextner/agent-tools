@@ -158,10 +158,23 @@ _REPRO_CHAIN = (
 
 
 def test_repro_chain_control_warns_then_blocks_with_no_harness(tmp_path, monkeypatch):
-    """Control: with no `harness` tag (today's CC shape) the exact repro chain still trips
-    WARN-then-BLOCK — proving the chain itself is what got misclassified, not some other cause,
-    and setting up the contrast with the harness-exempt cases below."""
+    """Control: with no `harness` tag at all (a hook fixture that predates agent-tools#533, or
+    any future bridge that doesn't set one) the exact repro chain still trips WARN-then-BLOCK —
+    proving the chain itself is what got misclassified, not some other cause, and setting up the
+    contrast with the harness-exempt cases below."""
     event = {"point": "pre-bash", "cwd": "/repo", "args": {"command": _REPRO_CHAIN}}
+    out1, _e, c1 = _run(event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense: advisory WARN
+    out2, _e, c2 = _run(event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"  # repeat: BLOCK
+
+
+def test_repro_chain_still_warns_then_blocks_with_harness_claude_code(tmp_path, monkeypatch):
+    """The actual CC shape (`cc_hook_bridge.HARNESS == "claude-code"`, not just an absent
+    field) must stay GOVERNED — this is the one positive case the allowlist exists to keep
+    blocking, so it needs its own test, not just the omitted-field control above."""
+    event = {"point": "pre-bash", "cwd": "/repo", "harness": "claude-code",
+              "args": {"command": _REPRO_CHAIN}}
     out1, _e, c1 = _run(event, monkeypatch, tmp_path / "m")
     assert c1 == 0 and _decision(out1) == "allow"  # first offense: advisory WARN
     out2, _e, c2 = _run(event, monkeypatch, tmp_path / "m")
@@ -171,23 +184,29 @@ def test_repro_chain_control_warns_then_blocks_with_no_harness(tmp_path, monkeyp
 @pytest.mark.parametrize("harness", ["codex", "opencode"])
 def test_repro_chain_allowed_silently_for_exempt_harness(tmp_path, monkeypatch, harness):
     """The SAME repro chain, tagged with a top-level `harness` a codex/opencode bridge would
-    set, is allowed silently on every call — no WARN, no BLOCK, no tier ever primed."""
+    set, is allowed silently on every call — no WARN, no BLOCK, no tier ever primed. Checks the
+    marker dir directly (not just the decision), since a first-offense WARN also decides
+    "allow" — only an empty marker dir proves no tier was primed at all (Fable review round 3)."""
+    marker_dir = tmp_path / "m"
     event = {"point": "pre-bash", "cwd": "/repo", "harness": harness,
               "args": {"command": _REPRO_CHAIN}}
     for _ in range(3):  # would BLOCK by the second call if harness-exemption didn't short-circuit
-        out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+        out, _e, c = _run(event, monkeypatch, marker_dir)
         assert c == 0 and _decision(out) == "allow"
+    assert not marker_dir.exists() or not list(marker_dir.iterdir())
 
 
 @pytest.mark.parametrize("harness", ["codex", "opencode"])
 def test_exempt_harness_also_exempts_code_write(tmp_path, monkeypatch, harness):
     """Same exemption on the pre-write side: a non-docs code write tagged with an exempt
-    `harness` is allowed even on repeat."""
+    `harness` is allowed even on repeat, and never primes a tier marker either."""
+    marker_dir = tmp_path / "m"
     event = {"point": "pre-write", "cwd": "/repo", "harness": harness,
               "args": {"file_path": "/repo/src/a.ts"}}
-    _run(event, monkeypatch, tmp_path / "m")
-    out, _e, c = _run(event, monkeypatch, tmp_path / "m")
+    _run(event, monkeypatch, marker_dir)
+    out, _e, c = _run(event, monkeypatch, marker_dir)
     assert c == 0 and _decision(out) == "allow"
+    assert not marker_dir.exists() or not list(marker_dir.iterdir())
 
 
 def test_unknown_harness_does_not_exempt(tmp_path, monkeypatch):
@@ -216,6 +235,74 @@ def test_exempt_harnesses_constant_is_codex_and_opencode_only():
     """Documents the allowlist's exact membership — `claude-code` (or anything else) must never
     be added here, or the gate would exempt the very orchestrator it exists to govern."""
     assert ost.EXEMPT_HARNESSES == frozenset({"codex", "opencode"})
+
+
+def test_codex_and_opencode_bridge_harness_constants_are_pinned_to_the_allowlist():
+    """Cross-module regression guard: `EXEMPT_HARNESSES` and the bridges' `HARNESS` constants
+    are independently hardcoded strings in three different files. Nothing else ties them
+    together — a rename on either side (e.g. `codex_hook_bridge.HARNESS` to `"codex-cli"`)
+    would silently reintroduce the #533 block for that harness with an otherwise-green suite,
+    because every OTHER test here hand-builds `{"harness": "codex"}` rather than importing the
+    bridge's own constant. This test is the one place that would catch it."""
+    import cc_hook_bridge.dispatch as cc_dispatch
+    import codex_hook_bridge.dispatch as codex_dispatch
+    import opencode_hook_bridge.dispatch as opencode_dispatch
+
+    assert codex_dispatch.HARNESS in ost.EXEMPT_HARNESSES
+    assert opencode_dispatch.HARNESS in ost.EXEMPT_HARNESSES
+    # The property that actually protects the orchestrator: CC's OWN harness must NEVER be in
+    # the allowlist, or this gate would exempt the very orchestrator it exists to govern.
+    assert cc_dispatch.HARNESS not in ost.EXEMPT_HARNESSES
+
+
+@pytest.mark.parametrize("bridge_module", ["codex_hook_bridge.dispatch", "opencode_hook_bridge.dispatch"])
+def test_real_bridge_to_v1_event_output_is_exempt_end_to_end(tmp_path, monkeypatch, bridge_module):
+    """Feeds an ACTUAL bridge-produced `to_v1_event(...)` output (not a hand-built fixture)
+    through the real hook — the integration point Codex review flagged as missing: every other
+    harness-exempt test in this file hand-builds the event, so a bridge that stopped setting
+    `harness` correctly could still pass every hand-built test here."""
+    import importlib
+
+    dispatch = importlib.import_module(bridge_module)
+    if bridge_module == "codex_hook_bridge.dispatch":
+        raw_event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": _REPRO_CHAIN},
+            "cwd": "/repo",
+        }
+    else:
+        raw_event = {
+            "hook": "tool.execute.before",
+            "cwd": "/repo",
+            "input": {"tool": "bash", "sessionID": "ses_1"},
+            "output": {"args": {"command": _REPRO_CHAIN}},
+        }
+    v1_event = dispatch.to_v1_event(raw_event, point="pre-bash")
+    assert v1_event["harness"] == dispatch.HARNESS
+
+    for _ in range(3):
+        out, _e, c = _run(v1_event, monkeypatch, tmp_path / "m")
+        assert c == 0 and _decision(out) == "allow"
+
+
+def test_real_cc_bridge_to_v1_event_output_stays_governed_end_to_end(tmp_path, monkeypatch):
+    """Closes the loop the exempt-harness end-to-end tests above leave open (Fable review round
+    3): the actual CC bridge's own `to_v1_event(...)` output — `harness == "claude-code"` — must
+    stay GOVERNED, not just a hand-built `{"harness": "claude-code"}` fixture."""
+    import cc_hook_bridge.dispatch as cc_dispatch
+
+    raw_event = {
+        "hook_event_name": "PreToolUse", "tool_name": "Bash",
+        "tool_input": {"command": _REPRO_CHAIN}, "cwd": "/repo",
+    }
+    v1_event = cc_dispatch.to_v1_event(raw_event, point="pre-bash")
+    assert v1_event["harness"] == "claude-code"
+
+    out1, _e, c1 = _run(v1_event, monkeypatch, tmp_path / "m")
+    assert c1 == 0 and _decision(out1) == "allow"  # first offense: advisory WARN
+    out2, _e, c2 = _run(v1_event, monkeypatch, tmp_path / "m")
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"  # repeat: BLOCK
 
 
 # ── regression: the OLD self-service escape hatch is DEAD (env AND inline) ──────────────────

@@ -123,8 +123,9 @@ or write looks like. `EXEMPT_HARNESSES = {"codex", "opencode"}`, checked against
 
 Why the whole harness, not a signal review-cli sets: this gate's premise is Claude-Code-specific
 — "the top-level Claude Code session must delegate implementation work to a CC `Agent`/`Task`
-subagent instead of doing it inline." Codex and opencode have no orchestrator/subagent
-distinction of their own, and neither bridge exposes a trusted subagent identity today (a forged
+subagent instead of doing it inline." Codex and opencode DO model a subagent lifecycle of their
+own (Codex's `SubagentStart`/`SubagentStop` events, opencode's `task` tool), but neither bridge
+exposes a TRUSTED per-tool-call subagent identity from it today (a forged
 `args.agent_id`/`agent_type` is stripped by both `lib/codex_hook_bridge` and
 `lib/opencode_hook_bridge`, and neither repopulates it from anything authoritative — there is no
 CC-shaped top-level field to restore it from). So EVERY Codex/opencode-sourced event used to look

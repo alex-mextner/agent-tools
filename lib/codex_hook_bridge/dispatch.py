@@ -20,14 +20,12 @@ from pathlib import Path
 HOOK_API = "agents-hooks/v1"
 # The v1 event's `harness` tag for every event this bridge produces — a MODULE LITERAL, not
 # derived from `codex_event`, so it cannot be forged via tool_input the way `args.harness` could
-# be. Codex exposes no trusted subagent identity today (`args.agent_id` is stripped below and
-# never repopulated — there is no top-level Codex field to restore it from, unlike CC), so every
-# Codex-sourced event used to look like "the orchestrator" to `_is_subagent`-gated hooks. Tagging
-# the harness lets a hook like orchestrator-stays-thin exempt the WHOLE harness instead
-# (agent-tools#533): that gate's premise (an orchestrator that must delegate to a CC `Agent`
-# subagent) doesn't apply to a Codex session either way — a bare Codex CLI run is not "the CC
-# orchestrator" refusing to delegate, and a Codex process spawned by another tool (review-cli's
-# reviewer backend, a CC-dispatched subagent) is delegated work by definition.
+# be. Codex exposes no TRUSTED per-tool-call subagent identity today (`args.agent_id` is stripped
+# below and never repopulated — there is no top-level Codex field to restore it from, unlike CC's
+# `agent_id`/`agent_type`). A hook can read `event["harness"]` to scope a policy to (or exempt)
+# this whole harness instead of relying on a subagent identity Codex doesn't give it — see
+# `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES` for the first consumer
+# (agent-tools#533).
 HARNESS = "codex"
 _KNOWN_EVENTS = frozenset(
     {"PreToolUse", "PostToolUse", "Stop", "SubagentStart", "SubagentStop"}
