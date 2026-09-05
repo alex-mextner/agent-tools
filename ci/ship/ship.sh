@@ -1927,7 +1927,15 @@ _auto_bump_decide() {
   if [ -n "$VB_NEWV" ] && [ "$VB_NEWV" != "$VB_OLDV" ]; then
     # The PR bumps by hand. Past the base = a deliberate minor/major (or a patch nobody raced):
     # leave it alone. Not past the base = the parallel-PR race this feature exists for (both
-    # bumped to the same next version): re-bump on top of the base's version.
+    # bumped to the same next version): re-bump on top of the base's version. Note this
+    # branches on the PR's OWN diff VALUES, not on whether $AB_HEADV happens to already equal
+    # $AB_BASEV — a prior investigation (review finding, #518) considered skipping
+    # update-branch whenever the CONTENT already matches, but content coincidentally matching
+    # is not the same as the branches being git-ancestrally reconciled: two independently
+    # hand-bumped-to-the-SAME-VALUE branches (this exact race) still need the real
+    # update-branch merge so the later squash has a common history to diff against — skipping
+    # it here reproduced a genuine squash-merge CONFLICT in testing (caught by
+    # test_hand_bump_raced_by_main_is_rebumped_on_top_of_base), so it was reverted.
     if _semver_gt "$VB_NEWV" "$AB_BASEV" || ! _semver_parts "$AB_BASEV" >/dev/null; then
       AUTO_BUMP_SKIP_REASON="PR already bumps $VFILE ($VB_OLDV -> $VB_NEWV, $AB_BASE_REF at $AB_BASEV)"; return 1
     fi
@@ -2292,7 +2300,7 @@ fi
 # A review bot (Codex) may review the auto-bump commit and open a thread on the version line.
 # Such a thread is ship's to close: the line is ship's own one-value change, it is outdated by
 # definition once the squash lands, and no human wrote it. Eligible = unresolved, on the version
-# file, anchored to the version line (current or original line number), and authored ENTIRELY
+# file, anchored to the CURRENT version line number, and authored ENTIRELY
 # by automated reviewers (the same login predicate as --resolve-addressed-threads, with the same
 # truncated-thread fail-closed guard). Anything else — a human comment, a thread elsewhere in the
 # file, a thread on another file — is never touched and still blocks below. Runs when the bump
@@ -2460,6 +2468,14 @@ else
   # identically-worded `git merge <base>`) — a documented, narrow residual: a human's own
   # conflict-resolution merge landing IMMEDIATELY before an EARLIER-run ship commit is swept
   # along with it. THIS run's own merges never rely on that heuristic — their oid is known.
+  # Related residual (review finding, #518): a STANDALONE BEHIND-clearing merge from an
+  # EARLIER (since-refused) run — no bump ever followed it, so there is no recognized bump for
+  # it to sit "immediately before" — is invisible to `is_merge`'s own adjacency requirement and
+  # is never peeled on a later re-run; $SHIP_KNOWN_OIDS is per-process, so that run's oid is
+  # gone too. A re-run within the dwell window can then measure the window from that old
+  # standalone merge (a commit nobody but ship authored) and refuse, self-healing only by
+  # waiting out SHIP_REVIEW_DWELL. Persisting ship-authored oids durably (e.g. hydrating from
+  # SHIP_AUDIT_FILE at startup) would close this; not attempted in this pass.
   # Built in pure bash, NOT via an external `jq` invocation: `gh api --jq` uses gh's OWN
   # bundled jq engine (no external `jq` binary needed), but this script itself must not gain
   # a hard `jq`-on-PATH requirement in a code path that runs even under --skip-ci — the
@@ -2483,8 +2499,15 @@ else
   # self-heals by waiting). An empty $c instead leaves pushedDate/committedDate both blank
   # below, so the bash side's max(createdAt, pushedDate, committedDate, forcePushedAt) falls
   # through to createdAt alone -- the PR's open time, never a fresher false floor.
+  # is_merge matches `.+` for the quoted branch name, NOT a literal-apostrophe pattern (review
+  # finding, #518): a `\x27`-style hex escape is a jq >=1.7 extension that jq <=1.6 rejects
+  # outright, and this script otherwise goes out of its way for portability (bash 3.2, BSD
+  # date, base64 -D) — depending on a specific jq vintage here would be off-brand and
+  # avoidable. An apostrophe is not a regex metacharacter, and GitHub's merge-message shape
+  # never contains a literal "into " inside the quoted branch name, so `.+` is an equivalent,
+  # engine-agnostic match with no escaping needed at all.
   DWELL_JQ='def is_bump: ((.commit.committer.email // "") == "'"$SHIP_AUTO_BUMP_COMMITTER_EMAIL"'") or ((.commit.oid // "__none__") as $o | ('"$SHIP_KNOWN_OIDS_JSON"' | index($o))) != null;
-    def is_merge: ((.commit.message // "") | test("^Merge (remote-tracking )?branch \\x27[^\\x27]+\\x27 into "));
+    def is_merge: ((.commit.message // "") | test("^Merge (remote-tracking )?branch .+ into "));
     def peel:
       if length == 0 then .
       elif (.[-1] | is_bump) then

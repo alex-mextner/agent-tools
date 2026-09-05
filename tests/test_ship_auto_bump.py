@@ -429,6 +429,43 @@ def test_hand_bump_raced_by_main_is_rebumped_on_top_of_base(tmp_path):
     assert 'version = "1.0.2"' in _origin_file(origin, "main", "pyproject.toml")
 
 
+def test_hand_bump_race_already_merged_bumps_the_current_head_cleanly(tmp_path):
+    """A hand-bumped PR (1.0.0 -> 1.0.1) raced by main (also now 1.0.1) whose branch has
+    ALREADY been merged with base (a human's own `git merge main`, or clicking GitHub's
+    "Update branch" banner) before ship ever runs -- the head's version file already reads
+    1.0.1, same as base. A real git merge of two commits that independently reach the SAME
+    version value collapses to no file-level diff at all for that line, so
+    version_line_bumped reports "not bumped" (empty VB_OLDV/VB_NEWV) and the PR is correctly
+    treated as a plain (non-hand-bumped) auto-bump: ship must bump the CURRENT head directly
+    (1.0.1 -> 1.0.2) with no update-branch call (the branches are already reconciled).
+
+    (A prior investigation into this scenario considered skipping update-branch whenever
+    $AB_HEADV already equals $AB_BASEV as a general rule, independent of whether the PR's own
+    diff shows a hand bump -- that was reverted: it broke the sibling test below, whose
+    branches are NOT git-ancestrally reconciled even though their file CONTENT coincidentally
+    matches, by skipping the update-branch merge the later squash needs to avoid a real
+    conflict. Content matching is not the same as history being reconciled.)"""
+    main, origin, state, bindir = _make_world(tmp_path)
+    wt = _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
+    _commit_file(wt, "pyproject.toml", _PYPROJECT.replace("1.0.0", "1.0.1"), "chore: patch bump")
+    # main moves to 1.0.1 independently (another PR shipped) BEFORE feat merges it in.
+    _commit_file(main, "pyproject.toml", _PYPROJECT.replace("1.0.0", "1.0.1"), "chore(release): 1.0.1")
+    _git("push", "-q", "origin", "main", cwd=main)
+    # feat already merged main in (a human's own `git merge main`, or an earlier BEHIND-clearing
+    # preflight this same run) -- both sides agree on 1.0.1, so the merge is clean and adds no
+    # conflict; feat's head now reads the SAME version as base.
+    _git("fetch", "-q", "origin", "main", cwd=wt)
+    _git("merge", "-q", "--no-ff", "-m", "Merge branch 'main' into feat", "origin/main", cwd=wt)
+    _git("push", "-q", "origin", "feat", cwd=wt)
+
+    r = _run_ship(main, bindir, state, "feat")
+
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "PUT update-branch" not in _gh_log(state), "the head already reflects base -- nothing to update"
+    assert "PUT contents" in _gh_log(state), "the bump must still proceed against the current head"
+    assert 'version = "1.0.2"' in _origin_file(origin, "main", "pyproject.toml")
+
+
 def test_opt_out_via_env_restores_the_refusal(tmp_path):
     main, origin, state, bindir = _make_world(tmp_path)
     _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
