@@ -2042,7 +2042,9 @@ fi
 # Prints the first ticket-like token found in $1, or nothing. Tries the repo's own HYP-<n>
 # convention first (case-insensitive, normalized to uppercase), then a generic
 # UPPERCASE-PREFIX-<n> ticket token (2+ uppercase letters, a hyphen, digits) so other repos'
-# conventions (JIRA-style PROJ-123, etc.) are also picked up, then a purely descriptive
+# conventions (JIRA-style PROJ-123, etc.) are also picked up, then a keyword-anchored GitHub
+# issue reference (`Fixes #105`, `Refs #105`) returned literal for repos that track work as
+# plain GitHub issues rather than a lettered ticket prefix, then a purely descriptive
 # review-cli task code (2+ uppercase letters, then 2-OR-MORE hyphen-joined 2+-letter uppercase
 # segments -- 3+ segments total, no digits) so hand-picked codes like `SME-ROADMAP-WORKTREE-NOTE`
 # or `WT-GITIGNORE-EXCLUDE` -- real task codes review-cli's own run-stats log records fine, just
@@ -2083,7 +2085,53 @@ _review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing
   if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z0-9]*(-[A-Z0-9]+)*' \
         | LC_ALL=C grep -xE '[A-Z][A-Z]+(-[A-Z][A-Z]+){2,}' | head -1 || true)
-  printf '%s' "$m"
+  if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
+  # GitHub issue reference (`Fixes #105`, `Refs #105`) — for repos (like conloca-landing) that
+  # track work as GitHub issues rather than Linear/JIRA-style codes. Returned LITERAL, not
+  # normalized: task-cli's own `_route_id_to_project` (tasklib/cli.py) routes a bare GitHub id
+  # by checking `tid.startswith("#")` first — a `GH-<n>`-style rewrite doesn't match that check,
+  # falls through to the Linear-team-prefix branch instead, and `task mark-shipped` fails with
+  # an unroutable-id error. review-cli's own `normalize_task_code` (reviewlib/stats.py) accepts
+  # any non-whitespace, non-control-character token — `#105` passes it unchanged, so there is no
+  # downstream reason to rewrite it.
+  # Only a KEYWORD-ANCHORED local reference qualifies (`Closes|Fixes|Resolves|Refs|References`
+  # immediately before the `#<n>`, GitHub's own closing-keyword grammar plus the `Refs` form used
+  # when the ticket must NOT auto-close on merge). Three hazards rule out a bare `#<n>` anywhere
+  # in the text, all of them concrete because this same helper feeds BOTH the review-quorum
+  # record lookup and the post-merge `task mark-shipped` call:
+  #   - GitHub's qualified cross-repo syntax (`other-org/other-repo#123`, incl. repo names ending
+  #     in `-`/`.`) names an issue in ANOTHER repo; extracting its `#123` would mark an unrelated
+  #     local issue shipped. The keyword form never matches it: `#` must follow the keyword
+  #     directly, never a repo name.
+  #   - a URL fragment (`https://example.org/docs/#105`) or a Markdown anchor is not an issue.
+  #   - an incidental prose mention (`follow-up for #12`, `(#268)`) of an ALREADY-SHIPPED issue
+  #     would resolve to that issue's OLD passed quorum record, granting an unreviewed PR merge
+  #     authority — unlike a wrongly-derived HYP/PROJ token, a referenced GitHub issue routinely
+  #     HAS a record in an issue-tracked repo, so the "fail-closed anyway" reasoning above does
+  #     not hold here.
+  # This arm is the LAST fallback — after the generic PREFIX-<n> arm AND the descriptive
+  # ALL-CAPS arm above — so a `Fixes #45` aside never shadows a real `PROJ-123` or
+  # `SME-ROADMAP-WORKTREE-NOTE` code in the same body (for a descriptive-code repo that aside
+  # would otherwise be the very borrowing path described above). The keyword itself must not be
+  # the TAIL of a repo path (`org/hot-fix#5`, `org/fix#5`, `org/my.fix#5` are all qualified refs),
+  # so the char before it may not be a repo-name char (`-`/`.`) or `/` either; the digits must end
+  # at a non-word boundary (`#123abc` is not an issue ref). Two DISTINCT anchored refs in one text
+  # (`Partially fixes #12 ... Closes #200`) are an ambiguous task code: every other branch of this
+  # gate is fail-closed, so nothing is derived and ship refuses instead of silently taking the
+  # first in document order. The match may swallow at most ONE trailing WORD char (to reject
+  # `#123abc` below) and never the non-word char after the digits: `grep -o` matches don't
+  # overlap, so consuming a `,` in `closes #12,fixes #200` would eat the second ref's leading
+  # boundary and hide the ambiguity. Known limit (POSIX ERE has no lookahead): the guard sees
+  # honest ambiguity with realistic separators (space, `,`, `;`, `.`+space, newline); a second
+  # ref glued on by a word char (`#34xrefs #56`) or by a `/`/`.`/`-` (`#12/fixes #200`) keeps no
+  # admissible leading boundary and stays hidden — an author who can craft that could as well
+  # omit the ref, so it is not defended against. Trade-off, accepted: a bare `#105` with no
+  # keyword (a `fix/#105` branch name, a `#105 widget` title) is NOT derived either — pass
+  # $REVIEW_TASK_CODE.
+  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE \
+      '(^|[^A-Za-z0-9_./-])(close[sd]?|fix(e[sd])?|resolve[sd]?|refs?|references?)[[:space:]]*:?[[:space:]]*#[0-9]+[A-Za-z0-9_]?' \
+      | LC_ALL=C grep -oE '#[0-9]+[A-Za-z0-9_]?$' | LC_ALL=C grep -xE '#[0-9]+' | LC_ALL=C sort -u || true)
+  if [ "$(printf '%s\n' "$m" | LC_ALL=C grep -c '#')" -eq 1 ]; then printf '%s' "$m"; fi
   return 0
 }
 
@@ -2944,6 +2992,44 @@ _acceptance_gate_pass() {  # $1 = task code $2 = `task gate --json` STDOUT ONLY 
     _ticket_gate_audit_log acceptance authorized "$1" "cancelled or the acceptance-checked gate is disabled for this ticket — skipping auto-close"
   fi
 }
+# Rewrites a "GH-<n>" code (case-insensitive: "gh-105" too, matching
+# require-ticket-before-commit's `re.IGNORECASE` on the same pattern) into the literal "#<n>" form
+# task-cli's own id argument expects (task mark-shipped/done accept "#123" or "HYP-456", never
+# "GH-123" -- see the routing rationale on _review_quorum_extract_ticket's own comment, ~line
+# 2052). "GH-<n>" is a convention, not a task-cli id: agent-hooks' require-ticket-before-commit
+# recognizes it as a valid ticket reference (see
+# agent-hooks/require-ticket-before-commit/require_ticket_before_commit.py), and it's also the
+# shape review-quorum's own matcher used to SYNTHESIZE from a bare "Fixes #105" before #511
+# changed that one arm to return the literal "#105" instead.
+#
+# #511 only closed that SYNTHESIS path. A "GH-<n>" token typed LITERALLY into a branch name, PR
+# title, or PR body is still matched by the generic PREFIX-<n> arm (the same arm that matches this
+# repo's own HYP-<n> convention) and derived as-is -- e.g. a branch named "GH-105-fix-crash"
+# reaches here as "GH-105". The other way a "GH-<n>" code reaches here is $REVIEW_TASK_CODE set by
+# hand (or by another tool) following the convention above -- note this is $REVIEW_TASK_CODE
+# specifically, not a bare $TASK_CODE env var: the quorum gate (on by default) unconditionally
+# overwrites $TASK_CODE from $REVIEW_TASK_CODE at its own assignment above, so an inherited
+# $TASK_CODE only survives untouched as an external input when the gate is disabled
+# (SHIP_REVIEW_QUORUM=0) -- which is how this file's tests drive that path directly.
+#
+# Either way, this normalization is the one place every path funnels through before reaching
+# `task`; a rewrite is logged to stderr so a misrouted ticket (e.g. a repo whose task-cli Linear
+# team key happens to be literally "GH") is traceable from the ship transcript instead of silent.
+# Every other code shape (HYP-<n>, a descriptive all-caps review-cli code, an already-literal
+# "#<n>") does not match and passes through byte-for-byte unchanged.
+_ship_normalize_gh_code_for_task_cli() {  # $1 = candidate code -> prints the task-cli-safe code
+  # The digits are captured once (BASH_REMATCH), not independently re-derived by a second glob —
+  # a single source of truth for "what counts as the GH-<n> shape", so widening the regex later
+  # (review finding) can't silently desync from a stripping pattern that no longer matches it.
+  if [[ "$1" =~ ^[Gg][Hh]-([0-9]+)$ ]]; then
+    local rewritten="#${BASH_REMATCH[1]}"
+    echo "[ship] normalizing task-cli notify code: ${1} -> ${rewritten} (GitHub-issue convention)" >&2
+    printf '%s' "$rewritten"
+  else
+    printf '%s' "$1"
+  fi
+}
+
 _acceptance_gate() {
   # The ops off-switches only echo, like the other gates' off-switches (no audit line: the
   # env one is a per-invocation operator choice, the .ship-config one is audited by being
@@ -2968,6 +3054,11 @@ _acceptance_gate() {
     echo "[ship] acceptance gate: could not derive a task code for #$PR — skipping (not every PR is tied to a tracked ticket)." >&2
     _ticket_gate_audit_log acceptance skipped "" "no task code"; return 0
   fi
+  # Same rewrite the post-merge notify step applies: a "GH-<n>" derived code (or
+  # $REVIEW_TASK_CODE set that way) is task-cli's convention, not its own id argument — it
+  # expects the literal "#<n>" form. Without this, the acceptance gate would ask `task gate`
+  # about a code it can't resolve even though mark-shipped, right after, resolves it fine.
+  code=$(_ship_normalize_gh_code_for_task_cli "$code")
   echo "[ship] acceptance gate: asking task-cli — task gate ${code} --json ..."
   local out rc=0 errfile
   # Capture stdout and stderr SEPARATELY (review finding, agent-tools#521 round 1, Opus + GLM:
@@ -3047,6 +3138,7 @@ _ship_notify_task_cli() {
     return 0
   fi
   local code; code=$(_ship_derive_task_code_for_notify)
+  code=$(_ship_normalize_gh_code_for_task_cli "$code")
   if [ -z "$code" ]; then
     echo "[ship] could not derive a task code for #$PR — skipping ticket notify (not every PR is tied to a tracked ticket; update it manually if this one is)." >&2
     return 0
