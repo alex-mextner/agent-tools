@@ -36,6 +36,20 @@ version, so the two disagree and neither is trustworthy.
   - Node: read `version` from `package.json` (e.g. `require('./package.json').version`).
 - **Docs-only / pure-test / pure-CI / a revert** is not a release — no bump required. The
   rule fires only when **shippable source** actually changed.
+- **Do NOT bump the patch version inside a PR by hand — `gh ship` does it at merge time.**
+  With several PRs open in parallel, each one bumping the same line to the same next
+  version makes the second to merge CONFLICTING (a rebase + re-bump chore for every PR in
+  the queue). So the default is: leave the version line alone in a fix PR; when the ship
+  gate would otherwise refuse for a missing bump, ship computes the next **patch** version
+  and commits `chore(release): bump version X -> Y (ship auto-bump for #N)` onto the PR's
+  head branch through the GitHub Contents API right before the squash-merge (updating the
+  branch from base first if base's version already moved, so it never conflicts). Every
+  later gate treats that commit as ship's own (CI waits on the new head; review-dwell is
+  measured from your last push, not ship's; a bot nit on the bump line is auto-closed).
+  Bump by hand **only** for a deliberate **minor** or **major** — ship sees a version that
+  moves past the base and makes no second bump. Opt a repo out with `SHIP_AUTO_BUMP=0` in
+  its committed `.ship-config` (or the env var for one run) to get the old refuse-until-bumped
+  behaviour.
 
 ## Why
 
@@ -66,5 +80,6 @@ def get_version() -> str:
     # NEVER:  return "0.1.0"   <- a literal that goes stale the moment you ship and forget
 ```
 
-A release is then: edit the one `version` line, ship. `--version` updates itself — there is
-no second place to remember, so it can't drift and can't go stale.
+A release is then: ship. For a fix, `gh ship` moves the one `version` line (patch) itself at
+merge time; for a minor/major you edit it in the PR and ship leaves it alone. `--version`
+updates itself — there is no second place to remember, so it can't drift and can't go stale.

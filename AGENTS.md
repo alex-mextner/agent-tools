@@ -201,8 +201,15 @@ mid-session. The sanctioned path is **`gh ship <PR>`** (which calls
 - a PR that changes **shippable source** (not docs/test/CI) has **bumped the declared
   version** (`pyproject.toml` `version` / `package.json` `"version"`) vs the PR base — a ship
   of source is a release, so `--version` stays a real freshness signal instead of a stale
-  literal (skill: `bump-version-on-release`); override a genuine no-release ship with
-  `--no-version-bump-ok <reason>` or `SHIP_SKIP_VERSION_BUMP=1`;
+  literal (skill: `bump-version-on-release`) — and **by default ship makes that PATCH bump
+  itself at merge time** (#518): it commits `chore(release): bump version X -> Y (ship
+  auto-bump for #N)` onto the PR head branch through the GitHub Contents API (updating the
+  branch from base first when base's version already moved, so parallel PRs never conflict on
+  the version line), waits for CI on the new head, measures review-dwell from the last
+  non-ship push, auto-resolves a bot thread on the bump line, and audits `version-bump:auto`;
+  a PR that already bumps past base (a deliberate minor/major) is left alone; `SHIP_AUTO_BUMP=0`
+  (env or the committed `.ship-config`) restores the refuse-until-bumped behaviour; override a
+  genuine no-release ship with `--no-version-bump-ok <reason>` or `SHIP_SKIP_VERSION_BUMP=1`;
 - the **review-quorum bar is met** (Guard-B of the self-merge-authority program) — the PR's task
   code (`$REVIEW_TASK_CODE`, else a `HYP-<n>`/uppercase ticket token, else a purely descriptive
   ALL-CAPS/hyphenated code (`SME-ROADMAP-WORKTREE-NOTE`-shaped, 3+ segments, no digits) — all

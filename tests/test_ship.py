@@ -49,6 +49,14 @@ os.environ.setdefault("SHIP_REVIEW_QUORUM", "0")
 # in isolation, with its own fake `task` binary, and overrides this back to "1" per-call.
 os.environ["SHIP_TASK_NOTIFY_ENABLED"] = "0"
 
+# The merge-time version auto-bump (#518) also defaults to ENABLED. Every fake `gh` in this file
+# predates it and answers the Contents/update-branch API calls with garbage (`0`, `[]`), which the
+# auto-bump treats as "could not read the version file — skip" — so the pre-existing version-bump
+# gate tests still see the old refusal, but only by accident of the fake. Pin the feature OFF here
+# so those tests exercise the gate they were written for deterministically; the auto-bump has its
+# own git-backed fake and suite in tests/test_ship_auto_bump.py (which sets it back on per call).
+os.environ.setdefault("SHIP_AUTO_BUMP", "0")
+
 # A fake `gh` that answers exactly the calls ship.sh makes (with --skip-ci the CI rollup
 # is not queried). Branch name is read from $SHIP_TEST_BRANCH so the test controls it.
 _FAKE_GH = """\
