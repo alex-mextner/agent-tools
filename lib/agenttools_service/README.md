@@ -150,10 +150,45 @@ half-done):
   `sys.executable`) in the `Service`. The plist renderer is pure and does not resolve PATH.
 
 **CLI output conventions** (`run_action` / `dispatch`): success lines go to **stdout**, failure
-and warning lines (`already running`, autostart `FAILED`, "won't survive reboot") go to
-**stderr**. Exit codes are `0` (ok), `3` (nothing running), `4` (autostart enable/disable
-failed) — except `run`, which returns the **raw** exit code of the foreground child (so it may
-itself be 3/4); the 3/4 contract applies only to the manager-driven actions.
+and warning lines (`already running`, autostart `FAILED`, "won't survive reboot", a still-
+occupied port) go to **stderr**. Exit codes are `0` (ok), `3` (nothing running), `4` (autostart
+enable/disable failed, OR `stop`/`disable` acted but something is still listening on the
+service's port afterward — see "Port liveness" below) — except `run`, which returns the **raw**
+exit code of the foreground child (so it may itself be 3/4); the 3/4 contract applies only to
+the manager-driven actions.
+
+**Port liveness after `stop`/`disable`:** `stop`/`disable` only ever act on the pidfile-tracked
+MANAGER-spawned instance. That is a different thing from "whatever is bound to the service's
+port right now" — an ad-hoc, unmanaged process started outside the pidfile lifecycle (e.g.
+`review dashboard run --port 7878` run by hand) has no pidfile at all, so `stop`/`disable`
+cannot see it. After acting where it is meaningful to check (see below), both re-check the
+service's own port (`ServiceManager.probe_port`, a real TCP connect to LOOPBACK + a
+best-effort `lsof` PID lookup) and, if something is still listening, print an explicit
+warning naming the port (and PID, when resolvable) on stderr and exit `4` **instead of** the
+plain success line — never claim "stopped" / "disabled and stopped" while the port is still
+occupied.
+
+The check does NOT fire on every branch of `stop`: when OS autostart owns the process
+(`enable`d on launchd/systemd) and there is no pidfile, an occupied port is the *expected,
+healthy* state (the OS-managed process itself) — `stop` cannot tell that apart from a
+genuine foreign listener, so it does not probe there at all and keeps the plain "run
+'disable' to stop the OS-managed process" hint. `disable` is the action that actually tears
+that process down, so its post-action probe is the one that means something.
+
+The probe always dials LOOPBACK addresses — **both** `127.0.0.1` and `::1`, occupied if
+either accepts — never `Service.host` verbatim. `host` is documented as display-only (it
+feeds the `url` shown to a human; it is not necessarily where the daemon binds), so dialing
+it directly would both (a) turn a local lifecycle command into an outbound probe of a
+config-/env-sourced address (an SSRF-shaped risk for a real, non-loopback `host`) and (b)
+risk a false negative if the display host's address family doesn't match the daemon's actual
+bind — trying only one loopback family, chosen from `host`, produced exactly that false
+negative in an earlier revision.
+
+`disable`'s probe gives a launchd/systemd teardown one brief settle-and-re-probe (0.5s, via
+the injectable `sleeper` seam) before reporting an occupied port: `launchctl unload` in
+particular can return before the process has actually released the port, and treating that
+transient window as a foreign listener would flap a genuinely successful `disable` into a
+false failure.
 
 ## Validation & safety
 
@@ -177,19 +212,21 @@ So a consumer can safely pass config-/env-sourced values to `Service` without ha
 | Symbol | Purpose |
 | --- | --- |
 | `Service(name, argv, *, port=None, host="127.0.0.1", tool=None, description="", home=None)` | the service descriptor (paths/label/url derived) |
-| `ServiceManager(service, *, platform=…, autostart=None, spawner=…, runner=…, alive=…, signaller=…, foreground_runner=…)` | the lifecycle manager |
+| `ServiceManager(service, *, platform=…, autostart=None, spawner=…, runner=…, alive=…, signaller=…, foreground_runner=…, port_probe=…, sleeper=…)` | the lifecycle manager |
 | `ServiceManager.run() -> int` | foreground, blocking; returns the exit code |
 | `ServiceManager.start() -> ServiceStatus` | background detached; writes pidfile |
 | `ServiceManager.status() -> ServiceStatus` | `{running, pid, port, url, enabled}` |
 | `ServiceManager.stop() -> bool` | stop background; `True` if one was signalled |
 | `ServiceManager.enable() -> ServiceStatus` | install autostart + start now |
 | `ServiceManager.disable() -> ServiceStatus` | remove autostart + stop |
+| `ServiceManager.probe_port() -> Optional[PortProbe]` | is something listening on the service's port right now, independent of the pidfile (`None` if the service has no port) |
 | `ServiceManager.autostart_active() -> bool` | unit installed AND the OS command accepted it (same-process) |
 | `ServiceManager.last_disable_ok -> bool` | whether the most recent `disable` fully removed autostart |
 | `ServiceStatus(running, state, pid, port, url, enabled)` | a status snapshot; `.as_dict()` |
+| `PortProbe(occupied, pid=None, addr=None)` | the port-liveness result: `occupied` is authoritative, `pid`/`addr` are best-effort |
 | `add_service_subcommands(subparsers, *, manager_factory, service_name, help_text=None)` | wire the 6 subcommands into argparse |
 | `dispatch(args, *, on_no_subcommand) -> int` | run the chosen action; bare → `on_no_subcommand` (HELP) |
-| `run_action(manager, action) -> int` | invoke one action, print a one-line result, return an exit code (`0` ok, `3` not-running, `4` autostart enable/disable failed) |
+| `run_action(manager, action) -> int` | invoke one action, print a one-line result, return an exit code (`0` ok, `3` not-running, `4` autostart enable/disable failed OR the port is still occupied after `stop`/`disable`) |
 | `select_autostart_backend(*, platform, home, has_systemctl=None, runner=None)` | pick the OS backend |
 | `render_launchd_plist(service) -> str` / `render_systemd_unit(service) -> str` | pure unit generators (call with a **validated** `Service`) |
 | `LaunchdBackend` / `SystemdUserBackend` / `NoopAutostartBackend` | the concrete backends |
@@ -213,6 +250,8 @@ real autostart and no real process:
 | `alive` | `os.kill(pid, 0)` probe | liveness (passed to the Supervisor) |
 | `signaller` | `os.kill` | the cross-process `stop` signal (passed to the Supervisor) |
 | `foreground_runner` | `subprocess.call` | how `run` blocks on the foreground process |
+| `port_probe` | real TCP connect (both loopback families) + best-effort `lsof` PID lookup | how `probe_port` checks the service's port after `stop`/`disable` |
+| `sleeper` | `time.sleep` | `disable`'s one settle-and-re-probe wait for a slow-draining OS teardown (0.5s) |
 
 ## Testability
 

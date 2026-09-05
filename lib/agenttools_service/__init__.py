@@ -63,6 +63,7 @@ from .core import (
     AutostartBackend,
     LaunchdBackend,
     NoopAutostartBackend,
+    PortProbe,
     Service,
     ServiceManager,
     ServiceStatus,
@@ -80,6 +81,7 @@ __all__ = [
     "Service",
     "ServiceManager",
     "ServiceStatus",
+    "PortProbe",
     "AutostartBackend",
     "LaunchdBackend",
     "SystemdUserBackend",
@@ -96,4 +98,4 @@ __all__ = [
     "LINUX",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
