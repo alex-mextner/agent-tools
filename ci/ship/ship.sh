@@ -230,11 +230,14 @@
 #                          auto-detect (same three manifests, one level deep, e2e/ ONLY — test/ and
 #                          tests/ are deliberately NOT auto-probed, see the priority-5 comment in
 #                          _local_test_runner; use .ship-config for those) > fail closed. A
-#                          present-but-empty/malformed .ship-config (neither key set, not committed
-#                          at HEAD, or an unrecognized/unsafe SHIP_LOCAL_TEST_DIR — absolute,
-#                          containing `..`, or resolving to the repo root itself — which invalidates
-#                          the WHOLE file, not just the dir) is ignored (with a logged warning) and
-#                          detection proceeds as if the file didn't exist.
+#                          present-but-empty/malformed .ship-config (no key set, or not committed
+#                          at HEAD) is ignored (with a logged warning) and detection proceeds as
+#                          if the file didn't exist. An unrecognized/unsafe SHIP_LOCAL_TEST_DIR —
+#                          absolute, containing `..`, or resolving to the repo root itself —
+#                          invalidates only the SHIP_LOCAL_TEST_DIR/SHIP_LOCAL_TEST_CMD pair (not
+#                          the whole file): a committed SHIP_AUTO_BUMP=0 survives that rejection
+#                          and still applies (an unrelated key's validity must never flip a
+#                          different key's policy meaning — see _ship_config_load's own comment).
 set -euo pipefail
 
 ORIG_PWD=$(pwd -P)
