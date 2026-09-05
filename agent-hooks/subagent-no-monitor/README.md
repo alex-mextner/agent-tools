@@ -63,9 +63,10 @@ genuine exception, ASK the human, or request one-time Telegram approval:
 RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR="self-managed watchdog, will poll for the result inline"
 ```
 
-Set in the process environment before the tool call — Monitor has no shell `command` string
-whose leading `VAR=value` prefix a pre-monitor hook could parse the way `subagent-no-bg-longproc`
-does for Bash (it takes a `command`/`ws` field, not an invoked executable line), so only the
+Set in the process environment before the tool call — Monitor's `tool_input` is a watch
+target (what to observe, e.g. a `description` of the thing being watched), not an invoked
+shell command line, so there is no leading `VAR=value` prefix a pre-monitor hook could parse
+out of it the way `subagent-no-bg-longproc` does for a real Bash command string. Only the
 process-env source applies here, matching how the pre-write hooks read this var. If unset, no
 Telegram call is made and the call simply blocks. If present but blank/bare (`1`/`true`/`yes`),
 the hook denies without contacting Telegram.
