@@ -715,6 +715,359 @@ def test_hatch_justification_exit1_blocks_citing_denial(tmp_path, monkeypatch):
     assert "hatch escalation denied" in json.loads(out)["message"].lower()
 
 
+# ── #472: a NEWLINE is a command separator, exactly like `;` ─────────────────────────────
+# `_strip_shell_comment` flattens the command to a single space-joined token stream, which
+# erased every newline. `GIT_COMMIT` anchors a run to the command HEAD (string start, or just
+# after a `|`/`&`/`;`), so once the newlines were gone the only commit still detectable was one
+# whose FIRST line was itself the `git` invocation. Every other multi-line commit — the single
+# most common shape an agent writes (`cd <repo>` / `set -e` / an `echo` on line 1, `git commit`
+# below it) — matched nothing, took the "not a normal commit → nothing to gate" branch, and
+# committed user-visible files with NO proof, NO hatch, and NO `overrides.log` line. Silent and
+# total: indistinguishable, from the outside, from a gate that simply never fired.
+
+@pytest.mark.parametrize("command", [
+    "cd {repo}\ngit commit -m x",
+    "cd {repo}\ngit add -A\ngit commit -m x",
+    "set -e\ngit commit -m x",
+    'echo "staging"\ngit commit -m x',
+    "cd {repo}\r\ngit commit -m x",
+    "git status\n\n  git commit -m x",
+])
+def test_multiline_commit_is_gated(tmp_path, monkeypatch, command):
+    """A `git commit` on any line of a multi-line command is a real commit and must be gated."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(command.format(repo=repo), repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_multiline_commit_without_visual_files_still_allowed(tmp_path, monkeypatch):
+    """The newline fix must not turn into a blanket block: a multi-line commit staging only
+    non-visual files has nothing to prove and is still allowed."""
+    repo = _mk_repo_with_staged(tmp_path, "server/api.ts")
+    out, _e, c = _run(f"cd {repo}\ngit commit -m x", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_multiline_prose_mentioning_git_and_commit_is_not_a_commit(tmp_path, monkeypatch):
+    """Newlines becoming separators must not make PROSE match: `git` and `commit` landing on
+    two different lines of an echoed message are two unrelated words, not an invocation."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run('echo "remember to git\nthen commit"', repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_multiline_skip_commit_still_exempt(tmp_path, monkeypatch):
+    """Rebase plumbing stays exempt when written across lines."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("cd {}\ngit commit --continue".format(repo), repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_multiline_comment_line_does_not_swallow_the_commit(tmp_path, monkeypatch):
+    """`#` runs to end-of-LINE. Comments must be stripped per line — normalizing newlines away
+    before tokenizing would let one comment swallow every command after it, failing OPEN in the
+    same direction as the bug this fixes."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("# stage everything first\ngit commit -m x", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_multiline_inline_hatch_on_a_later_line_still_reaches_the_hatch(tmp_path, monkeypatch):
+    """The inline hatch form is documented as the way to request approval. Written on a line
+    below the first, it must still be recognised as a commit and reach the Telegram hatch —
+    otherwise the newline fix stops one line short of the very form it protects. tg-ctl is
+    absent here, so the hatch resolves to a denial, which still proves it was CONSULTED."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    monkeypatch.setattr(vpg.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", ())
+    command = f'cd {repo}\nRIG_HATCH_REQUEST_VISUAL_PROOF_GATE="a real justification" git commit -m x'
+    out, _e, c = _run(command, repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert "hatch escalation denied" in json.loads(out)["message"].lower()
+
+
+def test_backslash_continuation_is_not_a_separator(tmp_path, monkeypatch):
+    """A backslash-newline SPLICES the next line onto this command — it does not start a new
+    one. `git \\<newline> commit` is a single invocation and must be gated as one."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("git \\\n  commit -m x", repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_newline_inside_quoted_commit_message_is_not_a_separator(tmp_path, monkeypatch):
+    """A newline inside a quoted multi-line commit message is ordinary text. It must not be
+    turned into a separator (which could make the trailing prose look like a command)."""
+    repo = _mk_repo_with_staged(tmp_path, "server/api.ts")
+    out, _e, c = _run('git commit -m "title\n\nbody mentions npm test"', repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"  # non-visual staging → nothing to prove
+
+
+@pytest.mark.parametrize("command", [
+    "cat > ship.sh <<'EOF'\ngit commit -m release\nEOF",
+    "cat > f <<EOF\ngit commit -m x\nEOF",
+    'cat > f << "EOF"\ngit commit -m x\nEOF',
+])
+def test_heredoc_body_is_data_not_commands(tmp_path, monkeypatch, command):
+    """A heredoc BODY is stdin data for the command on the redirection line, never a command
+    sequence. Treating its lines as command heads would hard-BLOCK (and fire the Telegram
+    hatch on) a `cat` that only writes a file — writing scripts by heredoc is an ordinary
+    agent pattern, so this would have been a constant false block."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(command, repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_real_commit_after_a_heredoc_is_still_gated(tmp_path, monkeypatch):
+    """Dropping the body must stop at the delimiter — a real commit AFTER the heredoc still
+    counts, otherwise the exemption becomes a bypass."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("cat > f <<'EOF'\nnothing\nEOF\ngit commit -m x", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_herestring_is_not_a_heredoc(tmp_path, monkeypatch):
+    """`<<<` feeds one string, it opens no body — the `<<` matcher must not swallow the rest
+    of the command looking for a delimiter that never comes."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run('grep x <<< "note"\ngit commit -m x', repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("first_line", [
+    "echo 'not a redirect <<EOF'",
+    'echo "not a redirect <<EOF"',
+    "echo ok # <<EOF",
+])
+def test_heredoc_operator_only_counts_as_shell_syntax(tmp_path, monkeypatch, first_line):
+    """A `<<` inside a quoted argument or a comment opens NOTHING. Matching it would let the
+    parser swallow every following command as heredoc body — a self-service bypass: write
+    `echo '<<EOF'` on line 1 and the commit below it disappears from the gate entirely."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(f"{first_line}\ngit commit -m x", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("delim", ["EOF-1", "'EOF-1'", '"end.txt"', "_v2", "'end of file'"])
+def test_heredoc_delimiter_may_be_any_shell_word(tmp_path, monkeypatch, delim):
+    """A delimiter is a shell WORD, not an identifier — `<<'EOF-1'`, `<<"end.txt"`, `<<_v2` are
+    all valid. Failing to recognise one exposes that heredoc's DATA to the command-head
+    anchors as if it were a command, and blocks a `cat` that only writes a file."""
+    bare = delim.strip("\"'")
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(f"cat > f <<{delim}\ngit commit -m x\n{bare}", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_heredoc_terminator_must_match_exactly(tmp_path, monkeypatch):
+    """A plain `<<EOF` ends only on a line holding EXACTLY `EOF`. A space-indented `  EOF` is
+    still body, so the commit under it is data the shell never runs — ending the body early
+    would gate a commit that does not exist."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("cat <<EOF\n  EOF\ngit commit -m x\nEOF", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_dash_heredoc_terminator_strips_tabs_only(tmp_path, monkeypatch):
+    """`<<-` tolerates leading TABS on its terminator (never spaces), so a tab-indented `EOF`
+    really does close the body and the commit after it is a real command."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("cat <<-EOF\n\tEOF\ngit commit -m x", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_every_heredoc_on_a_command_is_tracked(tmp_path, monkeypatch):
+    """One command may open several heredocs; their bodies follow in order. Tracking only the
+    first would end body-skipping at `A` and read the SECOND body as commands."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("cat <<A <<B\nfirst\nA\ngit commit -m x\nB", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+    # ...and a commit after BOTH bodies close is a real command again
+    out2, _e2, c2 = _run("cat <<A <<B\nfirst\nA\nsecond\nB\ngit commit -m x", repo, monkeypatch,
+                         proof_dir=tmp_path / "proof")
+    assert c2 == vpg.BLOCK_EXIT_CODE and _decision(out2) == "block"
+
+
+@pytest.mark.parametrize("command", [
+    ": $((1 << 2))\ngit commit -m bypass\n2",             # `$(( ))` arithmetic shift
+    "(( 1 << 2 ))\ngit commit -m bypass\n2",              # `(( ))` arithmetic command
+    ": $(( ((1)) << 2 ))\ngit commit -m bypass\n2",       # nested, with `$`
+    "(( ((1)) << 2 ))\ngit commit -m bypass\n2",          # nested, WITHOUT `$`
+])
+def test_arithmetic_shift_is_not_a_heredoc(tmp_path, monkeypatch, command):
+    """`<<` inside an arithmetic expansion is a SHIFT operator. Reading it as a redirection is
+    not merely cosmetic: if the operand later appears alone on a line it CLOSES the false
+    heredoc, so everything in between is silently swallowed as body — a working bypass, not a
+    fail-closed misparse."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(command, repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("first_line", [
+    ": # ignored \\",
+    ":;# ignored \\",   # `#` opens a word right after a control operator too
+    ": # it's fine",
+])
+def test_comment_stops_syntax_interpretation(tmp_path, monkeypatch, first_line):
+    """A comment runs to end-of-line, so bash neither continues on a trailing backslash inside
+    one nor opens a quote from one. Interpreting comment text as syntax splices the next
+    line's real command onto this one, hiding it from the command-head anchors."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(f"{first_line}\ngit commit -m bypass", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+@pytest.mark.parametrize("command", [
+    ": ${x:-1 << 2}\ngit commit -m bypass\n2}",     # parameter expansion, not a redirection
+    ': <<"t\\"rue"\ngit commit -m bypass\nt"rue',      # escape rules inside the delimiter
+])
+def test_unmodelled_shell_syntax_opens_no_heredoc(tmp_path, monkeypatch, command):
+    """Recognising a heredoc is the only thing that DROPS lines, so it is the only thing that
+    can hide a commit. A line carrying an expansion, or a delimiter whose quote-removal this
+    parser does not model exactly, is therefore not trusted to open one — its successors stay
+    commands. Refusing to guess is the fail-closed direction."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(command, repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_carriage_return_is_left_in_the_text(tmp_path, monkeypatch):
+    """A carriage return is an ordinary character to a POSIX shell, so `cd /tmp/B\r` targets a
+    directory whose name ends in CR — it fails, and the commit still runs where it started.
+    Stripping the CR would make `effective_cwd` resolve a directory bash never reached."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("cd /tmp/B\r\ngit commit -m x", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_unbalanced_quote_fallback_still_sees_newlines(tmp_path, monkeypatch):
+    """When tokenizing fails, the fallback must still surface newlines as separators. Returning
+    the raw command reinstates the original bug: one stray quote anywhere would hide every
+    commit below line 1 again."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run('echo "oops\ngit commit -m x', repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_escaped_operator_does_not_open_a_comment(tmp_path, monkeypatch):
+    """Bash starts a comment only at a `#` that OPENS a word, and an ESCAPED operator does not
+    end one: in `: \\;# ignored ; git commit`, `;#` is an argument, so the LATER `;` really
+    does separate commands. Judging by the raw previous character sees `;`, calls the rest a
+    comment, and blanks the commit away."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(": \\;# ignored ; git commit -m bypass", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_hash_inside_a_word_is_not_a_comment(tmp_path, monkeypatch):
+    """`shlex`'s own comment handling fires on a `#` ANYWHERE, so it would eat the rest of the
+    line after an ordinary word containing one. Comment removal is done by `_scan_line`, which
+    follows bash's start-of-word rule, and shlex is called with comments disabled."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("echo 'abc'# nope\ngit commit -m x", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_heredoc_delimiter_may_contain_a_hash(tmp_path, monkeypatch):
+    """A `#` inside a word is ordinary text, so `<<EOF#1` is one delimiter. Truncating it at the
+    `#` would leave the parser hunting for the wrong terminator."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("cat <<EOF#1\ngit commit -m x\nEOF#1", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_delimiter_word_is_assembled_from_adjacent_fragments(tmp_path, monkeypatch):
+    """Bash quote-removes `<<E'OF'` to the single word `EOF`, so the heredoc closes on line 2
+    and the commit runs. Reading only the first fragment (`E`) makes the parser hunt for the
+    wrong terminator and swallow the real one — and the commit — as body."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(": <<E'OF'\nEOF\ngit commit -m bypass\nE", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_empty_quoted_delimiter_is_a_real_heredoc(tmp_path, monkeypatch):
+    """`<<''` quote-removes to the empty string — a legal delimiter that terminates on a blank
+    line. An empty delimiter must stay distinguishable from "no delimiter found", or the body
+    is exposed as commands and an ordinary file-writing command gets blocked."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("cat <<''\ngit commit -m data\n", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+
+
+@pytest.mark.parametrize("command", [
+    "cat <<EOF\ngit commit -m x",          # delimiter never arrives
+    "cat <<NOPE\ngit commit -m x\nOTHER",  # only a non-matching line follows
+])
+def test_unterminated_heredoc_fails_closed(tmp_path, monkeypatch, command):
+    """A body that never meets its delimiter was never a body. Handing those lines back as
+    commands keeps the one remaining way to misread `<<` — an arithmetic shift — failing
+    CLOSED rather than silently dropping a real commit."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run(command, repo, monkeypatch, proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_lone_carriage_return_is_not_a_separator(tmp_path, monkeypatch):
+    """Only `\\r\\n` ends a line. A POSIX shell treats a LONE `\\r` as an ordinary character, so
+    splitting on it would invent a command head inside a single `echo`."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("echo x\rgit commit -m y", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == 0 and _decision(out) == "allow"
+
+
+def test_newline_after_an_operator_injects_no_empty_segment(tmp_path, monkeypatch):
+    """`git add -A &&<newline>git commit` already carries its separator; a second, synthetic
+    `;` would leave an empty segment for `_segments`/`effective_cwd` to walk."""
+    assert vpg._shell_tokens("git add -A &&\ngit commit -m x") == [
+        "git", "add", "-A", "&&", "git", "commit", "-m", "x",
+    ]
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    out, _e, c = _run("git add -A &&\ngit commit -m x", repo, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_effective_cwd_walks_a_newline_separator(tmp_path, monkeypatch):
+    """The `cd` on line 1 must actually resolve the commit's target repo — with session cwd
+    somewhere else, only a newline-aware `effective_cwd` finds the staged UI file."""
+    repo = _mk_repo_with_staged(tmp_path, "src/Button.tsx")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    out, _e, c = _run(f"cd {repo}\ngit commit -m x", elsewhere, monkeypatch,
+                      proof_dir=tmp_path / "proof")
+    assert c == vpg.BLOCK_EXIT_CODE and _decision(out) == "block"
+
+
+def test_newline_does_not_glue_two_commands_into_one_git_run(tmp_path, monkeypatch):
+    """Guards the accidental pre-fix match: `git add -A` + `git commit` on separate lines used
+    to be detected only because flattening glued them into one bogus `git add -A git commit`
+    run. After the fix they are two separate commands and the SECOND one is what trips the
+    gate — so a first line that merely starts with `git` must not be needed."""
+    assert vpg.GIT_COMMIT.search(vpg._strip_shell_comment("cd /r\ngit commit -m x"))
+    assert not vpg.GIT_COMMIT.search(vpg._strip_shell_comment('echo "git"\necho "commit"'))
+
+
 # ── B2: the GIT_COMMIT regex must NOT match `git`+`commit` in plain prose ────────────────
 
 def test_git_commit_prose_is_not_a_commit(tmp_path, monkeypatch):
