@@ -1,76 +1,89 @@
 # decision-request-format
 
-**Point:** `pre-bash` · **Fail policy:** `open` · **Priority:** 25 · **Advisory only (never blocks)**
+**Point:** `pre-bash` · **Fail policy:** `open` · **Priority:** 25 · **Graduated verdict: advisory for a partially-structured body; BLOCKS a bare body (hatchable) and the removed `question` tag (not hatchable)**
 
 Enforces the *self-check* half of the [`decision-request-discipline`](../../skills/universal/decision-request-discipline/SKILL.md)
-skill at the one moment a skill can't: **send time.** When the agent sends a decision request
-to the human's channel (`tg --tag decision …`), this parses the message body and, if it is
-missing the structural markers the skill mandates — **Context, Options, Recommendation** — it
-emits an **exit-0 ADVISORY** naming what's absent, so the agent can rewrite before the human
-gets a bare "A or B?".
+skill at the one moment a skill can't: **send time.** When the agent escalates to the human's
+channel (`tg --tag decision …` or `tg --tag problem …`), this parses the message body and grades
+it against the structural markers the skill mandates — **Context, Options, Recommendation** —
+so the human never gets a bare "A or B?".
 
-## Why advisory, never a block
+## The graduated verdict (deliberately lenient)
 
-A malformed decision request must stay **sendable.** A heuristic that wedged the send would
-be worse than the malformed message — the human would rather get an imperfect escalation than
-have a marker regex silently swallow it. So this hook **never returns exit 10**; it returns
-`allow` with a reminder message and lets the send proceed. The deterministic value it adds
-over the skill alone is purely about *timing*: it fires at send time, the exact moment the
-skill's "self-check before sending" is supposed to run but routinely gets skipped under load.
-A skill can only remind you to check; this checks.
+A false block of the human's ONLY comms channel to his agents is worse than a malformed
+message, so the hook errs HARD toward passing:
+
+| Body | Verdict |
+| --- | --- |
+| COMPLETE — all three markers present (a pros/cons table counts as Options) | silent `allow`, exit 0 |
+| PARTIAL — some structure, some markers missing | `allow` + an exit-0 **advisory** naming what's absent |
+| genuinely BARE — no table and NONE of the three markers (a bare "A or B?") | **BLOCK, exit 10** — the message shows the exact skeleton to re-send; a justified `RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT` hatch can force it through |
+
+Only the bare case blocks. A message that carries a pros/cons table (markdown OR HTML) — or any
+one of Context / Options / Recommendation — is never blocked. Table detection is generous on
+purpose: over-detecting only lets a message THROUGH.
+
+## No `question` tag — it is blocked with a redirect (agent-tools#524)
+
+`tg` no longer has a `question` tag (tg-cli#301, Alex 2026-09-05): an open question for the
+human IS a decision request and goes out as `--tag decision` in the decision-request format. The
+escalation tag set this hook grades is therefore **`decision` + `problem`**. A `tg` command
+carrying the `question` tag (any case, the space or the `=` spelling) is not graded at
+all — it is **BLOCKED (exit 10)** with a one-line hint to re-send as `--tag decision`, regardless
+of the body, and with no hatch (there is nothing to force through: the tag does not exist). This
+only moves the refusal one step earlier — `tg` itself would refuse the send with the same hint.
+Multi-segment commands follow the hook's usual first-match rule: the first `tg` segment carrying
+an inspected tag decides the verdict.
 
 ## Triggered (decided from a PARSED command — never a raw substring)
 
-Only an actual `tg` command carrying `--tag decision`:
+Only an actual `tg` command carrying an inspected `--tag` (`decision`, `problem`, or the removed
+`question`):
 
 - `tg --tag decision "<body>"` — the canonical decision request
 - `--tag=decision`, and the body assembled from positional text **plus** `--title <text>`
-- a `tg` later in a pipeline (`build_msg | tg --tag decision …`) — every `&&`/`;`/`|` segment
-  is walked
-- wrapped in leading no-op wrappers (`env TG_AI_MODEL=claude tg …`, `timeout 30 tg …`) — the
+- a `tg` later in a pipeline (`build_msg | tg --tag decision …`) — every `&&`/`||`/`;`/`|`/`&`
+  segment is walked
+- wrapped in leading no-op wrappers (`env TG_AI_MODEL=claude tg …`, `timeout 30 tg …`) and bare
+  `NAME=VALUE` assignment prefixes (`TG_AI_MODEL=claude tg …`, the skill's own form) — the
   wrapper + its own args are peeled before tokenizing
 
-The command is split on real shell separators, each segment is **shlex-tokenized**, and the
-tag + body are read **off the argv** exactly as `tg` would receive them. So none of these trip
-it (the `tg` / `decision` text is data, not a command + tag):
+The command is split on real shell separators **quote-awarely** — a separator inside the quoted
+body (`tg --tag decision "use A | B?"`) never tears the command apart — then each segment is
+**shlex-tokenized**, and the tag + body are read **off the argv** exactly as `tg` would receive
+them. So none of these trip it (the `tg` / `decision` text is data, not a command + tag):
 
 ```bash
 tg "remember to use --tag decision next time"   # no actual --tag flag; it's body text
 echo "send a tg --tag decision report"          # the words live inside an echo operand
-tg --tag report "build green"                    # a different tag — not a decision request
+tg --tag report "build green"                    # a different tag — not an escalation
 git commit -m "add tg --tag decision hook"       # the flag is inside the commit MESSAGE
 ```
 
-## Known boundary: a separator char inside the quoted body
+## Known boundaries (all fail toward allowing)
 
-The command is split on raw `&&`/`;`/`|` before each segment is shlex-tokenized, so a body
-that itself contains one of those chars inside quotes — `tg --tag decision "use A | B"` —
-is torn mid-quote, the segment gets an unbalanced quote, shlex raises, and that segment is
-skipped. Effect: **the advisory is missed** (the send still goes through). This is a false
-*negative* only — never a false positive, and never a block — which matches the hook's
-advisory/fail-open posture. A full quote-aware splitter would close it but is over-engineering
-for an advisory nudge; it's covered as a documented boundary in the test suite.
+A few shapes are missed by design, and every miss is a false NEGATIVE — the send goes through
+ungraded, it is never wrongly blocked: `sudo tg …` and a command substitution `$(tg …)` aren't
+unwrapped (neither is in the wrapper set, and substitutions aren't recursed), and a future `tg`
+value-flag not in the known set would leak its value into the parsed body (which can only
+*satisfy* a marker, never remove one). A command that shlex cannot tokenize is skipped, not
+blocked.
 
-A few other shapes are also missed by design, all false-negative-only on an advisory hook:
-`sudo tg …` and a command substitution `$(tg …)` aren't unwrapped (neither is in the wrapper
-set, and substitutions aren't recursed), and a future `tg` value-flag not in the known set
-would leak its value into the parsed body. None can ever *block* a send.
+## Not triggered (the hook only inspects escalation sends)
 
-## Not triggered (the hook only inspects decision requests)
-
-- any `tg` send without `--tag decision` (`--tag report`, `--tag problem`, no tag at all)
+- any `tg` send without an escalation tag (`--tag report`, `--tag answer`, no tag at all)
 - a non-`tg` command, or a `tg` substring inside a path / another flag's value
-- a decision-request body that **already has** all three markers → silent `allow`
+- an escalation body that **already has** all three markers → silent `allow`
 
 ## Marker detection is permissive on purpose
 
 The three markers are matched by deliberately loose, case-insensitive regexes (e.g. *Options*
-matches any of `option/variant/pros/cons/trade-off`). The goal is to catch a body that
-mentions **none** of a dimension — the bare "A or B?" — not to grade phrasing or word choice.
-A body that gestures at context, lists options, and states a recommendation passes, even if
-it doesn't use those exact headings. False *positives* (advising on a fine message) cost only
-a one-line stderr note since the send proceeds regardless; that asymmetry is why permissive is
-correct here.
+matches any of `option/variant/pros/cons/trade-off`; *Context* is also satisfied by a
+`file.ext:line` code ref). The goal is to catch a body that mentions **none** of a dimension —
+the bare "A or B?" — not to grade phrasing or word choice. A body that gestures at context,
+lists options, and states a recommendation passes, even if it doesn't use those exact
+headings. A false *positive* on a partial body costs only a one-line stderr note since the send
+proceeds regardless; the block is reserved for the body with no structure at all.
 
 ## Not subagent-exempt
 
@@ -78,12 +91,11 @@ The skill routes the *drafting* of a decision request to a subagent precisely so
 sloppily inline — so the self-check binds that subagent too. A subagent posting a malformed
 decision request is exactly what this catches; there is no `agent_id` carve-out.
 
-## No self-service silence — external approval only
+## No self-service escape — external approval only
 
-Because it never blocks, "escaping" here just silences the advisory note — but there is **no**
-`ALLOW_RAW_DECISION_REQUEST` env and **no** `# decision-request-ok:` inline sentinel any more.
-An agent could set either on its own command, so those were self-grant silencers. A one-time
-silence is now requested by setting
+There is **no** `ALLOW_RAW_DECISION_REQUEST` env and **no** `# decision-request-ok:` inline
+sentinel any more. An agent could set either on its own command, so those were self-grant
+bypasses. A one-time force-through of a BARE body is requested by setting
 `RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT="<written justification>"`, which routes one Telegram
 approval request to Alex (deny-by-default):
 
@@ -98,34 +110,42 @@ event carries (the hook runs in its own process *before* the shell evaluates tha
 value never reaches the hook's `os.environ`). Exporting the same var into the harness environment
 works too and takes precedence.
 
-Unset means the hook never contacts Telegram (the advisory prints as usual); a blank or bare
-`1`/`true`/`yes`/`on` is rejected without a Telegram call; a real justification runs the trusted
-`tg-ctl ask` and silences the advisory **only on exit 0**. Either way the send still goes
-through — the hatch only decides whether the advisory prints.
+Unset means the hook never contacts Telegram; a blank or bare `1`/`true`/`yes`/`on` is rejected
+without a Telegram call; a real justification runs the trusted `tg-ctl ask` and lets the bare
+body through **only on exit 0**. The hatch is consulted ONLY for a bare body — a partial body is
+never escalated to the human, and the removed `question` tag is blocked without consulting it.
 
 ## Fail-open, on purpose
 
-`on_error: "open"`. A formatting reminder, not a boundary — a crash (a command shlex can't
-tokenize, an unexpected event shape) must never wedge the ability to send a message. Every
-path returns `allow`; the only question is whether it also prints the advisory.
+`on_error: "open"`. A crash (an unexpected event shape, a malformed JSON event) must never
+wedge the ability to send a message. Every error path returns `allow`; the only deliberate
+hard stops are the narrow bare-body block and the removed-tag block.
 
 ## Test
 
-Capture the hook's exit and stdout. The exit is always `0`; the signal is whether the
-`allow` carries a `message`.
+Capture the hook's exit and stdout. Exit `0` means the send proceeds (the `allow` may carry an
+advisory `message`); exit `10` is a block.
 
 ```bash
 chmod +x decision_request_format.py
 
-# missing all three markers → allow WITH an advisory message:
+# a bare body (no table, none of the three markers) → BLOCK with the re-send skeleton:
 echo '{"args":{"command":"tg --tag decision \"should we go with A or B?\""}}' \
+  | ./decision_request_format.py; echo " exit=$?"        # → {"decision":"block","message":...} exit=10
+
+# a partial body (one marker) → allow WITH an advisory message:
+echo '{"args":{"command":"tg --tag decision \"Recommendation: go with A.\""}}' \
   | ./decision_request_format.py; echo " exit=$?"        # → {"decision":"allow","message":...} exit=0
 
 # a complete body → allow, NO message:
 echo '{"args":{"command":"tg --tag decision \"Context: the loader in app.py. Options: keep sync (simple, blocks) vs async (faster, complex). Recommendation: async.\""}}' \
   | ./decision_request_format.py; echo " exit=$?"        # → {"decision":"allow"} exit=0
 
-# a different tag → not a decision request, plain allow:
+# the removed question tag → BLOCK with the --tag decision redirect, whatever the body:
+echo '{"args":{"command":"tg --tag=question \"should we go with A or B?\""}}' \
+  | ./decision_request_format.py; echo " exit=$?"        # → {"decision":"block","message":...} exit=10
+
+# a different tag → not an escalation, plain allow:
 echo '{"args":{"command":"tg --tag report \"build green\""}}' \
   | ./decision_request_format.py; echo " exit=$?"        # → {"decision":"allow"} exit=0
 
@@ -133,9 +153,5 @@ echo '{"args":{"command":"tg --tag report \"build green\""}}' \
 echo '{"args":{"command":"echo \"use --tag decision\""}}' \
   | ./decision_request_format.py; echo " exit=$?"        # → {"decision":"allow"} exit=0
 ```
-
-A one-time silence is an external Telegram approval — set
-`RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT="<why>"` (deny-by-default; only an approved
-`tg-ctl ask` exit 0 silences the advisory).
 
 The full suite is `tests/test_decision_request_format.py` in the repo root.

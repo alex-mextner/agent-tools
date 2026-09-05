@@ -5895,6 +5895,144 @@ def test_review_quorum_derives_code_from_pr_body(tmp_path):
     assert "AUTHORITY CONFIRMED" in r.stdout and "HYP-999" in r.stdout, r.stdout
 
 
+def test_review_quorum_derives_literal_github_issue_ref_from_pr_body(tmp_path):
+    """A bare GitHub issue reference (`Fixes #105`) is a task code too, returned LITERAL
+    (`#105`, not `GH-105`): task-cli routes a GitHub id by its leading `#`, so a rewrite
+    would make the post-merge `task mark-shipped` unroutable."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": "Fixes #105 for the widget regression."},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "#105" in r.stdout, r.stdout
+    assert "GH-105" not in r.stdout, r.stdout
+
+
+def test_review_quorum_derives_refs_keyword_issue_ref_from_pr_body(tmp_path):
+    """`Refs #N` (the non-auto-closing reference form) anchors an issue ref just like GitHub's
+    closing keywords do; keyword matching is case-insensitive and tolerates a colon."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": "refs: #77 -- widget follow-up."},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "#77" in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # qualified cross-repo refs (incl. repo names ending in `-`/`.`) name ANOTHER repo's issue
+        "Fixes other-org/other-repo#123; closes org/trailing-#124; resolves org/dotted.#125.",
+        # a repo NAME/path ending in a keyword is still a qualified ref, not a keyword anchor
+        "Mirrors org/hot-fix#5, org/fix#6 and org/my.fix#7 upstream.",
+        # a URL fragment / Markdown anchor is not an issue reference
+        "See https://example.org/docs/#105 and the notes at #L245-L250.",
+        # an incidental prose mention of an (already-shipped) issue must not borrow its record
+        "Follow-up tidy-up for #12, reverts (#268). Not a fix for #123abc.",
+    ],
+)
+def test_review_quorum_ignores_non_anchored_github_issue_refs(tmp_path, body):
+    """Only a keyword-anchored local ref (`Fixes #N` / `Refs #N`) is a task code. The helper also
+    feeds the post-merge `task mark-shipped` call and the quorum-record lookup, so a cross-repo
+    ref, a URL fragment, or a bare prose mention of a shipped issue must NOT be derived — with
+    nothing else in the body ship refuses fail-closed."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": body})
+    assert r.returncode != 0, f"must not derive a task code from {body!r}\n{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_prefixed_ticket_takes_precedence_over_github_issue_ref(tmp_path):
+    """A lettered PREFIX-<n> ticket in the body wins over a `Fixes #N` aside in the same body —
+    the GitHub-issue arm runs AFTER the generic numeric arm so it never shadows a real ticket."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"SHIP_TEST_PR_BODY": "Fixes #45 as part of PROJ-123 (see the epic)."},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "PROJ-123" in r.stdout, r.stdout
+    assert "#45" not in r.stdout, r.stdout
+
+
+def test_review_quorum_descriptive_code_takes_precedence_over_github_issue_ref(tmp_path):
+    """A descriptive ALL-CAPS code in the body wins over an `also fixes #N` aside too — the
+    GitHub-issue arm is the LAST fallback, so a descriptive-code repo keeps deriving its own
+    code (no regression) and the aside can never borrow an already-shipped issue's record."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={
+            "SHIP_TEST_PR_BODY": "SME-ROADMAP-WORKTREE-NOTE — reword the note. Also fixes #12.",
+        },
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "SME-ROADMAP-WORKTREE-NOTE" in r.stdout, r.stdout
+    assert "#12" not in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Partially fixes #12 as a side effect.\n\nCloses #200\n",
+        # no whitespace between the refs: the first match must not swallow the `,`/`;` that is
+        # the second keyword's leading boundary, or the ambiguity would go undetected
+        "closes #12,fixes #200",
+        "Fixes #12;Refs: #200.",
+    ],
+)
+def test_review_quorum_refuses_two_distinct_anchored_github_issue_refs(tmp_path, body):
+    """Two DISTINCT keyword-anchored refs (`Partially fixes #12 ... Closes #200`) are an
+    ambiguous task code. Every other branch of the gate is fail-closed, so ship derives nothing
+    and refuses rather than silently taking the first ref in document order."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": body})
+    assert r.returncode != 0, f"{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_same_github_issue_ref_twice_is_not_ambiguous(tmp_path):
+    """The SAME issue anchored twice (`Fixes #105 ... Refs #105`) is one task code, not two."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"SHIP_TEST_PR_BODY": "Fixes #105.\n\nRefs #105 for the follow-up notes.\n"},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "#105" in r.stdout, r.stdout
+
+
+def test_review_quorum_invalid_github_issue_ref_does_not_count_toward_ambiguity(tmp_path):
+    """`Fixes #12abc` is not an issue ref (digits must end at a non-word boundary), so next to a
+    real `Closes #200` it neither derives `#12` nor makes the body ambiguous — `#200` wins."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": "Fixes #12abc Closes #200"},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "#200" in r.stdout, r.stdout
+    assert "#12" not in r.stdout.replace("#12abc", ""), r.stdout
+
+
 def test_review_quorum_derives_descriptive_code_from_pr_body(tmp_path):
     """No $REVIEW_TASK_CODE and no ticket in the branch name -> ship also derives a purely
     descriptive (non-numeric) review-cli task code from the PR body — the real-world #384

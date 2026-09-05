@@ -264,6 +264,157 @@ def test_notify_falls_back_to_pr_body_when_branch_and_title_have_no_code(repo_wi
     assert "mark-shipped HYP-931" in calls[0]
 
 
+def test_notify_passes_github_issue_ref_literal_to_mark_shipped(repo_with_pr_worktree, tmp_path):
+    """A `Fixes #105` PR body (a repo that tracks work as plain GitHub issues) reaches
+    `task mark-shipped` as the LITERAL `#105`, never a `GH-105` rewrite: task-cli routes a
+    GitHub id by its leading `#` (`_route_id_to_project` checks `tid.startswith("#")` first), so
+    a rewritten code would fall through to the Linear-prefix branch and be unroutable."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _bindir(tmp_path, with_task=True)
+
+    r, calls = _run_ship(
+        main, bindir, tmp_path, branch="fix-the-thing",
+        extra_env={"SHIP_TEST_PR_TITLE": "fix the thing", "SHIP_TEST_PR_BODY": "Fixes #105 for real."},
+    )
+
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert len(calls) == 1, calls
+    assert "mark-shipped #105" in calls[0]
+    assert "GH-105" not in calls[0]
+
+
+def test_notify_normalizes_a_reused_gh_synthetic_code_to_the_task_cli_id_format(repo_with_pr_worktree, tmp_path):
+    """Regression (real 404 hit live on tg-cli PR #305 and agent-tools PR #527): a `$TASK_CODE`
+    already in the synthetic "GH-<n>" shape -- the convention
+    agent-hooks/require-ticket-before-commit recognizes as a valid ticket reference, and the
+    shape the review-quorum gate's own ticket matcher used to derive internally before #511 --
+    reaches this function via the SAME reuse path `_ship_derive_task_code_for_notify` tries
+    first (`candidate="${TASK_CODE:-}"`, to avoid a redundant `gh pr view` call when the gate
+    already ran). Passing "GH-301" straight to `task mark-shipped` 404s: task-cli's
+    `_route_id_to_project` routes a GitHub id by checking `tid.startswith("#")` first, so
+    "GH-301" falls through to the Linear-team-prefix branch and is unroutable. It must reach
+    `task mark-shipped` as the literal "#301" instead."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _bindir(tmp_path, with_task=True)
+
+    r, calls = _run_ship(
+        main, bindir, tmp_path, branch="fix-the-thing",
+        extra_env={"TASK_CODE": "GH-301"},
+    )
+
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert len(calls) == 1, calls
+    assert "mark-shipped #301" in calls[0]
+    assert "GH-301" not in calls[0]
+    assert "normalizing task-cli notify code: GH-301 -> #301" in r.stderr
+
+
+def test_notify_leaves_a_gh_prefixed_non_matching_code_unaffected(repo_with_pr_worktree, tmp_path):
+    """The normalization is anchored to "GH-" followed by digits and NOTHING ELSE
+    (`^[Gg][Hh]-([0-9]+)$`) -- pins the regex's `$` anchor and digits-only tail so a future edit
+    that loosens either doesn't silently start rewriting a code like "GH-105A" (has a digit, so
+    it survives the earlier digit check, but isn't the exact GH-<n> shape) into something
+    unroutable in a different way."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _bindir(tmp_path, with_task=True)
+
+    r, calls = _run_ship(
+        main, bindir, tmp_path, branch="fix-the-thing",
+        extra_env={"TASK_CODE": "GH-105A"},
+    )
+
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert len(calls) == 1, calls
+    assert "mark-shipped GH-105A" in calls[0]
+
+
+def test_notify_normalizes_a_gh_code_derived_literally_from_the_branch_name(repo_with_pr_worktree, tmp_path):
+    """Regression on the SAME bug, reached via a DIFFERENT path than the $TASK_CODE reuse above:
+    a branch literally named "GH-105-..." is matched by _review_quorum_extract_ticket's generic
+    PREFIX-<n> arm (`[A-Z][A-Z]+-[0-9]+`, the same arm that matches this repo's own HYP-<n>
+    convention) and derived as "GH-105" -- #511 only stopped that matcher from SYNTHESIZING
+    "GH-<n>" out of a bare "Fixes #105"; it never taught the generic arm to reject a "GH-<n>"
+    token that was typed literally into the branch name itself. This must still normalize to
+    "#105", the exact same way the reused-$TASK_CODE case does."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _bindir(tmp_path, with_task=True)
+
+    r, calls = _run_ship(main, bindir, tmp_path, branch="GH-105-fix-crash")
+
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert len(calls) == 1, calls
+    assert "mark-shipped #105" in calls[0]
+    assert "GH-105" not in calls[0]
+
+
+def test_notify_normalizes_a_lowercase_gh_code(repo_with_pr_worktree, tmp_path):
+    """The convention require-ticket-before-commit recognizes is case-insensitive
+    (`re.IGNORECASE` on the same "GH-<n>" pattern) -- a lowercase "gh-301", however it arrives,
+    must normalize exactly like the uppercase form."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _bindir(tmp_path, with_task=True)
+
+    r, calls = _run_ship(
+        main, bindir, tmp_path, branch="fix-the-thing",
+        extra_env={"TASK_CODE": "gh-301"},
+    )
+
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert len(calls) == 1, calls
+    assert "mark-shipped #301" in calls[0]
+    assert "gh-301" not in calls[0]
+
+
+def test_notify_leaves_a_reused_literal_hash_code_unaffected_by_gh_normalization(repo_with_pr_worktree, tmp_path):
+    """A reused $TASK_CODE already in the literal "#<n>" shape (the form the keyword-anchored
+    GitHub-issue-reference arm has returned since #511) must not be double-rewritten -- it does
+    not match the "GH-<n>" case pattern at all, so it passes through untouched."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _bindir(tmp_path, with_task=True)
+
+    r, calls = _run_ship(
+        main, bindir, tmp_path, branch="fix-the-thing",
+        extra_env={"TASK_CODE": "#301"},
+    )
+
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert len(calls) == 1, calls
+    assert "mark-shipped #301" in calls[0]
+
+
+def test_notify_leaves_a_reused_hyp_code_unaffected_by_gh_normalization(repo_with_pr_worktree, tmp_path):
+    """A reused $TASK_CODE in the normal HYP-<n> shape must not be touched by the GH-<n>
+    normalization added for the regression above."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _bindir(tmp_path, with_task=True)
+
+    r, calls = _run_ship(
+        main, bindir, tmp_path, branch="fix-the-thing",
+        extra_env={"TASK_CODE": "HYP-931"},
+    )
+
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert len(calls) == 1, calls
+    assert "mark-shipped HYP-931" in calls[0]
+
+
+def test_notify_leaves_a_reused_descriptive_code_unaffected_by_gh_normalization(repo_with_pr_worktree, tmp_path):
+    """A reused $TASK_CODE in review-cli's own hyphenated descriptive shape (not the HYP-<n>
+    convention, and not the GH-<n> synthetic shape either) must not be touched by the GH-<n>
+    normalization added for the regression above."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _bindir(tmp_path, with_task=True)
+
+    r, calls = _run_ship(
+        main, bindir, tmp_path, branch="fix-the-thing",
+        extra_env={"TASK_CODE": "SME-ROADMAP-NOTE-42"},
+    )
+
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert len(calls) == 1, calls
+    assert "mark-shipped SME-ROADMAP-NOTE-42" in calls[0]
+
+
 def test_notify_skips_when_no_code_derivable_anywhere(repo_with_pr_worktree, tmp_path):
     main, _wt = repo_with_pr_worktree
     bindir = _bindir(tmp_path, with_task=True)
