@@ -78,8 +78,20 @@ def _install_descriptor(hooks_dir: Path, *, hook_id: str, point: str, cmd: Path,
 
 
 def _run_dispatch(event: str, cc_event: dict, *, home: Path) -> subprocess.CompletedProcess:
-    """Invoke the dispatcher exactly as CC's settings.json would: `python -m cc_hook_bridge <event>`."""
-    env = dict(os.environ)
+    """Invoke the dispatcher exactly as CC's settings.json would: `python -m cc_hook_bridge <event>`.
+
+    Strips every ambient `RIG_HATCH_REQUEST_*` var before launching. This subprocess crosses
+    a real process boundary, so conftest's `pwd.getpwuid`/`resolve_home` monkeypatches (which
+    only patch the CURRENT interpreter) never reach it — a hatch-using hook driven through here
+    (e.g. subagent-no-monitor's clean-room test) would resolve the REAL OS home and could find a
+    real `tg-ctl` in `_TRUSTED_TG_CTL_PATHS`. If the developer running pytest happens to have any
+    `RIG_HATCH_REQUEST_*` var exported in their shell (the documented way to arm a hatch — "set
+    in the process environment before the tool call"), an un-stripped env would let a routine
+    test run fire a REAL Telegram approval request at a human, then hang up to the hatch's ~900s
+    cap and blow this call's 30s timeout. Centralized here (not per-test) so every current and
+    future clean-room hatch test run through this helper is covered, not just one call site.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("RIG_HATCH_REQUEST_")}
     env["HOME"] = str(home)
     env["PYTHONPATH"] = str(_LIB) + os.pathsep + env.get("PYTHONPATH", "")
     return subprocess.run(

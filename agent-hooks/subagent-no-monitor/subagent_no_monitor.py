@@ -58,9 +58,9 @@ import os
 import sys
 from pathlib import Path
 
-# SYNC: duplicated in every hatch-using hook so each hook does not need a shared helper file
-# under agent-hooks/ (each hook script is a standalone subprocess with no shared import path).
-# Edit every copy together; tests/test_hatch_import_hardening.py guards the shared behavior.
+# SYNC: duplicated in every hatch-using hook so each hook does not need
+# a shared helper file under agent-hooks/. Edit every copy together;
+# tests/test_hatch_import_hardening.py guards the shared behavior.
 _HATCH_MODULE = "agenttools_hatch_escalation"
 
 
@@ -81,8 +81,8 @@ def _load_hatch_escalation():
         if name != _HATCH_MODULE:
             sys.modules.pop(name, None)
     sys.modules[_HATCH_MODULE] = module
-    # Leave the repo-local module installed on success so later imports in this hook process
-    # cannot regain a preloaded user/site package or submodule.
+    # Leave the repo-local module installed on success so later imports in this
+    # hook process cannot regain a preloaded user/site package or submodule.
     try:
         spec.loader.exec_module(module)
     except BaseException as exc:
