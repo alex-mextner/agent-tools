@@ -22,6 +22,41 @@ actually look, not just generate the image and move on.
 
 Only then claim it works, and attach the final capture as evidence.
 
+## Recording that you looked (the `visual-proof-gate` marker)
+
+Some repos gate the commit on a marker file proving you reviewed the capture (see the
+`visual-proof-gate` agent-hook). **Use `dev shot` — it captures and writes the record for
+you, no `touch` needed:**
+
+```bash
+dev shot 'http://localhost:PORT/path' --out shot.png --viewport 1440x900
+```
+
+Replace `http://localhost:PORT/path` with your real dev-server URL, KEEPING it quoted — do
+NOT wrap it in `<...>`: that's shell input-redirection syntax in bash/zsh, so `dev shot
+<url>` is a parse error, not a placeholder an agent fills in. An unquoted real URL
+containing `&`, `;`, `|`, or `?` can also be reinterpreted by the shell instead of passed
+through as one argument, so keep the quotes even after substituting the real URL. `dev
+shot` drives the capture, measures it (refusing a blank or wrong-sized result), and writes
+the proof record itself, in Python — nothing for a worktree-isolated Claude Code session's
+guard to trip on, because there's no shell command to construct in the first place.
+
+Only fall back to a manual touch when there's genuinely no URL to shoot. If you must, it's
+a **flat command with no substitution** — no `$(...)`, no `${...}`, no bare `$VAR` — e.g.
+`mkdir -p ~/.cache/agent-tools/visual-proof && touch ~/.cache/agent-tools/visual-proof/proof-key`
+(the `mkdir -p` covers a fresh machine where the directory doesn't exist yet — a bare `touch`
+into a missing directory fails). Freshness is judged by the file's mtime, so a fixed name
+works; a timestamped suffix like
+`touch .../key-$(date +%s)` buys nothing and, in a worktree-isolated Claude Code session,
+gets refused outright by the CLI's own worktree guard (unrelated to this hook, and it fires
+even though the command touches no git). If the marker directory might be overridden via
+`VISUAL_PROOF_DIR`, resolve it first with `printenv VISUAL_PROOF_DIR` (a separate call — safe
+because it passes the variable NAME as a plain argument, not an expansion) and touch a file
+INSIDE that literal directory, e.g. `mkdir -p /custom/proofs && touch
+/custom/proofs/proof-key` — not the directory itself (the gate checks mtimes of files inside
+the directory, not the directory's own mtime). Single-quote the directory if it has spaces
+(`touch '/custom path/proof-key'` is still zero-expansion, so it still passes the guard).
+
 ## Common failure
 
 Capturing a screenshot of an *idle* or *not-yet-rendered* state and calling it proof.

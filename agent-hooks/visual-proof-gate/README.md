@@ -19,19 +19,73 @@ If **no** user-visible file is staged → **allow** (nothing to prove). If git c
 
 ## The marker contract (how it knows a screenshot was looked at)
 
-The `visual-proof-cycle` skill / a screenshot-capture step **touches a file** after the agent
-VIEWS the capture:
+### PRIMARY: `dev shot` — captures AND writes the record, no `touch` command, ever
+
+```bash
+dev shot 'http://localhost:4173/' --out shot.png --viewport 1440x900
+```
+
+Always single-quote the URL when you fill it in with a real one — an unquoted URL
+containing `&`, `;`, `|`, or `?` can be reinterpreted by the shell (`&` backgrounds
+everything before it, `;`/`|` starts a new command) instead of being passed to `dev shot`
+as one argument.
+
+`dev shot` (dev-cli, `dev_cli/visual_proof.py`) drives the capture (viewport sizing, a
+scroll sweep so reveal-on-scroll content is actually visible), measures the result, and
+writes the proof record into `VISUAL_PROOF_DIR` itself — in Python, via
+`write_attestation()`. There is no shell `touch` anywhere in this path, so there is nothing
+for a worktree-isolated Claude Code session's `$()`/`${...}`/bare-`$VAR` guard to trip on;
+the recipe is structurally immune rather than carefully worded. It also refuses a blank or
+wrong-sized capture, which a bare `touch` never could.
+
+### FALLBACK: manual touch (only when there's no URL to shoot)
+
+Use this ONLY when there's genuinely no dev server / rendered URL to point `dev shot` at
+(e.g. a docs-only or backend-only visual asset). A screenshot-capture step **touches a
+file** after the agent VIEWS the capture:
 
 ```
 ~/.cache/agent-tools/visual-proof/<key>     # mtime = "looked at it" time
 ```
 
 Any fresh file in that dir (within `VISUAL_PROOF_WINDOW_S`, default `3600`s) satisfies the
-gate. Configure the dir with `VISUAL_PROOF_DIR`. This is the honest, satisfiable action —
-look at the screenshot, the capture step records that you did.
+gate. Configure the dir with `VISUAL_PROOF_DIR`. This is weaker than `dev shot` — it proves
+only that a file was touched, not that a real, non-blank capture exists — so prefer `dev
+shot` whenever there's a URL to point it at.
 
 > The env-configured marker dir is read at import time; CC re-invokes the script per call, so
 > each call picks up the current env — this is fine, not a footgun.
+
+> **In a worktree-isolated session, keep the touch a single flat command — no `$()`, no
+> `${...}`, no bare `$VAR`, no pipe, no loop.** Claude Code's own worktree-isolation Bash
+> guard (separate from this gate, built into the CLI) refuses ANY Bash command whose parsed
+> shape isn't "simple" — including a command with zero `git` in it — with a misleading
+> refusal that talks about "git operations". `mkdir -p ~/.cache/agent-tools/visual-proof &&
+> touch ~/.cache/agent-tools/visual-proof/hyp-1234-reviewed` passes (the `mkdir -p` covers a
+> fresh machine where the directory doesn't exist yet — a bare `touch` into a missing
+> directory fails); the common habit `touch .../hyp-1234-reviewed-$(date +%s)` gets refused,
+> wasting a round trip for no reason: freshness is judged by the file's **mtime**, not by a
+> unique/timestamped name, so the timestamp suffix buys nothing and should be dropped in a
+> worktree-isolated session. It's specifically `$()`/`${...}`/`$VAR`/pipes/loops/certain
+> heredocs that trip the CLI guard, not `&&` chaining by itself.
+>
+> If `VISUAL_PROOF_DIR` might be overridden, you can't reference it as `$VISUAL_PROOF_DIR` or
+> `${VISUAL_PROOF_DIR}` either — both trip the same guard, even split across two separate
+> Bash calls (the second call still contains the expansion). Resolve it first with `printenv
+> VISUAL_PROOF_DIR` (a plain string argument, not an expansion — always passes the guard),
+> then `mkdir -p` that literal directory (or the default above if empty) and `touch` a file
+> INSIDE it as its own flat command, e.g.
+> `mkdir -p /custom/proofs && touch /custom/proofs/hyp-1234`. The gate checks mtimes of files
+> INSIDE the directory, not the directory's own mtime, so `touch /custom/proofs` alone
+> (with no filename appended) does NOT satisfy it. If the directory has spaces or shell-special characters,
+> single-quote the LITERAL value — `touch '/custom/proofs with spaces/hyp-1234'` — quoting a
+> literal is not an expansion (no `$` inside it), so it still passes the guard.
+>
+> If you hit "is too complex to verify that it stays inside the worktree" while trying to
+> satisfy *this* gate, that's the CLI guard, not this hook — see upstream
+> anthropics/claude-code#88776 (duplicate of #84720, #86340, #87959; Anthropic engineering
+> acknowledged the false-positive on #86340: the too-complex bail fires before checking
+> whether the command touches git at all).
 
 ## Block, not warn (doctrine)
 
