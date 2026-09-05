@@ -55,6 +55,19 @@ os.environ.setdefault("SHIP_MAGIC_CLOSE_GATE", "0")
 # in isolation, with its own fake `task` binary, and overrides this back to "1" per-call.
 os.environ["SHIP_TASK_NOTIFY_ENABLED"] = "0"
 
+# The merge-time version auto-bump (#518) also defaults to ENABLED. Every fake `gh` in this file
+# predates it and answers the Contents/update-branch API calls with garbage (`0`, `[]`), which the
+# auto-bump treats as "could not read the version file — skip" — so the pre-existing version-bump
+# gate tests still see the old refusal, but only by accident of the fake. Pin the feature OFF here
+# so those tests exercise the gate they were written for deterministically; the auto-bump has its
+# own git-backed fake and suite in tests/test_ship_auto_bump.py (which explicitly `pop()`s this
+# back out per call, same as it must for SHIP_TASK_NOTIFY_ENABLED above). Unconditional assignment,
+# NOT `setdefault`, for the identical reason documented above: `setdefault` yields to an ambient
+# `SHIP_AUTO_BUMP=1` a developer's shell might already export, silently flipping this whole
+# ~30-fixture legacy suite onto the auto-bump path against fakes that answer the Contents API with
+# garbage — nondeterministic failures that depend on the shell (review finding, #518).
+os.environ["SHIP_AUTO_BUMP"] = "0"
+
 # A fake `gh` that answers exactly the calls ship.sh makes (with --skip-ci the CI rollup
 # is not queried). Branch name is read from $SHIP_TEST_BRANCH so the test controls it.
 _FAKE_GH = """\
