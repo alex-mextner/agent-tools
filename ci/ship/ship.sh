@@ -265,7 +265,7 @@ KF_AUDIT_PENDING=""
 # current thread is never touched (see the gate below).
 RESOLVE_THREADS=0
 case "${SHIP_RESOLVE_ADDRESSED_THREADS:-}" in 1|true|yes) RESOLVE_THREADS=1 ;; esac
-USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--resolve-addressed-threads] [--screenshot <path> [desc]]... [--known-flake <check-name>]...'
+USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--resolve-addressed-threads] [--rewrite-magic-close] [--screenshot <path> [desc]]... [--known-flake <check-name>]...'
 
 # Path to the review-quorum gate's hatch-escalation helper (ci/ship/review_quorum_hatch.py),
 # derived ONLY from this script's own location. That helper imports the shared
@@ -2838,8 +2838,9 @@ _magic_close_matches() {  # $1 = text -> one "keyword ref" phrase per line; ALWA
   # grep/sed are line-based, so an unnormalized scan would silently miss "Fixes\n#115" split
   # across two lines (a real shape: the commit scan synthesizes exactly `headline + "\n" +
   # body`). A phrase caught ONLY this way (not by a plain per-line scan) can't be safely fixed
-  # by the line-based `_magic_close_rewrite` sed — `_magic_close_gate` re-verifies after any
-  # rewrite and refuses rather than trust a rewrite that may have missed a cross-line phrase.
+  # by the line-based `_magic_close_rewrite` sed — `_magic_close_rewrite_pr` verifies its OWN
+  # rewrite result and refuses rather than trust a rewrite that may have missed a cross-line
+  # phrase.
   printf '%s' "$1" | LC_ALL=C tr '\n' ' ' | LC_ALL=C grep -oE "$_MAGIC_CLOSE_RE" | LC_ALL=C sed -E 's/^[^[:alnum:]_]//' || true
 }
 _magic_close_rewrite() {  # $1 = text -> stdout: the text with every keyword replaced by "Refs"
@@ -2847,7 +2848,7 @@ _magic_close_rewrite() {  # $1 = text -> stdout: the text with every keyword rep
   printf '%s\n' "$1" | LC_ALL=C sed -E "s~${_MAGIC_CLOSE_RE}~\\1Refs\\6\\7~g"
 }
 _magic_close_gate() {
-  local title body commits t_hits b_hits c_hits hits title_rc=0 body_rc=0 commits_rc=0
+  local title body commits t_hits b_hits c_hits hits tb_hits title_rc=0 body_rc=0 commits_rc=0
   # Track EACH `gh pr view` call's own exit code (review finding, round 2, Fable): the earlier
   # `|| title=""` made a genuine `gh` failure (rate-limited, network blip) indistinguishable
   # from "the title/body is legitimately empty" — a PR whose real body says "Closes HYP-1440"
@@ -2921,9 +2922,28 @@ _magic_close_rewrite_pr() {  # $1=title $2=body $3=title hits $4=body hits $5=jo
   # caller logs exactly ONE final decision per gate invocation, not a `rewritten` line
   # immediately followed by a `refused` one for the same ship run). A `gh pr edit` FAILURE is
   # unconditionally terminal either way, so that failure path still audits here.
+  local new_title="$1" new_body="$2"
   local -a edit_args=()
-  [ -n "$3" ] && edit_args+=(--title "$(_magic_close_rewrite "$1")")
-  [ -n "$4" ] && edit_args+=(--body "$(_magic_close_rewrite "$2")")
+  [ -n "$3" ] && new_title="$(_magic_close_rewrite "$1")" && edit_args+=(--title "$new_title")
+  [ -n "$4" ] && new_body="$(_magic_close_rewrite "$2")" && edit_args+=(--body "$new_body")
+  # Verify the rewrite RESULT — not a post-edit re-fetch (review finding, round 5, Opus + GLM:
+  # an earlier version re-fetched from GitHub after the edit to verify it landed, but that
+  # re-fetch used the SAME unguarded `|| var=""` pattern round 2 had already fixed elsewhere —
+  # a `gh` failure on the RE-fetch silently looked like "no keyword left", the exact fail-open
+  # this whole gate exists to prevent; it also mispredicted under `--dry-run`, where nothing
+  # was written yet the stale pre-edit text still re-matched). Scanning `new_title`/`new_body`
+  # — text already computed locally, no network call — catches a cross-line phrase the
+  # line-based rewrite sed couldn't reach in BOTH dry-run and real runs, with nothing to fail
+  # open on.
+  local residual
+  residual=$(printf '%s\n%s\n' "$(_magic_close_matches "$new_title")" "$(_magic_close_matches "$new_body")" | sed '/^$/d' | tr '\n' ';' | sed 's/;$//')
+  if [ -n "$residual" ]; then
+    { echo "Refusing: magic-close gate — rewriting PR #$PR would still leave a close keyword in the title/body (a phrase the line-based rewrite could not reach — e.g. split across lines)."
+      printf '%s\n' "$residual" | sed 's/^/  still present: "/; s/$/"/'
+      echo "  Fix by hand: edit the PR title/body directly (write \"Refs <ref>\"), then re-run ship."; } >&2
+    _ticket_gate_audit_log magic-close refused "" "rewrite-incomplete: $residual"
+    exit 1
+  fi
   echo "[ship] magic-close gate: --rewrite-magic-close — rewriting to Refs in #$PR: $5"
   if ! run gh pr edit "$PR" "${edit_args[@]}"; then
     { echo "Refusing: magic-close gate — 'gh pr edit $PR' failed while rewriting the keyword(s) to Refs ($5)."
@@ -2931,27 +2951,7 @@ _magic_close_rewrite_pr() {  # $1=title $2=body $3=title hits $4=body hits $5=jo
     _ticket_gate_audit_log magic-close refused "" "rewrite-failed: $5"
     exit 1
   fi
-  # Re-fetch and re-scan the ACTUAL post-edit title/body (review finding, round 4, GLM) — the
-  # rewrite sed is line-based, so a cross-line phrase `_magic_close_matches`' normalized scan
-  # caught but the sed couldn't reach (or a concurrent edit landing between the read and the
-  # write) would otherwise leave a keyword in place while the gate confidently reports success.
-  # Skipped under --dry-run: `run gh pr edit` is a no-op there, so nothing was actually written
-  # and a re-fetch would just re-find the SAME pre-edit hits.
-  if [ "$DRY_RUN" != "1" ]; then
-    local verify_title verify_body verify_hits
-    verify_title=$(gh pr view "$PR" --json title -q '.title // ""' 2>/dev/null) || verify_title=""
-    verify_body=$(gh pr view "$PR" --json body -q '.body // ""' 2>/dev/null) || verify_body=""
-    verify_hits=$(printf '%s\n%s\n' "$(_magic_close_matches "$verify_title")" "$(_magic_close_matches "$verify_body")" | sed '/^$/d' | tr '\n' ';' | sed 's/;$//')
-    if [ -n "$verify_hits" ]; then
-      { echo "Refusing: magic-close gate — after rewriting PR #$PR, the title/body STILL contains a close keyword (a phrase the line-based rewrite could not reach — e.g. split across lines — or a concurrent edit)."
-        printf '%s\n' "$verify_hits" | sed 's/^/  still present: "/; s/$/"/'
-        echo "  Fix by hand: edit the PR title/body directly (write \"Refs <ref>\"), then re-run ship."; } >&2
-      _ticket_gate_audit_log magic-close refused "" "rewrite-incomplete: $verify_hits"
-      exit 1
-    fi
-  fi
 }
-
 MAGIC_CLOSE_ENABLED=1
 case "${SHIP_MAGIC_CLOSE_GATE:-1}" in 0|false|no) MAGIC_CLOSE_ENABLED=0 ;; esac
 if [ "$MAGIC_CLOSE_ENABLED" = "0" ]; then

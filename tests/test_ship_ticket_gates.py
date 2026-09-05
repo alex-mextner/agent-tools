@@ -492,12 +492,13 @@ def test_magic_close_catches_a_keyword_split_across_lines(repo, tmp_path):
 
 def test_magic_close_rewrite_refuses_when_a_cross_line_phrase_survives_the_rewrite(repo, tmp_path):
     """The line-based rewrite sed cannot reach a phrase split across lines — the gate must
-    RE-VERIFY the actual post-edit title/body rather than trust the rewrite blindly, and
-    refuse (not silently merge) when the keyword is still present after the edit."""
+    verify the REWRITE RESULT before ever touching the PR, and refuse (never edit, never
+    merge) rather than trust the line-based sed blindly."""
     r = _run(repo, tmp_path, args=("--rewrite-magic-close",), env={"SHIP_TEST_PR_BODY": "Summary\n\nFixes\n#115"})
     assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
-    assert "STILL contains a close keyword" in r.stderr
+    assert "would still leave a close keyword" in r.stderr
     assert not _merged(tmp_path)
+    assert [l for l in _gh_log(tmp_path) if l.startswith("edit ")] == [], "must refuse BEFORE editing, not after"
     (line,) = _audit(tmp_path, "magic-close")
     assert line["decision"] == "refused" and "rewrite-incomplete" in line["detail"]
 
