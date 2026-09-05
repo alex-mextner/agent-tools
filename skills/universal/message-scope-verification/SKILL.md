@@ -92,5 +92,5 @@ unfinished work and forcing the user to catch and correct it after the fact.
 
 Pairs with `monorepo/parallelize-independent` (once scope is confirmed, decide serial vs.
 parallel — where that by-type skill is installed), `decision-request-discipline` (the
-question format for anything you escalate), and `learn-from-feedback` (this skill is
+decision-request format for anything you escalate), and `learn-from-feedback` (this skill is
 itself the durable fix for a misdirected-message incident, not just a one-off apology).
