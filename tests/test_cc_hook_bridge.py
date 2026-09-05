@@ -628,6 +628,33 @@ def test_pre_monitor_orchestrator_call_passes_clean_room(tmp_path):
         assert out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", out
 
 
+def test_pre_monitor_forged_tool_input_agent_id_does_not_deny_orchestrator_clean_room(tmp_path):
+    """End-to-end, the INVERTED direction from the forged-agent_id test above: the orchestrator's
+    own legitimate Monitor call (no top-level CC agent_id) must NOT be denied even when
+    `tool_input` happens to carry an agent_id-shaped field — the bridge's T2 drop loop
+    (`dispatch.py`) must not let a forged/incidental `tool_input.agent_id` fool the gate into
+    treating the orchestrator as a subagent. Symmetric coverage to
+    `test_forged_tool_input_agent_id_does_not_exempt_clean_room`, which proves the drop in the
+    exempt direction; this proves it in the deny-availability direction for pre-monitor."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="subagent-no-monitor", point="pre-monitor",
+                        cmd=SUBAGENT_NO_MONITOR, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Monitor",
+        "tool_input": {"description": "watch a dispatched subagent", "timeout_ms": 300000,
+                        "persistent": False, "agent_id": "forged"},
+        # no top-level agent_id — the real CC signal for a main-thread orchestrator call
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    if proc.stdout.strip():
+        out = json.loads(proc.stdout)
+        assert out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", out
+
+
 def test_unmatched_tool_does_not_run_pre_bash_hook(tmp_path):
     """A pre-bash hook must NOT fire on a Read (no logical point) — selection by point."""
     home = tmp_path / "home"

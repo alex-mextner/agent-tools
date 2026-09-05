@@ -110,4 +110,4 @@ git diff --cached --name-only   # must show ONLY .md files for the bypass to app
 | `review diff … &` (Bash, shell background) | NO | caught by `subagent-no-bg-longproc` hook |
 | `run_in_background: true` on Bash | NO | caught by `subagent-no-bg-longproc` hook |
 | TaskCreate / Task tool | NO | NOT caught by any hook; process dies with turn |
-| Monitor tool | NO | caught by `subagent-no-monitor` hook (once the companion rig-cli matcher is applied on this machine — see above); process dies with turn regardless |
+| Monitor tool | NO | caught by `subagent-no-monitor` hook (once the companion rig-cli matcher is applied on this machine — see above); otherwise the subagent wedges awaiting a notification only the main loop receives |

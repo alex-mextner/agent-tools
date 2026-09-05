@@ -168,9 +168,10 @@ def main() -> int:
     args = event.get("args") or {}
     cwd = str(event.get("cwd") or args.get("cwd") or os.getcwd())
 
-    ctx = {"hook": "subagent-no-monitor", "description": args.get("description")}
+    watched = str(args.get("description") or "monitor-watch")
+    ctx = {"hook": "subagent-no-monitor", "description": watched}
     hatch = hatch_escalation.request_hatch_approval(
-        "subagent-no-monitor", ctx, cwd=cwd
+        "subagent-no-monitor", ctx, cwd=cwd, command=watched
     )
     if hatch.should_stop:
         if hatch.approved:
