@@ -28,14 +28,15 @@ shell that happens to export one of ship's gate switches silently changes what t
 (caught live: this machine started exporting `SHIP_EXTERNAL_REVIEW=0` machine-wide, which disabled
 the external-review gate in five tests written to exercise it as enabled). This is deliberately a
 plain module-level `os.environ` mutation, run ONCE here at conftest import time, NOT a per-test
-`monkeypatch.delenv` autouse fixture: `tests/test_ship.py` and `tests/test_ship_notify_task_cli.py`
-each ALSO rely on a module-level `os.environ.setdefault("SHIP_REVIEW_QUORUM", "0")` /
-`os.environ["SHIP_TASK_NOTIFY_ENABLED"] = "0"` applied once at their own collection time, which a
-per-test fixture would strip during every test body (monkeypatch only restores the pre-test value
-AFTER each test's teardown) — reintroducing exactly the ambient-enabled gates those defaults exist
-to turn off. Since conftest.py is always imported before the test modules in this directory are
-collected, stripping here first lets those modules' own one-time defaults apply cleanly against a
-guaranteed-clean starting point.
+`monkeypatch.delenv` autouse fixture: `tests/test_ship.py` relies on its own module-level
+`os.environ.setdefault("SHIP_REVIEW_QUORUM", "0")` (also present in
+`tests/test_ship_notify_task_cli.py`) plus `os.environ["SHIP_TASK_NOTIFY_ENABLED"] = "0"`
+(test_ship.py only), applied once at each module's own collection time, which a per-test fixture
+would strip during every test body (monkeypatch only restores the pre-test value AFTER each test's
+teardown) — reintroducing exactly the ambient-enabled gates those defaults exist to turn off. Since
+conftest.py is always imported before the test modules in this directory are collected, stripping
+here first lets those modules' own one-time defaults apply cleanly against a guaranteed-clean
+starting point.
 """
 
 from __future__ import annotations
@@ -51,10 +52,15 @@ try:
 except ImportError:  # pragma: no cover - Windows compatibility for test collection.
     pwd = None
 
+# Any ambient env var ship.sh treats as a gate-control knob or hatch-request override. Kept as a
+# module constant (not inlined into the loop below) so tests/test_conftest_ship_env.py has a
+# stable target to assert against.
+_SHIP_ENV_PREFIXES = ("SHIP_", "RIG_HATCH_REQUEST_SHIP_")
+
 
 def _strip_ambient_ship_env() -> None:
     for name in tuple(os.environ):
-        if name.startswith("SHIP_") or name.startswith("RIG_HATCH_REQUEST_SHIP_"):
+        if name.startswith(_SHIP_ENV_PREFIXES):
             os.environ.pop(name, None)
 
 
