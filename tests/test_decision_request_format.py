@@ -1,13 +1,14 @@
 """Tests for the decision-request-format agent-hook (pre-bash, send-time escalation-format gate).
 
-Graduated verdict: a genuinely BARE escalation (`tg --tag decision|problem|question` whose body
-has no table and none of Context/Options/Recommendation) is BLOCKED (exit 10, the send is
+Graduated verdict: a genuinely BARE escalation (`tg --tag decision|problem` whose body has no
+table and none of Context/Options/Recommendation) is BLOCKED (exit 10, the send is
 stopped); a PARTIAL body (some structure) gets an exit-0 advisory nudge; a COMPLETE body sends
 silently. A pros/cons table (markdown OR HTML) always passes — the lenient-true-positive
 guarantee that protects the human's only comms channel from a false block.
 
 Covers: TRIGGER detection (parsed not raw-matched, through wrappers and pipelines), the
-bare→block / partial→advise / complete→silent grading, the table-always-passes leniency,
+bare→block / partial→advise / complete→silent grading, the table-always-passes leniency, the
+REMOVED `question` tag (agent-tools#524: blocked outright with the --tag decision redirect),
 NON-TRIGGER cases (other tag / no tag / non-tg / flag-inside-a-string), the DEAD self-service
 escape hatch (`ALLOW_RAW_DECISION_REQUEST` / `# decision-request-ok:`), the external Telegram
 hatch (`RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT`) forcing a bare body through, and FAIL-OPEN on
@@ -115,6 +116,8 @@ _HTML_TABLE = (
 )
 # A PARTIAL body: some structure (one marker) but not complete — must ADVISE, never block.
 _PARTIAL = "Recommendation: I'd go with A."
+# The external Telegram hatch that can force a BARE body through (never the removed tag).
+_HATCH_ENV = "RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT"
 
 
 def _assert_blocked(out: str, code: int) -> str:
@@ -153,15 +156,15 @@ def test_bare_body_is_blocked(command, monkeypatch):
 # ── a bare escalation whose body carries a shell OPERATOR inside its quotes → still BLOCK ──
 # The command splitter must be quote-aware. A raw split on `|` / `&&` / `;` tore the quoted body
 # apart (`"A | B?"` → `"A ` + ` B?"`), leaving an unbalanced segment that failed to tokenize, so
-# the escalation went unseen and the #12 bare-question block was bypassed for the common
+# the escalation went unseen and the #12 bare-body block was bypassed for the common
 # "A vs B" wording. (Codex P2 on PR #281.)
 @pytest.mark.parametrize("command", [
-    'tg --tag question "should we go with A | B?"',          # single pipe inside the body
+    'tg --tag decision "should we go with A | B?"',          # single pipe inside the body
     'tg --tag decision "keep sync || go async?"',            # `||` inside the body
     'tg --tag problem "run migrate && deploy, or roll back?"',  # `&&` inside the body
-    'tg --tag question "do A; then B?"',                     # `;` inside the body
+    'tg --tag problem "do A; then B?"',                      # `;` inside the body
     'TG_AI_MODEL=claude tg --tag decision "ship A | ship B?"',  # assignment + piped body
-    'echo x | tg --tag question "pick A | B?"',              # real pipeline AND a piped body
+    'echo x | tg --tag decision "pick A | B?"',              # real pipeline AND a piped body
 ])
 def test_bare_body_with_quoted_operator_is_blocked(command, monkeypatch):
     out, _, code = _run(command, monkeypatch)
@@ -277,20 +280,20 @@ def test_empty_body_with_decision_tag_is_blocked(monkeypatch):
     _assert_blocked(out, code)
 
 
-# ── #12: problem / question are the SAME escalation shape → each is GATED ──────────────────
+# ── #12: problem is the SAME escalation shape as decision → each is GATED ──────────────────
 
-@pytest.mark.parametrize("tag", ["decision", "problem", "question"])
+@pytest.mark.parametrize("tag", ["decision", "problem"])
 def test_all_escalation_tags_block_a_bare_body(tag, monkeypatch):
-    """decision/problem/question all route a structured escalation to the human, so a bare body
-    (no structure) is BLOCKED for EACH — an agent can't dodge the gate by picking `problem`/
-    `question` instead of `decision` (agent-tools#213/#12)."""
+    """decision/problem both route a structured escalation to the human, so a bare body (no
+    structure) is BLOCKED for EACH — an agent can't dodge the gate by picking `problem` instead
+    of `decision` (agent-tools#213/#12)."""
     out, _, code = _run(f'tg --tag {tag} "{_BARE}"', monkeypatch)
     msg = _assert_blocked(out, code)
     # The block message names the actual tag used, not a hardcoded "decision".
     assert f"--tag {tag}" in msg
 
 
-@pytest.mark.parametrize("tag", ["decision", "problem", "question"])
+@pytest.mark.parametrize("tag", ["decision", "problem"])
 def test_all_escalation_tags_complete_body_silent(tag, monkeypatch):
     out, _, code = _run(f'tg --tag {tag} "{_COMPLETE}"', monkeypatch)
     assert code == 0 and _decision(out) == "allow"
@@ -299,7 +302,7 @@ def test_all_escalation_tags_complete_body_silent(tag, monkeypatch):
 
 # ── LENIENCY: a structured escalation must always PASS (the false-block guard) ─────────────
 
-@pytest.mark.parametrize("tag", ["decision", "problem", "question"])
+@pytest.mark.parametrize("tag", ["decision", "problem"])
 def test_markdown_table_body_passes_silently(tag, monkeypatch):
     """A pros/cons markdown table + context + recommendation is a complete escalation → send
     silently. The human's channel must NEVER be blocked for a properly-formatted message."""
@@ -308,7 +311,7 @@ def test_markdown_table_body_passes_silently(tag, monkeypatch):
     assert _message(out) is None
 
 
-@pytest.mark.parametrize("tag", ["decision", "problem", "question"])
+@pytest.mark.parametrize("tag", ["decision", "problem"])
 def test_html_table_body_is_never_blocked(tag, monkeypatch):
     """A rich HTML `<table>` escalation must not be blocked — table detection covers HTML too."""
     out, _, code = _run(f"tg --tag {tag} {_q(_HTML_TABLE)}", monkeypatch)
@@ -344,8 +347,60 @@ def test_table_alone_satisfies_options_and_passes(monkeypatch):
     Recommendation) and must NOT be told to add a pros/cons table it already has."""
     body = "| left | right |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |"
     assert "Options" not in drf._missing_markers(body)  # the table satisfies Options
-    out, _, code = _run(f"tg --tag question {_q(body)}", monkeypatch)
+    out, _, code = _run(f"tg --tag decision {_q(body)}", monkeypatch)
     assert code != drf.BLOCK_EXIT_CODE and _decision(out) == "allow"
+
+
+# ── agent-tools#524: the `question` tag is REMOVED → BLOCKED with the --tag decision redirect ──
+
+def test_escalation_tag_set_is_decision_and_problem():
+    """The acceptance criterion in words: the escalation set is exactly decision + problem."""
+    assert drf._ESCALATION_TAGS == frozenset({"decision", "problem"})
+    assert "question" not in drf._ESCALATION_TAGS
+
+
+@pytest.mark.parametrize("command", [
+    f'tg --tag question "{_BARE}"',                    # a bare question — the old habit
+    f'tg --tag question {_q(_MD_TABLE)}',              # a COMPLETE body: still refused
+    f'tg --tag=question "{_BARE}"',                    # the --tag=value spelling
+    f'tg --tag QUESTION "{_BARE}"',                    # case-insensitive, like the escalation tags
+    f'tg --tag=QUESTION "{_BARE}"',                    # the --tag=value spelling, upper-cased
+    f'TG_AI_MODEL=claude tg --tag question "{_BARE}"',  # the skill's own prefix form
+    f'echo x | tg --tag question "{_BARE}"',           # later in a pipeline
+])
+def test_removed_question_tag_is_blocked_with_decision_hint(command, monkeypatch):
+    """`--tag question` no longer exists (tg refuses it): the hook BLOCKS the command with a
+    hint pointing at `--tag decision` + the decision-request format. Unlike the bare-body block
+    it is unconditional — a fully structured body is refused too, because the tag itself is the
+    problem, not the format."""
+    out, _, code = _run(command, monkeypatch)
+    msg = _assert_blocked(out, code)
+    assert "`question` tag was removed" in msg
+    assert "--tag decision" in msg
+    assert "decision-request-discipline" in msg
+    # NOT the bare-body skeleton — the agent is redirected, not asked to add a table.
+    assert "| Option | Pros | Cons |" not in msg
+
+
+def test_first_inspected_segment_decides_even_when_a_removed_tag_follows(monkeypatch):
+    """The hook's usual first-match rule holds for the removed tag too: a complete `--tag decision`
+    segment ahead of a `--tag question` one decides the verdict (allow) — the later segment is
+    never reached. tg itself still refuses that second send."""
+    out, _, code = _run(f'tg --tag decision "{_COMPLETE}" && tg --tag question "{_BARE}"', monkeypatch)
+    assert code == 0 and _decision(out) == "allow"
+    assert _message(out) is None
+
+
+def test_removed_question_tag_ignores_the_hatch(tmp_path, monkeypatch):
+    """No hatch applies to a removed tag — there is nothing to force through — so the hook
+    must block WITHOUT contacting tg-ctl even when the hatch var is set."""
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\nexit 0\n")
+    monkeypatch.setattr(drf.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _, code = _run(f'tg --tag question "{_BARE}"', monkeypatch, cwd=tmp_path,
+                        env={_HATCH_ENV: "a removed tag cannot be hatched"})
+    _assert_blocked(out, code)
+    assert not marker.exists()
 
 
 def test_html_table_with_context_and_recommendation_is_complete_silent(monkeypatch):
@@ -457,7 +512,6 @@ def test_inline_sentinel_no_longer_bypasses_block(monkeypatch):
 
 
 # ── external Telegram hatch: force a BARE body through with a written justification ────────
-_HATCH_ENV = "RIG_HATCH_REQUEST_DECISION_REQUEST_FORMAT"
 
 
 def test_hatch_unset_still_blocks(tmp_path, monkeypatch):
