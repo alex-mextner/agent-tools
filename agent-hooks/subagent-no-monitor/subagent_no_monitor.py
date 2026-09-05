@@ -18,13 +18,23 @@ simpler and unconditional: **any** subagent call to Monitor is the wedge. The or
 own Monitor use (e.g. watching a backgrounded subagent's own progress) is unaffected — this
 gate governs only tool calls made INSIDE a dispatched subagent (``agent_id`` present).
 
-The correct replacement for a subagent that needs to wait on something slow is a bounded,
-FOREGROUND polling loop it blocks on inline, e.g.::
+The correct replacement depends on what the subagent is waiting for:
 
-    timeout 900 bash -c 'until <condition-check>; do sleep 5; done'
+1. Waiting on a SINGLE long-running command it just started — set ``run_in_background: true``
+   on the Bash tool call. The harness auto-resumes the subagent when that command completes; no
+   Monitor is needed for this shape at all.
+2. Waiting on anything else (a condition to become true, a file to appear, several things at
+   once) — block on it SYNCHRONOUSLY in the foreground with a heartbeat loop: echo a line at
+   least every ~20s and keep each Bash call comfortably under ~540s (well inside the Bash
+   tool's own 600s hard cap), repeating the same bounded call until the wait is over, e.g.::
 
-(subject to ``subagent-no-bg-longproc``'s own long-process/backgrounding rules — a *foreground*
-bounded poll like the one above passes it; do not background this either.)
+    timeout 540 bash -c 'i=0; until <condition-check> || [ "$i" -ge 26 ]; do sleep 20; i=$((i+1)); echo "[wait] tick $i ($((i*20))s)"; done'
+
+Both shapes pass ``subagent-no-bg-longproc``'s own long-process/backgrounding rules (a
+foreground heartbeat loop is not backgrounded; ``run_in_background: true`` is only blocked by
+that sibling gate when the *backgrounded* command is itself a long-process label like
+``review``/``--watch``/a build-test suite/a long ``sleep`` — an ordinary single command is
+unaffected).
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; the subagent signal is in args.agent_id (or the top-level event)
@@ -119,13 +129,17 @@ BLOCK_MESSAGE = (
     "that notification (only the main loop is), so calling Monitor and ending your turn "
     "wedges you FOREVER with uncommitted work and no PR — the identical failure "
     "subagent-no-bg-longproc blocks for a backgrounded Bash command, just via a tool with no "
-    "foreground mode to fall back to. If you need to wait on something slow, poll it "
-    "SYNCHRONOUSLY in the foreground instead, bounded by a timeout, e.g.: "
-    "`timeout 900 bash -c 'until <condition-check>; do sleep 5; done'` — that call blocks "
-    "until it finishes, so your turn only ends once the wait is over. There is NO "
-    "self-service bypass. For a genuine exception, ASK the human, or request a one-time "
-    "Telegram approval by setting "
-    "RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR=\"<written justification>\" "
+    "foreground mode to fall back to. Use one of these instead: "
+    "(1) waiting on a SINGLE long-running command you just started — set "
+    "`run_in_background: true` on the Bash tool call; the harness auto-resumes you when that "
+    "command completes, no Monitor needed. "
+    "(2) waiting on anything else (a condition, a file, several things at once) — block on it "
+    "yourself in the FOREGROUND with a heartbeat loop: echo a line at least every ~20s and "
+    "keep each Bash call under ~540s, repeating the same bounded call until the wait is over, "
+    "e.g.: `timeout 540 bash -c 'i=0; until <condition-check> || [ \"$i\" -ge 26 ]; do sleep "
+    "20; i=$((i+1)); echo \"[wait] tick $i ($((i*20))s)\"; done'`. There is NO self-service "
+    "bypass. For a genuine exception, ASK the human, or request a one-time Telegram approval "
+    "by setting RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR=\"<written justification>\" "
     "(deny-by-default; a bare 1 is rejected)."
 )
 

@@ -28,11 +28,17 @@ hook catches Bash-level backgrounding (`run_in_background: true`, `&`, `setsid`)
 ```
 # WRONG — the review dies with your turn, marker never refreshes, commit blocked
 TaskCreate("review diff -C /repo")   # TaskCreate — FORBIDDEN
-Monitor("review diff -C /repo")      # Monitor — FORBIDDEN
+Monitor("review diff -C /repo")      # Monitor — now hard-BLOCKED by subagent-no-monitor
 ```
 
-The subagent-no-bg-longproc hook **does not intercept these** — they are agent tool
-calls, not Bash calls. You will not be warned. The wedge will happen silently.
+Neither `subagent-no-bg-longproc` nor `subagent-no-monitor` intercept **TaskCreate** — it is
+an agent tool call, not a Bash or Monitor call. You will not be warned; the wedge will happen
+silently. **Monitor is different**: a dispatched subagent calling Monitor is now hard-blocked
+by the `subagent-no-monitor` hook (`pre-monitor`, agent-tools#439 / HYP-1350) — but only once
+the companion rig-cli `Monitor` matcher has shipped and `rig apply` has run on the machine (a
+two-repo registration gap, same as `pre-agent`/`pre-skill`). Do not rely on the hook alone
+until you've confirmed it is actually wired on your machine — the rule above (never call
+Monitor from a subagent) still applies unconditionally regardless of whether the hook fires.
 
 ### 2. ALWAYS run review as a synchronous Bash call with an explicit timeout
 
@@ -70,10 +76,18 @@ If `git commit` is blocked with a message like "review marker not fresh" or
 
 `subagent-no-bg-longproc` fires on the `pre-bash` hook point — it sees Bash tool
 calls and can inspect `run_in_background`, trailing `&`, and `setsid`. It cannot
-see `TaskCreate` or `Monitor` tool calls, which fire on `pre-agent` (a different
-hook point). The `pre-agent` point is not yet wired to the anti-wedge guard
-(tracked: agent-tools#69). Until that wiring lands, **the skill is the only
-enforcement** for Task-tool-based review backgrounding.
+see `TaskCreate` or `Monitor` tool calls.
+
+`Monitor` now has its own dedicated hook, `subagent-no-monitor`, on a new `pre-monitor`
+point — it blocks **any** subagent call to Monitor unconditionally (no foreground mode
+exists for Monitor to fall back to, so there's no backgrounded/foreground classification to
+make). This closes the Monitor half of the gap this skill originally documented.
+
+`TaskCreate` (and `Task`) still fire on `pre-agent`, which is not yet wired to an
+anti-wedge guard for THIS wedge shape (tracked: agent-tools#69). Until that lands, **the
+skill is the only enforcement** for TaskCreate-based review backgrounding — Monitor-based
+backgrounding is now also hook-enforced, but keep following the rule above regardless, since
+the hook depends on a machine having the companion rig-cli matcher applied.
 
 ## Escape hatch
 
@@ -94,4 +108,4 @@ git diff --cached --name-only   # must show ONLY .md files for the bypass to app
 | `review diff … &` (Bash, shell background) | NO | caught by `subagent-no-bg-longproc` hook |
 | `run_in_background: true` on Bash | NO | caught by `subagent-no-bg-longproc` hook |
 | TaskCreate / Task tool | NO | NOT caught by any hook; process dies with turn |
-| Monitor tool | NO | NOT caught by any hook; process dies with turn |
+| Monitor tool | NO | caught by `subagent-no-monitor` hook (once the companion rig-cli matcher is applied on this machine — see above); process dies with turn regardless |

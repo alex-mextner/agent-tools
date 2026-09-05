@@ -31,17 +31,24 @@ call to Monitor, full stop**, regardless of what it watches or why.
 
 ## The correct alternative
 
-A subagent that needs to wait on something slow should poll **synchronously**, in the
-foreground, bounded by a timeout — the call blocks until it finishes, so the turn only ends
-once the wait is genuinely over:
+Which replacement applies depends on what the subagent is waiting for:
+
+1. **A single long-running command it just started** — set `run_in_background: true` on the
+   Bash tool call. The harness auto-resumes the subagent when that command completes; no
+   Monitor is needed for this shape at all.
+2. **Anything else** (a condition to become true, a file to appear, several things at once) —
+   block on it **synchronously**, in the foreground, with a heartbeat loop: echo a line at
+   least every ~20s and keep each Bash call comfortably under ~540s (well inside the Bash
+   tool's own 600s hard cap), repeating the same bounded call until the wait is over:
 
 ```bash
-timeout 900 bash -c 'until <condition-check>; do sleep 5; done'
+timeout 540 bash -c 'i=0; until <condition-check> || [ "$i" -ge 26 ]; do sleep 20; i=$((i+1)); echo "[wait] tick $i ($((i*20))s)"; done'
 ```
 
-This passes `subagent-no-bg-longproc`'s own rules too (verified): the invoked head is
-`timeout`→`bash`, not a `sleep N>=10` at argv[0] and not backgrounded, so the two gates don't
-fight each other.
+Both shapes pass `subagent-no-bg-longproc`'s own rules too (verified): a foreground heartbeat
+loop is not backgrounded, and that sibling gate only blocks `run_in_background: true` when the
+*backgrounded* command is itself a long-process label (`review`/`--watch`/a build-test
+suite/a long `sleep`) — an ordinary single command backgrounded this way is unaffected.
 
 ## No self-service bypass — external Telegram approval only
 

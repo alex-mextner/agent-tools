@@ -99,6 +99,27 @@ def test_block_message_names_the_synchronous_poll_alternative(monkeypatch):
     assert "timeout" in msg
 
 
+def test_block_message_names_run_in_background_for_a_single_command(monkeypatch):
+    """The first alternative: a single long-running command should use the Bash tool's
+    own `run_in_background: true`, which the harness auto-resumes the subagent from —
+    Monitor is never the right tool even for this shape."""
+    out, _e, _c = _run(monkeypatch, agent_id="sub-1")
+    msg = json.loads(out)["message"]
+    assert "run_in_background" in msg
+    assert "auto-resume" in msg.lower()
+
+
+def test_block_message_names_the_bounded_heartbeat_loop(monkeypatch):
+    """The second alternative (anything else): a foreground heartbeat loop that echoes at
+    least every ~20s and stays under the Bash tool's own ~600s hard cap per call — NOT a
+    single unbounded `timeout 900` call, which would exceed that cap and never fire."""
+    out, _e, _c = _run(monkeypatch, agent_id="sub-1")
+    msg = json.loads(out)["message"]
+    assert "20" in msg  # echo cadence
+    assert "540" in msg  # per-call bound, safely under the Bash tool's 600s cap
+    assert "echo" in msg
+
+
 # ── ALLOW: the orchestrator's own Monitor use (no agent_id) ──────────────────────────────
 
 def test_allow_orchestrator_monitor_call(monkeypatch):
