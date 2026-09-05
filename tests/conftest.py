@@ -22,6 +22,7 @@ so a subprocess built from `dict(os.environ)` inherits this override automatical
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -33,6 +34,20 @@ except ImportError:  # pragma: no cover - Windows compatibility for test collect
     pwd = None
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+# ci/ship/ship.sh's "agent-tools checkout staleness gate" defaults to ENABLED and, with no
+# override, derives the checkout to inspect from its own on-disk location — which, for any
+# test that runs the real ship.sh straight from this repo (test_ship.py's gate tests aside,
+# also tests/test_ship_notify_task_cli.py), IS the real agent-tools checkout. Set here
+# (conftest.py, loaded for every test file regardless of which one is run standalone) rather
+# than only inside test_ship.py's own module body — a lone `pytest
+# tests/test_ship_notify_task_cli.py` run never imports test_ship.py, so a module-level
+# default living only there would not apply and that file's real `ship.sh` invocations would
+# perform a real `git fetch` against the real origin (review finding, 2026-08-28). Unconditional
+# assignment (not `setdefault`): a real network fetch against the real checkout is a real side
+# effect, so an ambient SHIP_STALENESS_CHECK=1 in a developer's shell must not survive here
+# either. test_ship.py's own gate tests still opt back in per-call via `env_extra`.
+os.environ["SHIP_STALENESS_CHECK"] = "0"
 
 import agenttools_hatch_escalation  # noqa: E402 - after the sys.path insert above
 

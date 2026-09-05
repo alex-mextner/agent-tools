@@ -49,6 +49,13 @@ os.environ.setdefault("SHIP_REVIEW_QUORUM", "0")
 # in isolation, with its own fake `task` binary, and overrides this back to "1" per-call.
 os.environ["SHIP_TASK_NOTIFY_ENABLED"] = "0"
 
+# The agent-tools checkout staleness gate ("agent-tools checkout staleness gate" in ship.sh)
+# is disabled by default for the WHOLE suite in tests/conftest.py (loaded for every test
+# file, not just this one — a lone `pytest tests/test_ship_notify_task_cli.py` run needs the
+# same protection and never imports this module). The gate's own tests below opt back in
+# explicitly per-call via `env_extra={"SHIP_STALENESS_CHECK": "1", "SHIP_STALENESS_CHECK_ROOT":
+# <synthetic checkout>}` — never the real repo.
+
 # A fake `gh` that answers exactly the calls ship.sh makes (with --skip-ci the CI rollup
 # is not queried). Branch name is read from $SHIP_TEST_BRANCH so the test controls it.
 _FAKE_GH = """\
@@ -168,15 +175,18 @@ def repo_with_two_worktrees(tmp_path):
     return main, wt1, wt2
 
 
-def _run_ship(main: Path, bindir: Path, cwd: Path | None = None):
+def _run_ship(main: Path, bindir: Path, cwd: Path | None = None, env_extra: dict | None = None):
     """Run ship.sh. By default cwd is the main checkout; pass `cwd` to run it from INSIDE a
     worktree (the self-clean path). SHIP_MAIN_CHECKOUT is pinned to the main checkout so the
-    re-root target is deterministic regardless of which worktree we launch from."""
+    re-root target is deterministic regardless of which worktree we launch from. `env_extra`
+    layers additional env vars on top (e.g. the staleness gate's test hooks)."""
     env = dict(os.environ)
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
     env["SHIP_TEST_BRANCH"] = "feat"
     env["SHIP_DEFAULT_BRANCH"] = "main"
     env["SHIP_MAIN_CHECKOUT"] = str(main)
+    if env_extra:
+        env.update(env_extra)
     return _sh(
         # No --skip-ci: it is now a hatch-gated admin bypass. The fake gh returns a GREEN
         # statusCheckRollup, so the normal CI gate passes and ship does a normal (non-admin) merge.
@@ -8005,6 +8015,344 @@ def test_resolve_eligible_jq_selects_only_addressed_bot_threads():
     assert r.returncode == 0, r.stderr
     selected = [line for line in r.stdout.splitlines() if line.strip()]
     assert selected == ["BOT_OUTDATED"], selected
+
+
+# --- agent-tools checkout staleness gate (see "agent-tools checkout staleness gate" in
+# ship.sh, and agent-tools#315) -----------------------------------------------------------
+
+def _make_bare_and_checkout(root: Path, name: str, *, with_ci_ship: bool):
+    """A bare `<name>-origin.git` + a fresh checkout on `main` tracking it, optionally
+    seeded with a `ci/ship/ship.sh` stub. Shared bootstrap for every fixture below."""
+    origin = root / f"{name}-origin.git"
+    _sh("git", "init", "--bare", "-b", "main", "-q", str(origin), cwd=root)
+    checkout = root / f"{name}-checkout"
+    checkout.mkdir()
+    _git("init", "-q", "-b", "main", cwd=checkout)
+    _git("config", "user.email", "t@t", cwd=checkout)
+    _git("config", "user.name", "t", cwd=checkout)
+    _git("remote", "add", "origin", str(origin), cwd=checkout)
+    if with_ci_ship:
+        (checkout / "ci" / "ship").mkdir(parents=True)
+        (checkout / "ci" / "ship" / "ship.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    (checkout / "README.md").write_text(f"# {name}\n", encoding="utf-8")
+    _git("add", "-A", cwd=checkout)
+    _git("commit", "-qm", "init", cwd=checkout)
+    _git("push", "-q", "origin", "main", cwd=checkout)
+    return origin, checkout
+
+
+def _advance_origin_repo(origin: Path, tmp_path: Path, *, touch_ship: bool, tag: str) -> None:
+    """Push a new commit onto `origin`'s main WITHOUT touching any existing checkout of it —
+    simulates origin/main moving ahead of a checkout that was never `git pull`ed."""
+    pusher = tmp_path / f"pusher-{tag}"
+    _sh("git", "clone", "-q", str(origin), str(pusher), cwd=tmp_path)
+    _git("config", "user.email", "t@t", cwd=pusher)
+    _git("config", "user.name", "t", cwd=pusher)
+    if touch_ship:
+        (pusher / "ci" / "ship").mkdir(parents=True, exist_ok=True)
+        (pusher / "ci" / "ship" / "ship.sh").write_text("#!/usr/bin/env bash\necho fixed\n", encoding="utf-8")
+    else:
+        (pusher / "OTHER.md").write_text("other\n", encoding="utf-8")
+    _git("add", "-A", cwd=pusher)
+    _git("commit", "-qm", f"advance-{tag}", cwd=pusher)
+    _git("push", "-q", "origin", "main", cwd=pusher)
+
+
+@pytest.fixture
+def repo_with_agent_tools_checkout(tmp_path):
+    """A synthetic agent-tools checkout (`at_checkout`, its own `at_origin`, WITH a
+    `ci/ship/` stub) wholly SEPARATE from the PR repo ship.sh actually ships (`pr_main`/
+    `pr_wt`, WITHOUT one — the target repo never has its own ci/ship/) — wired together
+    only via the gate's SHIP_STALENESS_CHECK_ROOT test hook, never via BASH_SOURCE.
+    Returns (pr_main, pr_wt, pr_origin, at_checkout, at_origin)."""
+    if not shutil.which("bash") or not shutil.which("git"):
+        pytest.skip("bash/git required")
+
+    at_origin, at_checkout = _make_bare_and_checkout(tmp_path, "at", with_ci_ship=True)
+
+    pr_origin, pr_main = _make_bare_and_checkout(tmp_path, "pr", with_ci_ship=False)
+    _git("branch", "feat", cwd=pr_main)
+    _git("push", "-q", "origin", "feat", cwd=pr_main)
+    pr_wt = tmp_path / "pr-wt-feat"
+    _git("worktree", "add", "-q", str(pr_wt), "feat", cwd=pr_main)
+
+    return pr_main, pr_wt, pr_origin, at_checkout, at_origin
+
+
+def _path_without_timeout(tmp_path: Path) -> str:
+    """A PATH with the exact same tools resolvable as normal, EXCEPT `timeout`/`gtimeout` —
+    simulates the stock-macOS / minimal-launchd-PATH environment where neither exists,
+    which is the exact scenario the gate/refresh script must fail open (not silently
+    no-op) under. Built from symlinks rather than a bare `/usr/bin:/bin` so it still works
+    on a Linux CI box whose coreutils ARE `/usr/bin/timeout` (there we'd need to omit that
+    dir too — so every needed tool is symlinked individually into one clean dir instead of
+    relying on directory-level inclusion/exclusion)."""
+    safe_bin = tmp_path / "safe-bin-no-timeout"
+    if safe_bin.exists():
+        return str(safe_bin)
+    safe_bin.mkdir()
+    for name in ("bash", "git", "sed", "grep", "awk", "printf", "sort", "wc", "tr",
+                 "head", "mktemp", "date", "pgrep", "cut", "gh", "cat", "rm", "mkdir", "ls"):
+        found = shutil.which(name)
+        if found and Path(found).name not in ("timeout", "gtimeout"):
+            (safe_bin / name).symlink_to(found)
+    return str(safe_bin)
+
+
+def test_staleness_gate_refuses_when_ci_ship_itself_is_behind(repo_with_agent_tools_checkout, tmp_path):
+    """origin/main has a ci/ship/-touching commit the checkout lacks: the running ship
+    implementation is out of date — refuse rather than silently re-run an already-fixed bug."""
+    pr_main, pr_wt, pr_origin, at_checkout, at_origin = repo_with_agent_tools_checkout
+    _advance_origin_repo(at_origin, tmp_path, touch_ship=True, tag="ship-fix")
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(pr_main, bindir, env_extra={
+        "SHIP_STALENESS_CHECK": "1",
+        "SHIP_STALENESS_CHECK_ROOT": str(at_checkout),
+    })
+
+    assert r.returncode != 0, f"expected refusal\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "Refusing:" in r.stderr and "ci/ship/" in r.stderr, r.stderr
+    assert "pull --ff-only" in r.stderr, r.stderr
+
+
+def test_staleness_gate_refuses_with_distinct_message_on_feature_branch(repo_with_agent_tools_checkout, tmp_path):
+    """The literal motivating incident: the checkout running ship.sh is parked on a feature
+    branch (behind main in ci/ship/, as it would be after branching off an older main). A
+    plain "behind" refusal would print `pull --ff-only`, which CANNOT succeed on a diverged
+    branch — locking out every ship on the machine with an unactionable fix. The gate must
+    give a DISTINCT message naming the branch, not the generic ci/ship/-behind one."""
+    pr_main, pr_wt, pr_origin, at_checkout, at_origin = repo_with_agent_tools_checkout
+    _advance_origin_repo(at_origin, tmp_path, touch_ship=True, tag="ship-fix-while-branched")
+    _git("checkout", "-qb", "feat/wip", cwd=at_checkout)
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(pr_main, bindir, env_extra={
+        "SHIP_STALENESS_CHECK": "1",
+        "SHIP_STALENESS_CHECK_ROOT": str(at_checkout),
+    })
+
+    assert r.returncode != 0, f"expected refusal\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "Refusing:" in r.stderr, r.stderr
+    assert "not on main" in r.stderr and "feat/wip" in r.stderr, r.stderr
+    assert "checkout main" in r.stderr, r.stderr
+    # Must NOT claim the misleading generic "behind origin/main in ci/ship/" framing, whose
+    # `pull --ff-only` fix cannot succeed on a diverged branch.
+    assert "is behind origin/main in ci/ship/" not in r.stderr, r.stderr
+
+
+def test_staleness_gate_prefers_agent_tools_root_env_over_bash_source(repo_with_agent_tools_checkout, tmp_path):
+    """$AGENT_TOOLS_ROOT (the ecosystem's own name for the canonical checkout, already
+    `export`ed by pr-ship.sh in production) takes precedence over the BASH_SOURCE-derived
+    guess when SHIP_STALENESS_CHECK_ROOT (test-only) is not set — avoids misidentifying an
+    unrelated git-managed directory as the checkout when ship.sh runs from a copy."""
+    pr_main, pr_wt, pr_origin, at_checkout, at_origin = repo_with_agent_tools_checkout
+    _advance_origin_repo(at_origin, tmp_path, touch_ship=True, tag="ship-fix-via-env-root")
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(pr_main, bindir, env_extra={
+        "SHIP_STALENESS_CHECK": "1",
+        "AGENT_TOOLS_ROOT": str(at_checkout),
+    })
+
+    assert r.returncode != 0, f"expected refusal via AGENT_TOOLS_ROOT\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "Refusing:" in r.stderr and "ci/ship/" in r.stderr, r.stderr
+
+
+def test_staleness_gate_refuses_without_timeout_on_path(repo_with_agent_tools_checkout, tmp_path):
+    """The exact regression a full-panel review caught: `timeout` is GNU coreutils, absent
+    from a stock macOS PATH (and from a minimal launchd PATH even where Homebrew has it as
+    `gtimeout`). The gate must still fetch and refuse — not silently skip the whole check
+    — when neither binary is resolvable."""
+    pr_main, pr_wt, pr_origin, at_checkout, at_origin = repo_with_agent_tools_checkout
+    _advance_origin_repo(at_origin, tmp_path, touch_ship=True, tag="ship-fix-no-timeout")
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(pr_main, bindir, env_extra={
+        "SHIP_STALENESS_CHECK": "1",
+        "SHIP_STALENESS_CHECK_ROOT": str(at_checkout),
+        # env_extra REPLACES (not layers onto) the bindir-prefixed PATH _run_ship builds —
+        # so the fake `gh` bindir must be re-prefixed here, not dropped.
+        "PATH": f"{bindir}{os.pathsep}{_path_without_timeout(tmp_path)}",
+    })
+
+    assert r.returncode != 0, f"expected refusal even without timeout on PATH\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "Refusing:" in r.stderr and "ci/ship/" in r.stderr, r.stderr
+
+
+def test_staleness_gate_recognizes_linked_worktree_checkout(repo_with_agent_tools_checkout, tmp_path):
+    """AGENT_TOOLS_ROOT can itself be a LINKED worktree (agent-tools' own convention —
+    see .worktrees/ in this repo), where `.git` is a FILE, not a directory. The gate must
+    still recognize and check it — not silently no-op because `-d "$root/.git"` is false."""
+    pr_main, pr_wt, pr_origin, at_checkout, at_origin = repo_with_agent_tools_checkout
+    at_primary = tmp_path / "at-primary"
+    _git("clone", "-q", str(at_origin), str(at_primary), cwd=tmp_path)
+    _git("config", "user.email", "t@t", cwd=at_primary)
+    _git("config", "user.name", "t", cwd=at_primary)
+    at_linked = tmp_path / "at-linked-worktree"
+    _git("worktree", "add", "-q", "--force", str(at_linked), "main", cwd=at_primary)
+    assert (at_linked / ".git").is_file(), "fixture invariant: linked worktree .git must be a FILE"
+
+    _advance_origin_repo(at_origin, tmp_path, touch_ship=True, tag="ship-fix-linked-wt")
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(pr_main, bindir, env_extra={
+        "SHIP_STALENESS_CHECK": "1",
+        "SHIP_STALENESS_CHECK_ROOT": str(at_linked),
+    })
+
+    assert r.returncode != 0, f"expected refusal via the linked worktree\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "Refusing:" in r.stderr and "ci/ship/" in r.stderr, r.stderr
+
+
+def test_staleness_gate_warns_only_when_behind_outside_ci_ship(repo_with_agent_tools_checkout, tmp_path):
+    """origin/main moved, but not in ci/ship/: the currently-running ship code is not
+    outdated, so this must warn (stderr note) without blocking the merge."""
+    pr_main, pr_wt, pr_origin, at_checkout, at_origin = repo_with_agent_tools_checkout
+    _advance_origin_repo(at_origin, tmp_path, touch_ship=False, tag="other")
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(pr_main, bindir, env_extra={
+        "SHIP_STALENESS_CHECK": "1",
+        "SHIP_STALENESS_CHECK_ROOT": str(at_checkout),
+    })
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "merged #1" in r.stdout, r.stdout
+    assert "[ship] note:" in r.stderr and "behind origin/main" in r.stderr, r.stderr
+
+
+def test_staleness_gate_silent_when_in_sync(repo_with_agent_tools_checkout, tmp_path):
+    """at_checkout already matches origin/main: no refusal, no note."""
+    pr_main, pr_wt, pr_origin, at_checkout, at_origin = repo_with_agent_tools_checkout
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(pr_main, bindir, env_extra={
+        "SHIP_STALENESS_CHECK": "1",
+        "SHIP_STALENESS_CHECK_ROOT": str(at_checkout),
+    })
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "merged #1" in r.stdout, r.stdout
+    assert "behind origin/main" not in r.stderr, r.stderr
+
+
+def test_staleness_gate_disabled_via_env_does_not_refuse(repo_with_agent_tools_checkout, tmp_path):
+    """SHIP_STALENESS_CHECK=0 is the documented ops off-switch: even a ci/ship/-stale
+    checkout must not block the merge when explicitly disabled."""
+    pr_main, pr_wt, pr_origin, at_checkout, at_origin = repo_with_agent_tools_checkout
+    _advance_origin_repo(at_origin, tmp_path, touch_ship=True, tag="ship-fix-disabled")
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(pr_main, bindir, env_extra={
+        "SHIP_STALENESS_CHECK": "0",
+        "SHIP_STALENESS_CHECK_ROOT": str(at_checkout),
+    })
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_staleness_gate_skipped_when_self_hosting(repo_with_agent_tools_checkout, tmp_path):
+    """When SHIP_STALENESS_CHECK_ROOT resolves to the SAME checkout ship.sh is being run
+    against (the self-hosting case: shipping a ci/ship/ PR from a feature branch in the
+    agent-tools checkout itself), the gate must skip entirely — even with GENUINE ci/ship/
+    drift on that exact checkout (pr_origin is advanced past pr_main in ci/ship/ below;
+    without the self-hosting skip this would trip the same refusal as the test above)."""
+    pr_main, pr_wt, pr_origin, at_checkout, at_origin = repo_with_agent_tools_checkout
+    _advance_origin_repo(pr_origin, tmp_path, touch_ship=True, tag="self-hosting-drift")
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(pr_main, bindir, env_extra={
+        "SHIP_STALENESS_CHECK": "1",
+        "SHIP_STALENESS_CHECK_ROOT": str(pr_main),
+    })
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "merged #1" in r.stdout, r.stdout
+    assert "Refusing:" not in r.stderr, r.stderr
+
+
+def test_staleness_gate_not_exempted_when_repo_flag_targets_a_foreign_repo(
+    repo_with_agent_tools_checkout, tmp_path,
+):
+    """Review-cli finding (GH-470, P2): ROOT-equality alone is not a valid self-hosting
+    signal for `cd "$AGENT_TOOLS_ROOT" && gh ship 123 --repo owner/other-repo` — $ROOT
+    (derived from cwd) equals the staleness-check root there even though PR 123 belongs to
+    a completely different repo than the one this checkout pushes to. A stale checkout must
+    still be caught in that shape, not silently exempted the way the plain self-hosting test
+    above is (that test has NO --repo at all). Same genuine ci/ship/ drift + same
+    SHIP_STALENESS_CHECK_ROOT==pr_main setup as the self-hosting test, but with an explicit
+    --repo naming a target this checkout's own origin can't be confirmed to be — must REFUSE."""
+    pr_main, pr_wt, pr_origin, at_checkout, at_origin = repo_with_agent_tools_checkout
+    _advance_origin_repo(pr_origin, tmp_path, touch_ship=True, tag="foreign-repo-drift")
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship_repo(pr_main, bindir, ("--repo", "owner/other-repo"), {
+        "SHIP_STALENESS_CHECK": "1",
+        "SHIP_STALENESS_CHECK_ROOT": str(pr_main),
+    })
+
+    assert r.returncode != 0, f"expected refusal for a foreign --repo target\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "Refusing:" in r.stderr and "ci/ship/" in r.stderr, r.stderr
+
+
+def test_staleness_gate_not_exempted_when_gh_repo_env_targets_a_foreign_repo(
+    repo_with_agent_tools_checkout, tmp_path,
+):
+    """Review-cli finding (GH-470, second review round, P2): the FIRST --repo fix above still
+    left a gap — `gh` honours THREE ways to name a target repo (--repo, GH_SHIP_REPO, and an
+    ambient GH_REPO), and the self-hosting exemption originally only checked `REPO_FLAG`. A
+    foreign repo selected purely via the GH_REPO env var (no --repo flag at all) must be
+    caught exactly like the --repo case — the exemption now uses the same effective-target
+    precedence (--repo, else GH_SHIP_REPO, else GH_REPO) the cross-repo support block uses."""
+    pr_main, pr_wt, pr_origin, at_checkout, at_origin = repo_with_agent_tools_checkout
+    _advance_origin_repo(pr_origin, tmp_path, touch_ship=True, tag="foreign-repo-env-drift")
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(pr_main, bindir, env_extra={
+        "SHIP_STALENESS_CHECK": "1",
+        "SHIP_STALENESS_CHECK_ROOT": str(pr_main),
+        "GH_REPO": "owner/other-repo",
+    })
+
+    assert r.returncode != 0, f"expected refusal for a GH_REPO-only foreign target\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "Refusing:" in r.stderr and "ci/ship/" in r.stderr, r.stderr
+
+
+def test_staleness_gate_fails_open_on_unreachable_origin(repo_with_agent_tools_checkout, tmp_path):
+    """A checkout whose origin can't be fetched (offline, bad remote) must never block a
+    merge over a freshness hint it cannot actually determine."""
+    pr_main, pr_wt, pr_origin, at_checkout, at_origin = repo_with_agent_tools_checkout
+    _git("remote", "set-url", "origin", "https://127.0.0.1:1/does-not-exist.git", cwd=at_checkout)
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(pr_main, bindir, env_extra={
+        "SHIP_STALENESS_CHECK": "1",
+        "SHIP_STALENESS_CHECK_ROOT": str(at_checkout),
+        "GIT_HTTP_LOW_SPEED_LIMIT": "1000",
+        "GIT_HTTP_LOW_SPEED_TIME": "2",
+    })
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "merged #1" in r.stdout, r.stdout
+
+
+def test_staleness_gate_skips_on_nongit_root(repo_with_agent_tools_checkout, tmp_path):
+    """SHIP_STALENESS_CHECK_ROOT pointing at a directory that isn't a git repo at all must
+    not crash or refuse — the `-is-inside-work-tree` check must handle it cleanly."""
+    pr_main, pr_wt, pr_origin, at_checkout, at_origin = repo_with_agent_tools_checkout
+    not_a_repo = tmp_path / "plain-dir"
+    not_a_repo.mkdir()
+    bindir = _fake_gh_dir(tmp_path)
+
+    r = _run_ship(pr_main, bindir, env_extra={
+        "SHIP_STALENESS_CHECK": "1",
+        "SHIP_STALENESS_CHECK_ROOT": str(not_a_repo),
+    })
+
+    assert r.returncode == 0, f"ship exited {r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "merged #1" in r.stdout, r.stdout
 
 
 if __name__ == "__main__":

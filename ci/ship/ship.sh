@@ -178,6 +178,10 @@
 #                          decisions: external-review:bypass:approved / :bypass:denied /
 #                          :refused (has a `gate":"external-review"` field). --dry-run prints the
 #                          would-be audit instead of writing.
+#   SHIP_STALENESS_CHECK   set to 0 to disable the agent-tools checkout staleness gate below
+#                          (default: enabled). See "agent-tools checkout staleness gate".
+#   SHIP_STALENESS_CHECK_ROOT  test/override hook: the agent-tools checkout to check instead of
+#                          the one derived from this script's own location (BASH_SOURCE).
 #
 # Knobs (file):
 #   .ship-config           optional, committed at the repo root — an AUDITED, per-repo override
@@ -435,6 +439,144 @@ abort_if_cwd_core_bare
 
 ROOT=$(git rev-parse --show-toplevel); cd "$ROOT"
 command -v gh >/dev/null 2>&1 || { echo "gh CLI not found" >&2; exit 1; }
+
+# --- agent-tools checkout staleness gate -----------------------------------------------
+# ship.sh runs straight off disk from wherever it's checked out — no build step, no
+# packaging. The canonical checkout ($AGENT_TOOLS_ROOT, provisioned by `rig apply` into
+# every managed repo's .claude/scripts/pr-ship.sh delegator) has NO mechanism that keeps it
+# synced with origin/main: a merged ship.sh fix silently does not take effect on a given
+# machine until someone manually `git pull`s that checkout. This is the ci/ship-specific
+# slice of a known broader problem (agent-tools#315: live-checkout personal CLIs going
+# stale between sessions).
+#
+# We detect the dangerous case for free, using the checkout that is ACTUALLY executing
+# THIS file — derived (highest priority first) from SHIP_STALENESS_CHECK_ROOT (test-only),
+# $AGENT_TOOLS_ROOT (the ecosystem's own name for this checkout — pr-ship.sh already
+# `export`s it before exec'ing this file in production, and preferring it over a
+# BASH_SOURCE guess avoids misidentifying an unrelated git-managed $HOME as the checkout
+# when ship.sh has been copied to e.g. ~/bin — see the hatch-copy note above), then
+# $BASH_SOURCE via $_SHIP_SELF_DIR. NOT $ROOT (the repo this ship invocation targets; e.g. a
+# hyperide PR being shipped). Skipped when self-hosting (ROOT IS the agent-tools checkout —
+# shipping a ci/ship/ PR from a feature branch there): in that case the checked-out branch
+# IS the code intentionally under test, not stale.
+#
+# The self-hosting check is ROOT-equality alone, which is not sufficient on its own: for
+# `cd "$AGENT_TOOLS_ROOT" && gh ship 123 --repo owner/other-repo`, $ROOT equals $_AT_ROOT (both
+# resolve to the agent-tools checkout from cwd) even though PR 123 belongs to an unrelated repo
+# named by --repo — a stale agent-tools checkout would wrongly skip the gate for a target that
+# ISN'T self-hosted at all (review-cli finding, GH-470). A target can be named THREE ways, not
+# just --repo (same GH-470 review, second round): GH_SHIP_REPO and an ambient GH_REPO env var
+# select a foreign repo just as effectively — checking REPO_FLAG alone left both open. So
+# self-hosting additionally requires EITHER no effective target (--repo, else GH_SHIP_REPO,
+# else GH_REPO — same precedence _EFFECTIVE_TARGET uses below), OR one that resolves to this
+# same checkout's own origin (a redundant-but-legitimate explicit self-ship). This duplicates a
+# few lines of the origin-URL parse the "cross-repo (--repo) support" block below does more
+# fully (_CWD_ORIGIN_REPO) — duplicated rather than reordered because that block runs after
+# PR-state resolution further down and hoisting it here would widen this change's blast radius;
+# keep both derivations in sync if the github.com URL parsing ever changes.
+#
+# Residual, accepted: the origin-URL parse only recognizes a `github.com` URL. A checkout
+# whose origin is a non-github remote (or an SSH/URL form the sed doesn't match) resolves
+# `_AT_CWD_ORIGIN_REPO` empty, so ANY explicit `--repo` value there is treated as foreign —
+# including `--repo owner/agent-tools` typed for a genuinely self-hosted ship. This narrows
+# self-hosting exemption for that shape (previously always exempted on ROOT-equality alone);
+# the safe direction (an extra staleness check on a real self-ship is a false-positive
+# refusal, not a missed one). Not covered by an automated test: this suite is deliberately
+# hermetic (real local git repos only, no network — see test file docstrings), and testing
+# the positive github.com-match path would need either a real `github.com` remote (breaks
+# hermeticity, risks a hung/flaky test on a sandboxed CI runner) or a stubbed URL parse this
+# code doesn't have. Verified only by direct reasoning about the sed pattern above.
+#
+# Three-tier response, proportionate to what's actually at risk:
+#   - the checkout isn't on `main` (parked on a feature branch, or detached): REFUSE with a
+#     distinct message — this is the exact incident that motivated this gate (an agent-tools
+#     checkout left on a feature branch), and treating it as plain "behind" would print a
+#     `pull --ff-only` fix that CANNOT succeed on a diverged/detached checkout, locking out
+#     every ship on the machine with unactionable guidance.
+#   - on `main`, and origin/main has a ci/ship/-touching commit this checkout lacks: REFUSE.
+#     The running ship implementation itself is out of date — proceeding could re-run an
+#     already-fixed bug (the exact HYP/agent-tools#451 class of incident).
+#   - on `main`, origin/main is ahead elsewhere (not ci/ship/): warn only, don't block a
+#     merge over drift unrelated to what's currently executing.
+#
+# Fails OPEN on anything indeterminate (no root resolvable, not a git worktree, no `timeout`/
+# `gtimeout` binary, fetch fails/offline) — this is a freshness hint, not a security gate;
+# it must never block a merge on its own account. Disable entirely with SHIP_STALENESS_CHECK=0.
+if [ "${SHIP_STALENESS_CHECK:-1}" != "0" ]; then
+  _AT_ROOT_RAW="${SHIP_STALENESS_CHECK_ROOT:-${AGENT_TOOLS_ROOT:-}}"
+  if [ -z "$_AT_ROOT_RAW" ] && [ -d "$_SHIP_SELF_DIR" ]; then
+    _AT_ROOT_RAW="$_SHIP_SELF_DIR/../.."
+  fi
+  _AT_ROOT=""
+  [ -n "$_AT_ROOT_RAW" ] && _AT_ROOT="$(cd "$_AT_ROOT_RAW" 2>/dev/null && pwd -P || true)"
+  _ROOT_PHYS="$(cd "$ROOT" 2>/dev/null && pwd -P || echo "$ROOT")"
+  # Self-hosting exemption: ROOT-equality alone is not enough (see comment above) — also
+  # require that this invocation doesn't target a DIFFERENT repo than the one this checkout
+  # actually pushes to. A target can be named THREE ways, not just --repo (review-cli
+  # finding, GH-470 second round): `gh` also honours GH_SHIP_REPO and an ambient GH_REPO —
+  # either env var alone naming a foreign repo would leave REPO_FLAG empty and wrongly grant
+  # the exemption. Same precedence as _EFFECTIVE_TARGET further below (--repo, else
+  # GH_SHIP_REPO, else GH_REPO) — computed locally here too since that variable isn't
+  # assigned until after this gate (see the earlier duplication note).
+  _AT_EFFECTIVE_TARGET="${REPO_FLAG:-${GH_SHIP_REPO:-${GH_REPO:-}}}"
+  _AT_SELF_HOST_EXEMPT=0
+  if [ -n "$_AT_ROOT" ] && [ "$_AT_ROOT" = "$_ROOT_PHYS" ]; then
+    if [ -z "$_AT_EFFECTIVE_TARGET" ]; then
+      _AT_SELF_HOST_EXEMPT=1
+    else
+      _AT_CWD_ORIGIN_URL=$(git remote get-url origin 2>/dev/null) || true
+      _AT_CWD_ORIGIN_REPO=$(printf '%s' "$_AT_CWD_ORIGIN_URL" \
+        | sed 's|.*github\.com[:/]\(.*\)\.git$|\1|;s|.*github\.com[:/]\(.*\)$|\1|')
+      case "$_AT_CWD_ORIGIN_REPO" in *@*|*:*|""|*/*/*) _AT_CWD_ORIGIN_REPO="" ;; esac
+      [ -n "$_AT_CWD_ORIGIN_REPO" ] && [ "$_AT_EFFECTIVE_TARGET" = "$_AT_CWD_ORIGIN_REPO" ] && _AT_SELF_HOST_EXEMPT=1
+    fi
+  fi
+  # `git rev-parse --is-inside-work-tree` (NOT `-d "$_AT_ROOT/.git"`) so a LINKED worktree
+  # checkout — where .git is a FILE, not a directory — is still recognized. agent-tools'
+  # own checkouts routinely live under .worktrees/, so this is not a theoretical case.
+  if [ -n "$_AT_ROOT" ] && [ "$_AT_SELF_HOST_EXEMPT" != "1" ] \
+     && [ "$(git -C "$_AT_ROOT" rev-parse --is-inside-work-tree 2>/dev/null || true)" = "true" ]; then
+    # timeout(1) is GNU coreutils — absent from a stock macOS PATH (a launchd LaunchAgent's
+    # minimal /usr/bin:/bin:/usr/sbin:/sbin has neither `timeout` nor Homebrew's `gtimeout`
+    # linked). Resolve it; if truly absent, fetch unwrapped rather than silently skipping the
+    # whole gate — but still HTTP-speed-bounded (GIT_HTTP_LOW_SPEED_*) so a half-open HTTPS
+    # connection can't hang the fetch indefinitely even with no timeout binary at all (an SSH
+    # remote is the one residual case neither bounds; git fetch fails fast on a real network
+    # error in the common case, so this is a rare tail risk, and still fails open, never blocks).
+    _AT_TIMEOUT_BIN="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
+    if { [ -n "$_AT_TIMEOUT_BIN" ] \
+         && GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=10 \
+            "$_AT_TIMEOUT_BIN" 15 git -C "$_AT_ROOT" fetch -q origin main 2>/dev/null; } \
+       || { [ -z "$_AT_TIMEOUT_BIN" ] \
+            && GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=10 \
+               git -C "$_AT_ROOT" fetch -q origin main 2>/dev/null; }; then
+      _AT_BRANCH="$(git -C "$_AT_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+      if [ "$_AT_BRANCH" != "main" ]; then
+        echo "Refusing: the agent-tools checkout running THIS ship.sh ($_AT_ROOT) is not on main (currently: ${_AT_BRANCH:-detached HEAD}) — its ci/ship/ can't be verified against origin/main." >&2
+        echo "Fix:      finish or stash any work there, then: git -C $(shell_squote "$_AT_ROOT") checkout main && git -C $(shell_squote "$_AT_ROOT") pull --ff-only   (then re-run gh ship)" >&2
+        echo "Override (only if you know why): SHIP_STALENESS_CHECK=0 gh ship ..." >&2
+        exit 1
+      fi
+      _AT_SHIP_BEHIND_LOG=$(git -C "$_AT_ROOT" log --oneline HEAD..origin/main -- ci/ship/ 2>/dev/null || true)
+      if [ -n "$_AT_SHIP_BEHIND_LOG" ]; then
+        _AT_SHIP_BEHIND_N=$(printf '%s\n' "$_AT_SHIP_BEHIND_LOG" | wc -l | tr -d ' ')
+        echo "Refusing: the agent-tools checkout running THIS ship.sh ($_AT_ROOT) is behind origin/main in ci/ship/ — you would ship with an outdated ship implementation:" >&2
+        # `sed -n` (NOT `head`) so the reader never closes its input early — `head -n 15` can
+        # SIGPIPE an upstream `printf` on a large log under `set -o pipefail`, aborting the
+        # script with 141 before this refusal's Fix/Override lines print.
+        printf '%s\n' "$_AT_SHIP_BEHIND_LOG" | sed -n '1,15{s/^/  /;p;}' >&2
+        [ "$_AT_SHIP_BEHIND_N" -gt 15 ] && echo "  ...and $((_AT_SHIP_BEHIND_N - 15)) more" >&2
+        echo "Fix:      git -C $(shell_squote "$_AT_ROOT") pull --ff-only   (then re-run gh ship)" >&2
+        echo "Override (only if you know why): SHIP_STALENESS_CHECK=0 gh ship ..." >&2
+        exit 1
+      fi
+      _AT_BEHIND_COUNT=$(git -C "$_AT_ROOT" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
+      if [ "$_AT_BEHIND_COUNT" != "0" ]; then
+        echo "[ship] note: agent-tools checkout at $_AT_ROOT is $_AT_BEHIND_COUNT commit(s) behind origin/main (outside ci/ship/, not blocking). Consider: git -C $(shell_squote "$_AT_ROOT") pull --ff-only" >&2
+      fi
+    fi
+  fi
+fi
 
 # --- cross-repo (--repo) support -------------------------------------------------------
 # Derive THIS checkout's own origin repo (owner/repo) BEFORE any override. Used only to
