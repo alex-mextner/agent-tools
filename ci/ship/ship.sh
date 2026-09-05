@@ -2831,7 +2831,16 @@ _magic_close_matches() {  # $1 = text -> one "keyword ref" phrase per line; ALWA
   # depended on this (grep already ran under LC_ALL=C), so this is a display-consistency fix,
   # not a fail-open one — but pinning both sides to the SAME locale is the only way the header
   # comment's "grep and sed can never disagree" claim is actually true.
-  printf '%s\n' "$1" | LC_ALL=C grep -oE "$_MAGIC_CLOSE_RE" | LC_ALL=C sed -E 's/^[^[:alnum:]_]//' || true
+  # Whitespace-normalized (every run of whitespace, INCLUDING a newline, collapsed to one
+  # space) BEFORE matching (review finding, round 4, GLM): GitHub's own close-keyword parser
+  # is whitespace-tolerant across a linebreak — the review-quorum ticket-code derivation
+  # already normalizes newlines to spaces for the identical reason (`gsub("\n";" ")`) — but
+  # grep/sed are line-based, so an unnormalized scan would silently miss "Fixes\n#115" split
+  # across two lines (a real shape: the commit scan synthesizes exactly `headline + "\n" +
+  # body`). A phrase caught ONLY this way (not by a plain per-line scan) can't be safely fixed
+  # by the line-based `_magic_close_rewrite` sed — `_magic_close_gate` re-verifies after any
+  # rewrite and refuses rather than trust a rewrite that may have missed a cross-line phrase.
+  printf '%s' "$1" | LC_ALL=C tr '\n' ' ' | LC_ALL=C grep -oE "$_MAGIC_CLOSE_RE" | LC_ALL=C sed -E 's/^[^[:alnum:]_]//' || true
 }
 _magic_close_rewrite() {  # $1 = text -> stdout: the text with every keyword replaced by "Refs"
   # `~` as the s-command delimiter: the reference arm contains `/` (owner/repo#N).
@@ -2921,6 +2930,25 @@ _magic_close_rewrite_pr() {  # $1=title $2=body $3=title hits $4=body hits $5=jo
       echo "  Fix the title/body by hand (write \"Refs <ref>\"), then re-run ship."; } >&2
     _ticket_gate_audit_log magic-close refused "" "rewrite-failed: $5"
     exit 1
+  fi
+  # Re-fetch and re-scan the ACTUAL post-edit title/body (review finding, round 4, GLM) — the
+  # rewrite sed is line-based, so a cross-line phrase `_magic_close_matches`' normalized scan
+  # caught but the sed couldn't reach (or a concurrent edit landing between the read and the
+  # write) would otherwise leave a keyword in place while the gate confidently reports success.
+  # Skipped under --dry-run: `run gh pr edit` is a no-op there, so nothing was actually written
+  # and a re-fetch would just re-find the SAME pre-edit hits.
+  if [ "$DRY_RUN" != "1" ]; then
+    local verify_title verify_body verify_hits
+    verify_title=$(gh pr view "$PR" --json title -q '.title // ""' 2>/dev/null) || verify_title=""
+    verify_body=$(gh pr view "$PR" --json body -q '.body // ""' 2>/dev/null) || verify_body=""
+    verify_hits=$(printf '%s\n%s\n' "$(_magic_close_matches "$verify_title")" "$(_magic_close_matches "$verify_body")" | sed '/^$/d' | tr '\n' ';' | sed 's/;$//')
+    if [ -n "$verify_hits" ]; then
+      { echo "Refusing: magic-close gate — after rewriting PR #$PR, the title/body STILL contains a close keyword (a phrase the line-based rewrite could not reach — e.g. split across lines — or a concurrent edit)."
+        printf '%s\n' "$verify_hits" | sed 's/^/  still present: "/; s/$/"/'
+        echo "  Fix by hand: edit the PR title/body directly (write \"Refs <ref>\"), then re-run ship."; } >&2
+      _ticket_gate_audit_log magic-close refused "" "rewrite-incomplete: $verify_hits"
+      exit 1
+    fi
   fi
 }
 

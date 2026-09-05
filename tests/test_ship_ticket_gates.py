@@ -40,6 +40,15 @@ os.environ.setdefault("SHIP_TASK_NOTIFY_ENABLED", "0")
 _FAKE_GH = """\
 #!/usr/bin/env bash
 set -e
+# Stateful title/body (review finding, round 4, GLM: _magic_close_rewrite_pr now RE-FETCHES
+# title/body after a `gh pr edit` to verify the rewrite actually landed — a fake `gh` that
+# always answers with the original $SHIP_TEST_PR_TITLE/$SHIP_TEST_PR_BODY, ignoring `edit`
+# entirely, would make every successful-rewrite test look like a failed re-verify). State
+# lives in two files under $SHIP_TEST_STATE_DIR, seeded from the env vars on first read.
+TITLE_FILE="${SHIP_TEST_STATE_DIR:-.}/fake-gh-title"
+BODY_FILE="${SHIP_TEST_STATE_DIR:-.}/fake-gh-body"
+[ -f "$TITLE_FILE" ] || printf '%s' "${SHIP_TEST_PR_TITLE:-}" > "$TITLE_FILE"
+[ -f "$BODY_FILE" ] || printf '%s' "${SHIP_TEST_PR_BODY:-}" > "$BODY_FILE"
 sub="$1"; shift || true
 case "$sub" in
   pr)
@@ -54,12 +63,12 @@ case "$sub" in
         elif printf '%s' "$args" | grep -q statusCheckRollup; then
           printf '%s\\n' '[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI"}]'
         elif printf '%s' "$args" | grep -q -- '--json title,body'; then
-          printf '%s\\t%s\\n' "${SHIP_TEST_PR_TITLE:-}" "${SHIP_TEST_PR_BODY:-}"
+          printf '%s\\t%s\\n' "$(cat "$TITLE_FILE")" "$(cat "$BODY_FILE")"
         elif printf '%s' "$args" | grep -q -- '--json title'; then
           if [ "${SHIP_TEST_GH_PR_VIEW_TITLE_FAIL:-0}" = "1" ]; then exit 1; fi
-          printf '%s\\n' "${SHIP_TEST_PR_TITLE:-}"
+          cat "$TITLE_FILE"; echo
         elif printf '%s' "$args" | grep -q -- '--json body'; then
-          printf '%s\\n' "${SHIP_TEST_PR_BODY:-}"
+          cat "$BODY_FILE"; echo
         elif printf '%s' "$args" | grep -q -- '--json url,mergeCommit'; then
           printf '%s\\t%s\\n' "https://github.com/acme/widgets/pull/1" ""
         elif printf '%s' "$args" | grep -q -- '--json commits'; then
@@ -69,7 +78,15 @@ case "$sub" in
         fi ;;
       diff) echo "src/a.py" ;;
       comment) : ;;
-      edit) printf 'edit %s\\n' "$*" >> "${GH_LOG}" ;;
+      edit)
+        printf 'edit %s\\n' "$*" >> "${GH_LOG}"
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --title) printf '%s' "$2" > "$TITLE_FILE"; shift 2 ;;
+            --body) printf '%s' "$2" > "$BODY_FILE"; shift 2 ;;
+            *) shift ;;
+          esac
+        done ;;
       merge) printf 'merge %s\\n' "$*" >> "${GH_LOG}"; echo "[fake gh] merged" ;;
       *) : ;;
     esac ;;
@@ -187,6 +204,7 @@ def _run(main: Path, tmp_path: Path, *, branch="hyp-931-fix-thing", with_task=Tr
         "SHIP_REVIEW_DWELL": "0",
         "TASK_LOG": str(tmp_path / "task.log"),
         "GH_LOG": str(tmp_path / "gh.log"),
+        "SHIP_TEST_STATE_DIR": str(tmp_path),
         "SHIP_AUDIT_FILE": str(tmp_path / "audit.jsonl"),
         # this file exercises the gates themselves — always on unless a test turns one off
         "SHIP_ACCEPTANCE_GATE": "1",
@@ -458,6 +476,30 @@ def test_magic_close_refuses_when_gh_pr_view_fails(repo, tmp_path):
     assert not _merged(tmp_path)
     (line,) = _audit(tmp_path, "magic-close")
     assert line["decision"] == "refused" and "gh pr view failed" in line["detail"]
+
+
+def test_magic_close_catches_a_keyword_split_across_lines(repo, tmp_path):
+    """GLM finding (round 4): GitHub's own close-keyword parser is whitespace-tolerant across
+    a linebreak (the review-quorum ticket-code derivation already normalizes newlines to
+    spaces for the identical reason) — a plain per-line grep/sed scan would silently miss
+    "Fixes\\n#115" split across two lines. Detection is normalized; the reference case for
+    the (non-rewrite) refusal."""
+    r = _run(repo, tmp_path, env={"SHIP_TEST_PR_BODY": "Summary\n\nFixes\n#115"})
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert '  in the body:  "Fixes #115"' in r.stderr
+    assert not _merged(tmp_path)
+
+
+def test_magic_close_rewrite_refuses_when_a_cross_line_phrase_survives_the_rewrite(repo, tmp_path):
+    """The line-based rewrite sed cannot reach a phrase split across lines — the gate must
+    RE-VERIFY the actual post-edit title/body rather than trust the rewrite blindly, and
+    refuse (not silently merge) when the keyword is still present after the edit."""
+    r = _run(repo, tmp_path, args=("--rewrite-magic-close",), env={"SHIP_TEST_PR_BODY": "Summary\n\nFixes\n#115"})
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "STILL contains a close keyword" in r.stderr
+    assert not _merged(tmp_path)
+    (line,) = _audit(tmp_path, "magic-close")
+    assert line["decision"] == "refused" and "rewrite-incomplete" in line["detail"]
 
 
 def test_magic_close_catches_a_keyword_in_a_commit_message(repo, tmp_path):
