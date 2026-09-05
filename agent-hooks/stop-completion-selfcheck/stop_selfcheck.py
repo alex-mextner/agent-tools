@@ -77,7 +77,7 @@ HOOK_API = "agents-hooks/v1"
 MARKER_DIR = Path(os.path.expanduser(os.environ.get(
     "SELFCHECK_MARKER_DIR", "~/.cache/agent-tools/selfcheck")))
 # After this many seconds a marker is considered stale (a new task in the same session).
-MARKER_TTL_S = int(os.environ.get("SELFCHECK_TTL_S", "1800"))
+MARKER_TTL_S = max(1, int(os.environ.get("SELFCHECK_TTL_S", "1800")))
 # How far back to scan the transcript for the current turn. A turn rarely spans more than
 # a few dozen tool round-trips; this is generous headroom, not a tuned limit. <= 0 disables
 # the scan entirely (falls back to FULL_PROMPT, the pre-existing behavior).
@@ -244,9 +244,11 @@ def _read_tail_records(path: str, max_lines: int) -> list[dict]:
     top of whatever that byte window happens to contain (fewer than ``max_lines`` records
     when lines are large — a best-effort trade, not a broken guarantee).
 
-    ``max_lines <= 0`` means "scan nothing" (matches this hook's own ``TTL_S=0``-means-
-    "minimum" convention) — without this guard, ``list[-0:]`` silently means "the whole
-    file", the opposite of a caller trying to disable/shrink the scan.
+    ``max_lines <= 0`` means "scan nothing" — without this guard, ``list[-0:]`` silently
+    means "the whole file", the opposite of a caller trying to disable/shrink the scan.
+    (Unlike ``MARKER_TTL_S``, which is clamped away from 0 because 0 there means "never
+    fresh, block forever" — a different knob with a different failure direction, so a
+    different convention is fine and expected here.)
     """
     if max_lines <= 0:
         return []

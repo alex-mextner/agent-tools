@@ -64,11 +64,10 @@ remember to do this" into "the model is reliably prompted".
 - `SELFCHECK_MARKER_DIR` — where per-session markers live (default
   `~/.cache/agent-tools/selfcheck`)
 - `SELFCHECK_TTL_S` — marker freshness / cooldown window in seconds (default `1800`).
-  **`0` is a foot-gun, not "no cooldown"**: a marker is never fresher than `0` seconds
-  old, so every single stop re-blocks forever with no way out short of the kill switch.
-  It only appears in this README's kill-switch demo below, where `SELFCHECK_DISABLE=1`
-  short-circuits before the TTL is ever consulted — don't set `SELFCHECK_TTL_S=0` on its
-  own. Use a small positive value (e.g. `5`) for "almost no cooldown" instead.
+  Clamped to a minimum of `1`: `0` or negative would otherwise mean "a marker is never
+  fresh," which re-blocks every single stop forever with no way out short of the kill
+  switch — a real foot-gun, since `0` reads like "no cooldown" but means the opposite.
+  The clamp turns that mistake into "almost no cooldown" (effectively `1`) instead.
 - `SELFCHECK_TRANSCRIPT_TAIL_LINES` — how many trailing transcript lines to scan when
   classifying the turn (default `500`); `0` (or negative) disables classification
   entirely, same as a missing transcript — always FULL_PROMPT
@@ -127,9 +126,9 @@ echo '{"event_id":"sess-1"}' | ./stop_selfcheck.py; echo "exit=$?"
 #   re-blocked; the marker is only stale, and re-blocks, once SELFCHECK_TTL_S has passed)
 cat ~/.cache/agent-tools/selfcheck/firings.jsonl
 # → one JSON line per invocation above (block, allow, allow)
-SELFCHECK_DISABLE=1 SELFCHECK_TTL_S=0 sh -c '
+SELFCHECK_DISABLE=1 sh -c '
   rm -rf ~/.cache/agent-tools/selfcheck
   echo "{\"event_id\":\"sess-2\"}" | ./stop_selfcheck.py; echo "exit=$?"'
-# → decision":"allow", exit=0 (kill switch — no marker/log written even though the
-#   marker would otherwise be stale immediately with TTL=0)
+# → decision":"allow", exit=0 (kill switch — checked before any marker/log write, so
+#   nothing is written regardless of TTL/cooldown state)
 ```

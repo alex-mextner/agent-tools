@@ -401,6 +401,25 @@ def test_stop_after_ttl_expiry_blocks_again(monkeypatch):
     assert out["decision"] == "block" and code == selfcheck.BLOCK_EXIT_CODE
 
 
+@pytest.mark.parametrize("raw_ttl", ["0", "-5", "-1"])
+def test_ttl_zero_or_negative_env_is_clamped_not_forever_blocking(monkeypatch, raw_ttl):
+    """`fresh()` treats a marker as fresh when `age <= MARKER_TTL_S`. An unclamped
+    `SELFCHECK_TTL_S=0` (or a negative value) would mean NO marker is ever fresh, so every
+    single stop re-blocks forever with no way out short of the kill switch — a genuine
+    foot-gun, since `0` reads like "no cooldown" but means the opposite.
+
+    `MARKER_TTL_S` is computed once at MODULE IMPORT time from the real env var, so
+    pinning this requires actually re-importing the module with the env patched — a plain
+    `monkeypatch.setattr(selfcheck, "MARKER_TTL_S", 0)` would bypass the clamp entirely and
+    prove nothing about it."""
+    monkeypatch.setenv("SELFCHECK_TTL_S", raw_ttl)
+    spec = importlib.util.spec_from_file_location("stop_selfcheck_ttl_reload", _HOOK)
+    assert spec and spec.loader
+    reloaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reloaded)
+    assert reloaded.MARKER_TTL_S >= 1, "SELFCHECK_TTL_S<=0 must be clamped, not read literally"
+
+
 # ---------------------------------------------------------------------------
 # Kill switch (agent-tools#529)
 # ---------------------------------------------------------------------------
