@@ -15,6 +15,10 @@ Confirmed CC contract (https://code.claude.com/docs/en/hooks, CC 2.1.177):
                        {"decision": "block", "reason": "..."} (surfaces the reason to the
                        model, not un-running the tool). Maps to the `post-write` point for
                        the file-edit tools (format-on-write, lint-on-write).
+  - Stop stdin       : {hook_event_name: "Stop", session_id, transcript_path, cwd,
+                       stop_hook_active, …} — `transcript_path` points at the session's
+                       JSONL transcript; forwarded into the v1 event so a `stop` hook can
+                       read what actually happened this turn.
   - Stop block       : exit 0 + {"decision": "block", "reason": "..."}.
   - matcher          : matched by CC against tool_name BEFORE we run; the settings.json entry
                        carries the matcher, so the dispatcher only needs the logical point.
@@ -33,6 +37,12 @@ import sys
 from pathlib import Path
 
 HOOK_API = "agents-hooks/v1"
+# The v1 event's `harness` tag for every event this bridge produces. A MODULE LITERAL, not
+# derived from any field of `cc_event` — so it cannot be forged by a model/tool_input value the
+# way `args.harness` could be. A hook that wants to scope itself to (or exempt) one harness reads
+# `event["harness"]`, never `args`. See orchestrator-stays-thin's EXEMPT_HARNESSES for the first
+# consumer (agent-tools#533).
+HARNESS = "claude-code"
 # CC events this bridge knows how to register/handle (typo guard in main()).
 _KNOWN_EVENTS = frozenset({"PreToolUse", "Stop", "PostToolUse"})
 
@@ -157,8 +167,18 @@ def to_v1_event(cc_event: dict, *, point: str) -> dict:
         "event_id": cc_event.get("session_id", ""),
         "tool": cc_event.get("tool_name"),
         "point": point,
+        "harness": HARNESS,
         "command": tool_input.get("command", ""),
         "cwd": cc_event.get("cwd", os.getcwd()),
+        # CC's Stop payload carries this pointing at the session's own JSONL transcript
+        # (https://code.claude.com/docs/en/hooks). Forwarded unconditionally (empty string
+        # when absent) so the `stop` point's hooks — currently only
+        # stop-completion-selfcheck — can read what actually happened this turn instead of
+        # firing the same static text regardless of content. Not part of the T2 identity
+        # loop above: it isn't attacker-controlled (no tool_input carries it for `stop`,
+        # which has no tool_input at all) and it isn't used to scope a gating DECISION, only
+        # to pick which prompt text to show.
+        "transcript_path": cc_event.get("transcript_path", ""),
         "args": args,
     }
 

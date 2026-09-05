@@ -70,6 +70,10 @@
 #                          unreadable-body, or still-current threads are never touched and still
 #                          block. Also SHIP_RESOLVE_ADDRESSED_THREADS=1. A bot thread with >100
 #                          comments is fail-closed (never auto-resolved).
+#   --rewrite-magic-close  when the magic-close gate finds a Closes/Fixes/Resolves keyword
+#                          targeting an issue/ticket in the PR title or body, rewrite the keyword
+#                          to "Refs" via `gh pr edit` (audited) and continue, instead of refusing.
+#                          Under --dry-run the edit is only printed.
 #   --screenshot P [D]     attach a local screenshot P (desc D) via SHIP_IMAGE_UPLOAD_CMD,
 #                          then post it as a PR comment. Repeatable.
 #   --known-flake NAME     assert that the FAILED check named NAME (as printed by the green-CI
@@ -185,6 +189,18 @@
 #   RIG_HATCH_REQUEST_SHIP_EXTERNAL_REVIEW  one-time bypass request for the external-review
 #                          gate, same shape/hardening as RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM
 #                          above — see ci/ship/external_review_hatch.py.
+#   SHIP_ACCEPTANCE_GATE   set to 0/false/no to disable the pre-merge ACCEPTANCE gate (default:
+#                          enabled) — the gate that runs `task gate <code> --json` (task-cli) and
+#                          refuses the merge while the ticket has unchecked criteria or checks
+#                          without a proof. Also settable as a committed `.ship-config` line
+#                          (see "Knobs (file)"). Ops off-switch; the per-ticket opt-out is
+#                          `task change <code> --post-merge-acceptance "<reason>"`, recorded ON
+#                          the ticket and reported in the audit line. See "acceptance gate" below.
+#   SHIP_MAGIC_CLOSE_GATE  set to 0/false/no to disable the magic-close keyword gate (default:
+#                          enabled) — refuses a PR whose title/body carries close/closes/closed/
+#                          fix/fixes/fixed/resolve/resolves/resolved followed by #N, owner/repo#N
+#                          or a ticket code (ABC-123), because GitHub and Linear close the ticket
+#                          on merge behind task-cli's gates. See "magic-close keyword gate" below.
 #   SHIP_AUDIT_FILE        path for the gate audit JSONL (default
 #                          ~/.config/agent-tools/ship-audit.jsonl). One line is appended per
 #                          non-dry-run gated ship. review-quorum gate decisions: authorized /
@@ -192,8 +208,16 @@
 #                          --skip-ci gate decisions: skipci:bypass:approved / skipci:bypass:denied
 #                          / skipci:refused (has a `gate":"skip-ci"` field). external-review gate
 #                          decisions: external-review:bypass:approved / :bypass:denied /
-#                          :refused (has a `gate":"external-review"` field). --dry-run prints the
-#                          would-be audit instead of writing.
+#                          :refused (has a `gate":"external-review"` field). acceptance gate
+#                          decisions: authorized / authorized:post-merge-opt-out / refused /
+#                          skipped / auto-closed / auto-close-failed (has `gate":"acceptance"`, a
+#                          `task_code` when one was derived, and a `detail` — the opt-out reason,
+#                          the open criteria, or why it was skipped; auto-closed/auto-close-failed
+#                          are the post-merge `task done <code>` this gate also runs when every
+#                          criterion was already proven pre-merge — see ci/ship/README.md's
+#                          "Auto-close" section). magic-close gate decisions: refused / rewritten
+#                          (has `gate":"magic-close"` and the matched phrases in `detail`).
+#                          --dry-run prints the would-be audit instead of writing.
 #
 # Knobs (file):
 #   .ship-config           optional, committed at the repo root — an AUDITED, per-repo override
@@ -212,10 +236,13 @@
 #                          just documentation. Simple `KEY=value` lines, no quote-stripping
 #                          (don't wrap values in quotes — `KEY="val"` means the literal value
 #                          `"val"`, not `val`); `#`-only-prefixed lines and blank lines are
-#                          ignored. Three whitelisted keys, nothing else is read or evaluated
+#                          ignored. Four whitelisted keys, nothing else is read or evaluated
 #                          from the file:
 #                            SHIP_AUTO_BUMP=0             opt this repo out of the merge-time version
 #                                                  bump (same as the env var; env wins when set).
+#                            SHIP_ACCEPTANCE_GATE=0       ops off-switch for the pre-merge acceptance
+#                                                  gate, per repo (same effect as the env var of
+#                                                  the same name; any other value keeps it on).
 #                            SHIP_LOCAL_TEST_DIR=<path>   directory (relative to repo root) to run
 #                                                  the test command from, or to scope
 #                                                  auto-detection to when SHIP_LOCAL_TEST_CMD is
@@ -242,6 +269,9 @@ set -euo pipefail
 
 ORIG_PWD=$(pwd -P)
 PR=""; SKIP_CI=0; DRY_RUN=0; NO_SHOT_OK=""; NO_VBUMP_OK=""; NO_DWELL_OK=""; REPO_FLAG=""
+# --rewrite-magic-close: let the magic-close gate rewrite Closes/Fixes/Resolves -> Refs via
+# `gh pr edit` and continue, instead of refusing. See "magic-close keyword gate" below.
+REWRITE_MAGIC_CLOSE=0
 SHOT_PATHS=(); SHOT_DESCS=()
 # --known-flake NAME, repeatable — see the "known-flake gate" block below _ci_github_status_indicator.
 KNOWN_FLAKES=()
@@ -256,7 +286,7 @@ KF_AUDIT_PENDING=""
 # current thread is never touched (see the gate below).
 RESOLVE_THREADS=0
 case "${SHIP_RESOLVE_ADDRESSED_THREADS:-}" in 1|true|yes) RESOLVE_THREADS=1 ;; esac
-USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--resolve-addressed-threads] [--screenshot <path> [desc]]... [--known-flake <check-name>]...'
+USAGE='Usage: ship.sh <PR-number> [--repo <owner/repo>] [--skip-ci] [--dry-run] [--no-screenshot-ok <reason>] [--no-version-bump-ok <reason>] [--no-review-dwell-ok <reason>] [--resolve-addressed-threads] [--rewrite-magic-close] [--screenshot <path> [desc]]... [--known-flake <check-name>]...'
 
 # Path to the review-quorum gate's hatch-escalation helper (ci/ship/review_quorum_hatch.py),
 # derived ONLY from this script's own location. That helper imports the shared
@@ -286,6 +316,7 @@ while [ "$i" -lt "$n" ]; do
     --skip-ci) SKIP_CI=1 ;;
     --dry-run) DRY_RUN=1 ;;
     --resolve-addressed-threads) RESOLVE_THREADS=1 ;;
+    --rewrite-magic-close) REWRITE_MAGIC_CLOSE=1 ;;
     --no-screenshot-ok)
       i=$((i+1)); { [ "$i" -lt "$n" ] && [ "${args[$i]:0:1}" != "-" ]; } || { echo "--no-screenshot-ok needs a <reason>." >&2; exit 1; }
       NO_SHOT_OK=${args[$i]}; [ -n "$NO_SHOT_OK" ] || { echo "--no-screenshot-ok reason empty." >&2; exit 1; } ;;
@@ -529,6 +560,7 @@ _ship_config_assign() {  # $1 = key, $2 = trimmed value
     SHIP_LOCAL_TEST_DIR) SHIP_CFG_DIR="$2" ;;
     SHIP_LOCAL_TEST_CMD) SHIP_CFG_CMD="$2" ;;
     SHIP_AUTO_BUMP) SHIP_CFG_AUTO_BUMP="$2" ;;
+    SHIP_ACCEPTANCE_GATE) SHIP_CFG_ACCEPTANCE_GATE="$2" ;;
   esac
 }
 
@@ -537,6 +569,7 @@ _ship_config_load() {
   SHIP_CFG_DIR=""
   SHIP_CFG_CMD=""
   SHIP_CFG_AUTO_BUMP=""
+  SHIP_CFG_ACCEPTANCE_GATE=""
   if ! (cd "$root" && git show HEAD:.ship-config) >/dev/null 2>&1; then
     [ -f "$root/.ship-config" ] && \
       echo "[ship] local gate: .ship-config exists in the working tree but is not committed at HEAD — ignoring (uncommitted config is not audited)." >&2
@@ -593,7 +626,7 @@ _ship_config_load() {
     line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     case "$line" in
       ''|'#'*) continue ;;
-      SHIP_LOCAL_TEST_DIR=*|SHIP_LOCAL_TEST_CMD=*|SHIP_AUTO_BUMP=*)
+      SHIP_LOCAL_TEST_DIR=*|SHIP_LOCAL_TEST_CMD=*|SHIP_AUTO_BUMP=*|SHIP_ACCEPTANCE_GATE=*)
         key="${line%%=*}"
         val="${line#*=}"
         val="$(printf '%s' "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
@@ -605,12 +638,13 @@ _ship_config_load() {
   done <<< "$content"
   if [ -n "$SHIP_CFG_DIR" ] && ! _ship_config_dir_is_safe "$SHIP_CFG_DIR"; then
     # Invalidates only the LOCAL-TEST pair (DIR + CMD, the two keys the rejected DIR value
-    # actually governs) — NOT SHIP_CFG_AUTO_BUMP. Review finding (#518): an unrelated
-    # SHIP_LOCAL_TEST_DIR typo used to also silently clear a committed SHIP_AUTO_BUMP=0
-    # opt-out, re-enabling the auto-bump's REMOTE writes on a repo that explicitly asked for
-    # the old refuse-until-bumped behavior — an unrelated key's validity must never flip a
-    # different key's policy meaning.
-    echo "[ship] local gate: .ship-config: SHIP_LOCAL_TEST_DIR '$SHIP_CFG_DIR' is not a safe repo-relative subdirectory (absolute, a '..' path component, or '.'/repo root itself — omit the key to mean root) — ignoring SHIP_LOCAL_TEST_DIR/SHIP_LOCAL_TEST_CMD (SHIP_AUTO_BUMP, if present, still applies)." >&2
+    # actually governs) — NOT SHIP_CFG_AUTO_BUMP or SHIP_CFG_ACCEPTANCE_GATE. Review finding
+    # (#518): an unrelated SHIP_LOCAL_TEST_DIR typo used to also silently clear a committed
+    # SHIP_AUTO_BUMP=0 opt-out, re-enabling the auto-bump's REMOTE writes on a repo that
+    # explicitly asked for the old refuse-until-bumped behavior — an unrelated key's validity
+    # must never flip a different key's policy meaning. Applies equally to
+    # SHIP_ACCEPTANCE_GATE, an unrelated ops off-switch added alongside this key.
+    echo "[ship] local gate: .ship-config: SHIP_LOCAL_TEST_DIR '$SHIP_CFG_DIR' is not a safe repo-relative subdirectory (absolute, a '..' path component, or '.'/repo root itself — omit the key to mean root) — ignoring SHIP_LOCAL_TEST_DIR/SHIP_LOCAL_TEST_CMD (SHIP_AUTO_BUMP/SHIP_ACCEPTANCE_GATE, if present, still apply)." >&2
     SHIP_CFG_DIR=""
     SHIP_CFG_CMD=""
   fi
@@ -1078,41 +1112,6 @@ ci_appears_structurally_down() {
   return 0
 }
 
-# Parse the audited per-repo config file $root/.ship-config, if present. Sets three globals
-# for the caller: SHIP_CFG_DIR, SHIP_CFG_CMD and SHIP_CFG_AUTO_BUMP (each "" when unset/absent/
-# rejected). Only whole-line `#` comments and the three whitelisted `KEY=value` keys are
-# recognized — the file is never eval'd itself. Any non-blank, non-comment line that doesn't
-# match one of the three keys is logged and ignored (not silently dropped) so a typo doesn't
-# silently downgrade the gate to auto-detection.
-#
-# The file is read from the last COMMITTED content at HEAD (`git show HEAD:.ship-config`),
-# never the working tree — the "audited, committed" trust story in the header doc is an
-# enforced property, not just a claim. Reading the worktree copy would let a tracked-but-
-# locally-modified file (or a staged-but-never-committed one) take effect with no audit
-# trail; reading HEAD means only content that has actually landed in history — reviewed
-# like any other committed change — can ever run. A file present in the working tree but
-# absent/uncommitted at HEAD is ignored with a warning, exactly as if it didn't exist.
-#
-# SHIP_LOCAL_TEST_DIR is rejected (logged) if it is an absolute path, contains a `..`
-# component, or resolves to the repo root itself (`.`, `./`, or any all-`.`-segments path).
-# Rejection invalidates the LOCAL-TEST PAIR (SHIP_LOCAL_TEST_DIR + SHIP_LOCAL_TEST_CMD are
-# cleared together), not just the DIR — a rejected dir alongside a still-present
-# SHIP_LOCAL_TEST_CMD must not silently relocate that command to run from the repo root
-# instead of the (rejected) directory the author asked for; that would verify a different
-# suite than intended. Local-test detection then proceeds exactly as if the pair was never
-# set. SHIP_AUTO_BUMP is a SEPARATE, unrelated key and is NEVER cleared by this rejection
-# (review finding, #518: an earlier revision cleared all three keys together, so a typo'd
-# SHIP_LOCAL_TEST_DIR could silently re-enable a committed SHIP_AUTO_BUMP=0 opt-out's remote
-# writes — an unrelated key's validity must never flip a different key's policy meaning).
-#
-# Threat model: $root/.ship-config's committed content is under the SAME trust boundary as
-# rig.yaml/package.json (both already dictate what the gate runs) — a PR that edits it is
-# reviewed like any other change, this does not add a new attack surface (see the
-# header-doc caveat above). The DIR safety check is accident-prevention (a typo'd
-# absolute/traversal/root path), not a security boundary — SHIP_LOCAL_TEST_CMD is arbitrary
-# eval'd shell regardless of DIR.
-# Route one whitelisted `.ship-config` key to its SHIP_CFG_* variable (the whitelist itself is
-# the `case` in _ship_config_load; an unlisted key never reaches here).
 # True (exit 0) if $2 (a real, existing directory) is a STRICT physical descendant of $1
 # (root) — i.e. inside it, but not equal to it — resolving symlinks on BOTH sides via
 # `cd ... && pwd -P`. _ship_config_dir_is_safe only checks the CONFIGURED string lexically
@@ -3430,41 +3429,23 @@ else
   fi
 fi
 
-# --- merge -----------------------------------------------------------------------------
-if [ "$SKIP_CI" = "1" ]; then
-  # Deny-by-default: the --skip-ci admin bypass proceeds ONLY on a one-time live Telegram approval
-  # (RIG_HATCH_REQUEST_SHIP_SKIP_CI). Refuses here otherwise — before any merge.
-  _skip_ci_hatch_gate
-  echo "[ship] --skip-ci: admin-merging PR #${PR} (${BRANCH}) --${MERGE_METHOD} --admin ..."
-  run gh pr merge "$PR" "--$MERGE_METHOD" --admin
-else
-  echo "[ship] preflight clean — merging PR #${PR} (${BRANCH}) --${MERGE_METHOD} ..."
-  run gh pr merge "$PR" "--$MERGE_METHOD"
-fi
-# `run gh pr merge` above runs under `set -e` — a merge failure would have already aborted the
-# script, so reaching here means the merge (or its --dry-run stand-in) succeeded. ONLY now is it
-# true that a known-flake claim was "confirmed" in the sense the audit trail promises (an
-# actual merge happened, not merely a passed local check that a LATER gate then refused).
-if [ -n "$KF_AUDIT_PENDING" ]; then
-  _known_flake_audit_log confirmed "$KF_AUDIT_PENDING"
-fi
+# --- ticket gates: magic-close keywords + pre-merge acceptance (agent-tools#521) ---------
+# Both close the same hole from two sides. task-cli's close gates (every criterion checked WITH
+# a proof) only run inside `task done` — but GitHub's "Closes/Fixes/Resolves #N" keywords and
+# Linear's GitHub integration (the same words before a ticket code, "Fixes HYP-1295") move the
+# ticket to Done the INSTANT the PR merges, entirely outside task-cli. 127 of the 435 HYP
+# tickets closed since June 2026 are Done with unchecked criteria (HYP-1440, HYP-1347,
+# HYP-1295). A merge gate is the only place that can stop that automation, so:
+#   1. the MAGIC-CLOSE gate refuses a PR whose title/body carries such a keyword (the fix is to
+#      write "Refs <ref>" — links without closing; `--rewrite-magic-close` does it for you);
+#   2. the ACCEPTANCE gate asks task-cli (`task gate <code> --json`) whether the ticket is
+#      accepted and refuses while criteria are unchecked or checked without a proof.
+# Both run under --dry-run (same refusal; the rewrite is only printed), both log one audit line
+# to SHIP_AUDIT_FILE, and each has its own ops off-switch (SHIP_MAGIC_CLOSE_GATE=0,
+# SHIP_ACCEPTANCE_GATE=0 — the latter also as a committed .ship-config line).
 
-# --- task-cli notify (best-effort; never blocks or fails the ship) --------------------
-# The merge above already succeeded. Tell task-cli about it so the ticket TRACKS the merge
-# instead of drifting out of sync (the class of bug behind a real 13-ticket status-divergence
-# cleanup) — and so the ticket surfaces its acceptance instructions (what proof is still
-# needed) instead of silently going quiet. This is pure notification: `task mark-shipped`
-# (task-cli) never closes the ticket itself, only PROPER acceptance does that — see its own
-# docstring. A failure anywhere in this step is a WARNING, never a ship failure: the merge is
-# already durable, this is best-effort bookkeeping on top of it.
-#
-# SHIP_TASK_NOTIFY_ENABLED=0 disables the whole step (ops off-switch, same shape as
-# SHIP_REVIEW_QUORUM_ENABLED above) — the test harness's shared fixtures (tests/test_ship.py)
-# default it off process-wide (review finding: those ~30 pre-existing fixtures never stub a
-# fake `task`, so leaving this on-by-default there would invoke whatever REAL task-cli happens
-# to be on the developer's PATH, against a fake PR carrying garbage `--pr`/`--commit` values —
-# a real, unintended mutation of a real ticket store during a test run).
-#
+# The ticket-code derivation is SHARED by the acceptance gate (pre-merge) and the task-cli
+# notify step (post-merge) — one matcher, defined once, here, before its first caller.
 # Task-code derivation reuses _review_quorum_extract_ticket (the same matcher the review-quorum
 # gate above uses) but tries MORE sources, each validated independently, falling through to the
 # next on rejection: the gate's own $TASK_CODE (if it already ran and found one — avoids a
@@ -3524,6 +3505,310 @@ _ship_derive_task_code_for_notify() {
   return 0
 }
 
+# One audit line for either ticket gate -> SHIP_AUDIT_FILE, mirroring _review_quorum_audit_log's
+# dry-run contract and jq-less JSON-safety. $1=gate (acceptance|magic-close) $2=decision
+# $3=task_code (may be empty) $4=detail (free text; may be empty).
+_ticket_gate_audit_log() {
+  local gate="$1" decision="$2" code="${3:-}" detail="${4:-}"
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "[dry-run] would append ${gate} audit: decision=${decision}${code:+ task=${code}}${detail:+ detail=${detail}}" >&2
+    return 0
+  fi
+  local file="${SHIP_AUDIT_FILE:-$HOME/.config/agent-tools/ship-audit.jsonl}"
+  mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
+  local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if command -v jq >/dev/null 2>&1; then
+    jq -nc --arg ts "$ts" --arg pr "$PR" --arg gate "$gate" --arg dec "$decision" \
+      --arg code "$code" --arg detail "$detail" \
+      '{ts:$ts, pr:$pr, gate:$gate, decision:$dec} +
+       (if $code == "" then {} else {task_code:$code} end) +
+       (if $detail == "" then {} else {detail:$detail} end)' \
+      >> "$file" 2>/dev/null || true
+  else
+    local esc_pr esc_code esc_detail
+    esc_pr=$(printf '%s' "$PR" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    esc_code=$(printf '%s' "$code" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    esc_detail=$(printf '%s' "$detail" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    printf '{"ts":"%s","pr":"%s","gate":"%s","decision":"%s"%s%s}\n' \
+      "$ts" "$esc_pr" "$gate" "$decision" \
+      "${esc_code:+,\"task_code\":\"${esc_code}\"}" "${esc_detail:+,\"detail\":\"${esc_detail}\"}" \
+      >> "$file" 2>/dev/null || true
+  fi
+}
+
+# --- magic-close keyword gate ---------------------------------------------------------
+# The keyword ERE is spelled with per-letter case classes rather than a case-insensitive flag:
+# macOS `sed -E` has no /I and BSD grep's -i cannot be shared with sed, and the SAME expression
+# drives both the match (grep) and the rewrite (sed) so the two can never disagree about what a
+# "magic-close phrase" is. Matches GitHub's full keyword list (close/closes/closed, fix/fixes/
+# fixed, resolve/resolves/resolved) plus Linear's -ing forms, whitespace, then an issue
+# reference (#N, owner/repo#N, or a full https://…/issues|pull/N URL — GitHub documents the
+# full-URL form as an equally valid close target) or a ticket code (two+ letters, hyphen,
+# digits — HYP-1295; Linear matches these case-insensitively too). A leading non-word char /
+# line start keeps "prefixes #1" from matching; no colon is allowed between keyword and
+# reference, so a conventional-commit title "fix: HYP-1295 …" (which neither GitHub nor Linear
+# treats as a close) passes. Known false positive: a keyword before an acronym-with-number
+# ("fixed UTF-8 decoding") — the refusal prints the exact phrase, so one word change clears it.
+_MAGIC_CLOSE_KW='([Cc][Ll][Oo][Ss]([Ee]|[Ee][Ss]|[Ee][Dd]|[Ii][Nn][Gg])|[Ff][Ii][Xx]([Ee][Ss]|[Ee][Dd]|[Ii][Nn][Gg])?|[Rr][Ee][Ss][Oo][Ll][Vv]([Ee]|[Ee][Ss]|[Ee][Dd]|[Ii][Nn][Gg]))'
+_MAGIC_CLOSE_REF='(([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+|[A-Za-z][A-Za-z]+-[0-9]+|https?://[A-Za-z0-9_./-]+/(issues|pull)/[0-9]+)'
+# sed group map: \1 = leading char (or line start), \2..\5 = the keyword, \6 = the whitespace,
+# \7..\9 = the reference (\9 only populated for the URL form). The rewrite keeps \1, \6 and \7
+# and drops only the keyword.
+_MAGIC_CLOSE_RE="(^|[^[:alnum:]_])${_MAGIC_CLOSE_KW}([[:space:]]+)${_MAGIC_CLOSE_REF}"
+
+_magic_close_matches() {  # $1 = text -> one "keyword ref" phrase per line; ALWAYS exits 0
+  # LC_ALL=C on BOTH grep and sed (review finding: an earlier version left the trailing sed in
+  # the AMBIENT locale) — under a non-UTF-8-aware ambient locale, a multi-byte leading boundary
+  # char (e.g. an em dash glued directly to the keyword, "Summary—Fixes #12") could otherwise
+  # be stripped byte-by-byte inconsistently between the two tools. Detection itself never
+  # depended on this (grep already ran under LC_ALL=C), so this is a display-consistency fix,
+  # not a fail-open one — but pinning both sides to the SAME locale is the only way the header
+  # comment's "grep and sed can never disagree" claim is actually true.
+  # Whitespace-normalized (every run of whitespace, INCLUDING a newline, collapsed to one
+  # space) BEFORE matching (review finding, round 4, GLM): GitHub's own close-keyword parser
+  # is whitespace-tolerant across a linebreak — the review-quorum ticket-code derivation
+  # already normalizes newlines to spaces for the identical reason (`gsub("\n";" ")`) — but
+  # grep/sed are line-based, so an unnormalized scan would silently miss "Fixes\n#115" split
+  # across two lines (a real shape: the commit scan synthesizes exactly `headline + "\n" +
+  # body`). A phrase caught ONLY this way (not by a plain per-line scan) can't be safely fixed
+  # by the line-based `_magic_close_rewrite` sed — `_magic_close_rewrite_pr` verifies its OWN
+  # rewrite result and refuses rather than trust a rewrite that may have missed a cross-line
+  # phrase.
+  printf '%s' "$1" | LC_ALL=C tr '\n' ' ' | LC_ALL=C grep -oE "$_MAGIC_CLOSE_RE" | LC_ALL=C sed -E 's/^[^[:alnum:]_]//' || true
+}
+_magic_close_rewrite() {  # $1 = text -> stdout: the text with every keyword replaced by "Refs"
+  # `~` as the s-command delimiter: the reference arm contains `/` (owner/repo#N).
+  printf '%s\n' "$1" | LC_ALL=C sed -E "s~${_MAGIC_CLOSE_RE}~\\1Refs\\6\\7~g"
+}
+_magic_close_gate() {
+  local title body commits t_hits b_hits c_hits hits tb_hits title_rc=0 body_rc=0 commits_rc=0
+  # Track EACH `gh pr view` call's own exit code (review finding, round 2, Fable): the earlier
+  # `|| title=""` made a genuine `gh` failure (rate-limited, network blip) indistinguishable
+  # from "the title/body is legitimately empty" — a PR whose real body says "Closes HYP-1440"
+  # would sail through as "no keyword found" the moment the fetch itself failed, exactly the
+  # incident class this gate exists to stop. Fail closed on an unreadable fetch, like the
+  # review-quorum gate does on an unreadable store.
+  title=$(gh pr view "$PR" --json title -q '.title // ""' 2>/dev/null) || title_rc=$?
+  body=$(gh pr view "$PR" --json body -q '.body // ""' 2>/dev/null) || body_rc=$?
+  # GitHub also honours a close keyword in a PR's COMMIT messages (review finding, round 2,
+  # Fable + Opus): with the default squash merge, GitHub's own squash-message template
+  # includes each commit's message in the final commit body unless the repo customizes it, so
+  # a keyword buried in one commit can still close the ticket even with a clean title/body.
+  commits=$(gh pr view "$PR" --json commits -q '[.commits[] | (.messageHeadline // "") + "\n" + (.messageBody // "")] | join("\n")' 2>/dev/null) || commits_rc=$?
+  if [ "$title_rc" != "0" ] || [ "$body_rc" != "0" ] || [ "$commits_rc" != "0" ]; then
+    { echo "Refusing: magic-close gate — could not read PR #$PR's title/body/commits from GitHub (gh exit ${title_rc}/${body_rc}/${commits_rc}) — cannot verify it is free of a close keyword."
+      echo "  Retry once gh/GitHub is reachable. SHIP_MAGIC_CLOSE_GATE=0 bypasses this gate entirely (ops off-switch) — only if you have verified the text by hand."; } >&2
+    _ticket_gate_audit_log magic-close refused "" "gh pr view failed: title_rc=${title_rc} body_rc=${body_rc} commits_rc=${commits_rc}"
+    exit 1
+  fi
+  t_hits=$(_magic_close_matches "$title")
+  b_hits=$(_magic_close_matches "$body")
+  c_hits=$(_magic_close_matches "$commits")
+  if [ -z "$t_hits" ] && [ -z "$b_hits" ] && [ -z "$c_hits" ]; then
+    echo "[ship] magic-close gate: no close/fix/resolve keyword targets an issue or ticket in #$PR's title/body/commits."
+    return 0
+  fi
+  hits=$(printf '%s\n%s\n%s\n' "$t_hits" "$b_hits" "$c_hits" | sed '/^$/d' | tr '\n' ';' | sed 's/;$//')
+  # `tb_hits` (title+body only, no commits) is what --rewrite-magic-close can actually FIX —
+  # kept separate from `hits` (which also includes commit phrases) for the audit `detail` on
+  # the rewrite path, so that line never claims a rewrite that didn't happen.
+  tb_hits=$(printf '%s\n%s\n' "$t_hits" "$b_hits" | sed '/^$/d' | tr '\n' ';' | sed 's/;$//')
+  if [ "$REWRITE_MAGIC_CLOSE" = "1" ]; then
+    [ -n "$t_hits" ] || [ -n "$b_hits" ] && _magic_close_rewrite_pr "$title" "$body" "$t_hits" "$b_hits" "$tb_hits"
+    if [ -n "$c_hits" ]; then
+      # A commit-message hit can NEVER be fixed by --rewrite-magic-close — `gh pr edit` can't
+      # touch commit history (and this script never rewrites/rebases a branch) — REGARDLESS of
+      # whether title/body ALSO had hits (review finding, round 3, Opus + Fable: an earlier
+      # version rewrote title/body and let the merge proceed anyway when a commit hit
+      # coexisted, leaving the un-rewritable commit keyword to close the ticket on merge, and
+      # logged a false `rewritten` audit line claiming the commit phrase was fixed too — it
+      # wasn't). Any title/body rewrite above already landed (harmless, and worth keeping); the
+      # merge itself must still be refused.
+      { echo "Refusing: magic-close keyword found in a COMMIT message of PR #$PR — --rewrite-magic-close can only edit the PR title/body, never commit history (this script never rewrites or rebases a branch)."
+        [ -n "$t_hits" ] || [ -n "$b_hits" ] && echo "  (the title/body keyword(s) were rewritten to Refs; the commit message keyword below was NOT — it still closes the ticket on merge.)"
+        printf '%s\n' "$c_hits" | sed 's/^/  in a commit: "/; s/$/"/'
+        echo "  Fix by hand: amend the offending commit message(s) locally, force-push the branch yourself (ship never does), then re-run ship — or reword just to drop the keyword (e.g. \"see HYP-1295\" instead of \"Fixes HYP-1295\")."; } >&2
+      _ticket_gate_audit_log magic-close refused "" "$hits"
+      exit 1
+    fi
+    _ticket_gate_audit_log magic-close rewritten "" "$tb_hits"
+    return 0
+  fi
+  { echo "Refusing: magic-close keyword in PR #$PR — it would close the ticket the instant the PR merges, behind task-cli's acceptance gates."
+    [ -n "$t_hits" ] && printf '%s\n' "$t_hits" | sed 's/^/  in the title: "/; s/$/"/'
+    [ -n "$b_hits" ] && printf '%s\n' "$b_hits" | sed 's/^/  in the body:  "/; s/$/"/'
+    [ -n "$c_hits" ] && printf '%s\n' "$c_hits" | sed 's/^/  in a commit: "/; s/$/"/'
+    echo "  Why: GitHub's Closes/Fixes/Resolves #N and Linear's GitHub integration (the same words before a ticket code) move the ticket to Done on merge, so no criterion is ever checked with a proof."
+    echo "  Fix: write \"Refs <ref>\" instead (e.g. \"Refs #115\", \"Refs HYP-1295\") — \`gh pr edit $PR --title/--body\` — then re-run ship;"
+    if [ -n "$c_hits" ]; then
+      echo "       a COMMIT message keyword has no automatic fix — amend it and force-push the branch yourself, or reword to drop the keyword; --rewrite-magic-close can fix a title/body hit but never a commit one."
+    else
+      echo "       or re-run with --rewrite-magic-close to have ship rewrite the keyword(s) to Refs via 'gh pr edit' and continue."
+    fi
+    echo "  SHIP_MAGIC_CLOSE_GATE=0 disables this gate entirely (ops off-switch)."; } >&2
+  _ticket_gate_audit_log magic-close refused "" "$hits"
+  exit 1
+}
+_magic_close_rewrite_pr() {  # $1=title $2=body $3=title hits $4=body hits $5=joined title/body hits
+  # Does NOT itself audit-log a `rewritten` decision on success (review finding, round 3: this
+  # is also called when a commit hit coexists and the overall verdict is still `refused` — the
+  # caller logs exactly ONE final decision per gate invocation, not a `rewritten` line
+  # immediately followed by a `refused` one for the same ship run). A `gh pr edit` FAILURE is
+  # unconditionally terminal either way, so that failure path still audits here.
+  local new_title="$1" new_body="$2"
+  local -a edit_args=()
+  [ -n "$3" ] && new_title="$(_magic_close_rewrite "$1")" && edit_args+=(--title "$new_title")
+  [ -n "$4" ] && new_body="$(_magic_close_rewrite "$2")" && edit_args+=(--body "$new_body")
+  # Verify the rewrite RESULT — not a post-edit re-fetch (review finding, round 5, Opus + GLM:
+  # an earlier version re-fetched from GitHub after the edit to verify it landed, but that
+  # re-fetch used the SAME unguarded `|| var=""` pattern round 2 had already fixed elsewhere —
+  # a `gh` failure on the RE-fetch silently looked like "no keyword left", the exact fail-open
+  # this whole gate exists to prevent; it also mispredicted under `--dry-run`, where nothing
+  # was written yet the stale pre-edit text still re-matched). Scanning `new_title`/`new_body`
+  # — text already computed locally, no network call — catches a cross-line phrase the
+  # line-based rewrite sed couldn't reach in BOTH dry-run and real runs, with nothing to fail
+  # open on.
+  local residual
+  residual=$(printf '%s\n%s\n' "$(_magic_close_matches "$new_title")" "$(_magic_close_matches "$new_body")" | sed '/^$/d' | tr '\n' ';' | sed 's/;$//')
+  if [ -n "$residual" ]; then
+    { echo "Refusing: magic-close gate — rewriting PR #$PR would still leave a close keyword in the title/body (a phrase the line-based rewrite could not reach — e.g. split across lines)."
+      printf '%s\n' "$residual" | sed 's/^/  still present: "/; s/$/"/'
+      echo "  Fix by hand: edit the PR title/body directly (write \"Refs <ref>\"), then re-run ship."; } >&2
+    _ticket_gate_audit_log magic-close refused "" "rewrite-incomplete: $residual"
+    exit 1
+  fi
+  echo "[ship] magic-close gate: --rewrite-magic-close — rewriting to Refs in #$PR: $5"
+  if ! run gh pr edit "$PR" "${edit_args[@]}"; then
+    { echo "Refusing: magic-close gate — 'gh pr edit $PR' failed while rewriting the keyword(s) to Refs ($5)."
+      echo "  Fix the title/body by hand (write \"Refs <ref>\"), then re-run ship."; } >&2
+    _ticket_gate_audit_log magic-close refused "" "rewrite-failed: $5"
+    exit 1
+  fi
+}
+MAGIC_CLOSE_ENABLED=1
+case "${SHIP_MAGIC_CLOSE_GATE:-1}" in 0|false|no) MAGIC_CLOSE_ENABLED=0 ;; esac
+if [ "$MAGIC_CLOSE_ENABLED" = "0" ]; then
+  echo "[ship] magic-close gate disabled (SHIP_MAGIC_CLOSE_GATE=${SHIP_MAGIC_CLOSE_GATE})."
+else
+  _magic_close_gate
+fi
+
+# --- pre-merge acceptance gate --------------------------------------------------------
+# Asks task-cli for the read-only verdict: `task gate <code> --json` (task-cli#115). Its contract,
+# identical on both ends (task-cli README "The pre-merge gate" / ci/ship/README.md): exit 0 =
+# accepted (every criterion checked WITH a proof, or a recorded post-merge opt-out, or the gate
+# disabled in that repo's task config, or a cancelled ticket); exit 1 = NOT accepted; exit 2 =
+# could not evaluate (unknown id, backend error). Exit 0/1 print one JSON object: {id, ok,
+# state, gate_enabled, post_merge_acceptance (reason string or null), criteria (total; 0 is a
+# refusal), unchecked: [{index, text}], proofless: [{index, text}]} — `index` is the 1-based
+# number `task check <id> <n>` takes. The VERDICT is the exit code; the JSON only shapes the
+# message and the audit detail, so a jq-less machine still gates correctly.
+#
+# Skips (logged, never a refusal) when task-cli is absent, the invocation targets a foreign
+# --repo, or no ticket code is derivable — the same three "not every PR is tied to a tracked
+# ticket" cases the post-merge notify below already skips on; the code derivation IS
+# _ship_derive_task_code_for_notify (never a second matcher). Exit 2 is also a logged skip: an
+# unknown ticket (the digit-check false positives that matcher documents — "UTF-8") or a
+# backend outage is not evidence that the ticket is unaccepted, and the ops off-switch exists
+# for the case where an operator wants the gate silent for other reasons.
+# `below_minimum` (task-cli#115 round 2) can be true with BOTH unchecked/proofless EMPTY — a
+# ticket below its configured acceptance_min (e.g. one fully-proven criterion, minimum two)
+# refuses `task gate` on count alone, not on any specific criterion's proof — so it needs its
+# own line here or a refusal would print with nothing under it.
+_acceptance_gate_print_gaps() {  # $1 = `task gate --json` stdout -> the open criteria, one per line
+  if command -v jq >/dev/null 2>&1 && printf '%s' "$1" | jq -e . >/dev/null 2>&1; then
+    printf '%s' "$1" | jq -r '
+      (.unchecked[]? | "    [\(.index)] \(.text)  (unchecked)"),
+      (.proofless[]? | "    [\(.index)] \(.text)  (checked without a proof)"),
+      (if (.criteria // 1) == 0 then "    (the ticket has no acceptance criteria at all — nothing can be accepted)"
+       elif (.below_minimum // false) then "    (only \(.criteria) acceptance criteria — below this repo'"'"'s configured minimum, even with every one it has proven)"
+       else empty end)'
+  else
+    printf '    %s\n' "$1"
+  fi
+}
+_acceptance_gate_detail() {  # $1 = `task gate --json` stdout -> one-line audit detail
+  if command -v jq >/dev/null 2>&1 && printf '%s' "$1" | jq -e . >/dev/null 2>&1; then
+    printf '%s' "$1" | jq -r '"criteria=\(.criteria // 0) below_minimum=\(.below_minimum // false) unchecked=\([.unchecked[]?.index | tostring] | join(",")) proofless=\([.proofless[]?.index | tostring] | join(","))"'
+  else
+    printf '%s' "$1" | LC_ALL=C tr '\n' ' '
+  fi
+}
+_acceptance_gate_refuse() {  # $1 = task code $2 = `task gate --json` stdout; exits 1
+  { echo "Refusing: acceptance gate — ticket ${1} is NOT accepted (task gate ${1} exit 1); merging now would close it behind task-cli with these criteria unproven:"
+    _acceptance_gate_print_gaps "$2"
+    echo "  Fix: task accept ${1}   (walks each open criterion, asking for a proof), or"
+    echo "       task check ${1} <n> [<n> ...] --proof <path> [--proof <path> ...]   (one proof per criterion, in order; --force \"<reason>\" when a proof is impossible)"
+    echo "       then \`task gate ${1}\` must exit 0. If acceptance is inherently post-merge (a release publish, a deploy the merge triggers):"
+    echo "       task change ${1} --post-merge-acceptance \"<reason>\"   — recorded ON the ticket and in the ship audit log; task done still needs real proofs afterwards."
+    echo "  SHIP_ACCEPTANCE_GATE=0 (env, or a committed .ship-config line) disables this gate entirely (ops off-switch)."; } >&2
+  _ticket_gate_audit_log acceptance refused "$1" "$(_acceptance_gate_detail "$2")"
+  exit 1
+}
+# Set by `_acceptance_gate` for the post-merge notify step to read (agent-tools#521 follow-up,
+# 2026-09-05): tg-cli#301 shipped for real via PR #305 — every criterion was independently
+# verified against the merged code — yet #301 sat OPEN for days because closing it needed a
+# separate `task done` nobody remembered to run. A gate that only refuses a BAD merge does not
+# by itself close that gap; `_ship_notify_task_cli` uses these two globals to also DO the
+# close automatically when the criteria were already proven true before the merge, so the
+# ticket does not depend on a human remembering the extra step. Genuinely empty/unset ("")
+# means "do not attempt an automatic close" — either the gate never ran, refused (unreachable,
+# ship would have exited), was skipped/disabled, or passed only via the post-merge opt-out
+# (whose entire point is that acceptance is NOT yet true at merge time).
+ACCEPTANCE_GATE_CODE=""
+ACCEPTANCE_GATE_FULLY_ACCEPTED=""
+# Whether an exit-0 `task gate --json` payload is safe to auto-close on (review finding,
+# agent-tools#521 round 1, Opus + GLM): exit 0 alone covers FOUR distinct cases — fully
+# proven, a recorded post-merge opt-out, `gate_enabled: false` for this ticket, and a
+# cancelled ticket — and only the FIRST is actually "nothing left to prove". An earlier
+# version treated "no opt-out reason" as sufficient, so a cancelled ticket or a gate-disabled
+# repo (both legitimately exit 0 with criteria still unchecked) triggered a doomed `task done`
+# attempt, logging a "criteria were fully proven" audit line that was simply false. Requires
+# jq: without it, the opt-out/cancelled/disabled distinction can't be read at all, so this
+# ALWAYS returns "not safe" — an unverifiable exit-0 is never grounds to auto-close.
+_acceptance_gate_fully_accepted() {  # $1 = task gate --json stdout (exit 0) -> "1" or ""
+  command -v jq >/dev/null 2>&1 || { printf ''; return 0; }
+  # `state != "done"` too (review finding, round 2): task-cli's own contract example shows
+  # `task gate` exit 0 with `"state":"done"` is a real, reachable shape — a follow-up PR
+  # referencing an ALREADY-DONE ticket (`Refs HYP-931` against a ticket closed by an earlier
+  # merge) hits this same path. `task done` on an already-Done ticket refuses (a re-close is
+  # rejected, not a silent re-write — see task-cli's own transition validation), so treating
+  # it as "safe to auto-close" produced the same false "fully proven" narrative the cancelled
+  # case did. `done` and `cancelled` are task-cli's only two terminal states.
+  if printf '%s' "$1" | jq -e '
+      (.post_merge_acceptance == null) and (.gate_enabled != false) and
+      (.state != "cancelled") and (.state != "done")
+    ' >/dev/null 2>&1
+  then printf '1'; else printf ''; fi
+}
+_acceptance_gate_pass() {  # $1 = task code $2 = `task gate --json` STDOUT ONLY (exit 0)
+  local reason="" have_jq=0
+  command -v jq >/dev/null 2>&1 && have_jq=1
+  if [ "$have_jq" = "1" ]; then
+    reason=$(printf '%s' "$2" | jq -r '.post_merge_acceptance // ""' 2>/dev/null) || reason=""
+  fi
+  ACCEPTANCE_GATE_CODE="$1"
+  if [ -n "$reason" ]; then
+    echo "[ship] acceptance gate: ${1} passes on a recorded post-merge-acceptance opt-out — reason: ${reason}"
+    echo "[ship]   the criteria are still owed after the merge: task accept ${1}, then task done ${1}."
+    _ticket_gate_audit_log acceptance "authorized:post-merge-opt-out" "$1" "$reason"
+    # Deliberately NOT setting ACCEPTANCE_GATE_FULLY_ACCEPTED: the opt-out exists exactly
+    # because acceptance is NOT yet true — an automatic `task done` here would just fail (or
+    # worse, close a ticket whose criteria are genuinely still open).
+    return 0
+  fi
+  echo "[ship] acceptance gate: ${1} accepted — task gate ${1} exit 0 ($(_acceptance_gate_detail "$2"))."
+  if [ "$have_jq" = "0" ]; then
+    _ticket_gate_audit_log acceptance authorized "$1" "no jq on PATH — opt-out/cancelled/disabled status unverifiable, skipping auto-close"
+    return 0
+  fi
+  if [ -n "$(_acceptance_gate_fully_accepted "$2")" ]; then
+    _ticket_gate_audit_log acceptance authorized "$1" ""
+    ACCEPTANCE_GATE_FULLY_ACCEPTED=1
+  else
+    _ticket_gate_audit_log acceptance authorized "$1" "already done, cancelled, or the acceptance-checked gate is disabled for this ticket — skipping auto-close"
+  fi
+}
 # Rewrites a "GH-<n>" code (case-insensitive: "gh-105" too, matching
 # require-ticket-before-commit's `re.IGNORECASE` on the same pattern) into the literal "#<n>" form
 # task-cli's own id argument expects (task mark-shipped/done accept "#123" or "HYP-456", never
@@ -3561,6 +3846,124 @@ _ship_normalize_gh_code_for_task_cli() {  # $1 = candidate code -> prints the ta
     printf '%s' "$1"
   fi
 }
+
+_acceptance_gate() {
+  # The ops off-switches only echo, like the other gates' off-switches (no audit line: the
+  # env one is a per-invocation operator choice, the .ship-config one is audited by being
+  # committed at HEAD).
+  case "${SHIP_ACCEPTANCE_GATE:-1}" in
+    0|false|no) echo "[ship] acceptance gate disabled (SHIP_ACCEPTANCE_GATE=${SHIP_ACCEPTANCE_GATE})."; return 0 ;;
+  esac
+  _ship_config_load "$ROOT"
+  case "$SHIP_CFG_ACCEPTANCE_GATE" in
+    0|false|no) echo "[ship] acceptance gate disabled by the committed .ship-config (SHIP_ACCEPTANCE_GATE=${SHIP_CFG_ACCEPTANCE_GATE})."; return 0 ;;
+  esac
+  if ! command -v task >/dev/null 2>&1; then
+    echo "[ship] acceptance gate: task-cli not on PATH — skipping (install task-cli to gate merges on accepted criteria)." >&2
+    _ticket_gate_audit_log acceptance skipped "" "task-cli not on PATH"; return 0
+  fi
+  if [ "${_FOREIGN_REPO_INVOKE:-0}" = "1" ]; then
+    echo "[ship] acceptance gate: --repo targets a foreign remote — skipping (a local 'task' here reads the wrong project)." >&2
+    _ticket_gate_audit_log acceptance skipped "" "foreign --repo"; return 0
+  fi
+  local code; code=$(_ship_derive_task_code_for_notify)
+  if [ -z "$code" ]; then
+    echo "[ship] acceptance gate: could not derive a task code for #$PR — skipping (not every PR is tied to a tracked ticket)." >&2
+    _ticket_gate_audit_log acceptance skipped "" "no task code"; return 0
+  fi
+  # Same rewrite the post-merge notify step applies: a "GH-<n>" derived code (or
+  # $REVIEW_TASK_CODE set that way) is task-cli's convention, not its own id argument — it
+  # expects the literal "#<n>" form. Without this, the acceptance gate would ask `task gate`
+  # about a code it can't resolve even though mark-shipped, right after, resolves it fine.
+  code=$(_ship_normalize_gh_code_for_task_cli "$code")
+  echo "[ship] acceptance gate: asking task-cli — task gate ${code} --json ..."
+  local out rc=0 errfile
+  # Capture stdout and stderr SEPARATELY (review finding, agent-tools#521 round 1, Opus + GLM:
+  # an earlier `2>&1` merged them, so ANY stderr line task-cli emits — a warning, a deprecation
+  # notice — corrupted the JSON `_acceptance_gate_pass`/`_acceptance_gate_refuse` parse with jq;
+  # the failure was silent (jq just returned empty) and mis-set the post-merge-opt-out /
+  # fully-accepted verdict). `errfile` is best-effort (falls back to /dev/null, losing only the
+  # diagnostic text, never the JSON stdout `$out` needs to stay pure).
+  errfile=$(mktemp 2>/dev/null) || errfile=/dev/null
+  # From "$ROOT", not via -C: task-cli's -C is a per-subcommand flag (see the notify step).
+  out=$(cd "$ROOT" && task gate "$code" --json 2>"$errfile") || rc=$?
+  if [ "$errfile" != "/dev/null" ] && [ -s "$errfile" ]; then
+    echo "[ship] acceptance gate: task-cli stderr: $(LC_ALL=C tr '\n' ' ' < "$errfile")" >&2
+  fi
+  [ "$errfile" != "/dev/null" ] && rm -f "$errfile"  # always, not only when -s (review finding: the file leaked on the common empty-stderr path)
+  # `task` is a famously ambiguous command name (Taskwarrior, go-task also install as `task`)
+  # — review finding, round 2 (Opus): `command -v task` alone can resolve to one of those on a
+  # developer's machine. Trust NEITHER exit 0 NOR exit 1 as a genuine task-cli result unless
+  # `$out` has task-cli's OWN JSON shape — an earlier version only guarded the exit-1 arm,
+  # leaving a foreign `task` that happens to exit 0 on garbage (its own "gate" subcommand
+  # succeeding by coincidence, or simply printing nothing) to fail OPEN: `_acceptance_gate_pass`
+  # would parse `""` as "no opt-out reason" and audit a false `authorized`, letting the merge
+  # proceed with NOTHING actually verified (review finding, round 3, Opus).
+  if [ "$rc" = "0" ] || [ "$rc" = "1" ]; then
+    if ! _acceptance_gate_looks_like_task_cli_json "$out"; then
+      echo "[ship] WARNING: acceptance gate could not evaluate ${code} — '$(command -v task)' on PATH did not return task-cli's expected JSON shape (a DIFFERENT 'task' binary — e.g. Taskwarrior or go-task — may be shadowing task-cli). Skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
+      _ticket_gate_audit_log acceptance skipped "$code" "'task' on PATH does not look like task-cli"
+      return 0
+    fi
+  fi
+  case "$rc" in
+    0) _acceptance_gate_pass "$code" "$out" ;;
+    1) _acceptance_gate_refuse "$code" "$out" ;;
+    *)
+      echo "[ship] WARNING: acceptance gate could not evaluate ${code} (task gate exit ${rc}) — skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
+      _ticket_gate_audit_log acceptance skipped "$code" "could not evaluate: exit ${rc}" ;;
+  esac
+}
+# Whether `$1` (task gate's stdout) looks like task-cli's OWN JSON contract, not just any
+# non-empty text — the discriminator for the PATH-collision guard above. With jq, requires the
+# three fields every `task gate --json` payload carries; without it, a cheap substring
+# heuristic (task-cli's payload always contains the literal `"criteria"` key).
+_acceptance_gate_looks_like_task_cli_json() {
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$1" | jq -e 'has("id") and has("ok") and has("criteria")' >/dev/null 2>&1
+  else
+    case "$1" in *'"criteria"'*) return 0 ;; *) return 1 ;; esac
+  fi
+}
+_acceptance_gate
+
+# --- merge -----------------------------------------------------------------------------
+if [ "$SKIP_CI" = "1" ]; then
+  # Deny-by-default: the --skip-ci admin bypass proceeds ONLY on a one-time live Telegram approval
+  # (RIG_HATCH_REQUEST_SHIP_SKIP_CI). Refuses here otherwise — before any merge.
+  _skip_ci_hatch_gate
+  echo "[ship] --skip-ci: admin-merging PR #${PR} (${BRANCH}) --${MERGE_METHOD} --admin ..."
+  run gh pr merge "$PR" "--$MERGE_METHOD" --admin
+else
+  echo "[ship] preflight clean — merging PR #${PR} (${BRANCH}) --${MERGE_METHOD} ..."
+  run gh pr merge "$PR" "--$MERGE_METHOD"
+fi
+# `run gh pr merge` above runs under `set -e` — a merge failure would have already aborted the
+# script, so reaching here means the merge (or its --dry-run stand-in) succeeded. ONLY now is it
+# true that a known-flake claim was "confirmed" in the sense the audit trail promises (an
+# actual merge happened, not merely a passed local check that a LATER gate then refused).
+if [ -n "$KF_AUDIT_PENDING" ]; then
+  _known_flake_audit_log confirmed "$KF_AUDIT_PENDING"
+fi
+
+# --- task-cli notify (best-effort; never blocks or fails the ship) --------------------
+# The merge above already succeeded. Tell task-cli about it so the ticket TRACKS the merge
+# instead of drifting out of sync (the class of bug behind a real 13-ticket status-divergence
+# cleanup) — and so the ticket surfaces its acceptance instructions (what proof is still
+# needed) instead of silently going quiet. This is pure notification: `task mark-shipped`
+# (task-cli) never closes the ticket itself, only PROPER acceptance does that — see its own
+# docstring. A failure anywhere in this step is a WARNING, never a ship failure: the merge is
+# already durable, this is best-effort bookkeeping on top of it.
+#
+# SHIP_TASK_NOTIFY_ENABLED=0 disables the whole step (ops off-switch, same shape as
+# SHIP_REVIEW_QUORUM_ENABLED above) — the test harness's shared fixtures (tests/test_ship.py)
+# default it off process-wide (review finding: those ~30 pre-existing fixtures never stub a
+# fake `task`, so leaving this on-by-default there would invoke whatever REAL task-cli happens
+# to be on the developer's PATH, against a fake PR carrying garbage `--pr`/`--commit` values —
+# a real, unintended mutation of a real ticket store during a test run).
+#
+# The task-code derivation (_ship_derive_task_code_for_notify) is defined ABOVE the merge,
+# next to the pre-merge acceptance gate that shares it — see "ticket gates".
 
 # Call `task mark-shipped <code> --pr <url> [--commit <sha>]` for the just-merged PR. Skipped
 # (with a logged reason, never an error) when: the feature is disabled (SHIP_TASK_NOTIFY_ENABLED=0);
@@ -3605,8 +4008,44 @@ _ship_notify_task_cli() {
   # effects, so scoping the `cd` around it too is safe.
   local -a mark_args=(mark-shipped "$code" --pr "$pr_url")
   [ -n "$merge_sha" ] && mark_args+=(--commit "$merge_sha")
-  if ! (cd "$ROOT" || { echo "[ship] WARNING: could not cd to $ROOT for task-cli notify." >&2; exit 1; }; run task "${mark_args[@]}"); then
+  if (cd "$ROOT" || { echo "[ship] WARNING: could not cd to $ROOT for task-cli notify." >&2; exit 1; }; run task "${mark_args[@]}"); then
+    # Only auto-close AFTER a successful mark-shipped (review finding, round 3, Codex): if
+    # mark-shipped itself failed — an older task-cli lacking the subcommand, a transient
+    # backend error — the merged PR/commit link never got recorded on the ticket. Closing it
+    # anyway via auto-close would recreate exactly the task/repository divergence this whole
+    # notify step exists to prevent: a Done ticket with no record of what shipped it.
+    _ship_auto_close_accepted_ticket "$code"
+  else
     echo "[ship] WARNING: 'task mark-shipped ${code}' failed — the ticket may be out of sync with this merge. Update it manually: task read ${code}" >&2
+  fi
+}
+
+# Close the "nobody remembered the extra step" gap (agent-tools#521 follow-up, tg-cli#301/#305
+# incident): when the pre-merge acceptance gate found EVERY criterion already checked with a
+# proof (ACCEPTANCE_GATE_FULLY_ACCEPTED, set only on a genuine pass — never on the post-merge
+# opt-out, where acceptance is deliberately not yet true), there is nothing left to verify —
+# `task done` is a formality task-cli should be asked to do right here, not left for a human to
+# remember days later. Best-effort and NEVER fails the ship: `task done` still enforces every
+# OTHER close gate (formatting, links, screenshots, msgref, …), so a genuine failure there is
+# expected sometimes and only ever a warning with the manual fallback command.
+#
+# $1 = the notify step's OWN derived code — only acts when it equals ACCEPTANCE_GATE_CODE (the
+# code the pre-merge gate actually verified); a mismatch (e.g. the gate was skipped for #$PR
+# but a different code happens to be derivable post-merge) must never auto-close a ticket this
+# run never verified.
+_ship_auto_close_accepted_ticket() {
+  local code="$1"
+  [ -n "$ACCEPTANCE_GATE_FULLY_ACCEPTED" ] || return 0
+  [ "$code" = "$ACCEPTANCE_GATE_CODE" ] || return 0
+  echo "[ship] acceptance gate: ${code} was fully accepted before the merge — closing it now: task done ${code} ..."
+  # Same "cd $ROOT, don't pass -C" reasoning as the mark-shipped call above; output flows
+  # straight through (not captured) — same style as that call.
+  if (cd "$ROOT" || { echo "[ship] WARNING: could not cd to $ROOT to auto-close ${code}." >&2; exit 1; }; run task done "$code"); then
+    echo "[ship] ${code} closed — task done succeeded (acceptance was already proven before the merge)."
+    _ticket_gate_audit_log acceptance auto-closed "$code" ""
+  else
+    echo "[ship] WARNING: acceptance criteria were fully proven pre-merge, but 'task done ${code}' still failed (another close gate — formatting/links/screenshots/etc. — is likely blocking it). Close it by hand: task done ${code}" >&2
+    _ticket_gate_audit_log acceptance auto-close-failed "$code" ""
   fi
 }
 if [ "$DRY_RUN" = "1" ]; then

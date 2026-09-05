@@ -130,6 +130,18 @@ def test_to_v1_event_forwards_agent_id_and_type_for_pre_agent():
     assert v1["args"]["prompt"] == "do the thing"
 
 
+def test_to_v1_event_tags_harness_claude_code():
+    """agent-tools#533: every v1 event this bridge produces carries the top-level `harness`
+    tag `"claude-code"`, unconditionally — set from the bridge's own module constant, never
+    from `cc_event`. A forgeable `tool_input.harness` (if a hook ever misread `args`) must not
+    override it."""
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+          "tool_input": {"command": "ls", "harness": "codex"}, "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="pre-bash")
+    assert v1["harness"] == "claude-code"
+    assert dispatch.HARNESS == "claude-code"
+
+
 def test_to_v1_event_main_thread_has_no_agent_id():
     """A main-thread Agent dispatch carries NO agent_id (the signal is absent) → the gate
     treats it as the orchestrator, not a subagent."""
@@ -225,6 +237,23 @@ def test_to_v1_event_forwards_session_id_for_stop():
           "session_id": "sess-xyz", "cwd": "/repo"}
     v1 = dispatch.to_v1_event(cc, point="stop")
     assert v1["args"]["session_id"] == "sess-xyz"
+
+
+def test_to_v1_event_forwards_transcript_path_for_stop():
+    """stop-completion-selfcheck reads this to classify what the turn actually did instead
+    of firing the same static prompt regardless of content — must round-trip unchanged."""
+    cc = {"hook_event_name": "Stop", "stop_hook_active": True,
+          "session_id": "sess-xyz", "cwd": "/repo",
+          "transcript_path": "/Users/x/.claude/projects/p/sess-xyz.jsonl"}
+    v1 = dispatch.to_v1_event(cc, point="stop")
+    assert v1["transcript_path"] == "/Users/x/.claude/projects/p/sess-xyz.jsonl"
+
+
+def test_to_v1_event_transcript_path_defaults_to_empty_string_when_absent():
+    cc = {"hook_event_name": "Stop", "stop_hook_active": True,
+          "session_id": "sess-xyz", "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="stop")
+    assert v1["transcript_path"] == ""
 
 
 def test_to_v1_event_empty_string_top_level_session_id_overwrites_tool_input():

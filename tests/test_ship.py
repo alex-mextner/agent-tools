@@ -36,6 +36,12 @@ _SHIP = Path(__file__).resolve().parents[1] / "ci" / "ship" / "ship.sh"
 # SHIP_REVIEW_QUORUM=1 in their own env dict (each test builds `env = dict(os.environ)`,
 # so a later explicit assignment there still wins over this default).
 os.environ.setdefault("SHIP_REVIEW_QUORUM", "0")
+# The two pre-merge ticket gates (acceptance + magic-close, agent-tools#521) default ENABLED
+# too and have their own fixtures in tests/test_ship_ticket_gates.py; off here so a fixture
+# PR body that happens to say "Fixes HYP-999", or a fake `task` that logs every call, is not
+# gated by a feature this file never set out to exercise.
+os.environ.setdefault("SHIP_ACCEPTANCE_GATE", "0")
+os.environ.setdefault("SHIP_MAGIC_CLOSE_GATE", "0")
 
 # The post-merge task-cli notify step (`_ship_notify_task_cli`) also defaults to ENABLED, but
 # none of the ~30 fixtures in this file stub a fake `task` binary — leaving it on here would

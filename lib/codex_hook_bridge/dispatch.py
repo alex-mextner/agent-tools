@@ -18,6 +18,15 @@ import sys
 from pathlib import Path
 
 HOOK_API = "agents-hooks/v1"
+# The v1 event's `harness` tag for every event this bridge produces — a MODULE LITERAL, not
+# derived from `codex_event`, so it cannot be forged via tool_input the way `args.harness` could
+# be. Codex exposes no TRUSTED per-tool-call subagent identity today (`args.agent_id` is stripped
+# below and never repopulated — there is no top-level Codex field to restore it from, unlike CC's
+# `agent_id`/`agent_type`). A hook can read `event["harness"]` to scope a policy to (or exempt)
+# this whole harness instead of relying on a subagent identity Codex doesn't give it — see
+# `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES` for the first consumer
+# (agent-tools#533).
+HARNESS = "codex"
 _KNOWN_EVENTS = frozenset(
     {"PreToolUse", "PostToolUse", "Stop", "SubagentStart", "SubagentStop"}
 )
@@ -92,6 +101,7 @@ def to_v1_event(codex_event: dict, *, point: str) -> dict:
         "event_id": _event_id(codex_event),
         "tool": codex_event.get("tool_name"),
         "point": point,
+        "harness": HARNESS,
         "command": command,
         "cwd": codex_event.get("cwd") or os.getcwd(),
         "args": args,
