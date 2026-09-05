@@ -36,6 +36,21 @@ assert _spec and _spec.loader
 hook = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(hook)
 
+# The sibling hook, loaded so the two remedies BLOCK_MESSAGE recommends can be run through the
+# REAL sibling gate (not merely asserted as strings) — see
+# test_remedy_1_run_in_background_ordinary_command_passes_sibling_gate and
+# test_remedy_2_heartbeat_loop_passes_sibling_gate below.
+_SIBLING_HOOK = (
+    Path(__file__).resolve().parents[1]
+    / "agent-hooks"
+    / "subagent-no-bg-longproc"
+    / "subagent_no_bg_longproc.py"
+)
+_sibling_spec = importlib.util.spec_from_file_location("subagent_no_bg_longproc", _SIBLING_HOOK)
+assert _sibling_spec and _sibling_spec.loader
+sibling_hook = importlib.util.module_from_spec(_sibling_spec)
+_sibling_spec.loader.exec_module(sibling_hook)
+
 
 def _run(
     monkeypatch,
@@ -118,6 +133,47 @@ def test_block_message_names_the_bounded_heartbeat_loop(monkeypatch):
     assert "20" in msg  # echo cadence
     assert "540" in msg  # per-call bound, safely under the Bash tool's 600s cap
     assert "echo" in msg
+
+
+def _run_sibling(command, monkeypatch, *, run_in_background=None) -> tuple[str, int]:
+    """Drive the REAL `subagent-no-bg-longproc` sibling hook with a subagent event, exactly as
+    a subagent following BLOCK_MESSAGE's printed remedy would trigger it — proves the remedy is
+    a legal move, not just a string this test file asserts appears in the message."""
+    args = {"command": command, "agent_id": "sub-1"}
+    if run_in_background is not None:
+        args["run_in_background"] = run_in_background
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"args": args})))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    for k in ("ALLOW_SUBAGENT_BACKGROUND", "ALLOW_SUBAGENT_BACKGROUND_REASON",
+              "RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC"):
+        monkeypatch.delenv(k, raising=False)
+    code = sibling_hook.main()
+    return out.getvalue(), code
+
+
+def test_remedy_1_run_in_background_ordinary_command_passes_sibling_gate(monkeypatch):
+    """Remedy (1) — an ORDINARY (non-labeled) command backgrounded with run_in_background:true —
+    must actually be ALLOWED by subagent-no-bg-longproc, or the printed remedy pinballs a
+    subagent between the two gates with no legal move (agent-tools#546 follow-up context)."""
+    out, code = _run_sibling("curl -sS https://example.com/status", monkeypatch,
+                             run_in_background=True)
+    assert code == 0, out
+    assert json.loads(out)["decision"] == "allow"
+
+
+def test_remedy_2_heartbeat_loop_passes_sibling_gate(monkeypatch):
+    """Remedy (2) — the literal foreground heartbeat-loop command from BLOCK_MESSAGE — must
+    also be ALLOWED by subagent-no-bg-longproc (it is foreground, and its invoked head is
+    `timeout`->`bash`, not a labeled long-process command at argv[0])."""
+    remedy_2 = (
+        'timeout 540 bash -c \'i=0; until <condition-check> || [ "$i" -ge 26 ]; do sleep 20; '
+        'i=$((i+1)); echo "[wait] tick $i ($((i*20))s)"; done\''
+    )
+    out, code = _run_sibling(remedy_2, monkeypatch)
+    assert code == 0, out
+    assert json.loads(out)["decision"] == "allow"
 
 
 # ── ALLOW: the orchestrator's own Monitor use (no agent_id) ──────────────────────────────

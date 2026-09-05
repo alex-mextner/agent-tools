@@ -162,8 +162,12 @@ here should be `on_error: open` and always emit `allow`.
 `pre-monitor` fires before CC's `Monitor` tool call runs (the fire-and-forget background
 event-stream watch — start it, keep working, get notified per line/event later). Its one
 consumer, `subagent-no-monitor`, blocks it **unconditionally** whenever `agent_id` is present
-(a dispatched subagent), because a subagent is never re-invoked by a later notification — only
-the main loop is. The orchestrator's own Monitor use is unaffected. **Registration gap:** the
+(a dispatched subagent), because a subagent is never re-invoked by a Monitor-event notification
+— only the main loop is (Monitor has no harness-tracked child at all, unlike an ordinary
+backgrounded Bash `run_in_background: true` command; see `agent-hooks/subagent-no-monitor/`'s
+own README for the empirically-verified distinction, tracked against `subagent-no-bg-longproc`'s
+broader stated rationale as agent-tools#546). The orchestrator's own Monitor use is unaffected.
+**Registration gap:** the
 point mapping lives in `lib/cc_hook_bridge/dispatch.py`, but CC only fires a `PreToolUse` hook
 for a tool it has an explicit `settings.json` matcher for — that matcher is written by
 rig-cli's `hook_bridge_entries` (a separate repo, same split `pre-agent`/`pre-skill` went

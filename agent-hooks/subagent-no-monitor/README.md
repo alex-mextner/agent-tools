@@ -5,10 +5,11 @@
 Stops a **dispatched subagent** from calling the **Monitor** tool at all (HYP-1350's
 retrospective, hyperide/hyper-saas PR #754). The wedge: a subagent started a Monitor watch on
 its own spawned child process, then ended its turn saying *"I'll wait for the completion
-notification."* But a **subagent is NOT re-invoked by a background/Monitor-event notification
-— only the main loop is.** So it idles forever with uncommitted work and no PR — the exact
-same failure `subagent-no-bg-longproc` exists to stop, just reached through a different CC
-tool that gate doesn't inspect.
+notification."* But a **subagent is NOT re-invoked by a Monitor-event notification — only the
+main loop is** (Monitor has no harness-tracked child at all, unlike an ordinary backgrounded
+Bash command — see "The correct alternative" below). So it idles forever with uncommitted work
+and no PR — the exact same failure `subagent-no-bg-longproc` exists to stop for a *labeled*
+long process, just reached through a different CC tool that gate doesn't inspect.
 
 ## Where it sits in the doctrine (sibling of subagent-no-bg-longproc)
 
@@ -33,10 +34,13 @@ call to Monitor, full stop**, regardless of what it watches or why.
 
 Which replacement applies depends on what the subagent is waiting for:
 
-1. **A single long-running command it just started** — set `run_in_background: true` on the
-   Bash tool call. The harness auto-resumes the subagent when that command completes; no
-   Monitor is needed for this shape at all.
-2. **Anything else** (a condition to become true, a file to appear, several things at once) —
+1. **A single ORDINARY command it just started** — one that is NOT itself a labeled long
+   process (`review`, `--watch`, a build-test suite, a long `sleep` — those go to option 2
+   instead, since `subagent-no-bg-longproc` blocks backgrounding them) — set
+   `run_in_background: true` on the Bash tool call. The harness auto-resumes the subagent when
+   that command completes; no Monitor is needed for this shape at all.
+2. **Anything else** — a labeled long process, a condition to become true, a file to appear,
+   several things at once —
    block on it **synchronously**, in the foreground, with a heartbeat loop: echo a line at
    least every ~20s and keep each Bash call comfortably under ~540s (well inside the Bash
    tool's own 600s hard cap), repeating the same bounded call until the wait is over:
