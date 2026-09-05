@@ -180,7 +180,7 @@ def test_hatch_justification_exit0_allows(tmp_path, monkeypatch):
         monkeypatch, agent_id="sub-1",
         env={"RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR": "self-managed watchdog, polls inline"},
     )
-    assert code == 0 and _decision(out) == "allow"
+    assert code == 0 and _decision(out) == "allow", (out, _e)
     assert marker.exists()
     assert "hatch escalation" in json.loads(out)["message"].lower()
 
