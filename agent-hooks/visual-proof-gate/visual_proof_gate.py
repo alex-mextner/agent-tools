@@ -41,11 +41,13 @@ never wedge committing.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
 import re
 import shlex
+import stat
 import subprocess  # noqa: S404 — listing staged files is the whole job
 import sys
 import time
@@ -99,6 +101,14 @@ HOOK_API = "agents-hooks/v1"
 PROOF_DIR = Path(os.path.expanduser(os.environ.get(
     "VISUAL_PROOF_DIR", "~/.cache/agent-tools/visual-proof")))
 PROOF_WINDOW_S = int(os.environ.get("VISUAL_PROOF_WINDOW_S", "3600"))
+# When set, ONLY a `dev shot` attestation bound to this staged change is accepted; a bare
+# freshness marker is refused. Default off so repos that have not adopted `dev shot` keep
+# working — turn it on per-repo once `dev shot` is in the workflow.
+REQUIRE_BINDING = os.environ.get("VISUAL_PROOF_REQUIRE_BINDING", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 # Intentionally < the descriptor's `timeout_ms` (8000): the inner python `git diff` timeout
 # must fire FIRST and fail OPEN (allow), rather than the bridge killing the whole hook on its
 # own timeout. Don't tighten the descriptor to 5000 — the gap is the safety margin (#14).
@@ -701,8 +711,209 @@ def visual_staged(files: list[str]) -> list[str]:
     return [f for f in files if VISUAL_EXT.search(f) or VISUAL_DIR.search(f)]
 
 
-def _proof_fresh() -> bool:
-    """True if any marker in PROOF_DIR is fresh (a screenshot was looked at recently)."""
+def _staged_diff_hash(cwd: str) -> str | None:
+    """sha256 of ``git diff --cached`` in ``cwd`` — the identity of THIS staged change.
+
+    ``dev shot`` records the same hash when it attests, so comparing them answers the question
+    an mtime never could: was this proof produced for the change being committed, or for
+    something else? Fails soft (``None``) so a git problem degrades to the legacy check rather
+    than wedging the commit.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "diff", "--cached"],
+            capture_output=True,
+            timeout=GIT_DIFF_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return hashlib.sha256(proc.stdout).hexdigest()
+
+
+# A proof record is a small JSON object. Anything larger is not one, and reading it is how
+# the hook gets hung: `truncate -s 50G planted.json` is a REGULAR file, so a type check alone
+# lets it through and the read then thrashes past the bridge timeout into `on_error: open`.
+MAX_RECORD_BYTES = 1024 * 1024
+
+
+def _read_record(path: Path) -> str | None:
+    """Read a proof record, or None if it is not one we are willing to open.
+
+    The type check happens on the OPEN, not before it. Checking with ``lstat`` and reading
+    afterwards is a time-of-check/time-of-use race the gated agent can win by swapping the
+    path between a regular file and a FIFO in a loop until a commit attempt lands in the
+    window - the read then blocks, the bridge times out, and ``on_error: open`` allows the
+    very commit this gate exists to hold.
+
+    ``O_NOFOLLOW`` refuses a symlink, ``O_NONBLOCK`` makes opening a FIFO return immediately
+    instead of hanging, and ``fstat`` on the resulting descriptor cannot be raced - it
+    describes the object actually opened.
+    """
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_RECORD_BYTES:
+            return None
+        return os.read(fd, MAX_RECORD_BYTES).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _git_toplevel(cwd: str) -> Path | None:
+    """Resolved repository root for ``cwd``, or None when git cannot answer.
+
+    ``dev shot`` records the repo ROOT. Comparing that against ``cwd`` itself would reject a
+    perfectly good record whenever `git commit` runs from a subdirectory — the gate would be
+    unsatisfiable without changing directory or reaching for the hatch. Both sides must be
+    normalised to the same thing, and the top-level is that thing.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            timeout=GIT_DIFF_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    # os.fsdecode, not decode("replace"): a path is bytes, and "replace" silently mangles a
+    # non-UTF-8 one into a path that exists nowhere. Strip only git's single trailing newline
+    # - .strip() would eat a real trailing space from a directory legitimately named "repo ".
+    raw = proc.stdout
+    if raw.endswith(b"\n"):
+        raw = raw[:-1]
+    if not raw:
+        return None
+    try:
+        return Path(os.fsdecode(raw)).resolve()
+    except (OSError, ValueError):
+        return None
+
+
+def _fresh_records(now: float) -> list[Path]:
+    """Fresh `.json` candidates in PROOF_DIR. Scanned BEFORE hashing the staged diff so a
+    repo with no `dev shot` adoption does not pay an extra `git diff --cached` per commit —
+    two sequential git calls could otherwise approach the bridge timeout and be killed
+    instead of failing open."""
+    try:
+        if not PROOF_DIR.is_dir():
+            return []
+        children = list(PROOF_DIR.iterdir())
+    except OSError:
+        return []
+    fresh = []
+    for child in children:
+        if child.suffix != ".json":
+            continue
+        try:
+            # The guard `_capture_digest` applies to captures, for the same reason: a FIFO
+            # named `*.json` blocks the later `read_text()` until the bridge timeout, and
+            # `on_error: open` then ALLOWS the very commit this gate exists to hold. A symlink
+            # could likewise redirect the read. lstat, so the link itself is what is judged.
+            st = child.lstat()
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            if (now - st.st_mtime) <= PROOF_WINDOW_S:
+                fresh.append(child)
+        except OSError:
+            continue
+    return fresh
+
+
+# A capture beyond this is not a screenshot; refuse rather than read it. `capture_path` comes
+# from a record we did not write, so it could point at a huge file or a FIFO that would block
+# the hook past the bridge timeout — and `on_error: open` would then ALLOW the commit.
+MAX_CAPTURE_BYTES = 256 * 1024 * 1024
+
+
+def _capture_digest(path_str: str) -> str | None:
+    """sha256 of a capture file, or None if it is missing, not a regular file, or too big."""
+    try:
+        path = Path(path_str)
+        if path.is_symlink() or not path.is_file():
+            return None  # a FIFO or device would block; a symlink could redirect the proof
+        if path.stat().st_size > MAX_CAPTURE_BYTES:
+            return None
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _bound_proof_matches(cwd: str) -> bool:
+    """True if a fresh ``dev shot`` attestation is bound to exactly this staged change.
+
+    A bound record is strictly stronger than the legacy marker: the tool that wrote it also
+    captured and measured the screenshot, so the record cannot exist for a blank page or for a
+    page nobody rendered.
+    """
+    now = time.time()
+    candidates = _fresh_records(now)
+    if not candidates:
+        return False
+    staged = _staged_diff_hash(cwd)
+    if staged is None:
+        return False
+    repo_root = _git_toplevel(cwd)
+    if repo_root is None:
+        return False
+    for child in candidates:
+        text = _read_record(child)
+        if text is None:
+            continue
+        try:
+            record = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        if record.get("staged_sha256") != staged:
+            continue
+        # An identical staged patch in a DIFFERENT repository must not inherit this proof:
+        # the record is evidence that THIS working tree was rendered.
+        recorded_repo = record.get("repo")
+        if isinstance(recorded_repo, str):
+            try:
+                if Path(recorded_repo).resolve() != repo_root:
+                    continue
+            except OSError:
+                continue
+        # The producer records whether unstaged edits existed, because the browser renders the
+        # WORKING TREE while the binding is to the INDEX. When binding is required, a dirty
+        # tree means the pixels may show something other than what is being committed.
+        if REQUIRE_BINDING and record.get("worktree_dirty") is True:
+            continue
+        capture = record.get("capture_path")
+        digest = record.get("capture_sha256")
+        if not isinstance(capture, str) or not isinstance(digest, str):
+            continue
+        if _capture_digest(capture) != digest:
+            continue
+        return True
+    return False
+
+
+def _legacy_marker_fresh() -> bool:
+    """The pre-binding contract: any fresh file in PROOF_DIR counts.
+
+    Kept so repositories that have not adopted ``dev shot`` keep working unchanged. Set
+    ``VISUAL_PROOF_REQUIRE_BINDING=1`` to refuse it and demand a bound attestation.
+    """
     try:
         if not PROOF_DIR.is_dir():
             return False
@@ -718,14 +929,31 @@ def _proof_fresh() -> bool:
     return False
 
 
+def _proof_fresh(cwd: str) -> bool:
+    """True when the staged change carries acceptable visual proof.
+
+    Prefers a bound ``dev shot`` attestation; falls back to the legacy freshness marker unless
+    binding is required.
+    """
+    if _bound_proof_matches(cwd):
+        return True
+    if REQUIRE_BINDING:
+        return False
+    return _legacy_marker_fresh()
+
+
 def _block_message(visual: list[str]) -> str:
     """The BLOCK message: what's wrong, how to satisfy the marker, and the hatch how-to."""
     sample = ", ".join(visual[:3]) + (", …" if len(visual) > 3 else "")
     return (
         f"This commit changes user-visible files ({sample}) but no screenshot was captured "
         "and looked at. Per visual-proof-cycle: capture the rendered result, read the capture "
-        f"back, verify it, THEN commit. Touch a file under {PROOF_DIR} when you've reviewed a "
-        "screenshot. No self-service bypass. ASK the human, or request a one-time Telegram "
+        "back, verify it, THEN commit.\n"
+        "Satisfy it with:  dev shot <url> --out <path.png> --viewport 1440x900\n"
+        "That captures with a scroll sweep, refuses a blank or wrong-sized capture, and "
+        f"records the proof under {PROOF_DIR} bound to this exact staged change. "
+        f"{'A bound `dev shot` attestation is REQUIRED here (VISUAL_PROOF_REQUIRE_BINDING).' if REQUIRE_BINDING else 'A plain fresh marker in that directory is still accepted for now.'}\n"
+        "No self-service bypass. ASK the human, or request a one-time Telegram "
         'approval via RIG_HATCH_REQUEST_VISUAL_PROOF_GATE="<justification>" (deny-by-default; '
         "bare 1 rejected)."
     )
@@ -788,8 +1016,8 @@ def main() -> int:
         emit("allow")  # no user-visible files staged → nothing to prove
         return 0
 
-    if _proof_fresh():
-        emit("allow")  # a screenshot was captured and looked at recently → satisfied
+    if _proof_fresh(cwd):
+        emit("allow")  # proof bound to this change, or a fresh legacy marker → satisfied
         return 0
 
     return _decide_block(command, cwd, visual)

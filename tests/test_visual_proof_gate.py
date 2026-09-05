@@ -59,13 +59,15 @@ def _mk_repo_with_staged(tmp_path: Path, *files: str) -> Path:
 
 
 def _run(command, cwd, monkeypatch, *, proof_dir: Path,
-         env: dict | None = None) -> tuple[str, str, int]:
+         env: dict | None = None, require_binding: bool | None = None) -> tuple[str, str, int]:
     out, err = io.StringIO(), io.StringIO()
     event = {"cwd": str(cwd), "args": {"command": command}}
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
     monkeypatch.setattr(vpg, "PROOF_DIR", proof_dir)
+    if require_binding is not None:
+        monkeypatch.setattr(vpg, "REQUIRE_BINDING", require_binding)
     monkeypatch.delenv("RIG_HATCH_REQUEST_VISUAL_PROOF_GATE", raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
@@ -878,3 +880,339 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
         repo, monkeypatch, proof_dir=tmp_path / "proof")  # env NOT set — inline only
     assert c == 0 and _decision(out) == "allow"
     assert "deleting a dead component, nothing to render" in question.read_text()
+
+
+# ── BOUND ATTESTATIONS (`dev shot`) ────────────────────────────────────────────────────
+#
+# The legacy contract was "any fresh file in PROOF_DIR", which a bare `touch` satisfied —
+# so the marker proved nothing about whether a screenshot existed, let alone whether it was
+# blank. `dev shot` now writes a JSON record binding the capture digest to `git diff
+# --cached`. These tests pin BOTH halves: the bound record is honoured, and the legacy
+# marker still works unless a repo opts into requiring binding.
+
+
+def _write_bound_record(proof_dir: Path, repo: Path, capture: Path, *, staged: str | None = None):
+    """Write a `dev shot`-shaped attestation for ``repo``'s current staged diff."""
+    import hashlib
+
+    proof_dir.mkdir(parents=True, exist_ok=True)
+    if staged is None:
+        diff = subprocess.run(["git", "-C", str(repo), "diff", "--cached"],
+                              capture_output=True, timeout=30, check=True).stdout
+        staged = hashlib.sha256(diff).hexdigest()
+    record = {
+        "version": 1,
+        "tool": "dev shot",
+        "capture_path": str(capture),
+        "capture_sha256": hashlib.sha256(capture.read_bytes()).hexdigest(),
+        "staged_sha256": staged,
+        "repo": str(repo),
+    }
+    out = proof_dir / "attest-test.json"
+    out.write_text(json.dumps(record))
+    return out
+
+
+def test_bound_attestation_allows_the_commit(tmp_path, monkeypatch):
+    repo = _mk_repo_with_staged(tmp_path, "src/App.tsx")
+    capture = tmp_path / "shot.png"
+    capture.write_bytes(b"pretend-png-bytes")
+    proof = tmp_path / "proof"
+    _write_bound_record(proof, repo, capture)
+    out, _, code = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert (_decision(out), code) == ("allow", 0)
+
+
+def test_bound_attestation_is_rejected_after_further_staging(tmp_path, monkeypatch):
+    """Editing after the capture must invalidate the proof — that is the anti-reuse property."""
+    repo = _mk_repo_with_staged(tmp_path, "src/App.tsx")
+    capture = tmp_path / "shot.png"
+    capture.write_bytes(b"pretend-png-bytes")
+    proof = tmp_path / "proof"
+    _write_bound_record(proof, repo, capture)
+    (repo / "src" / "Other.tsx").write_text("more")
+    _git(repo, "add", "src/Other.tsx")
+    out, _, code = _run("git commit -m x", repo, monkeypatch,
+                        proof_dir=proof, require_binding=True)
+    assert (_decision(out), code) == ("block", vpg.BLOCK_EXIT_CODE)
+
+
+def test_bound_attestation_is_rejected_when_the_capture_was_swapped(tmp_path, monkeypatch):
+    repo = _mk_repo_with_staged(tmp_path, "src/App.tsx")
+    capture = tmp_path / "shot.png"
+    capture.write_bytes(b"pretend-png-bytes")
+    proof = tmp_path / "proof"
+    _write_bound_record(proof, repo, capture)
+    capture.write_bytes(b"a-completely-different-image")
+    out, _, code = _run("git commit -m x", repo, monkeypatch,
+                        proof_dir=proof, require_binding=True)
+    assert (_decision(out), code) == ("block", vpg.BLOCK_EXIT_CODE)
+
+
+def test_bound_attestation_is_rejected_when_the_capture_is_gone(tmp_path, monkeypatch):
+    repo = _mk_repo_with_staged(tmp_path, "src/App.tsx")
+    capture = tmp_path / "shot.png"
+    capture.write_bytes(b"pretend-png-bytes")
+    proof = tmp_path / "proof"
+    _write_bound_record(proof, repo, capture)
+    capture.unlink()
+    out, _, code = _run("git commit -m x", repo, monkeypatch,
+                        proof_dir=proof, require_binding=True)
+    assert (_decision(out), code) == ("block", vpg.BLOCK_EXIT_CODE)
+
+
+def test_record_for_a_different_change_does_not_transfer(tmp_path, monkeypatch):
+    """A record minted for some other staged diff must not satisfy this one."""
+    repo = _mk_repo_with_staged(tmp_path, "src/App.tsx")
+    capture = tmp_path / "shot.png"
+    capture.write_bytes(b"pretend-png-bytes")
+    proof = tmp_path / "proof"
+    _write_bound_record(proof, repo, capture, staged="0" * 64)
+    out, _, code = _run("git commit -m x", repo, monkeypatch,
+                        proof_dir=proof, require_binding=True)
+    assert (_decision(out), code) == ("block", vpg.BLOCK_EXIT_CODE)
+
+
+def test_legacy_touch_marker_still_allows_by_default(tmp_path, monkeypatch):
+    """Repos that have not adopted `dev shot` must keep working unchanged."""
+    repo = _mk_repo_with_staged(tmp_path, "src/App.tsx")
+    proof = tmp_path / "proof"
+    _touch_proof(proof)
+    out, _, code = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert (_decision(out), code) == ("allow", 0)
+
+
+def test_legacy_touch_marker_is_refused_when_binding_is_required(tmp_path, monkeypatch):
+    repo = _mk_repo_with_staged(tmp_path, "src/App.tsx")
+    proof = tmp_path / "proof"
+    _touch_proof(proof)
+    out, _, code = _run("git commit -m x", repo, monkeypatch,
+                        proof_dir=proof, require_binding=True)
+    assert (_decision(out), code) == ("block", vpg.BLOCK_EXIT_CODE)
+
+
+def test_a_stale_bound_record_does_not_count(tmp_path, monkeypatch):
+    """Freshness still applies to bound records, not just legacy markers."""
+    import os
+    import time
+
+    repo = _mk_repo_with_staged(tmp_path, "src/App.tsx")
+    capture = tmp_path / "shot.png"
+    capture.write_bytes(b"pretend-png-bytes")
+    proof = tmp_path / "proof"
+    rec = _write_bound_record(proof, repo, capture)
+    old = time.time() - (vpg.PROOF_WINDOW_S + 600)
+    os.utime(rec, (old, old))
+    out, _, code = _run("git commit -m x", repo, monkeypatch,
+                        proof_dir=proof, require_binding=True)
+    assert (_decision(out), code) == ("block", vpg.BLOCK_EXIT_CODE)
+
+
+def test_valid_bound_record_allows_under_require_binding(tmp_path, monkeypatch):
+    """THE load-bearing positive: with the legacy fallback OFF, only a working matcher allows.
+
+    Without this, replacing `_bound_proof_matches` with `return False` passes the whole suite —
+    the negatives all block via require_binding, and the one allow case is satisfied by the
+    legacy fresh-file fallback rather than by the binding logic.
+    """
+    repo = _mk_repo_with_staged(tmp_path, "src/App.tsx")
+    capture = tmp_path / "shot.png"
+    capture.write_bytes(b"pretend-png-bytes")
+    proof = tmp_path / "proof"
+    _write_bound_record(proof, repo, capture)
+    out, _, code = _run("git commit -m x", repo, monkeypatch,
+                        proof_dir=proof, require_binding=True)
+    assert (_decision(out), code) == ("allow", 0)
+
+
+def test_record_from_another_repo_with_an_identical_diff_does_not_transfer(tmp_path, monkeypatch):
+    """The record is evidence THIS working tree was rendered, not that some tree was."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    repo_a = _mk_repo_with_staged(tmp_path / "a", "src/App.tsx")
+    repo_b = _mk_repo_with_staged(tmp_path / "b", "src/App.tsx")
+    capture = tmp_path / "shot.png"
+    capture.write_bytes(b"pretend-png-bytes")
+    proof = tmp_path / "proof"
+    # Minted in A; the identical staged patch in B must not inherit it.
+    _write_bound_record(proof, repo_a, capture)
+    out, _, code = _run("git commit -m x", repo_b, monkeypatch,
+                        proof_dir=proof, require_binding=True)
+    assert (_decision(out), code) == ("block", vpg.BLOCK_EXIT_CODE)
+
+
+def test_dirty_worktree_record_is_refused_under_require_binding(tmp_path, monkeypatch):
+    """The browser renders the WORKING TREE; the binding is to the INDEX. If they diverged,
+    the pixels may show something other than what is being committed."""
+    repo = _mk_repo_with_staged(tmp_path, "src/App.tsx")
+    capture = tmp_path / "shot.png"
+    capture.write_bytes(b"pretend-png-bytes")
+    proof = tmp_path / "proof"
+    rec = _write_bound_record(proof, repo, capture)
+    record = json.loads(rec.read_text())
+    record["worktree_dirty"] = True
+    rec.write_text(json.dumps(record))
+    out, _, code = _run("git commit -m x", repo, monkeypatch,
+                        proof_dir=proof, require_binding=True)
+    assert (_decision(out), code) == ("block", vpg.BLOCK_EXIT_CODE)
+
+
+def test_capture_path_pointing_at_a_fifo_does_not_hang_the_gate(tmp_path, monkeypatch):
+    """`capture_path` comes from a record we did not write; reading a FIFO would block past
+    the bridge timeout, and `on_error: open` would then ALLOW the commit."""
+    import os
+
+    repo = _mk_repo_with_staged(tmp_path, "src/App.tsx")
+    fifo = tmp_path / "fifo.png"
+    os.mkfifo(fifo)
+    proof = tmp_path / "proof"
+    proof.mkdir(parents=True, exist_ok=True)
+    diff = subprocess.run(["git", "-C", str(repo), "diff", "--cached"],
+                          capture_output=True, timeout=30, check=True).stdout
+    import hashlib
+    (proof / "attest-fifo.json").write_text(json.dumps({
+        "version": 1, "tool": "dev shot", "capture_path": str(fifo),
+        "capture_sha256": "0" * 64,
+        "staged_sha256": hashlib.sha256(diff).hexdigest(), "repo": str(repo),
+    }))
+    out, _, code = _run("git commit -m x", repo, monkeypatch,
+                        proof_dir=proof, require_binding=True)
+    assert (_decision(out), code) == ("block", vpg.BLOCK_EXIT_CODE)
+
+
+def test_no_json_records_skips_the_staged_diff_hash(tmp_path, monkeypatch):
+    """Legacy-only repos must not pay a second `git diff --cached` on every UI commit."""
+    repo = _mk_repo_with_staged(tmp_path, "src/App.tsx")
+    proof = tmp_path / "proof"
+    _touch_proof(proof)  # a legacy marker, no .json records
+    calls: list[str] = []
+    real = vpg._staged_diff_hash
+
+    def counting(cwd):
+        calls.append(cwd)
+        return real(cwd)
+
+    monkeypatch.setattr(vpg, "_staged_diff_hash", counting)
+    out, _, code = _run("git commit -m x", repo, monkeypatch, proof_dir=proof)
+    assert (_decision(out), code) == ("allow", 0)
+    assert calls == [], "no .json candidates means the staged diff must not be hashed"
+
+
+def test_a_fifo_record_is_never_a_candidate(tmp_path: Path, monkeypatch) -> None:
+    """`read_text()` on a FIFO blocks. A FIFO named `*.json` in PROOF_DIR therefore hung the
+    hook until the descriptor's timeout, which resolves through `on_error: open` — so a UI
+    commit was ALLOWED without proof, the gate failing open on a trivially planted file."""
+    import os
+    import time
+
+    proof = tmp_path / "proof"
+    proof.mkdir()
+    fifo = proof / "planted.json"
+    os.mkfifo(fifo)
+    monkeypatch.setattr(vpg, "PROOF_DIR", proof)
+    assert vpg._fresh_records(time.time()) == [], "a FIFO must never be opened as a record"
+
+
+def test_a_symlinked_record_is_never_a_candidate(tmp_path: Path, monkeypatch) -> None:
+    """A symlink could point the read at a file the gate never validated."""
+    import time
+
+    proof = tmp_path / "proof"
+    proof.mkdir()
+    target = tmp_path / "elsewhere.json"
+    target.write_text("{}")
+    (proof / "link.json").symlink_to(target)
+    monkeypatch.setattr(vpg, "PROOF_DIR", proof)
+    assert vpg._fresh_records(time.time()) == []
+
+
+def test_a_plain_record_is_still_a_candidate(tmp_path: Path, monkeypatch) -> None:
+    """The guard must not reject everything — that would disable binding altogether while
+    every test about rejection kept passing."""
+    import time
+
+    proof = tmp_path / "proof"
+    proof.mkdir()
+    good = proof / "good.json"
+    good.write_text("{}")
+    monkeypatch.setattr(vpg, "PROOF_DIR", proof)
+    assert vpg._fresh_records(time.time()) == [good]
+
+
+def test_repo_identity_resolves_to_the_git_toplevel(tmp_path: Path) -> None:
+    """`dev shot` records the repo ROOT. Comparing that against the raw cwd rejected a valid
+    record whenever `git commit` ran from a subdirectory, leaving the gate unsatisfiable
+    without changing directory or reaching for the hatch."""
+    repo = tmp_path / "r"
+    (repo / "src" / "deep").mkdir(parents=True)
+    _git(repo, "init", "-q")
+    root = vpg._git_toplevel(str(repo))
+    nested = vpg._git_toplevel(str(repo / "src" / "deep"))
+    assert root is not None and nested == root, "a subdirectory must resolve to the same root"
+
+
+def test_git_toplevel_outside_a_repo_is_none(tmp_path: Path) -> None:
+    """Fail soft: no repo means no binding, not a crash mid-hook."""
+    assert vpg._git_toplevel(str(tmp_path)) is None
+
+
+def test_reading_a_record_refuses_a_fifo_even_if_it_passed_the_scan(tmp_path: Path) -> None:
+    """Closes the time-of-check/time-of-use window. The scan's lstat and the read happen in
+    different functions, so a gated agent could swap the path between a regular file and a
+    FIFO in a loop and retry commits until one landed in the gap - the read then blocks, the
+    bridge times out, and on_error open ALLOWS the unproven commit. Enforced at the open, the
+    swap cannot help: O_NONBLOCK returns immediately and fstat describes what was opened."""
+    import os as _os
+    import signal as _signal
+
+    fifo = tmp_path / "swapped.json"
+    _os.mkfifo(fifo)
+
+    # A regression BLOCKS rather than returns, so without this alarm the suite would HANG
+    # instead of failing - the CI symptom would be a stuck job, not a red test.
+    def _timeout(_sig, _frm):
+        raise AssertionError("_read_record blocked on a FIFO - the fail-open hazard is back")
+
+    previous = _signal.signal(_signal.SIGALRM, _timeout)
+    _signal.alarm(5)
+    try:
+        assert vpg._read_record(fifo) is None
+    finally:
+        _signal.alarm(0)
+        _signal.signal(_signal.SIGALRM, previous)
+
+
+def test_reading_a_record_refuses_a_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "real.json"
+    target.write_text("{}")
+    link = tmp_path / "link.json"
+    link.symlink_to(target)
+    assert vpg._read_record(link) is None
+
+
+def test_reading_a_record_refuses_an_oversized_file(tmp_path: Path) -> None:
+    """A sparse multi-gigabyte file is a REGULAR file, so a type check alone admits it and the
+    read thrashes past the bridge timeout into the same fail-open."""
+    big = tmp_path / "big.json"
+    with big.open("wb") as fh:
+        fh.truncate(vpg.MAX_RECORD_BYTES + 1)
+    assert vpg._read_record(big) is None
+
+
+def test_reading_a_plain_record_works(tmp_path: Path) -> None:
+    """The guard must not refuse everything - that would disable binding while every
+    rejection test kept passing."""
+    good = tmp_path / "good.json"
+    good.write_text('{"hello": "world"}')
+    assert vpg._read_record(good) == '{"hello": "world"}'
+
+
+def test_git_toplevel_keeps_a_trailing_space_in_a_directory_name(tmp_path: Path) -> None:
+    """`.strip()` would eat a real trailing space from a directory named "repo ", so a valid
+    record would stop matching and commits would block with no explanation."""
+    repo = tmp_path / "repo "
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    root = vpg._git_toplevel(str(repo))
+    assert root is not None
+    assert root.name == "repo ", f"trailing space must survive, got {root.name!r}"
