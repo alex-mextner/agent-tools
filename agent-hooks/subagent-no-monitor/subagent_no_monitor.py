@@ -7,9 +7,15 @@ backgrounding a Bash command, called the **Monitor** tool on its own spawned chi
 and then ENDED ITS TURN expecting a completion notification. Monitor is CC's dedicated
 fire-and-forget watch tool — start it, keep working, get notified per output line/event later
 — which is precisely the shape that never reaches a subagent: a subagent is NOT re-invoked by
-a background-completion (or Monitor-event) notification, only the main loop is. So the
-subagent idles forever with uncommitted work and no PR, identical to the Bash-backgrounding
-wedge, just via a tool that has no foreground mode to fall back to.
+a Monitor-event notification, only the main loop is (Monitor has no "child" the harness
+tracks against the calling agent). This is DIFFERENT from a Bash `run_in_background: true`
+child, which the harness DOES track against its calling agent and DOES use to re-invoke that
+agent once the child exits (verified empirically: a subagent that backgrounds a Bash job this
+way and ends its turn is resumed with the job's output once it completes) — that is exactly
+why remedy (1) below recommends it as Monitor's replacement for this one shape. So a subagent
+that reaches for Monitor instead idles forever with uncommitted work and no PR, identical to
+the Bash-backgrounding wedge `subagent-no-bg-longproc` blocks for a LABELED long process, just
+via a tool that has no foreground mode and no harness-tracked child to fall back to at all.
 
 Unlike ``subagent-no-bg-longproc``, there is no "foreground vs backgrounded" axis to classify
 here: Monitor *is* the background primitive, unconditionally, by construction — there is no

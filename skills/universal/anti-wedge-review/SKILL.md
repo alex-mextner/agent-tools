@@ -83,11 +83,13 @@ point — it blocks **any** subagent call to Monitor unconditionally (no foregro
 exists for Monitor to fall back to, so there's no backgrounded/foreground classification to
 make). This closes the Monitor half of the gap this skill originally documented.
 
-`TaskCreate` (and `Task`) still fire on `pre-agent`, which is not yet wired to an
-anti-wedge guard for THIS wedge shape (tracked: agent-tools#69). Until that lands, **the
-skill is the only enforcement** for TaskCreate-based review backgrounding — Monitor-based
-backgrounding is now also hook-enforced, but keep following the rule above regardless, since
-the hook depends on a machine having the companion rig-cli matcher applied.
+`Task` fires on `pre-agent`, which is not yet wired to an anti-wedge guard for THIS wedge
+shape (tracked: agent-tools#69). `TaskCreate` maps to no hook point at all
+(`lib/cc_hook_bridge/dispatch.py`'s `_AGENT_TOOLS` set is `{"Agent", "Task"}` only) — it is
+invisible to the hook bridge entirely, not merely unguarded. Until agent-tools#69 lands,
+**the skill is the only enforcement** for TaskCreate/Task-based review backgrounding —
+Monitor-based backgrounding is now also hook-enforced, but keep following the rule above
+regardless, since the hook depends on a machine having the companion rig-cli matcher applied.
 
 ## Escape hatch
 
