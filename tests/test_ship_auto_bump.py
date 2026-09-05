@@ -48,7 +48,9 @@ case "$sub" in
     case "$action" in
       view)
         if grep -q -- '--json reviews' <<<"$argstr"; then echo "${SHIP_TEST_REVIEW_COUNT:-1}"
-        elif grep -q -- '--json mergeStateStatus' <<<"$argstr"; then echo "${SHIP_TEST_MERGE_STATE_AFTER:-CLEAN}"
+        elif grep -q -- '--json mergeStateStatus' <<<"$argstr"; then
+          if [ -n "${SHIP_TEST_MERGE_STATE_REREAD_FAIL:-}" ]; then echo "fake gh: simulated read failure" >&2; exit 1; fi
+          echo "${SHIP_TEST_MERGE_STATE_AFTER:-CLEAN}"
         elif grep -q headRefName <<<"$argstr"; then printf '%s\tOPEN\tMERGEABLE\t%s\t%s\n' "$B" "${SHIP_TEST_CROSS_REPO:-false}" "${SHIP_TEST_MERGE_STATE:-CLEAN}"
         elif grep -q statusCheckRollup <<<"$argstr"; then
           git_c fetch -q origin
@@ -122,11 +124,16 @@ case "$sub" in
             _msg=$(git_c log -1 --format=%s "$_sha")
             _cdate=$(TZ=UTC git_c log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd "$_sha")
             _cemail=$(git_c log -1 --format=%ce "$_sha")
-            nodes=$(jq --arg msg "$_msg" --arg cd "$_cdate" --arg ce "$_cemail" \
-              '. + [{commit:{message:$msg, committedDate:$cd, pushedDate:null, committer:{email:$ce}}}]' <<<"$nodes")
+            nodes=$(jq --arg oid "$_sha" --arg msg "$_msg" --arg cd "$_cdate" --arg ce "$_cemail" \
+              '. + [{commit:{oid:$oid, message:$msg, committedDate:$cd, pushedDate:null, committer:{email:$ce}}}]' <<<"$nodes")
           done
           jq -n --argjson nodes "$nodes" --arg created "${SHIP_TEST_CREATED:-2020-01-01T00:00:00Z}" \
             '{data:{repository:{pullRequest:{createdAt:$created, commits:{nodes:$nodes}, timelineItems:{nodes:[]}}}}}' | jq -r "$jqexpr"
+        elif grep -q messageHeadline <<<"$F_query"; then
+          git_c fetch -q origin
+          _headline=$(git_c log -1 --format=%s "origin/$B" 2>/dev/null || echo "")
+          jq -n --arg h "$_headline" \
+            '{data:{repository:{pullRequest:{commits:{nodes:[{commit:{messageHeadline:$h}}]}}}}}' | jq -r "$jqexpr"
         else echo 0; fi ;;
       repos/*/contents/*)
         path="${endpoint#*/contents/}"; file="${path%%\?*}"; ref="${path#*ref=}"; [ "$ref" = "$path" ] && ref=""
@@ -356,7 +363,7 @@ def test_ci_red_after_bump_refuses_with_guidance_and_rerun_needs_no_second_bump(
 
     assert r.returncode != 0, r.stdout
     assert "PUT contents file=pyproject.toml branch=feat" in _gh_log(state)
-    assert "waiting on the checks of ship's own bump commit" in r.stdout, r.stdout
+    assert "waiting on the checks of ship's own push" in r.stdout, r.stdout
     assert "check(s) not passing" in r.stderr, r.stderr
     assert "Fix CI, then re-run" in r.stderr
     assert "[fake gh] merged" not in r.stdout
@@ -707,6 +714,98 @@ def test_behind_with_unpushed_local_commit_refuses_before_any_remote_write(tmp_p
     assert "unpushed commit(s)" in r.stderr, r.stderr
     assert "attempting to update it via the GitHub API" not in r.stderr, r.stderr
     assert "PUT update-branch" not in _gh_log(state), _gh_log(state)
+
+
+def test_behind_docs_only_pr_merges_without_a_spurious_dwell_refusal(tmp_path):
+    """The standalone BEHIND-clearing merge must not itself look like a fresh human push to the
+    review-dwell gate when NO bump follows it -- the common case: docs-only, test-only, a
+    hand-bumped minor/major, no version file, an opted-out repo (review finding, #518: the
+    original fix only recognized ship's own commit via the BUMP commit's identity, so a
+    standalone merge with nothing behind it reset the dwell clock to 'now' and refused)."""
+    main, origin, state, bindir = _make_world(tmp_path)
+    _make_pr_branch(main, "feat", "README.md", "docs change\n")
+    _commit_file(main, "src/other.py", "o = 1\n", "feat: unrelated change on main")
+    _git("push", "-q", "origin", "main", cwd=main)
+
+    r = _run_ship(main, bindir, state, "feat", env_extra={
+        "SHIP_TEST_MERGE_STATE": "BEHIND", "SHIP_REVIEW_DWELL": "600",
+    })
+
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "no longer BEHIND" in r.stderr, r.stderr
+    assert "review-dwell gate OK" in r.stdout, r.stdout
+    assert "review-dwell window is 600s" not in r.stderr, r.stderr
+    assert "[fake gh] merged" in r.stdout
+    assert "PUT contents" not in _gh_log(state), "docs-only PR: no bump should have been made"
+
+
+def test_behind_docs_only_pr_widens_ci_grace_too(tmp_path):
+    """Same standalone-merge scenario as above, from the green-CI gate's side: the
+    registration-grace widening used to key on AUTO_BUMP_DONE alone, which a standalone
+    BEHIND-clearing merge never sets."""
+    main, origin, state, bindir = _make_world(tmp_path)
+    _make_pr_branch(main, "feat", "README.md", "docs change\n")
+    _commit_file(main, "src/other.py", "o = 1\n", "feat: unrelated change on main")
+    _git("push", "-q", "origin", "main", cwd=main)
+
+    r = _run_ship(main, bindir, state, "feat", env_extra={"SHIP_TEST_MERGE_STATE": "BEHIND"})
+
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "waiting on the checks of ship's own push" in r.stdout, r.stdout
+
+
+def test_ship_config_typo_does_not_silently_re_enable_auto_bump(tmp_path):
+    """Review finding, #518: rejecting a malformed SHIP_LOCAL_TEST_DIR used to invalidate the
+    WHOLE .ship-config file, including an unrelated, otherwise-valid SHIP_AUTO_BUMP=0 -- an
+    operator's explicit opt-out of ship's remote writes must survive a typo in a DIFFERENT key."""
+    main, origin, state, bindir = _make_world(tmp_path)
+    _commit_file(main, ".ship-config", "SHIP_LOCAL_TEST_DIR=./\nSHIP_AUTO_BUMP=0\n", "chore: ship-config")
+    _git("push", "-q", "origin", "main", cwd=main)
+    _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
+
+    r = _run_ship(main, bindir, state, "feat")
+
+    assert r.returncode != 0, r.stdout
+    assert "ignoring SHIP_LOCAL_TEST_DIR/SHIP_LOCAL_TEST_CMD" in r.stderr, r.stderr
+    assert "version in pyproject.toml is UNCHANGED" in r.stderr, r.stderr
+    assert "PUT contents" not in _gh_log(state), "SHIP_AUTO_BUMP=0 must still apply"
+
+
+def test_behind_mergestate_reread_failure_does_not_clobber_the_refusal(tmp_path):
+    """Review finding, #518: reading mergeStateStatus back into a bare global with `|| true`
+    turned a FAILED re-read into an empty string, which then read as 'not BEHIND anymore' and
+    let ship proceed on an UNKNOWN state. A failed re-read must leave the original BEHIND
+    refusal exactly as if the update attempt was never made."""
+    main, origin, state, bindir = _make_world(tmp_path)
+    _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
+    _commit_file(main, "src/other.py", "o = 1\n", "feat: unrelated change on main")
+    _git("push", "-q", "origin", "main", cwd=main)
+
+    r = _run_ship(main, bindir, state, "feat", env_extra={
+        "SHIP_TEST_MERGE_STATE": "BEHIND", "SHIP_TEST_MERGE_STATE_REREAD_FAIL": "1",
+    })
+
+    assert r.returncode != 0, r.stdout
+    assert "could not re-read its merge state" in r.stderr, r.stderr
+    assert "head is BEHIND its base. Update it (gh pr update-branch" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_non_semver_base_version_refuses_before_any_remote_write(tmp_path):
+    """Review finding, #518: when base's version has moved to something non-X.Y.Z, ship used to
+    push the update-branch merge FIRST and only discover it couldn't finish the bump afterward
+    -- a real remote write for nothing. The semver check must happen before that write."""
+    main, origin, state, bindir = _make_world(tmp_path)
+    wt = _make_pr_branch(main, "feat", "src/a.py", "x = 1\n")
+    _commit_file(main, "pyproject.toml", _PYPROJECT.replace("1.0.0", "1.0.0rc1"), "chore(release): rc")
+    _git("push", "-q", "origin", "main", cwd=main)
+
+    r = _run_ship(main, bindir, state, "feat")
+
+    assert r.returncode != 0, r.stdout
+    assert "is not a plain X.Y.Z — bump it by hand" in r.stderr, r.stderr
+    assert "PUT update-branch" not in _gh_log(state), _gh_log(state)
+    assert "PUT contents" not in _gh_log(state)
 
 
 def test_behind_resolution_skipped_when_auto_bump_opted_out(tmp_path):

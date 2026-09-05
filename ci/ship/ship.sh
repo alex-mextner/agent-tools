@@ -601,10 +601,15 @@ _ship_config_load() {
     esac
   done <<< "$content"
   if [ -n "$SHIP_CFG_DIR" ] && ! _ship_config_dir_is_safe "$SHIP_CFG_DIR"; then
-    echo "[ship] local gate: .ship-config: SHIP_LOCAL_TEST_DIR '$SHIP_CFG_DIR' is not a safe repo-relative subdirectory (absolute, a '..' path component, or '.'/repo root itself — omit the key to mean root) — ignoring the whole file." >&2
+    # Invalidates only the LOCAL-TEST pair (DIR + CMD, the two keys the rejected DIR value
+    # actually governs) — NOT SHIP_CFG_AUTO_BUMP. Review finding (#518): an unrelated
+    # SHIP_LOCAL_TEST_DIR typo used to also silently clear a committed SHIP_AUTO_BUMP=0
+    # opt-out, re-enabling the auto-bump's REMOTE writes on a repo that explicitly asked for
+    # the old refuse-until-bumped behavior — an unrelated key's validity must never flip a
+    # different key's policy meaning.
+    echo "[ship] local gate: .ship-config: SHIP_LOCAL_TEST_DIR '$SHIP_CFG_DIR' is not a safe repo-relative subdirectory (absolute, a '..' path component, or '.'/repo root itself — omit the key to mean root) — ignoring SHIP_LOCAL_TEST_DIR/SHIP_LOCAL_TEST_CMD (SHIP_AUTO_BUMP, if present, still applies)." >&2
     SHIP_CFG_DIR=""
     SHIP_CFG_CMD=""
-    SHIP_CFG_AUTO_BUMP=""
   fi
 }
 
@@ -643,6 +648,17 @@ SHIP_AUTO_BUMP_MSG_RE='^chore\(release\): bump version [^ ]+ -> [^ ]+ \(ship aut
 # without deliberately forging their local git config (out of scope — see the header comment's
 # accepted PATH-trust threat model).
 SHIP_AUTO_BUMP_COMMITTER_EMAIL='ship-auto-bump@noreply.agent-tools.local'
+# Every commit oid ship itself creates THIS RUN — the standalone BEHIND-clearing merge, an
+# auto-bump's own update-branch merge, and the bump commit — space-separated, appended via
+# _record_ship_oid. Two gates key on "did ship touch the head this run" INDEPENDENTLY of
+# AUTO_BUMP_DONE (review finding, #518): a standalone BEHIND-clearing merge with no bump
+# behind it — docs/test-only PRs, a hand-bumped minor/major, no version file, a non-semver
+# version, or an opted-out repo — never sets AUTO_BUMP_DONE, so keying the green-CI grace and
+# the review-dwell skip on that flag alone left ship's OWN push mis-treated as a human one on
+# exactly those (common) BEHIND PRs: the CI grace stayed at the tight default right after a
+# fresh push, and the dwell gate refused on a commit nobody but ship authored.
+SHIP_KNOWN_OIDS=""
+_record_ship_oid() { [ -n "${1:-}" ] && SHIP_KNOWN_OIDS="${SHIP_KNOWN_OIDS} $1"; }
 
 _auto_bump_enabled() {
   case "${SHIP_AUTO_BUMP:-}" in 0|false|no) return 1 ;; esac
@@ -674,13 +690,15 @@ _wait_pr_head_oid() {  # $1 = eq|ne, $2 = sha
 }
 
 # Generic BEHIND-clearing attempt: ask GitHub to merge the PR's base into its head, wait for
-# the head to move, then re-read mergeStateStatus. Leaves $MERGE_STATE updated on success;
-# a failed/conflicting update or an unreadable base/head leaves $MERGE_STATE untouched (still
-# BEHIND), and the caller's own refusal fires exactly as before. Never exits non-zero itself —
-# it only ever improves the odds of the refusal below not firing.
+# the head to move, then re-read mergeStateStatus. Leaves $MERGE_STATE updated ONLY when the
+# re-read itself succeeds; a failed/conflicting update, an unreadable base/head, or a failed
+# re-read leaves $MERGE_STATE untouched (still BEHIND), and the caller's own refusal fires
+# exactly as before. Never exits non-zero itself — it only ever improves the odds of the
+# refusal below not firing. Once the head genuinely moves, its oid is recorded via
+# _record_ship_oid regardless of the mergeStateStatus outcome — a real commit ship authored.
 behind_clear_pr_branch_via_update_api() {
   echo "[ship] PR #$PR is BEHIND its base — attempting to update it via the GitHub API before refusing (#518) ..." >&2
-  local base head out
+  local base head out new_state new_head
   base=$(gh pr view "$PR" --json baseRefName -q '.baseRefName' 2>/dev/null) || base=""
   case "$base" in ''|-*|*[!A-Za-z0-9._/-]*) base="" ;; esac
   head=$(_pr_head_oid) || head=""
@@ -696,7 +714,22 @@ behind_clear_pr_branch_via_update_api() {
     echo "[ship] update-branch was accepted for PR #$PR but its head did not move within ${SHIP_AUTO_BUMP_HEAD_WAIT:-90}s — falling through to the BEHIND refusal." >&2
     return 0
   fi
-  MERGE_STATE=$(gh pr view "$PR" --json mergeStateStatus -q '.mergeStateStatus' 2>/dev/null) || true
+  # The merge genuinely happened (the head moved) — record its oid regardless of what
+  # mergeStateStatus reports next, so the CI-grace and review-dwell gates recognize this
+  # commit as ship's own even if THIS run makes no subsequent version bump (the common case:
+  # docs/test-only PRs, a hand-bumped minor/major, no version file, an opted-out repo).
+  new_head=$(_pr_head_oid) || new_head=""
+  _record_ship_oid "$new_head"
+  # Read into a LOCAL first: a failed re-read must never clobber the caller's $MERGE_STATE to
+  # empty (review finding, #518) — that would make its own `[ "${MERGE_STATE:-}" = "BEHIND" ]`
+  # refusal below silently no-op on an UNKNOWN state instead of a proven-cleared one. Only a
+  # successful read updates the global.
+  new_state=$(gh pr view "$PR" --json mergeStateStatus -q '.mergeStateStatus' 2>/dev/null) || new_state=""
+  if [ -z "$new_state" ]; then
+    echo "[ship] updated PR #$PR from ${base} (head moved) but could not re-read its merge state — falling through to the BEHIND refusal (re-run once GitHub settles)." >&2
+    return 0
+  fi
+  MERGE_STATE="$new_state"
   if [ "$MERGE_STATE" = "BEHIND" ]; then
     echo "[ship] updated PR #$PR from ${base} but it is still reported BEHIND — falling through to the refusal." >&2
   else
@@ -1002,11 +1035,15 @@ ci_appears_structurally_down() {
 #
 # SHIP_LOCAL_TEST_DIR is rejected (logged) if it is an absolute path, contains a `..`
 # component, or resolves to the repo root itself (`.`, `./`, or any all-`.`-segments path).
-# Rejection invalidates the WHOLE file (all three keys cleared), not just the DIR — a rejected
-# dir alongside a still-present SHIP_LOCAL_TEST_CMD must not silently relocate that command
-# to run from the repo root instead of the (rejected) directory the author asked for; that
-# would verify a different suite than intended. Detection then proceeds exactly as if the
-# file didn't exist, per the header doc.
+# Rejection invalidates the LOCAL-TEST PAIR (SHIP_LOCAL_TEST_DIR + SHIP_LOCAL_TEST_CMD are
+# cleared together), not just the DIR — a rejected dir alongside a still-present
+# SHIP_LOCAL_TEST_CMD must not silently relocate that command to run from the repo root
+# instead of the (rejected) directory the author asked for; that would verify a different
+# suite than intended. Local-test detection then proceeds exactly as if the pair was never
+# set. SHIP_AUTO_BUMP is a SEPARATE, unrelated key and is NEVER cleared by this rejection
+# (review finding, #518: an earlier revision cleared all three keys together, so a typo'd
+# SHIP_LOCAL_TEST_DIR could silently re-enable a committed SHIP_AUTO_BUMP=0 opt-out's remote
+# writes — an unrelated key's validity must never flip a different key's policy meaning).
 #
 # Threat model: $root/.ship-config's committed content is under the SAME trust boundary as
 # rig.yaml/package.json (both already dictate what the gate runs) — a PR that edits it is
@@ -1701,6 +1738,7 @@ _auto_bump_update_branch() {  # $1 = current head oid, $2 = base ref
     echo "Refusing: GitHub accepted the update-branch request for PR #$PR but the head did not move within ${SHIP_AUTO_BUMP_HEAD_WAIT:-90}s — re-run ship once it has. Nothing was merged." >&2
     exit 1
   fi
+  _record_ship_oid "$(_pr_head_oid)"
 }
 
 # Author the bump commit on the PR head branch. Sets AUTO_BUMP_SHA. Refuses (exit 1, nothing
@@ -1726,6 +1764,7 @@ _auto_bump_push() {  # $1 = blob sha of the file at the current head; reads $AB_
   fi
   AUTO_BUMP_SHA=$(printf '%s' "$out" | tr -d '[:space:]')
   case "$AUTO_BUMP_SHA" in ''|*[!0-9a-f]*) echo "Refusing: the Contents API returned no commit sha for the version bump (${out}) — nothing was merged." >&2; exit 1 ;; esac
+  _record_ship_oid "$AUTO_BUMP_SHA"
 }
 
 # The local branch is now BEHIND the remote by ship's own commit(s). Fast-forward every clean
@@ -1820,6 +1859,17 @@ _auto_bump_decide() {
     AB_MERGE_BASE_V="$VB_OLDV"
   else
     AB_MERGE_BASE_V="$AB_HEADV"
+  fi
+  # Whenever base has moved past this PR's merge-base, the caller will update-branch BEFORE
+  # bumping — and in either branch above, the version actually bumped afterward is $AB_BASEV
+  # (that's what the head reads as once updated). Validate IT parses as plain X.Y.Z before
+  # authorizing that remote write (review finding, #518): the hand-bump branch already checked
+  # this for ITS OWN values, but neither branch previously checked $AB_BASEV itself — a
+  # non-semver base version would otherwise get a real update-branch merge pushed to the PR,
+  # only for the bump step afterward to discover it can't finish and bail with nothing to show
+  # for the write it already made.
+  if [ "$AB_BASEV" != "$AB_MERGE_BASE_V" ] && ! _semver_parts "$AB_BASEV" >/dev/null; then
+    AUTO_BUMP_SKIP_REASON="$AB_BASE_REF's version '$AB_BASEV' is not a plain X.Y.Z — bump it by hand"; return 1
   fi
   return 0
 }
@@ -1922,14 +1972,18 @@ if [ "$SKIP_CI" = "0" ]; then
     def _dts:  ((.completedAt // .startedAt // .createdAt) as $t | if $t != null then $t elif (_dsettled|not) then "~" else "" end);
     (. // []) | group_by(_dkey) | map(max_by(_dts))'
   CI_WAIT="${SHIP_CI_WAIT:-900}"; CI_POLL="${SHIP_CI_POLL:-20}"; CI_GRACE="${SHIP_CI_GRACE:-45}"
-  if [ "$AUTO_BUMP_DONE" = "1" ] && [ "$CI_GRACE" -lt "${SHIP_AUTO_BUMP_CI_GRACE:-120}" ]; then
-    # Ship JUST pushed the bump commit: the new head's rollup is legitimately EMPTY until Actions
+  if [ -n "$SHIP_KNOWN_OIDS" ] && [ "$CI_GRACE" -lt "${SHIP_AUTO_BUMP_CI_GRACE:-120}" ]; then
+    # Ship JUST pushed to the head THIS RUN — either the bump commit, or (review finding, #518)
+    # the standalone BEHIND-clearing merge when no bump followed it (docs/test-only PRs, a
+    # hand-bumped minor/major, no version file, a non-semver version, an opted-out repo — every
+    # one of those skips the bump but still moves the head). Keying this ONLY on AUTO_BUMP_DONE
+    # missed all of them. Either way the new head's rollup is legitimately EMPTY until Actions
     # enqueues its run, which can take longer than the fresh-PR grace. Without a wider grace the
     # empty rollup could be read as a CI outage and fall into the local-fallback merge while the
-    # real run is still spinning up (fail-open). The head oid was already confirmed to be the bump
-    # commit before this loop, so the rollup read here is the NEW commit's, never the old one's.
+    # real run is still spinning up (fail-open). The head oid was already confirmed to be one of
+    # ship's own commits before this loop, so the rollup read here is the NEW commit's.
     CI_GRACE="${SHIP_AUTO_BUMP_CI_GRACE:-120}"
-    echo "[ship] green-CI gate: waiting on the checks of ship's own bump commit ${AUTO_BUMP_SHA} (registration grace widened to ${CI_GRACE}s)."
+    echo "[ship] green-CI gate: waiting on the checks of ship's own push (registration grace widened to ${CI_GRACE}s)."
   fi
   START=$(date +%s); DEADLINE=$(( START + CI_WAIT )); GRACE_DEADLINE=$(( START + CI_GRACE ))
   while :; do
@@ -2165,7 +2219,12 @@ fi
 # would under that flag; only the login/all-bot and path+line checks differ.
 _pr_head_is_ship_bump() {
   local headline
-  headline=$(gh pr view "$PR" --json commits -q '.commits[-1].messageHeadline // ""' 2>/dev/null) || return 1
+  # commits(last:1) (not `gh pr view --json commits`, which returns the FULL commit list) — a
+  # ship carrying hundreds of commits would otherwise pay for the whole history on every ship
+  # that didn't bump THIS run (perf review finding, #518).
+  headline=$(gh api graphql -F owner='{owner}' -F name='{repo}' -F pr="$PR" \
+      -f query='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){commits(last:1){nodes{commit{messageHeadline}}}}}}' \
+      --jq '.data.repository.pullRequest.commits.nodes[0].commit.messageHeadline // ""' 2>/dev/null) || return 1
   printf '%s' "$headline" | grep -Eq "$SHIP_AUTO_BUMP_MSG_RE"
 }
 BUMP_THREAD_Q='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved path line originalLine comments(first:100){totalCount nodes{author{login} body}}}}}}}'
@@ -2280,27 +2339,50 @@ else
   # SHIP'S OWN COMMITS DO NOT RESET THE CLOCK (#518): the merge-time auto-bump adds a commit on
   # the head branch (and, when the base had moved, an update-branch merge commit right before
   # it), possibly MORE THAN ONCE (a red-CI refusal leaves the bump on the branch; a later re-run
-  # can update-branch + re-bump again on top of it). Neither carries reviewable code from the PR
-  # author, so the window is measured from the last NON-ship push: fetch a generous lookback
-  # (last:15 — comfortably wider than any realistic stack of ship attempts) and, from the END,
-  # repeatedly peel a trailing commit ship itself authored, plus (each time) one immediately
-  # preceding merge-shaped commit, until the trailing commit is no longer ship's own.
+  # can update-branch + re-bump again on top of it) — and the BEHIND preflight above can push a
+  # STANDALONE such merge with no bump ever following it (docs/test-only PRs, a hand-bumped
+  # minor/major, no version file, a non-semver version, an opted-out repo). None of these carry
+  # reviewable code from the PR author, so the window is measured from the last NON-ship push:
+  # fetch a generous lookback (last:15) and, from the END, repeatedly peel a trailing commit
+  # ship itself authored, plus (each time) one immediately preceding merge-shaped commit, until
+  # the trailing commit is no longer ship's own.
   #
-  # "Ship's own" is decided by COMMITTER IDENTITY, not message text (Opus/GLM review, #518): the
-  # Contents API PUT that authors the bump (see _auto_bump_push) sets an explicit, fixed
-  # committer email nothing else in this pipeline ever writes — a human's commit, however it is
-  # worded, carries THEIR OWN git identity and can only match this by deliberately forging their
-  # local git config, the same PATH-level trust this file's header already accepts as out of
-  # scope ("a shipper who fully controls the ship PROCESS's PATH can defeat ANY gate"). An
-  # earlier revision matched the BUMP COMMIT'S OWN MESSAGE substring instead — genuinely
-  # forgeable by an innocent human commit that happens to contain the same words, and (with a
-  # fixed depth-2 peel) either under- or over-skipped once ship had bumped a PR more than once.
-  # The MERGE commit peeled alongside a recognized bump is still matched by MESSAGE SHAPE only
-  # (GitHub's own update-branch merge commit message isn't otherwise distinguishable from a
-  # human's identically-worded `git merge <base>`) — a documented, narrow residual: a human's own
-  # conflict-resolution merge landing IMMEDIATELY before a ship re-bump is swept along with it.
-  DWELL_Q='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){createdAt commits(last:15){nodes{commit{message committedDate pushedDate committer{email}}}} timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{__typename ... on HeadRefForcePushedEvent{createdAt}}}}}}'
-  DWELL_JQ='def is_bump: ((.commit.committer.email // "") == "'"$SHIP_AUTO_BUMP_COMMITTER_EMAIL"'");
+  # "Ship's own" is decided TWO ways, both identity-based, never by message text (review, #518):
+  #   1. Its oid is in $SHIP_KNOWN_OIDS — commits ship ITSELF created THIS RUN (the bump, an
+  #      update-branch merge, and — the case identity-by-message could never catch — a
+  #      STANDALONE BEHIND-clearing merge with no bump after it); exact, not a heuristic.
+  #   2. Its committer email matches SHIP_AUTO_BUMP_COMMITTER_EMAIL — recognizes a bump commit
+  #      from an EARLIER (refused) run, whose oid this run never learned. The Contents API PUT
+  #      that authors the bump (see _auto_bump_push) sets this explicit, fixed identity; nothing
+  #      else in this pipeline ever writes it, and a human's commit can only match it by
+  #      deliberately forging their local git config (out of scope — see the header comment's
+  #      accepted PATH-trust threat model).
+  # An earlier revision matched the bump commit's own MESSAGE SUBSTRING instead — genuinely
+  # forgeable by an innocent human commit that happens to contain the same words, blind to a
+  # standalone BEHIND merge entirely (no bump message to match), and (with a fixed depth-2 peel)
+  # either under- or over-skipped once ship had bumped a PR more than once.
+  # The MERGE commit peeled alongside a recognized bump/standalone-merge from an EARLIER run is
+  # still matched by MESSAGE SHAPE only when its own oid isn't in $SHIP_KNOWN_OIDS (GitHub's own
+  # update-branch merge commit message isn't otherwise distinguishable from a human's
+  # identically-worded `git merge <base>`) — a documented, narrow residual: a human's own
+  # conflict-resolution merge landing IMMEDIATELY before an EARLIER-run ship commit is swept
+  # along with it. THIS run's own merges never rely on that heuristic — their oid is known.
+  # Built in pure bash, NOT via an external `jq` invocation: `gh api --jq` uses gh's OWN
+  # bundled jq engine (no external `jq` binary needed), but this script itself must not gain
+  # a hard `jq`-on-PATH requirement in a code path that runs even under --skip-ci — the
+  # review-quorum gate further down deliberately keeps working (with its own printf-based
+  # audit fallback) when jq is absent, and an earlier revision of this line broke that
+  # (`set -e` on a "jq: command not found" here killed the script before quorum ever ran —
+  # review finding, #518). Every oid is a git sha (hex only, validated where recorded), so no
+  # JSON-string escaping is needed to embed each one as a literal quoted array element.
+  SHIP_KNOWN_OIDS_JSON="["; _sk_first=1
+  for _sk_oid in $SHIP_KNOWN_OIDS; do
+    [ "$_sk_first" = "1" ] || SHIP_KNOWN_OIDS_JSON="${SHIP_KNOWN_OIDS_JSON},"
+    SHIP_KNOWN_OIDS_JSON="${SHIP_KNOWN_OIDS_JSON}\"${_sk_oid}\""; _sk_first=0
+  done
+  SHIP_KNOWN_OIDS_JSON="${SHIP_KNOWN_OIDS_JSON}]"
+  DWELL_Q='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){createdAt commits(last:15){nodes{commit{oid message committedDate pushedDate committer{email}}}} timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{__typename ... on HeadRefForcePushedEvent{createdAt}}}}}}'
+  DWELL_JQ='def is_bump: ((.commit.committer.email // "") == "'"$SHIP_AUTO_BUMP_COMMITTER_EMAIL"'") or ((.commit.oid // "__none__") as $o | ('"$SHIP_KNOWN_OIDS_JSON"' | index($o))) != null;
     def is_merge: ((.commit.message // "") | test("^Merge (remote-tracking )?branch \\x27[^\\x27]+\\x27 into "));
     def peel:
       if length == 0 then .
