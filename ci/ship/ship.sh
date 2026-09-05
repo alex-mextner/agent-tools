@@ -2227,9 +2227,14 @@ _pr_head_is_ship_bump() {
       --jq '.data.repository.pullRequest.commits.nodes[0].commit.messageHeadline // ""' 2>/dev/null) || return 1
   printf '%s' "$headline" | grep -Eq "$SHIP_AUTO_BUMP_MSG_RE"
 }
-BUMP_THREAD_Q='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved path line originalLine comments(first:100){totalCount nodes{author{login} body}}}}}}}'
+BUMP_THREAD_Q='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved path line comments(first:100){totalCount nodes{author{login} body}}}}}}}'
 _bump_line_eligible_jq() {  # $1 = version file path, $2 = version line number -> prints the jq filter
   local f; f=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  # CURRENT line only — no `originalLine` fallback (review finding, #518): the bump rewrites
+  # only the version VALUE in place, never inserting/removing a line, so the version line's
+  # line number never moves and originalLine added no real coverage; it only risked matching
+  # an UNRELATED thread whose historical position happened to coincide with the (possibly
+  # different) current version-line number after other edits shifted things around.
   printf '%s' 'def readable_body:
     if type == "string" then (gsub("[^[:alnum:]]"; "") | length) > 0 else false end;
   def has_high_severity_marker:
@@ -2237,7 +2242,7 @@ _bump_line_eligible_jq() {  # $1 = version file path, $2 = version line number -
   [.data.repository.pullRequest.reviewThreads.nodes[]
   | select(.isResolved == false)
   | select(.path == "'"$f"'")
-  | select(.line == '"$2"' or .originalLine == '"$2"')
+  | select(.line == '"$2"')
   | select((.comments.nodes | length) > 0)
   | select(.comments.totalCount != null and (.comments.nodes | length) >= .comments.totalCount)
   | select([.comments.nodes[].author.login // ""] | all(. as $l | ($l | endswith("[bot]")) or ($l == "chatgpt-codex-connector") or ($l == "codex-review-bot")))
