@@ -26,11 +26,13 @@ gate governs only tool calls made INSIDE a dispatched subagent (``agent_id`` pre
 
 The correct replacement depends on what the subagent is waiting for:
 
-1. Waiting on a SINGLE long-running command it just started — set ``run_in_background: true``
-   on the Bash tool call. The harness auto-resumes the subagent when that command completes; no
-   Monitor is needed for this shape at all.
-2. Waiting on anything else (a condition to become true, a file to appear, several things at
-   once) — block on it SYNCHRONOUSLY in the foreground with a heartbeat loop: echo a line at
+1. Waiting on a SINGLE ORDINARY command it just started — one that is NOT itself a labeled long
+   process (``review``, ``--watch``, a build-test suite, a long ``sleep``; see below) — set
+   ``run_in_background: true`` on the Bash tool call. The harness auto-resumes the subagent when
+   that command completes; no Monitor is needed for this shape at all.
+2. Waiting on anything else — a LABELED long process, a condition to become true, a file to
+   appear, several things at once — block on it SYNCHRONOUSLY in the foreground with a heartbeat
+   loop: echo a line at
    least every ~20s and keep each Bash call comfortably under ~540s (well inside the Bash
    tool's own 600s hard cap), repeating the same bounded call until the wait is over, e.g.::
 
@@ -136,10 +138,13 @@ BLOCK_MESSAGE = (
     "wedges you FOREVER with uncommitted work and no PR — the identical failure "
     "subagent-no-bg-longproc blocks for a backgrounded Bash command, just via a tool with no "
     "foreground mode to fall back to. Use one of these instead: "
-    "(1) waiting on a SINGLE long-running command you just started — set "
+    "(1) waiting on a SINGLE ORDINARY command you just started (NOT review/--watch/a "
+    "build-test suite/a long sleep — those are blocked from backgrounding by "
+    "subagent-no-bg-longproc, run those in the FOREGROUND instead) — set "
     "`run_in_background: true` on the Bash tool call; the harness auto-resumes you when that "
     "command completes, no Monitor needed. "
-    "(2) waiting on anything else (a condition, a file, several things at once) — block on it "
+    "(2) waiting on anything else (a labeled long process, a condition, a file, several things "
+    "at once) — block on it "
     "yourself in the FOREGROUND with a heartbeat loop: echo a line at least every ~20s and "
     "keep each Bash call under ~540s, repeating the same bounded call until the wait is over, "
     "e.g.: `timeout 540 bash -c 'i=0; until <condition-check> || [ \"$i\" -ge 26 ]; do sleep "
@@ -168,10 +173,21 @@ def main() -> int:
     args = event.get("args") or {}
     cwd = str(event.get("cwd") or args.get("cwd") or os.getcwd())
 
+    # SECURITY: the watched target is recorded into the audit trail via ctx["command"], NEVER
+    # via request_hatch_approval's own `command=` kwarg. That kwarg is also this library's INLINE
+    # hatch source (`RIG_HATCH_REQUEST_<ID>=<value> <rest>` parsed out of a real shell command
+    # string) — and `description` is a free-form, fully MODEL-authored Monitor tool_input field.
+    # Passing it as `command=` would let a blocked subagent re-arm the hatch by writing
+    # `description: 'RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR="..." watch tests'` on its retry,
+    # firing a real Telegram ask with a self-authored justification — exactly the self-service
+    # bypass this hook's own README says is impossible for Monitor (it has no shell command
+    # string). `_append_overrides_log` falls back to `context.get("command")` for the audit line
+    # (see `lib/agenttools_hatch_escalation/__init__.py`), so ctx alone is enough to fix the
+    # empty-"command"-forever audit gap without reopening the inline-parse path.
     watched = str(args.get("description") or "monitor-watch")
-    ctx = {"hook": "subagent-no-monitor", "description": watched}
+    ctx = {"hook": "subagent-no-monitor", "description": watched, "command": watched}
     hatch = hatch_escalation.request_hatch_approval(
-        "subagent-no-monitor", ctx, cwd=cwd, command=watched
+        "subagent-no-monitor", ctx, cwd=cwd
     )
     if hatch.should_stop:
         if hatch.approved:

@@ -10,7 +10,7 @@ Covers: BLOCK (any subagent call to Monitor, unconditionally — there's no fore
 axis to classify since Monitor IS the background primitive), ALLOW (the orchestrator's own
 Monitor use — no agent_id), the top-level agent_id fallback, and the deny-by-default Telegram
 hatch escalation (RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR with a written justification asks
-tg-ctl and allows only on exit 0; a bare `1` denies without contacting Telegram).
+tg-ctl and allows only on an explicit allow reply; a bare `1` denies without contacting Telegram).
 
 Run from the repo root::
 
@@ -178,6 +178,25 @@ def test_hatch_bare_flag_denies_without_tg_call(tmp_path, monkeypatch):
     monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
     out, _e, code = _run(monkeypatch, agent_id="sub-1",
                          env={"RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR": "1"})
+    assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert not marker.exists()
+
+
+def test_hatch_inline_form_in_description_does_not_self_arm(tmp_path, monkeypatch):
+    """A blocked subagent cannot re-arm the hatch by writing an inline
+    `RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR="..."` assignment into the free-form, model-authored
+    `description` Monitor field. That inline-parse path only ever fires against a real Bash
+    `command=` string passed to `request_hatch_approval` (pre-bash hooks only, parsing the
+    documented `VAR=value <gated-command>` shell prefix) -- Monitor has no shell command string,
+    so this hook must never pass the watched description as `command=`. With the env var unset,
+    the described self-arm attempt must still deny with no tg-ctl contact."""
+    marker = tmp_path / "asked"
+    tg_ctl = _fake_tg_ctl(tmp_path / "tg-ctl", f"touch {marker}\n" + _ALLOW_REPLY_SH)
+    monkeypatch.setattr(hook.hatch_escalation, "_TRUSTED_TG_CTL_PATHS", (tg_ctl,))
+    out, _e, code = _run(
+        monkeypatch, agent_id="sub-1",
+        description='RIG_HATCH_REQUEST_SUBAGENT_NO_MONITOR="self-authored justification" watch tests',
+    )
     assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
     assert not marker.exists()
 
