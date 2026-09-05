@@ -24,6 +24,12 @@ _SHIP = Path(__file__).resolve().parents[1] / "ci" / "ship" / "ship.sh"
 # product but this file never exercises it (no `review`/`jq` quorum fixture here) — force it off
 # process-wide; nothing here re-enables it.
 os.environ.setdefault("SHIP_REVIEW_QUORUM", "0")
+# The two pre-merge ticket gates (acceptance + magic-close, agent-tools#521) default ENABLED
+# too and have their own fixtures in tests/test_ship_ticket_gates.py; off here so a fixture
+# PR body that happens to say "Fixes HYP-999", or a fake `task` that logs every call, is not
+# gated by a feature this file never set out to exercise.
+os.environ.setdefault("SHIP_ACCEPTANCE_GATE", "0")
+os.environ.setdefault("SHIP_MAGIC_CLOSE_GATE", "0")
 
 # A minimal fake `gh` answering exactly the calls ship.sh makes on the notify path: the
 # preflight (headRefName,...), the CI rollup (green, so the normal merge path is taken), the
