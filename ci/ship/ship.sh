@@ -2838,26 +2838,58 @@ _magic_close_rewrite() {  # $1 = text -> stdout: the text with every keyword rep
   printf '%s\n' "$1" | LC_ALL=C sed -E "s~${_MAGIC_CLOSE_RE}~\\1Refs\\6\\7~g"
 }
 _magic_close_gate() {
-  local title body t_hits b_hits hits
-  title=$(gh pr view "$PR" --json title -q '.title // ""' 2>/dev/null) || title=""
-  body=$(gh pr view "$PR" --json body -q '.body // ""' 2>/dev/null) || body=""
+  local title body commits t_hits b_hits c_hits hits title_rc=0 body_rc=0 commits_rc=0
+  # Track EACH `gh pr view` call's own exit code (review finding, round 2, Fable): the earlier
+  # `|| title=""` made a genuine `gh` failure (rate-limited, network blip) indistinguishable
+  # from "the title/body is legitimately empty" — a PR whose real body says "Closes HYP-1440"
+  # would sail through as "no keyword found" the moment the fetch itself failed, exactly the
+  # incident class this gate exists to stop. Fail closed on an unreadable fetch, like the
+  # review-quorum gate does on an unreadable store.
+  title=$(gh pr view "$PR" --json title -q '.title // ""' 2>/dev/null) || title_rc=$?
+  body=$(gh pr view "$PR" --json body -q '.body // ""' 2>/dev/null) || body_rc=$?
+  # GitHub also honours a close keyword in a PR's COMMIT messages (review finding, round 2,
+  # Fable + Opus): with the default squash merge, GitHub's own squash-message template
+  # includes each commit's message in the final commit body unless the repo customizes it, so
+  # a keyword buried in one commit can still close the ticket even with a clean title/body.
+  commits=$(gh pr view "$PR" --json commits -q '[.commits[] | (.messageHeadline // "") + "\n" + (.messageBody // "")] | join("\n")' 2>/dev/null) || commits_rc=$?
+  if [ "$title_rc" != "0" ] || [ "$body_rc" != "0" ] || [ "$commits_rc" != "0" ]; then
+    { echo "Refusing: magic-close gate — could not read PR #$PR's title/body/commits from GitHub (gh exit ${title_rc}/${body_rc}/${commits_rc}) — cannot verify it is free of a close keyword."
+      echo "  Retry once gh/GitHub is reachable. SHIP_MAGIC_CLOSE_GATE=0 bypasses this gate entirely (ops off-switch) — only if you have verified the text by hand."; } >&2
+    _ticket_gate_audit_log magic-close refused "" "gh pr view failed: title_rc=${title_rc} body_rc=${body_rc} commits_rc=${commits_rc}"
+    exit 1
+  fi
   t_hits=$(_magic_close_matches "$title")
   b_hits=$(_magic_close_matches "$body")
-  if [ -z "$t_hits" ] && [ -z "$b_hits" ]; then
-    echo "[ship] magic-close gate: no close/fix/resolve keyword targets an issue or ticket in #$PR's title/body."
+  c_hits=$(_magic_close_matches "$commits")
+  if [ -z "$t_hits" ] && [ -z "$b_hits" ] && [ -z "$c_hits" ]; then
+    echo "[ship] magic-close gate: no close/fix/resolve keyword targets an issue or ticket in #$PR's title/body/commits."
     return 0
   fi
-  hits=$(printf '%s\n%s\n' "$t_hits" "$b_hits" | sed '/^$/d' | tr '\n' ';' | sed 's/;$//')
+  hits=$(printf '%s\n%s\n%s\n' "$t_hits" "$b_hits" "$c_hits" | sed '/^$/d' | tr '\n' ';' | sed 's/;$//')
   if [ "$REWRITE_MAGIC_CLOSE" = "1" ]; then
+    if [ -n "$c_hits" ] && [ -z "$t_hits" ] && [ -z "$b_hits" ]; then
+      # Nothing in title/body to rewrite — `gh pr edit` can't touch commit history (and this
+      # script never rewrites/rebases a branch), so there is no automatic fix here.
+      { echo "Refusing: magic-close keyword found only in a COMMIT message of PR #$PR — --rewrite-magic-close can only edit the PR title/body, never commit history (this script never rewrites or rebases a branch)."
+        printf '%s\n' "$c_hits" | sed 's/^/  in a commit: "/; s/$/"/'
+        echo "  Fix by hand: amend the offending commit message(s) locally, force-push the branch yourself (ship never does), then re-run ship — or reword just to drop the keyword (e.g. \"see HYP-1295\" instead of \"Fixes HYP-1295\")."; } >&2
+      _ticket_gate_audit_log magic-close refused "" "$hits"
+      exit 1
+    fi
     _magic_close_rewrite_pr "$title" "$body" "$t_hits" "$b_hits" "$hits"
     return 0
   fi
   { echo "Refusing: magic-close keyword in PR #$PR — it would close the ticket the instant the PR merges, behind task-cli's acceptance gates."
     [ -n "$t_hits" ] && printf '%s\n' "$t_hits" | sed 's/^/  in the title: "/; s/$/"/'
     [ -n "$b_hits" ] && printf '%s\n' "$b_hits" | sed 's/^/  in the body:  "/; s/$/"/'
+    [ -n "$c_hits" ] && printf '%s\n' "$c_hits" | sed 's/^/  in a commit: "/; s/$/"/'
     echo "  Why: GitHub's Closes/Fixes/Resolves #N and Linear's GitHub integration (the same words before a ticket code) move the ticket to Done on merge, so no criterion is ever checked with a proof."
     echo "  Fix: write \"Refs <ref>\" instead (e.g. \"Refs #115\", \"Refs HYP-1295\") — \`gh pr edit $PR --title/--body\` — then re-run ship;"
-    echo "       or re-run with --rewrite-magic-close to have ship rewrite the keyword(s) to Refs via 'gh pr edit' and continue."
+    if [ -n "$c_hits" ] && [ -z "$t_hits" ] && [ -z "$b_hits" ]; then
+      echo "       a commit message keyword has no automatic fix — amend it and force-push the branch yourself, or reword to drop the keyword."
+    else
+      echo "       or re-run with --rewrite-magic-close to have ship rewrite the keyword(s) to Refs via 'gh pr edit' and continue."
+    fi
     echo "  SHIP_MAGIC_CLOSE_GATE=0 disables this gate entirely (ops off-switch)."; } >&2
   _ticket_gate_audit_log magic-close refused "" "$hits"
   exit 1
@@ -2959,8 +2991,16 @@ ACCEPTANCE_GATE_FULLY_ACCEPTED=""
 # ALWAYS returns "not safe" — an unverifiable exit-0 is never grounds to auto-close.
 _acceptance_gate_fully_accepted() {  # $1 = task gate --json stdout (exit 0) -> "1" or ""
   command -v jq >/dev/null 2>&1 || { printf ''; return 0; }
+  # `state != "done"` too (review finding, round 2): task-cli's own contract example shows
+  # `task gate` exit 0 with `"state":"done"` is a real, reachable shape — a follow-up PR
+  # referencing an ALREADY-DONE ticket (`Refs HYP-931` against a ticket closed by an earlier
+  # merge) hits this same path. `task done` on an already-Done ticket refuses (a re-close is
+  # rejected, not a silent re-write — see task-cli's own transition validation), so treating
+  # it as "safe to auto-close" produced the same false "fully proven" narrative the cancelled
+  # case did. `done` and `cancelled` are task-cli's only two terminal states.
   if printf '%s' "$1" | jq -e '
-      (.post_merge_acceptance == null) and (.gate_enabled != false) and (.state != "cancelled")
+      (.post_merge_acceptance == null) and (.gate_enabled != false) and
+      (.state != "cancelled") and (.state != "done")
     ' >/dev/null 2>&1
   then printf '1'; else printf ''; fi
 }
@@ -2989,7 +3029,7 @@ _acceptance_gate_pass() {  # $1 = task code $2 = `task gate --json` STDOUT ONLY 
     _ticket_gate_audit_log acceptance authorized "$1" ""
     ACCEPTANCE_GATE_FULLY_ACCEPTED=1
   else
-    _ticket_gate_audit_log acceptance authorized "$1" "cancelled or the acceptance-checked gate is disabled for this ticket — skipping auto-close"
+    _ticket_gate_audit_log acceptance authorized "$1" "already done, cancelled, or the acceptance-checked gate is disabled for this ticket — skipping auto-close"
   fi
 }
 # Rewrites a "GH-<n>" code (case-insensitive: "gh-105" too, matching
@@ -3072,15 +3112,38 @@ _acceptance_gate() {
   out=$(cd "$ROOT" && task gate "$code" --json 2>"$errfile") || rc=$?
   if [ "$errfile" != "/dev/null" ] && [ -s "$errfile" ]; then
     echo "[ship] acceptance gate: task-cli stderr: $(LC_ALL=C tr '\n' ' ' < "$errfile")" >&2
-    rm -f "$errfile"
   fi
+  [ "$errfile" != "/dev/null" ] && rm -f "$errfile"  # always, not only when -s (review finding: the file leaked on the common empty-stderr path)
   case "$rc" in
     0) _acceptance_gate_pass "$code" "$out" ;;
-    1) _acceptance_gate_refuse "$code" "$out" ;;
+    1)
+      # `task` is a famously ambiguous command name (Taskwarrior, go-task also install as
+      # `task`) — review finding, round 2: `command -v task` alone can resolve to one of
+      # those on a developer's machine, and its exit-1 for an unknown `gate` subcommand looks
+      # identical to a genuine task-cli refusal, blocking EVERY merge with a message that
+      # doesn't hint at the real cause. Only trust exit 1 as a real refusal when `$out` has
+      # task-cli's OWN JSON shape; otherwise this isn't task-cli at all — skip, don't refuse.
+      if _acceptance_gate_looks_like_task_cli_json "$out"; then
+        _acceptance_gate_refuse "$code" "$out"
+      else
+        echo "[ship] WARNING: acceptance gate could not evaluate ${code} — '$(command -v task)' on PATH did not return task-cli's expected JSON shape (a DIFFERENT 'task' binary — e.g. Taskwarrior or go-task — may be shadowing task-cli). Skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
+        _ticket_gate_audit_log acceptance skipped "$code" "'task' on PATH does not look like task-cli"
+      fi ;;
     *)
       echo "[ship] WARNING: acceptance gate could not evaluate ${code} (task gate exit ${rc}) — skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
       _ticket_gate_audit_log acceptance skipped "$code" "could not evaluate: exit ${rc}" ;;
   esac
+}
+# Whether `$1` (task gate's stdout) looks like task-cli's OWN JSON contract, not just any
+# non-empty text — the discriminator for the PATH-collision guard above. With jq, requires the
+# three fields every `task gate --json` payload carries; without it, a cheap substring
+# heuristic (task-cli's payload always contains the literal `"criteria"` key).
+_acceptance_gate_looks_like_task_cli_json() {
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$1" | jq -e 'has("id") and has("ok") and has("criteria")' >/dev/null 2>&1
+  else
+    case "$1" in *'"criteria"'*) return 0 ;; *) return 1 ;; esac
+  fi
 }
 _acceptance_gate
 

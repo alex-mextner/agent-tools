@@ -56,11 +56,14 @@ case "$sub" in
         elif printf '%s' "$args" | grep -q -- '--json title,body'; then
           printf '%s\\t%s\\n' "${SHIP_TEST_PR_TITLE:-}" "${SHIP_TEST_PR_BODY:-}"
         elif printf '%s' "$args" | grep -q -- '--json title'; then
+          if [ "${SHIP_TEST_GH_PR_VIEW_TITLE_FAIL:-0}" = "1" ]; then exit 1; fi
           printf '%s\\n' "${SHIP_TEST_PR_TITLE:-}"
         elif printf '%s' "$args" | grep -q -- '--json body'; then
           printf '%s\\n' "${SHIP_TEST_PR_BODY:-}"
         elif printf '%s' "$args" | grep -q -- '--json url,mergeCommit'; then
           printf '%s\\t%s\\n' "https://github.com/acme/widgets/pull/1" ""
+        elif printf '%s' "$args" | grep -q -- '--json commits'; then
+          printf '%s\\n' "${SHIP_TEST_PR_COMMITS:-}"
         else
           echo '[]'
         fi ;;
@@ -349,6 +352,104 @@ def test_auto_close_skipped_on_a_cancelled_ticket(repo, tmp_path):
     (line,) = _audit(tmp_path, "acceptance")
     assert line["decision"] == "authorized"
     assert "cancelled" in line["detail"]
+
+
+def test_auto_close_skipped_on_an_already_done_ticket(repo, tmp_path):
+    """Review finding (round 2): `task gate` also exits 0 for a ticket already in the `done`
+    state (task-cli's own README contract example shows exactly this shape) — a follow-up PR
+    referencing an already-closed ticket must not trigger a doomed `task done` attempt either.
+    `done` and `cancelled` are task-cli's only two terminal states."""
+    already_done = json.dumps({
+        "id": "HYP-931", "ok": True, "state": "done", "gate_enabled": True,
+        "post_merge_acceptance": None, "criteria": 3, "below_minimum": False,
+        "unchecked": [], "proofless": [],
+    })
+    r = _run(repo, tmp_path, env={"SHIP_TASK_NOTIFY_ENABLED": "1", "SHIP_TEST_TASK_GATE_JSON": already_done})
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "closing it now" not in r.stdout
+    assert "done HYP-931" not in " ".join(_task_calls(tmp_path))
+    (line,) = _audit(tmp_path, "acceptance")
+    assert line["decision"] == "authorized"
+    assert "already done" in line["detail"]
+
+
+def test_acceptance_gate_skips_instead_of_refusing_when_task_on_path_is_not_task_cli(repo, tmp_path):
+    """Opus finding (round 2): `task` is an ambiguous binary name (Taskwarrior, go-task also
+    install as `task`). Its exit-1-for-unknown-subcommand looks identical to a genuine
+    task-cli refusal — an earlier version treated ANY exit 1 as "ticket not accepted" and
+    blocked every merge, with a message that doesn't hint at the real cause. Only exit 1 with
+    task-cli's OWN JSON shape (id/ok/criteria) is a real refusal; anything else is a skip."""
+    r = _run(repo, tmp_path, env={
+        "SHIP_TEST_TASK_GATE_JSON": "error: unknown command \"gate\" for \"task\"",
+        "SHIP_TEST_TASK_GATE_EXIT": "1",
+    })
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "did not return task-cli's expected JSON shape" in r.stderr
+    assert "NOT accepted" not in r.stderr
+    assert _merged(tmp_path)
+    (line,) = _audit(tmp_path, "acceptance")
+    assert line["decision"] == "skipped"
+    assert "does not look like task-cli" in line["detail"]
+
+
+def test_acceptance_gate_still_refuses_a_genuine_task_cli_exit_1(repo, tmp_path):
+    """The fix above must not swallow a REAL refusal — exit 1 with task-cli's own JSON shape
+    (id/ok/criteria present) still refuses exactly as before."""
+    r = _run(repo, tmp_path, env={"SHIP_TEST_TASK_GATE_JSON": _NOT_ACCEPTED, "SHIP_TEST_TASK_GATE_EXIT": "1"})
+    assert r.returncode == 1
+    assert "Refusing: acceptance gate — ticket HYP-931 is NOT accepted" in r.stderr
+    assert not _merged(tmp_path)
+
+
+def test_magic_close_refuses_when_gh_pr_view_fails(repo, tmp_path):
+    """Fable finding (round 2): an earlier version's `|| title=""` made a genuine `gh` failure
+    (rate-limited, network blip) indistinguishable from "the title is legitimately empty" —
+    the exact incident class this gate exists to stop could sail through the instant the
+    fetch itself failed. Must fail CLOSED, like the review-quorum gate does on an unreadable
+    store."""
+    r = _run(repo, tmp_path, env={"SHIP_TEST_GH_PR_VIEW_TITLE_FAIL": "1"})
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "could not read PR #1's title/body/commits from GitHub" in r.stderr
+    assert not _merged(tmp_path)
+    (line,) = _audit(tmp_path, "magic-close")
+    assert line["decision"] == "refused" and "gh pr view failed" in line["detail"]
+
+
+def test_magic_close_catches_a_keyword_in_a_commit_message(repo, tmp_path):
+    """Opus + Fable finding (round 2): GitHub also honours a close keyword in a PR's commit
+    messages — with the default squash merge, GitHub's own squash-message template includes
+    each commit's message in the final commit body unless the repo customizes it, so a clean
+    title/body with a keyword buried in one commit can still close the ticket on merge."""
+    r = _run(repo, tmp_path, env={"SHIP_TEST_PR_COMMITS": "wip\n\nCloses HYP-1295 for real this time"})
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert '  in a commit: "Closes HYP-1295"' in r.stderr
+    assert not _merged(tmp_path)
+
+
+def test_magic_close_rewrite_refuses_a_commit_only_hit_with_no_automatic_fix(repo, tmp_path):
+    """`--rewrite-magic-close` can only edit the PR title/body via `gh pr edit` — it can never
+    rewrite commit history (this script never rewrites or rebases a branch) — so a keyword
+    found ONLY in a commit message must still refuse, explaining there is no automatic fix."""
+    r = _run(repo, tmp_path, args=("--rewrite-magic-close",), env={
+        "SHIP_TEST_PR_COMMITS": "Closes HYP-1295",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "can only edit the PR title/body, never commit history" in r.stderr
+    assert [l for l in _gh_log(tmp_path) if l.startswith("edit ")] == []
+    assert not _merged(tmp_path)
+
+
+def test_magic_close_rewrite_still_works_when_title_body_hits_coexist_with_a_commit_hit(repo, tmp_path):
+    """A commit-message hit alongside a real title/body hit must not block the normal rewrite
+    of the title/body — only a commit-ONLY hit has no automatic fix."""
+    r = _run(repo, tmp_path, args=("--rewrite-magic-close",), env={
+        "SHIP_TEST_PR_BODY": "Closes #115",
+        "SHIP_TEST_PR_COMMITS": "Closes HYP-1295",
+    })
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    edits = [l for l in _gh_log(tmp_path) if l.startswith("edit ")]
+    assert edits == ["edit 1 --body Refs #115"]
+    assert _merged(tmp_path)
 
 
 def test_acceptance_gate_ignores_stderr_noise_mixed_with_the_json(repo, tmp_path):
