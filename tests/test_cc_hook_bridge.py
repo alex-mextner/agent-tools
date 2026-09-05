@@ -227,6 +227,23 @@ def test_to_v1_event_forwards_session_id_for_stop():
     assert v1["args"]["session_id"] == "sess-xyz"
 
 
+def test_to_v1_event_forwards_transcript_path_for_stop():
+    """stop-completion-selfcheck reads this to classify what the turn actually did instead
+    of firing the same static prompt regardless of content — must round-trip unchanged."""
+    cc = {"hook_event_name": "Stop", "stop_hook_active": True,
+          "session_id": "sess-xyz", "cwd": "/repo",
+          "transcript_path": "/Users/x/.claude/projects/p/sess-xyz.jsonl"}
+    v1 = dispatch.to_v1_event(cc, point="stop")
+    assert v1["transcript_path"] == "/Users/x/.claude/projects/p/sess-xyz.jsonl"
+
+
+def test_to_v1_event_transcript_path_defaults_to_empty_string_when_absent():
+    cc = {"hook_event_name": "Stop", "stop_hook_active": True,
+          "session_id": "sess-xyz", "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="stop")
+    assert v1["transcript_path"] == ""
+
+
 def test_to_v1_event_empty_string_top_level_session_id_overwrites_tool_input():
     """The T2 loop tests identity (`is not None`), not truthiness, so a top-level
     session_id == "" now OVERWRITES a tool_input copy too (the old standalone rule used
