@@ -70,6 +70,25 @@ _AGENT_TOOLS = frozenset({"Agent", "Task"})
 # note as `_AGENT_TOOLS` above applies: this half only maps the point, rig-cli's
 # `hook_bridge_entries` must register a `Skill` PreToolUse matcher for it to actually fire.
 _SKILL_TOOLS = frozenset({"Skill"})
+# CC's Monitor tool (a background event-stream watch: `tail -f`, a poll loop, a websocket —
+# started, then the caller keeps working and gets a notification per output line/event). A
+# PreToolUse on it maps to `pre-monitor`, the point subagent-no-monitor uses to block a
+# SUBAGENT from ever calling it: Monitor is categorically fire-and-forget (that is the whole
+# point of the tool), and a dispatched subagent is NOT re-invoked by a MONITOR-EVENT
+# notification — only the main loop is (Monitor has no harness-tracked child at all, unlike a
+# Bash `run_in_background: true` child, which the harness DOES use to re-invoke its calling
+# subagent — verified empirically; see subagent_no_monitor.py's docstring). Hit in HYP-1350's
+# retrospective: a subagent called Monitor on its own spawned child process, then ended its
+# turn awaiting a notification that only the top-level orchestrator ever receives. NOTE: the
+# stated rationale of the sibling `subagent-no-bg-longproc` hook/AGENTS.md entry ("a subagent
+# is never re-invoked by a background-completion notification") is broader than what this
+# comment claims and does not hold for an ordinary backgrounded Bash command — tracked
+# separately as agent-tools#546, out of scope for this mapping. The orchestrator's own Monitor
+# use (watching a backgrounded subagent) is legitimate and unaffected — this point only
+# governs subagent tool calls. Same rig-cli follow-up note as `_AGENT_TOOLS`/`_SKILL_TOOLS`
+# above applies: this half only maps the point, rig-cli's `hook_bridge_entries` must register
+# a `Monitor` PreToolUse matcher for it to actually fire.
+_MONITOR_TOOLS = frozenset({"Monitor"})
 
 
 def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
@@ -85,6 +104,8 @@ def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
             return "pre-agent"
         if tool_name in _SKILL_TOOLS:
             return "pre-skill"
+        if tool_name in _MONITOR_TOOLS:
+            return "pre-monitor"
     if hook_event_name == "PostToolUse" and tool_name in _WRITE_TOOLS:
         # The write already landed on disk → the REACTIVE point (format-on-write,
         # lint-on-write). A post-write hook's exit-10 is FEEDBACK to the model, not

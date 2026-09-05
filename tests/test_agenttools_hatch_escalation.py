@@ -465,6 +465,12 @@ _AGENT_HOOKS_DIR = Path(__file__).resolve().parents[1] / "agent-hooks"
         _AGENT_HOOKS_DIR
         / "worktree-only-writes"
         / "worktree-only-writes.pre-write.json",
+        _AGENT_HOOKS_DIR
+        / "subagent-no-monitor"
+        / "subagent-no-monitor.pre-monitor.json",
+        _AGENT_HOOKS_DIR
+        / "subagent-no-bg-longproc"
+        / "subagent-no-bg-longproc.pre-bash.json",
     ],
 )
 def test_descriptor_timeout_strictly_exceeds_helper_worst_case(descriptor):

@@ -102,9 +102,11 @@ These are the *logical* points; map them to your harness's actual tool-use event
 > **Claude Code:** CC does NOT run these descriptors directly — it only runs hooks declared
 > in `settings.json`. The `lib/cc_hook_bridge` dispatcher is the carrier that makes them
 > fire: rig wires it into `settings.json` (PreToolUse for `pre-bash`/`pre-write`/`pre-agent`/
-> `pre-skill`, PostToolUse for `post-write`, Stop for `stop`) and translates the exit-10
-> BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`. Without that bridge
-> these hooks are inert in CC (agent-tools#18).
+> `pre-skill`/`pre-monitor`, PostToolUse for `post-write`, Stop for `stop`) and translates
+> the exit-10 BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`. Without
+> that bridge these hooks are inert in CC (agent-tools#18). `pre-monitor` is the newest of
+> these and, like `pre-agent`/`pre-skill` before it, needs its own rig-cli-side `Monitor`
+> matcher shipped before it actually fires — see the `pre-monitor` section below.
 
 > **Codex:** Codex also needs a carrier bridge. `lib/codex_hook_bridge` is the first
 > dispatcher for the confirmed Codex hooks contract: TOML hooks call it for `PreToolUse`
@@ -130,6 +132,7 @@ These are the *logical* points; map them to your harness's actual tool-use event
 | `pre-bash`     | before a shell command runs                  | block-devserver-primary, block-no-verify, block-raw-pr-merge, block-reset-hard, pin-primary-worktree, pkill-guard, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash, orchestrator-stays-thin, no-long-inline-process, subagent-no-bg-longproc, no-shell-file-edit, skills-read-gate, visual-proof-gate, decision-request-format, heavy-op-memory-gate |
 | `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env, orchestrator-stays-thin, worktree-only-writes |
 | `pre-skill` **(live in Claude Code when rig provisions the bridge; NOT mapped in Codex/opencode yet)** | before a Skill-tool invocation | skills-marker-writer |
+| `pre-monitor` **(mapped by the bridge; NOT yet wired to a rig-cli matcher — inert until that ships, see below)** | before a Monitor-tool call | subagent-no-monitor |
 | `post-write`   | after a file write/edit has landed on disk   | format-on-write, lint-on-write          |
 | `stop`         | when the agent is about to end its turn      | stop-completion-selfcheck               |
 
@@ -153,6 +156,23 @@ session id, so one session invoking a skill can't satisfy another concurrent ses
 so `skills-read-gate`'s freshness check (on `pre-bash`) has something real to read. A
 `pre-skill` hook should never block — the point is a recording tap, not a gate — so hooks
 here should be `on_error: open` and always emit `allow`.
+
+### `pre-monitor` — block a subagent's Monitor call
+
+`pre-monitor` fires before CC's `Monitor` tool call runs (the fire-and-forget background
+event-stream watch — start it, keep working, get notified per line/event later). Its one
+consumer, `subagent-no-monitor`, blocks it **unconditionally** whenever `agent_id` is present
+(a dispatched subagent), because a subagent is never re-invoked by a Monitor-event notification
+— only the main loop is (Monitor has no harness-tracked child at all, unlike an ordinary
+backgrounded Bash `run_in_background: true` command; see `agent-hooks/subagent-no-monitor/`'s
+own README for the empirically-verified distinction, tracked against `subagent-no-bg-longproc`'s
+broader stated rationale as agent-tools#546). The orchestrator's own Monitor use is unaffected.
+**Registration gap:** the
+point mapping lives in `lib/cc_hook_bridge/dispatch.py`, but CC only fires a `PreToolUse` hook
+for a tool it has an explicit `settings.json` matcher for — that matcher is written by
+rig-cli's `hook_bridge_entries` (a separate repo, same split `pre-agent`/`pre-skill` went
+through) and requires `rig apply` (or an equivalent manual edit) to take effect on a given
+machine.
 
 ### `post-write` — react to a *completed* write
 
