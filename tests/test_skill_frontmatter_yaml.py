@@ -71,12 +71,22 @@ def test_skill_frontmatter_is_valid_yaml(path: Path) -> None:
     assert fm_text is not None, f"{path}: missing or malformed --- frontmatter fence"
     try:
         data = yaml.safe_load(fm_text)
-    except yaml.YAMLError as exc:  # pragma: no cover - failure path is the point of this test
+    except yaml.YAMLError as exc:
         pytest.fail(f"{path}: invalid YAML frontmatter: {exc}")
     assert isinstance(data, dict), f"{path}: frontmatter did not parse to a mapping"
     assert data.get("name"), f"{path}: frontmatter missing a non-empty 'name'"
     assert data.get("description"), f"{path}: frontmatter missing a non-empty 'description'"
-    description_length = len(str(data["description"]))
+    # Both must be actual strings, not merely truthy: a `description:` written as a nested
+    # block (a YAML mapping/list instead of a scalar) parses as valid YAML, is truthy, and
+    # would otherwise sail through the length check below (`len(str(...))` coerces silently)
+    # while every harness that reads `description` as trigger text gets a mapping and the
+    # skill is unusable — exactly the "invalid despite green tests" class this module exists
+    # to close, reopened one level up. Same reasoning applies to `name`.
+    assert isinstance(data["name"], str), f"{path}: 'name' must be a string, got {type(data['name']).__name__}"
+    assert isinstance(data["description"], str), (
+        f"{path}: 'description' must be a string, got {type(data['description']).__name__}"
+    )
+    description_length = len(data["description"])
     assert description_length <= MAX_DESCRIPTION_LENGTH, (
         f"{path}: description is {description_length} characters, over the "
         f"{MAX_DESCRIPTION_LENGTH}-character spec limit — shorten it"
