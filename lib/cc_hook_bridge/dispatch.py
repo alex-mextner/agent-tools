@@ -85,9 +85,12 @@ _SKILL_TOOLS = frozenset({"Skill"})
 # comment claims and does not hold for an ordinary backgrounded Bash command — tracked
 # separately as agent-tools#546, out of scope for this mapping. The orchestrator's own Monitor
 # use (watching a backgrounded subagent) is legitimate and unaffected — this point only
-# governs subagent tool calls. Same rig-cli follow-up note as `_AGENT_TOOLS`/`_SKILL_TOOLS`
-# above applies: this half only maps the point, rig-cli's `hook_bridge_entries` must register
-# a `Monitor` PreToolUse matcher for it to actually fire.
+# governs subagent tool calls. Same two-repo split as `_AGENT_TOOLS`/`_SKILL_TOOLS` above:
+# this half only maps the point, and rig-cli's `hook_bridge_entries` registers the `Monitor`
+# PreToolUse matcher that makes it actually fire (rig-cli#296, shipped) — a given machine
+# needs `rig apply` to have run after both merged, plus a fresh CC session (hook config is
+# read at session start, not live), and the bridge itself enabled at all (see this module's
+# README's Installation section) for the block to actually take effect.
 _MONITOR_TOOLS = frozenset({"Monitor"})
 
 

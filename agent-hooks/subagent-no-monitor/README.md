@@ -71,16 +71,32 @@ process-env source applies here, matching how the pre-write hooks read this var.
 Telegram call is made and the call simply blocks. If present but blank/bare (`1`/`true`/`yes`),
 the hook denies without contacting Telegram.
 
-## Registration gap (read before assuming this fires)
+## Registration (read before assuming this fires on an unpatched machine)
 
 Mapping `Monitor` → `pre-monitor` in `lib/cc_hook_bridge/dispatch.py` is **not**, on its own,
 enough for CC to ever invoke the bridge for a `Monitor` tool call — Claude Code only runs
 `PreToolUse` hooks it has an explicit **matcher** for in `settings.json`, and matchers are
 written by **rig-cli**'s `hook_bridge_entries` (a separate repo), not by this dispatcher. This
-is the identical two-repo split `pre-agent` and `pre-skill` went through. Until rig-cli's
-`Monitor` matcher change ships **and** `rig apply` (or an equivalent manual `settings.json`
-edit) runs on a given machine, this descriptor is installed but inert — CC never calls the
-bridge for `Monitor` at all, so `subagent_no_monitor.py` never runs.
+is the identical two-repo split `pre-agent` and `pre-skill` went through, and — like both of
+those — **has now shipped**: rig-cli#296 adds the `Monitor` matcher, and `rig apply` on a
+given machine wires it into `settings.json`. Verified the dispatcher itself: piping a
+synthetic subagent `Monitor` PreToolUse event directly into the real deployed
+`PYTHONPATH=... python3 -m cc_hook_bridge PreToolUse` command produces a real `deny` with
+this hook's documented message — this exercises the dispatcher's own `Monitor -> pre-monitor`
+routing and this hook's block logic, but bypasses CC's own `settings.json` matcher lookup, so
+it does not on its own confirm the CC-side wiring on any given machine. On a machine where
+the Claude Code hook bridge is already
+enabled and active (a `claude-code` `harness:` block present, `agent_hooks` on, and
+`harness.hook_bridge` not opted out — see `lib/cc_hook_bridge/README.md`'s Installation
+section for those prerequisites), two more things gate that specific machine/session
+actually seeing the block:
+1. `rig apply` needs to have run on that machine AFTER both halves merged (`rig status` /
+   the settings.json `hooks.PreToolUse` matcher list will show `Monitor` once it has).
+2. Claude Code reads its hook configuration at **session start**, not live — a session (or a
+   subagent dispatched from one) already running when `rig apply` adds the matcher keeps
+   using the config it started with. Start a fresh session to pick up a newly-applied matcher.
+If the bridge itself isn't enabled on a machine at all, `rig apply` and a fresh session are
+not enough on their own — check the bridge's own prerequisites first.
 
 ## Fail-open, on purpose
 
