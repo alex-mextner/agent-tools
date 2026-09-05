@@ -684,6 +684,25 @@ _record_ship_oid() {
   SHIP_KNOWN_OIDS="${SHIP_KNOWN_OIDS} $1"
 }
 
+# True (exit 0) iff $2 is genuinely the merge commit ship's own update-branch call produced on
+# top of $1: exactly 2 parents, first parent == $1 (GitHub's own convention for "merge branch
+# X into head" — first parent is the branch merged INTO, i.e. head's prior tip). Callers use
+# this to gate _record_ship_oid, not to gate the ship itself (review finding, #518): `_wait_
+# pr_head_oid ne "$1"` only proves the head MOVED — a human push landing in the same narrow
+# window between the update-branch PUT's 202 accept and GitHub's async merge actually landing
+# could be the thing that "moved" it to, and get misattributed as ship's own commit (widening
+# the CI grace and letting review-dwell skip a push nobody but a human made). A read failure
+# fails CLOSED (not verified -> not recorded) — the caller already treats "not verified" as
+# "just don't attribute this oid", never as a reason to abort what has already been written.
+_verify_is_merge_of() {  # $1 = expected first-parent oid (old head), $2 = candidate merge oid
+  local parents n p0
+  parents=$(gh api graphql -F owner='{owner}' -F name='{repo}' -F oid="$2" \
+      -f query='query($owner:String!,$name:String!,$oid:String!){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{parents(first:2){totalCount nodes{oid}}}}}}' \
+      --jq '.data.repository.object.parents | (.totalCount|tostring) + " " + (.nodes[0].oid // "") + " " + (.nodes[1].oid // "")' 2>/dev/null) || return 1
+  n=${parents%% *}; p0=${parents#* }; p0=${p0%% *}
+  [ "$n" = "2" ] && [ "$p0" = "$1" ]
+}
+
 _auto_bump_enabled() {
   # Case-INSENSITIVE (review finding, #518): the one knob that gates ship pushing commits to a
   # remote branch must not silently mean the OPPOSITE of what an operator wrote. A bare
@@ -747,12 +766,17 @@ behind_clear_pr_branch_via_update_api() {
     echo "[ship] update-branch was accepted for PR #$PR but its head did not move within ${SHIP_AUTO_BUMP_HEAD_WAIT:-90}s — falling through to the BEHIND refusal." >&2
     return 0
   fi
-  # The merge genuinely happened (the head moved) — record its oid regardless of what
-  # mergeStateStatus reports next, so the CI-grace and review-dwell gates recognize this
-  # commit as ship's own even if THIS run makes no subsequent version bump (the common case:
-  # docs/test-only PRs, a hand-bumped minor/major, no version file, an opted-out repo).
+  # The head moved — VERIFY it's genuinely ship's own merge (not a human push racing the same
+  # narrow async window, review finding #518) before recording it, so the CI-grace and
+  # review-dwell gates recognize it as ship's own even if THIS run makes no subsequent version
+  # bump (the common case: docs/test-only PRs, a hand-bumped minor/major, no version file, an
+  # opted-out repo). An unverified oid is simply never attributed — not a reason to refuse.
   new_head=$(_pr_head_oid) || new_head=""
-  _record_ship_oid "$new_head"
+  if _verify_is_merge_of "$head" "$new_head"; then
+    _record_ship_oid "$new_head"
+  else
+    echo "[ship] could not verify the new head is ship's own update-branch merge — not attributing it to ship (the review-dwell/CI-grace gates will treat it as a normal push)." >&2
+  fi
   # Read into a LOCAL first: a failed re-read must never clobber the caller's $MERGE_STATE to
   # empty (review finding, #518) — that would make its own `[ "${MERGE_STATE:-}" = "BEHIND" ]`
   # refusal below silently no-op on an UNKNOWN state instead of a proven-cleared one. Only a
@@ -1771,7 +1795,7 @@ _remote_file_fetch() {  # $1 = path, $2 = ref
 # signed merge commit, no local git involved. The API is asynchronous (202) — wait for the head
 # to move. Refuses (exit 1, nothing merged) on an API error, typically a 422 merge conflict.
 _auto_bump_update_branch() {  # $1 = current head oid, $2 = base ref
-  local out
+  local out new_oid
   echo "[ship] auto-bump: $2 already moved $AUTO_BUMP_FILE past this PR's merge-base — updating ${BRANCH} from $2 first (otherwise the squash would conflict on the version line) ..."
   if ! out=$(gh api -X PUT "repos/{owner}/{repo}/pulls/$PR/update-branch" -f expected_head_sha="$1" 2>&1); then
     { echo "Refusing: could not update ${BRANCH} from $2 (GitHub update-branch API failed): ${out}"
@@ -1782,7 +1806,15 @@ _auto_bump_update_branch() {  # $1 = current head oid, $2 = base ref
     echo "Refusing: GitHub accepted the update-branch request for PR #$PR but the head did not move within ${SHIP_AUTO_BUMP_HEAD_WAIT:-90}s — re-run ship once it has. Nothing was merged." >&2
     exit 1
   fi
-  _record_ship_oid "$(_pr_head_oid)"
+  # VERIFY before attributing (review finding, #518 — same rationale as the BEHIND-preflight's
+  # own update-branch call above): `ne` only proves the head moved, not that it moved to
+  # ship's own merge.
+  new_oid=$(_pr_head_oid) || new_oid=""
+  if _verify_is_merge_of "$1" "$new_oid"; then
+    _record_ship_oid "$new_oid"
+  else
+    echo "[ship] auto-bump: could not verify the new head is ship's own update-branch merge — not attributing it to ship." >&2
+  fi
 }
 
 # Author the bump commit on the PR head branch. Sets AUTO_BUMP_SHA. Refuses (exit 1, nothing

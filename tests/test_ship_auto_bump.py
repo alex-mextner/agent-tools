@@ -95,7 +95,7 @@ case "$sub" in
     esac ;;
   api)
     method=GET; endpoint=""; jqexpr=""
-    F_message=""; F_content=""; F_sha=""; F_branch=""; F_expected=""; F_query=""; F_id=""
+    F_message=""; F_content=""; F_sha=""; F_branch=""; F_expected=""; F_query=""; F_id=""; F_oid=""
     F_committer_email=""; F_committer_name=""
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -103,7 +103,7 @@ case "$sub" in
         -f|-F) kv="$2"; shift 2; k="${kv%%=*}"; v="${kv#*=}"
           case "$k" in
             message) F_message="$v" ;; content) F_content="$v" ;; sha) F_sha="$v" ;; branch) F_branch="$v" ;;
-            expected_head_sha) F_expected="$v" ;; query) F_query="$v" ;; id) F_id="$v" ;;
+            expected_head_sha) F_expected="$v" ;; query) F_query="$v" ;; id) F_id="$v" ;; oid) F_oid="$v" ;;
             committer\[email\]) F_committer_email="$v" ;; committer\[name\]) F_committer_name="$v" ;;
           esac ;;
         --jq) jqexpr="$2"; shift 2 ;;
@@ -142,6 +142,12 @@ case "$sub" in
           _headline=$(git_c log -1 --format=%s "origin/$B" 2>/dev/null || echo "")
           jq -n --arg h "$_headline" \
             '{data:{repository:{pullRequest:{commits:{nodes:[{commit:{messageHeadline:$h}}]}}}}}' | jq -r "$jqexpr"
+        elif grep -q parents <<<"$F_query"; then
+          git_c fetch -q origin
+          _pset=$(git_c log -1 --format=%P "$F_oid" 2>/dev/null || echo "")
+          _pnodes=$(printf '%s\n' $_pset | jq -R -s -c 'split("\n") | map(select(length>0)) | map({oid:.})')
+          jq -n --argjson pn "$_pnodes" \
+            '{data:{repository:{object:{parents:{totalCount:($pn|length), nodes:$pn}}}}}' | jq -r "$jqexpr"
         else echo 0; fi ;;
       repos/*/contents/*)
         path="${endpoint#*/contents/}"; file="${path%%\?*}"; ref="${path#*ref=}"; [ "$ref" = "$path" ] && ref=""
