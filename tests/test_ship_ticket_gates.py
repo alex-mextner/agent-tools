@@ -401,6 +401,34 @@ def test_acceptance_gate_still_refuses_a_genuine_task_cli_exit_1(repo, tmp_path)
     assert not _merged(tmp_path)
 
 
+def test_acceptance_gate_skips_when_a_non_task_cli_task_exits_0_on_garbage(repo, tmp_path):
+    """Opus finding (round 3): the PATH-collision guard was applied only on the exit-1 arm —
+    a foreign `task` (Taskwarrior/go-task) that happens to exit 0 with non-JSON stdout on an
+    unknown `gate` subcommand fell straight into `_acceptance_gate_pass`, which parsed the
+    garbage as "no opt-out reason" and audited a false `authorized`, letting the merge proceed
+    with NOTHING actually verified — a fail-OPEN gate. Exit 0 must be shape-checked too."""
+    r = _run(repo, tmp_path, env={
+        "SHIP_TEST_TASK_GATE_JSON": "Type 'task' for usage.",
+        "SHIP_TEST_TASK_GATE_EXIT": "0",
+    })
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "did not return task-cli's expected JSON shape" in r.stderr
+    assert _merged(tmp_path)
+    (line,) = _audit(tmp_path, "acceptance")
+    assert line["decision"] == "skipped"
+    assert "does not look like task-cli" in line["detail"]
+
+
+def test_acceptance_gate_still_accepts_a_genuine_task_cli_exit_0(repo, tmp_path):
+    """The fix above must not swallow a REAL acceptance — exit 0 with task-cli's own JSON
+    shape still authorizes exactly as before."""
+    r = _run(repo, tmp_path)
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "acceptance gate: HYP-931 accepted" in r.stdout
+    (line,) = _audit(tmp_path, "acceptance")
+    assert line["decision"] == "authorized"
+
+
 def test_magic_close_refuses_when_gh_pr_view_fails(repo, tmp_path):
     """Fable finding (round 2): an earlier version's `|| title=""` made a genuine `gh` failure
     (rate-limited, network blip) indistinguishable from "the title is legitimately empty" —
@@ -439,17 +467,28 @@ def test_magic_close_rewrite_refuses_a_commit_only_hit_with_no_automatic_fix(rep
     assert not _merged(tmp_path)
 
 
-def test_magic_close_rewrite_still_works_when_title_body_hits_coexist_with_a_commit_hit(repo, tmp_path):
-    """A commit-message hit alongside a real title/body hit must not block the normal rewrite
-    of the title/body — only a commit-ONLY hit has no automatic fix."""
+def test_magic_close_rewrite_still_refuses_when_a_commit_hit_coexists_with_a_title_body_hit(repo, tmp_path):
+    """Opus + Fable finding (round 3): an earlier version rewrote the title/body and let the
+    merge PROCEED when a commit hit coexisted — but rewriting title/body does nothing to stop
+    the un-rewritable commit-message keyword from still closing the ticket on merge. The
+    title/body rewrite is harmless and worth keeping, but the ship must still refuse; the audit
+    `detail` must list only what was ACTUALLY rewritten (title/body), never claim the commit
+    phrase was fixed too."""
     r = _run(repo, tmp_path, args=("--rewrite-magic-close",), env={
         "SHIP_TEST_PR_BODY": "Closes #115",
         "SHIP_TEST_PR_COMMITS": "Closes HYP-1295",
     })
-    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "the commit message keyword below was NOT" in r.stderr
+    assert '  in a commit: "Closes HYP-1295"' in r.stderr
+    # the title/body rewrite still lands — it's harmless and worth keeping
     edits = [l for l in _gh_log(tmp_path) if l.startswith("edit ")]
     assert edits == ["edit 1 --body Refs #115"]
-    assert _merged(tmp_path)
+    assert not _merged(tmp_path)
+    (line,) = _audit(tmp_path, "magic-close")
+    assert line["decision"] == "refused"
+    assert "Closes HYP-1295" in line["detail"]  # the un-fixed hit IS in the refusal detail
+    assert "Refs #115" not in line["detail"]  # but never claims the rewritten form as a hit
 
 
 def test_acceptance_gate_ignores_stderr_noise_mixed_with_the_json(repo, tmp_path):

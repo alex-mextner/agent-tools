@@ -2866,17 +2866,29 @@ _magic_close_gate() {
     return 0
   fi
   hits=$(printf '%s\n%s\n%s\n' "$t_hits" "$b_hits" "$c_hits" | sed '/^$/d' | tr '\n' ';' | sed 's/;$//')
+  # `tb_hits` (title+body only, no commits) is what --rewrite-magic-close can actually FIX —
+  # kept separate from `hits` (which also includes commit phrases) for the audit `detail` on
+  # the rewrite path, so that line never claims a rewrite that didn't happen.
+  tb_hits=$(printf '%s\n%s\n' "$t_hits" "$b_hits" | sed '/^$/d' | tr '\n' ';' | sed 's/;$//')
   if [ "$REWRITE_MAGIC_CLOSE" = "1" ]; then
-    if [ -n "$c_hits" ] && [ -z "$t_hits" ] && [ -z "$b_hits" ]; then
-      # Nothing in title/body to rewrite — `gh pr edit` can't touch commit history (and this
-      # script never rewrites/rebases a branch), so there is no automatic fix here.
-      { echo "Refusing: magic-close keyword found only in a COMMIT message of PR #$PR — --rewrite-magic-close can only edit the PR title/body, never commit history (this script never rewrites or rebases a branch)."
+    [ -n "$t_hits" ] || [ -n "$b_hits" ] && _magic_close_rewrite_pr "$title" "$body" "$t_hits" "$b_hits" "$tb_hits"
+    if [ -n "$c_hits" ]; then
+      # A commit-message hit can NEVER be fixed by --rewrite-magic-close — `gh pr edit` can't
+      # touch commit history (and this script never rewrites/rebases a branch) — REGARDLESS of
+      # whether title/body ALSO had hits (review finding, round 3, Opus + Fable: an earlier
+      # version rewrote title/body and let the merge proceed anyway when a commit hit
+      # coexisted, leaving the un-rewritable commit keyword to close the ticket on merge, and
+      # logged a false `rewritten` audit line claiming the commit phrase was fixed too — it
+      # wasn't). Any title/body rewrite above already landed (harmless, and worth keeping); the
+      # merge itself must still be refused.
+      { echo "Refusing: magic-close keyword found in a COMMIT message of PR #$PR — --rewrite-magic-close can only edit the PR title/body, never commit history (this script never rewrites or rebases a branch)."
+        [ -n "$t_hits" ] || [ -n "$b_hits" ] && echo "  (the title/body keyword(s) were rewritten to Refs; the commit message keyword below was NOT — it still closes the ticket on merge.)"
         printf '%s\n' "$c_hits" | sed 's/^/  in a commit: "/; s/$/"/'
         echo "  Fix by hand: amend the offending commit message(s) locally, force-push the branch yourself (ship never does), then re-run ship — or reword just to drop the keyword (e.g. \"see HYP-1295\" instead of \"Fixes HYP-1295\")."; } >&2
       _ticket_gate_audit_log magic-close refused "" "$hits"
       exit 1
     fi
-    _magic_close_rewrite_pr "$title" "$body" "$t_hits" "$b_hits" "$hits"
+    _ticket_gate_audit_log magic-close rewritten "" "$tb_hits"
     return 0
   fi
   { echo "Refusing: magic-close keyword in PR #$PR — it would close the ticket the instant the PR merges, behind task-cli's acceptance gates."
@@ -2885,8 +2897,8 @@ _magic_close_gate() {
     [ -n "$c_hits" ] && printf '%s\n' "$c_hits" | sed 's/^/  in a commit: "/; s/$/"/'
     echo "  Why: GitHub's Closes/Fixes/Resolves #N and Linear's GitHub integration (the same words before a ticket code) move the ticket to Done on merge, so no criterion is ever checked with a proof."
     echo "  Fix: write \"Refs <ref>\" instead (e.g. \"Refs #115\", \"Refs HYP-1295\") — \`gh pr edit $PR --title/--body\` — then re-run ship;"
-    if [ -n "$c_hits" ] && [ -z "$t_hits" ] && [ -z "$b_hits" ]; then
-      echo "       a commit message keyword has no automatic fix — amend it and force-push the branch yourself, or reword to drop the keyword."
+    if [ -n "$c_hits" ]; then
+      echo "       a COMMIT message keyword has no automatic fix — amend it and force-push the branch yourself, or reword to drop the keyword; --rewrite-magic-close can fix a title/body hit but never a commit one."
     else
       echo "       or re-run with --rewrite-magic-close to have ship rewrite the keyword(s) to Refs via 'gh pr edit' and continue."
     fi
@@ -2894,7 +2906,12 @@ _magic_close_gate() {
   _ticket_gate_audit_log magic-close refused "" "$hits"
   exit 1
 }
-_magic_close_rewrite_pr() {  # $1=title $2=body $3=title hits $4=body hits $5=joined hits
+_magic_close_rewrite_pr() {  # $1=title $2=body $3=title hits $4=body hits $5=joined title/body hits
+  # Does NOT itself audit-log a `rewritten` decision on success (review finding, round 3: this
+  # is also called when a commit hit coexists and the overall verdict is still `refused` — the
+  # caller logs exactly ONE final decision per gate invocation, not a `rewritten` line
+  # immediately followed by a `refused` one for the same ship run). A `gh pr edit` FAILURE is
+  # unconditionally terminal either way, so that failure path still audits here.
   local -a edit_args=()
   [ -n "$3" ] && edit_args+=(--title "$(_magic_close_rewrite "$1")")
   [ -n "$4" ] && edit_args+=(--body "$(_magic_close_rewrite "$2")")
@@ -2905,7 +2922,6 @@ _magic_close_rewrite_pr() {  # $1=title $2=body $3=title hits $4=body hits $5=jo
     _ticket_gate_audit_log magic-close refused "" "rewrite-failed: $5"
     exit 1
   fi
-  _ticket_gate_audit_log magic-close rewritten "" "$5"
 }
 
 MAGIC_CLOSE_ENABLED=1
@@ -3114,21 +3130,24 @@ _acceptance_gate() {
     echo "[ship] acceptance gate: task-cli stderr: $(LC_ALL=C tr '\n' ' ' < "$errfile")" >&2
   fi
   [ "$errfile" != "/dev/null" ] && rm -f "$errfile"  # always, not only when -s (review finding: the file leaked on the common empty-stderr path)
+  # `task` is a famously ambiguous command name (Taskwarrior, go-task also install as `task`)
+  # — review finding, round 2 (Opus): `command -v task` alone can resolve to one of those on a
+  # developer's machine. Trust NEITHER exit 0 NOR exit 1 as a genuine task-cli result unless
+  # `$out` has task-cli's OWN JSON shape — an earlier version only guarded the exit-1 arm,
+  # leaving a foreign `task` that happens to exit 0 on garbage (its own "gate" subcommand
+  # succeeding by coincidence, or simply printing nothing) to fail OPEN: `_acceptance_gate_pass`
+  # would parse `""` as "no opt-out reason" and audit a false `authorized`, letting the merge
+  # proceed with NOTHING actually verified (review finding, round 3, Opus).
+  if [ "$rc" = "0" ] || [ "$rc" = "1" ]; then
+    if ! _acceptance_gate_looks_like_task_cli_json "$out"; then
+      echo "[ship] WARNING: acceptance gate could not evaluate ${code} — '$(command -v task)' on PATH did not return task-cli's expected JSON shape (a DIFFERENT 'task' binary — e.g. Taskwarrior or go-task — may be shadowing task-cli). Skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
+      _ticket_gate_audit_log acceptance skipped "$code" "'task' on PATH does not look like task-cli"
+      return 0
+    fi
+  fi
   case "$rc" in
     0) _acceptance_gate_pass "$code" "$out" ;;
-    1)
-      # `task` is a famously ambiguous command name (Taskwarrior, go-task also install as
-      # `task`) — review finding, round 2: `command -v task` alone can resolve to one of
-      # those on a developer's machine, and its exit-1 for an unknown `gate` subcommand looks
-      # identical to a genuine task-cli refusal, blocking EVERY merge with a message that
-      # doesn't hint at the real cause. Only trust exit 1 as a real refusal when `$out` has
-      # task-cli's OWN JSON shape; otherwise this isn't task-cli at all — skip, don't refuse.
-      if _acceptance_gate_looks_like_task_cli_json "$out"; then
-        _acceptance_gate_refuse "$code" "$out"
-      else
-        echo "[ship] WARNING: acceptance gate could not evaluate ${code} — '$(command -v task)' on PATH did not return task-cli's expected JSON shape (a DIFFERENT 'task' binary — e.g. Taskwarrior or go-task — may be shadowing task-cli). Skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
-        _ticket_gate_audit_log acceptance skipped "$code" "'task' on PATH does not look like task-cli"
-      fi ;;
+    1) _acceptance_gate_refuse "$code" "$out" ;;
     *)
       echo "[ship] WARNING: acceptance gate could not evaluate ${code} (task gate exit ${rc}) — skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
       _ticket_gate_audit_log acceptance skipped "$code" "could not evaluate: exit ${rc}" ;;
