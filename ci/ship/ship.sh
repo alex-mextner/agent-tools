@@ -2005,7 +2005,9 @@ fi
 # Prints the first ticket-like token found in $1, or nothing. Tries the repo's own HYP-<n>
 # convention first (case-insensitive, normalized to uppercase), then a generic
 # UPPERCASE-PREFIX-<n> ticket token (2+ uppercase letters, a hyphen, digits) so other repos'
-# conventions (JIRA-style PROJ-123, etc.) are also picked up, then a purely descriptive
+# conventions (JIRA-style PROJ-123, etc.) are also picked up, then a keyword-anchored GitHub
+# issue reference (`Fixes #105`, `Refs #105`) returned literal for repos that track work as
+# plain GitHub issues rather than a lettered ticket prefix, then a purely descriptive
 # review-cli task code (2+ uppercase letters, then 2-OR-MORE hyphen-joined 2+-letter uppercase
 # segments -- 3+ segments total, no digits) so hand-picked codes like `SME-ROADMAP-WORKTREE-NOTE`
 # or `WT-GITIGNORE-EXCLUDE` -- real task codes review-cli's own run-stats log records fine, just
@@ -2046,7 +2048,53 @@ _review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing
   if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z0-9]*(-[A-Z0-9]+)*' \
         | LC_ALL=C grep -xE '[A-Z][A-Z]+(-[A-Z][A-Z]+){2,}' | head -1 || true)
-  printf '%s' "$m"
+  if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
+  # GitHub issue reference (`Fixes #105`, `Refs #105`) — for repos (like conloca-landing) that
+  # track work as GitHub issues rather than Linear/JIRA-style codes. Returned LITERAL, not
+  # normalized: task-cli's own `_route_id_to_project` (tasklib/cli.py) routes a bare GitHub id
+  # by checking `tid.startswith("#")` first — a `GH-<n>`-style rewrite doesn't match that check,
+  # falls through to the Linear-team-prefix branch instead, and `task mark-shipped` fails with
+  # an unroutable-id error. review-cli's own `normalize_task_code` (reviewlib/stats.py) accepts
+  # any non-whitespace, non-control-character token — `#105` passes it unchanged, so there is no
+  # downstream reason to rewrite it.
+  # Only a KEYWORD-ANCHORED local reference qualifies (`Closes|Fixes|Resolves|Refs|References`
+  # immediately before the `#<n>`, GitHub's own closing-keyword grammar plus the `Refs` form used
+  # when the ticket must NOT auto-close on merge). Three hazards rule out a bare `#<n>` anywhere
+  # in the text, all of them concrete because this same helper feeds BOTH the review-quorum
+  # record lookup and the post-merge `task mark-shipped` call:
+  #   - GitHub's qualified cross-repo syntax (`other-org/other-repo#123`, incl. repo names ending
+  #     in `-`/`.`) names an issue in ANOTHER repo; extracting its `#123` would mark an unrelated
+  #     local issue shipped. The keyword form never matches it: `#` must follow the keyword
+  #     directly, never a repo name.
+  #   - a URL fragment (`https://example.org/docs/#105`) or a Markdown anchor is not an issue.
+  #   - an incidental prose mention (`follow-up for #12`, `(#268)`) of an ALREADY-SHIPPED issue
+  #     would resolve to that issue's OLD passed quorum record, granting an unreviewed PR merge
+  #     authority — unlike a wrongly-derived HYP/PROJ token, a referenced GitHub issue routinely
+  #     HAS a record in an issue-tracked repo, so the "fail-closed anyway" reasoning above does
+  #     not hold here.
+  # This arm is the LAST fallback — after the generic PREFIX-<n> arm AND the descriptive
+  # ALL-CAPS arm above — so a `Fixes #45` aside never shadows a real `PROJ-123` or
+  # `SME-ROADMAP-WORKTREE-NOTE` code in the same body (for a descriptive-code repo that aside
+  # would otherwise be the very borrowing path described above). The keyword itself must not be
+  # the TAIL of a repo path (`org/hot-fix#5`, `org/fix#5`, `org/my.fix#5` are all qualified refs),
+  # so the char before it may not be a repo-name char (`-`/`.`) or `/` either; the digits must end
+  # at a non-word boundary (`#123abc` is not an issue ref). Two DISTINCT anchored refs in one text
+  # (`Partially fixes #12 ... Closes #200`) are an ambiguous task code: every other branch of this
+  # gate is fail-closed, so nothing is derived and ship refuses instead of silently taking the
+  # first in document order. The match may swallow at most ONE trailing WORD char (to reject
+  # `#123abc` below) and never the non-word char after the digits: `grep -o` matches don't
+  # overlap, so consuming a `,` in `closes #12,fixes #200` would eat the second ref's leading
+  # boundary and hide the ambiguity. Known limit (POSIX ERE has no lookahead): the guard sees
+  # honest ambiguity with realistic separators (space, `,`, `;`, `.`+space, newline); a second
+  # ref glued on by a word char (`#34xrefs #56`) or by a `/`/`.`/`-` (`#12/fixes #200`) keeps no
+  # admissible leading boundary and stays hidden — an author who can craft that could as well
+  # omit the ref, so it is not defended against. Trade-off, accepted: a bare `#105` with no
+  # keyword (a `fix/#105` branch name, a `#105 widget` title) is NOT derived either — pass
+  # $REVIEW_TASK_CODE.
+  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE \
+      '(^|[^A-Za-z0-9_./-])(close[sd]?|fix(e[sd])?|resolve[sd]?|refs?|references?)[[:space:]]*:?[[:space:]]*#[0-9]+[A-Za-z0-9_]?' \
+      | LC_ALL=C grep -oE '#[0-9]+[A-Za-z0-9_]?$' | LC_ALL=C grep -xE '#[0-9]+' | LC_ALL=C sort -u || true)
+  if [ "$(printf '%s\n' "$m" | LC_ALL=C grep -c '#')" -eq 1 ]; then printf '%s' "$m"; fi
   return 0
 }
 
