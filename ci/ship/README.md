@@ -24,6 +24,8 @@ that isn't actually ready even with a one-liner.
 | UI-touching PR with no screenshot | Same check as [`../screenshots/`](../screenshots/); override with `--no-screenshot-ok`. |
 | **Shippable source changed but the version is UNCHANGED** | A ship of source is a release; the declared version (`pyproject.toml` `version`/`package.json` `"version"`) must be bumped so `--version` stays a real freshness signal (skill: `bump-version-on-release`). Docs-only / pure test/CI PRs are exempt. Override a genuine no-release ship with `--no-version-bump-ok <reason>` (or `SHIP_SKIP_VERSION_BUMP=1`). |
 | **Review-quorum bar not met** (Guard-B, self-merge-authority) | The gate that makes self-merge *"strictly controlled"*. Before merging, ship derives the PR's task code (`$REVIEW_TASK_CODE`, else a `HYP-<n>`/uppercase ticket token, else a purely descriptive ALL-CAPS/hyphenated code — `SME-ROADMAP-WORKTREE-NOTE`-shaped, 3+ segments, no digits — tried against the branch name, then the PR body) and asks review-cli whether that task has >= `SHIP_REVIEW_QUORUM_MIN_ITER` **PASSED** review iterations across >= `SHIP_REVIEW_QUORUM_MIN_ROLES` distinct **BOARD ROLES** among those passed iterations (`review task <code> --check --min-roles N`, retrying without `--min-roles` if the installed review-cli predates role support — review-cli's own history shows no build ever supported both `--quorum-check` and `--min-roles`, so a role-less retry (still reporting real iteration/model data, honestly 0 roles) comes before the legacy `--quorum-check` fallback for pre-rename builds — a failed/degraded review does not count toward the bar). Role-based coverage is the **PRIMARY/default mechanism now** (matching review-cli's own default, review-cli#246) — `--min-roles` is always sent. `SHIP_REVIEW_QUORUM_MIN_MODELS` is enforced **ADDITIONALLY, only when the operator explicitly sets it** — there is no default model floor any more; ship sends `--min-models` to review-cli only in that case, mirroring review-cli's own explicit-vs-default AND logic so an explicit model-floor request can never be silently outvoted by role coverage (or the reverse). All floors are **clamped to a hard minimum of 3** (raise-only; a `0`/negative/below-3 value resolves to 3). Bar met -> ship **re-derives the verdict from the counts** (never trusts the subprocess's `passed` boolean alone), prints `AUTHORITY CONFIRMED`, and proceeds. Bar not met, a quorum reading 0 iterations / 0 distinct roles, no task code, `review`/`jq` missing, or the store unreadable -> **fail-closed refuse**. There is **NO self-service override flag**: a one-time bypass is requested by setting `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM="<justification>"`, which asks Alex **live on Telegram** (via the shared `agenttools_hatch_escalation` lib) and proceeds ONLY on his real-time approval — a blank/bare value is denied. Runs **independently of `--skip-ci`**. Every non-dry-run gated ship appends an audit line (`authorized` / `bypass:approved` / `bypass:denied` / `refused`, now carrying `roles`/`min_roles`/`min_models` alongside `models` — `min_models` reads `0` when the model floor was not enforced) to `SHIP_AUDIT_FILE`; `--dry-run` prints the would-be audit instead. Disable the whole gate with `SHIP_REVIEW_QUORUM=0`. |
+| **Magic-close keyword in the PR title/body** (`Closes #115`, `Fixes HYP-1295`, `Fixes https://github.com/acme/widgets/issues/115`, …) | GitHub's `close/closes/closed/fix/fixes/fixed/resolve/resolves/resolved` (+ Linear's `-ing` forms) followed by `#N`, `owner/repo#N`, a ticket code (`ABC-123`), or a full `https://…/issues/N` or `…/pull/N` URL (GitHub documents the URL form as an equally valid close target) makes GitHub / Linear's GitHub integration move the ticket to **Done the instant the PR merges** — behind task-cli's close gates, so the ticket ends up Done with empty checkboxes (127 of 435 HYP tickets since June 2026; HYP-1440, HYP-1347, HYP-1295). Ship refuses and prints the exact phrase(s) (`in the body: "Closes #115"`) with the fix: write **`Refs <ref>`** (links without closing). `--rewrite-magic-close` rewrites the keyword(s) to `Refs` via `gh pr edit` (audited, `decision: rewritten`) and continues. Case-insensitive; a colon between keyword and reference is NOT a close (`fix: HYP-1295 …` conventional titles pass). Runs under `--dry-run` (same refusal; the edit is only printed). Audited to `SHIP_AUDIT_FILE` (`gate:"magic-close"`, `refused` / `rewritten`, matched phrases in `detail`). Disable with `SHIP_MAGIC_CLOSE_GATE=0`. |
+| **Ticket not accepted** (`task gate <code>` exit 1) | The pre-merge **acceptance gate** (task-cli#115 / #521). When task-cli is on PATH and a ticket code is derivable (branch → PR title → PR body — the same derivation the post-merge notify uses), ship runs `task gate <code> --json` BEFORE merging and refuses while the ticket has **unchecked** criteria or criteria **checked without a proof** — printing them (`[3] survives a restart (unchecked)`) with the fix (`task accept <code>` / `task check <code> <n> … --proof …`). A ticket whose acceptance is inherently post-merge (a release publish) records `task change <code> --post-merge-acceptance "<reason>"` ON the ticket: the gate then passes and the reason lands in the audit line (`decision: authorized:post-merge-opt-out`). task-cli absent / foreign `--repo` / no derivable code / `task gate` exit 2 (could not evaluate — unknown ticket, backend error) → logged **skip**, never a refusal. Runs under `--dry-run`. Disable with `SHIP_ACCEPTANCE_GATE=0` (env, or a committed `.ship-config` line). Contract below. |
 | Local branch has unpushed/diverged commits, or dirty worktree | Avoids merging stale/uncommitted local state. |
 
 Then it squash-merges, deletes the remote branch, removes the local branch+worktree
@@ -123,7 +125,9 @@ Nothing org-/tracker-/layout-specific is hard-coded. Configure via env:
 | `SHIP_REVIEW_QUORUM_MIN_MODELS` | `3` if set, else unenforced | Quorum floor: distinct models across those PASSED iterations. **Only takes effect if you explicitly set this env var** — there is no default model floor any more (role-based coverage is the default); `3` is merely the clamp floor the value resolves to once you opt in, same as `MIN_ITER`. Setting it to ANY value — including `0` or blank — counts as opting in and is clamped up to 3 (never treated as "explicitly disabled"; only leaving the var **completely unset** skips the model floor). When set, ship also passes `--min-models` to review-cli, so BOTH floors are required together (mirrors review-cli's own explicit-vs-default AND logic, review-cli#246). |
 | `REVIEW_TASK_CODE` | (auto) | The PR's task code for the quorum gate. Unset → derived from a `HYP-<n>`/uppercase ticket token, then a purely descriptive ALL-CAPS/hyphenated code (`SME-ROADMAP-WORKTREE-NOTE`-shaped, 3+ segments, no digits), tried against the branch name then the PR body; none found → fail-closed refuse. |
 | `RIG_HATCH_REQUEST_SHIP_REVIEW_QUORUM` | (unset) | One-time bypass request for a not-met quorum bar: set to a written justification to ask Alex live on Telegram (shared `agenttools_hatch_escalation` lib); proceeds ONLY on his real-time approval. Under `--dry-run`, the helper reports the would-be request but does not contact `tg-ctl` or write a bypass audit line. Blank/bare values denied. **No self-service reason flag exists.** The lib is imported from a fixed path relative to `ship.sh`, and tg-ctl is resolved from a rig.yaml in the OS account's **real home** (`pwd.getpwuid` — **not** the `$HOME` env var, **not** the PR's repo) then a trusted-paths allowlist. So neither an env var (including a doctored `HOME`) nor a rig.yaml the PR commits can redirect approval to a stub. |
-| `SHIP_AUDIT_FILE` | `~/.config/agent-tools/ship-audit.jsonl` | JSONL audit log; one line per non-dry-run gated ship. Review-quorum decisions: `authorized` / `bypass:approved` / `bypass:denied` / `refused` (with a `task_code`, plus `roles`/`min_roles`/`models`/`min_models` — `min_models` is `0` when the model floor was NOT enforced for that decision, since a genuinely enforced floor is always clamped to >=3 and can never legitimately be `0`; note the `bypass:approved` line is written by the shared `agenttools_hatch_escalation` lib and does not yet carry the roles/min_models fields — see the code comment at the DENIED-case call site, tracked as agent-tools#414). `--skip-ci` decisions: `skipci:bypass:approved` / `skipci:bypass:denied` / `skipci:refused` (with `gate":"skip-ci"`). External-review decisions: `external-review:refused` / `external-review:bypass:approved` / `external-review:bypass:denied` (with `gate":"external-review"`). `--known-flake` decisions: `confirmed` / `confirmed-local-gate-failed` / `refused` (with `"gate":"known-flake"` and the asserted check names) — `confirmed` is written only after `gh pr merge` actually succeeds, never merely after the claim checks out. |
+| `SHIP_ACCEPTANCE_GATE` | enabled | Set to `0` to disable the pre-merge acceptance gate (`task gate`) — ops off-switch, also accepted as a committed `.ship-config` line. The per-ticket opt-out is `task change <code> --post-merge-acceptance "<reason>"`, not this. |
+| `SHIP_MAGIC_CLOSE_GATE` | enabled | Set to `0` to disable the magic-close keyword gate. |
+| `SHIP_AUDIT_FILE` | `~/.config/agent-tools/ship-audit.jsonl` | JSONL audit log; one line per non-dry-run gated ship. Review-quorum decisions: `authorized` / `bypass:approved` / `bypass:denied` / `refused` (with a `task_code`, plus `roles`/`min_roles`/`models`/`min_models` — `min_models` is `0` when the model floor was NOT enforced for that decision, since a genuinely enforced floor is always clamped to >=3 and can never legitimately be `0`; note the `bypass:approved` line is written by the shared `agenttools_hatch_escalation` lib and does not yet carry the roles/min_models fields — see the code comment at the DENIED-case call site, tracked as agent-tools#414). `--skip-ci` decisions: `skipci:bypass:approved` / `skipci:bypass:denied` / `skipci:refused` (with `gate":"skip-ci"`). External-review decisions: `external-review:refused` / `external-review:bypass:approved` / `external-review:bypass:denied` (with `gate":"external-review"`). `--known-flake` decisions: `confirmed` / `confirmed-local-gate-failed` / `refused` (with `"gate":"known-flake"` and the asserted check names) — `confirmed` is written only after `gh pr merge` actually succeeds, never merely after the claim checks out. Acceptance-gate decisions: `authorized` / `authorized:post-merge-opt-out` / `refused` / `skipped` / `auto-closed` / `auto-close-failed` (with `"gate":"acceptance"`, a `task_code` when one was derived, and a `detail` — the opt-out reason, `criteria=3 unchecked=3 proofless=2`, or why it was skipped; `auto-closed`/`auto-close-failed` are the post-merge `task done <code>` this gate also runs when everything was already proven — see "Auto-close" below). Magic-close decisions: `refused` / `rewritten` (with `"gate":"magic-close"` and the matched phrases in `detail`, `;`-joined). |
 
 ### Migrating to the role-based default (review-cli#246)
 
@@ -183,6 +187,10 @@ model floor too), not just the role requirement.
   **not** a verified fix. A still-valid bot finding on rewritten/rebased code can therefore be
   auto-closed; use the flag only when you trust the bot threads are genuinely addressed. A
   severity-aware gate (never auto-close a P0/P1/security bot thread) is a tracked follow-up.
+- `--rewrite-magic-close` — when the magic-close gate finds `Closes/Fixes/Resolves <ref>` in the
+  PR title or body, rewrite the keyword(s) to `Refs` via `gh pr edit` (audited, `rewritten`) and
+  continue instead of refusing. Only the field that matched is edited; the rest of the text is
+  untouched. Under `--dry-run` the edit is printed, not made.
 - `--screenshot <path> [desc]` — upload (via `SHIP_IMAGE_UPLOAD_CMD`) and post a screenshot
   as a PR comment; repeatable.
 - `--known-flake <check-name>` — assert that the FAILED check named `<check-name>` (exactly as
@@ -202,6 +210,78 @@ agent-tools checkout (or via `gh ship` pointed at it) to use the hatch. A bare `
 ~/bin/ship` copy can still *enforce* the gate but can't reach the lib, so a bypass request from a
 detached copy **fails closed** (refuses) — that's intentional, not a bug.
 
+## The acceptance gate's contract with task-cli (`task gate <code> --json`)
+
+Kept byte-for-byte identical on both ends — this section and task-cli's README "The pre-merge
+gate" describe the same thing; a change is a two-repo change.
+
+```
+task gate <code>            # exit 0 = accepted; 1 = NOT accepted; 2 = could not evaluate
+task gate <code> --json     # exit 0 and 1 print one JSON object; exit 2 prints `error: …` (not JSON)
+```
+
+```json
+{
+  "id": "HYP-1440", "ok": false, "state": "done", "gate_enabled": true,
+  "post_merge_acceptance": null,          // or the recorded opt-out reason (string)
+  "criteria": 3,                          // total count; 0 => refused (nothing to accept)
+  "below_minimum": false,                 // true when criteria < this repo's acceptance_min, not skipped
+  "unchecked": [{"index": 3, "text": "survives a restart"}],
+  "proofless": [{"index": 2, "text": "handles the empty case"}]   // checked without a proof/force reason
+}
+```
+
+- **The verdict is the exit code.** Ship never re-derives it from the JSON, so a jq-less
+  machine still gates correctly; the JSON only shapes the refusal message and the audit `detail`.
+- Exit 0 covers: every criterion checked with a proof (or a `--force` reason) AND at least the
+  configured minimum count; a recorded `post_merge_acceptance` (ship prints the reason and writes
+  `authorized:post-merge-opt-out`); the gate disabled in that repo's task config
+  (`gate_enabled: false`); a cancelled ticket.
+- Exit 1 covers: any `unchecked` or `proofless` criterion, `criteria: 0`, or `below_minimum:
+  true`. **`below_minimum` can be true with BOTH `unchecked` and `proofless` EMPTY** — a ticket
+  below its configured minimum (e.g. one fully-proven criterion, minimum two) refuses on count
+  alone, not on any specific criterion's proof — ship's own refusal message checks this field,
+  and any other consumer must too, or a refusal like this prints with nothing listed under it.
+  `index` is the 1-based position in the full criteria list — the number `task check <code> <n>`
+  takes. `unchecked`/`proofless` are always populated, even on a passing opt-out, so the shipper
+  sees what is still owed after the merge.
+- Exit 2 (unknown id, backend error) is a logged skip on ship's side — not evidence either way.
+- Ship's own knobs: `SHIP_ACCEPTANCE_GATE=0` (env or committed `.ship-config`) disables the
+  gate; there is no reason flag — the opt-out lives ON the ticket, where `task done` and an
+  auditor can see it.
+
+The code derivation is `_ship_derive_task_code_for_notify` (branch name → PR title → PR body,
+each candidate validated to contain a digit) — the same function the post-merge
+`task mark-shipped` notify uses, so the ticket ship gates on is the ticket it later marks shipped.
+
+### Auto-close: the merge itself finishes the ticket when nothing is left to prove
+
+A gate that only REFUSES a bad merge does not by itself close the gap it exists for: tg-cli#301
+shipped for real via PR #305 (every criterion independently verified against the merged code)
+yet sat OPEN for days, because closing it needed a separate `task done` nobody remembered to run
+after the merge. So when the pre-merge acceptance gate finds every criterion **already** checked
+with a proof — a genuine pass, never the post-merge opt-out, where acceptance is deliberately not
+yet true — the post-merge notify step also runs `task done <code>` right there, immediately after
+`task mark-shipped`. There is nothing left to prove at that point; `task done` is a formality
+task-cli should be asked to do, not a step left for a human to remember.
+
+Best-effort, like the rest of the notify step: `task done` still enforces every OTHER close gate
+(formatting, links, screenshots, msgref, …), so a genuine refusal there is expected sometimes and
+only ever WARNS with the manual fallback (`task done <code>`) — it never fails the ship (the merge
+already succeeded and is durable). Runs only when `SHIP_TASK_NOTIFY_ENABLED` reaches that far (the
+same switch as the notify step) and the acceptance gate genuinely ran and passed for THIS PR's own
+derived code — a gate that was skipped, disabled, refused (unreachable — ship would already have
+exited), or passed only via the opt-out never triggers an auto-close. "Genuinely passed" is
+narrower than a bare `ok: true`: the JSON's `post_merge_acceptance` must be `null`,
+`gate_enabled` must not be `false`, and `state` must not be `"cancelled"` — a cancelled ticket
+or one whose `acceptance_checked` gate is disabled for this repo also exits 0, but neither has
+"nothing left to prove" in the sense that makes an automatic `task done` sensible; without `jq`
+(so that distinction can't be verified from the JSON at all) auto-close never fires either.
+stdout and stderr from `task gate` are captured SEPARATELY — any diagnostic line task-cli
+writes to stderr is logged on its own, never mixed into the text `jq` parses as JSON. Audited
+to `SHIP_AUDIT_FILE` as a THIRD acceptance-gate decision alongside `authorized`/`refused`/`skipped`: `auto-closed` /
+`auto-close-failed`.
+
 ## What was stripped vs an internal version
 
 This is generalized from a real in-house ship script. Removed/parameterized: any issue-
@@ -214,5 +294,6 @@ want tracker integration back, set `SHIP_IMAGE_UPLOAD_CMD` to your tracker's att
 
 When you merge PRs from the CLI and want the merge to be impossible unless the PR is green,
 its threads resolved, a review-dwell window elapsed (so review questions had time to form),
-and (for UI) its screenshot present — without trusting yourself to remember. The CI workflows
-in this directory are the server-side backstop; `ship` is the client-side gate.
+(for UI) its screenshot present, its ticket accepted with proofs, and no magic-close keyword
+waiting to close that ticket behind the gates — without trusting yourself to remember. The CI
+workflows in this directory are the server-side backstop; `ship` is the client-side gate.
