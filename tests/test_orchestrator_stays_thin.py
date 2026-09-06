@@ -208,9 +208,9 @@ def test_repro_chain_still_warns_then_blocks_with_harness_claude_code(tmp_path, 
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"  # repeat: BLOCK
 
 
-@pytest.mark.parametrize("harness", ["codex", "opencode"])
+@pytest.mark.parametrize("harness", ["codex", "opencode", "omp"])
 def test_repro_chain_allowed_silently_for_exempt_harness(tmp_path, monkeypatch, harness):
-    """The SAME repro chain, tagged with a top-level `harness` a codex/opencode bridge would
+    """The SAME repro chain, tagged with a top-level `harness` a codex/opencode/omp bridge would
     set, is allowed silently on every call — no WARN, no BLOCK, no tier ever primed. Checks the
     marker dir directly (not just the decision), since a first-offense WARN also decides
     "allow" — only an empty marker dir proves no tier was primed at all (Fable review round 3)."""
@@ -223,7 +223,7 @@ def test_repro_chain_allowed_silently_for_exempt_harness(tmp_path, monkeypatch, 
     assert not marker_dir.exists() or not list(marker_dir.iterdir())
 
 
-@pytest.mark.parametrize("harness", ["codex", "opencode"])
+@pytest.mark.parametrize("harness", ["codex", "opencode", "omp"])
 def test_exempt_harness_also_exempts_code_write(tmp_path, monkeypatch, harness):
     """Same exemption on the pre-write side: a non-docs code write tagged with an exempt
     `harness` is allowed even on repeat, and never primes a tier marker either."""
@@ -258,31 +258,36 @@ def test_forged_args_harness_does_not_exempt(tmp_path, monkeypatch):
     assert c == ost.BLOCK_EXIT_CODE and _decision(out) == "block"
 
 
-def test_exempt_harnesses_constant_is_codex_and_opencode_only():
+def test_exempt_harnesses_constant_is_exactly_codex_opencode_omp():
     """Documents the allowlist's exact membership — `claude-code` (or anything else) must never
     be added here, or the gate would exempt the very orchestrator it exists to govern."""
-    assert ost.EXEMPT_HARNESSES == frozenset({"codex", "opencode"})
+    assert ost.EXEMPT_HARNESSES == frozenset({"codex", "opencode", "omp"})
 
 
-def test_codex_and_opencode_bridge_harness_constants_are_pinned_to_the_allowlist():
+def test_exempt_bridge_harness_constants_are_pinned_to_the_allowlist():
     """Cross-module regression guard: `EXEMPT_HARNESSES` and the bridges' `HARNESS` constants
-    are independently hardcoded strings in three different files. Nothing else ties them
+    are independently hardcoded strings in four different files. Nothing else ties them
     together — a rename on either side (e.g. `codex_hook_bridge.HARNESS` to `"codex-cli"`)
     would silently reintroduce the #533 block for that harness with an otherwise-green suite,
     because every OTHER test here hand-builds `{"harness": "codex"}` rather than importing the
     bridge's own constant. This test is the one place that would catch it."""
     import cc_hook_bridge.dispatch as cc_dispatch
     import codex_hook_bridge.dispatch as codex_dispatch
+    import omp_hook_bridge.dispatch as omp_dispatch
     import opencode_hook_bridge.dispatch as opencode_dispatch
 
     assert codex_dispatch.HARNESS in ost.EXEMPT_HARNESSES
     assert opencode_dispatch.HARNESS in ost.EXEMPT_HARNESSES
+    assert omp_dispatch.HARNESS in ost.EXEMPT_HARNESSES
     # The property that actually protects the orchestrator: CC's OWN harness must NEVER be in
     # the allowlist, or this gate would exempt the very orchestrator it exists to govern.
     assert cc_dispatch.HARNESS not in ost.EXEMPT_HARNESSES
 
 
-@pytest.mark.parametrize("bridge_module", ["codex_hook_bridge.dispatch", "opencode_hook_bridge.dispatch"])
+@pytest.mark.parametrize(
+    "bridge_module",
+    ["codex_hook_bridge.dispatch", "opencode_hook_bridge.dispatch", "omp_hook_bridge.dispatch"],
+)
 def test_real_bridge_to_v1_event_output_is_exempt_end_to_end(tmp_path, monkeypatch, bridge_module):
     """Feeds an ACTUAL bridge-produced `to_v1_event(...)` output (not a hand-built fixture)
     through the real hook — the integration point Codex review flagged as missing: every other
@@ -297,6 +302,14 @@ def test_real_bridge_to_v1_event_output_is_exempt_end_to_end(tmp_path, monkeypat
             "tool_name": "Bash",
             "tool_input": {"command": _REPRO_CHAIN},
             "cwd": "/repo",
+        }
+    elif bridge_module == "omp_hook_bridge.dispatch":
+        raw_event = {
+            "event": "tool_call",
+            "toolName": "bash",
+            "input": {"command": _REPRO_CHAIN},
+            "cwd": "/repo",
+            "toolCallId": "call_1",
         }
     else:
         raw_event = {
