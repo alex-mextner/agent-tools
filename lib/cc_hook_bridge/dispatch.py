@@ -278,13 +278,59 @@ def _warn(msg: str) -> None:
     sys.stderr.write(f"cc-hook-bridge: {msg}\n")
 
 
+def _inbox_text(hook_event_name: str, cc_event: dict) -> str:
+    """The tg-ctl Stop-hook inbox (agent-tools#526 / tg-cli#306): the pending Telegram
+    messages for THIS agent, consumed (archived, at-most-once) and rendered as block-
+    reason text, so CC feeds them to the agent as its next instruction — the tmux-free
+    delivery channel for a session tg-ctl cannot reach with send-keys. "" when there is
+    nothing: empty / missing / malformed inbox, the reader lib absent, or any failure
+    locating the agent (never blocks on its own; one stderr line).
+    """
+    if hook_event_name != "Stop":
+        return ""
+    try:
+        from agenttools_tg_inbox import agent_key_for_process, stop_inbox_text
+    except Exception as exc:  # noqa: BLE001 - optional lib; its absence must not block a stop
+        _warn(f"tg inbox reader unavailable, skipping inbox check: {exc}")
+        return ""
+    cwd = cc_event.get("cwd") or os.getcwd()
+    session_id = str(cc_event.get("session_id") or "")
+    return stop_inbox_text(lambda: agent_key_for_process(cwd), session_id=session_id, warn=_warn)
+
+
+def _combine_block(hook_event_name: str, inbox_text: str, hook_reason: str | None) -> dict | None:
+    """One block carrying BOTH the inbox messages and a blocking stop hook's reason.
+
+    The v1 `stop` descriptors always run (a fail-closed gate there must never be starved
+    by a busy inbox); when one blocks, its reason follows the human's messages in the
+    same block, so neither is deferred a turn. The rule itself (incl. "an empty-reason
+    block still blocks") is `agenttools_tg_inbox.combine_stop_parts`, shared with the
+    Codex bridge; without the lib, a hook block passes through unchanged.
+    """
+    try:
+        from agenttools_tg_inbox import combine_stop_parts
+    except Exception:  # noqa: BLE001 - optional lib: no inbox, plain hook semantics
+        return None if hook_reason is None else cc_block_output(hook_event_name, hook_reason)
+    reason = combine_stop_parts(inbox_text, hook_reason)
+    return None if reason is None else cc_block_output(hook_event_name, reason)
+
+
 def dispatch(hook_event_name: str, cc_event: dict) -> dict | None:
     """Run the applicable v1 hooks for this CC event; return the CC block JSON or None.
 
     None = no hook blocked → emit nothing (the tool proceeds through CC's normal flow).
     First block wins; its reason is surfaced to the model. Errors here are caught by the
-    caller and turned into a fail-OPEN allow.
+    caller and turned into a fail-OPEN allow. On Stop, pending tg-ctl inbox messages are
+    delivered in the same block (see `_inbox_text` / `_combine_block`) — consumed LAST,
+    after the hooks ran: consuming is irreversible, and a hook that raises would
+    otherwise have eaten a message the agent never saw.
     """
+    hook_reason = _first_hook_block(hook_event_name, cc_event)
+    return _combine_block(hook_event_name, _inbox_text(hook_event_name, cc_event), hook_reason)
+
+
+def _first_hook_block(hook_event_name: str, cc_event: dict) -> str | None:
+    """The reason of the first blocking v1 hook for this event, or None."""
     tool_name = cc_event.get("tool_name")
     point = point_for_event(hook_event_name, tool_name)
     if point is None:
@@ -300,7 +346,7 @@ def dispatch(hook_event_name: str, cc_event: dict) -> dict | None:
     for spec in specs:
         outcome, reason = run_hook(spec, v1_event, warn=_warn)
         if outcome == "block":
-            return cc_block_output(hook_event_name, reason)
+            return reason
     return None
 
 

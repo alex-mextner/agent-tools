@@ -121,8 +121,49 @@ def hooks_dir() -> Path:
     return Path(os.path.expanduser("~/.codex/hooks"))
 
 
+def _inbox_text(hook_event_name: str, codex_event: dict) -> str:
+    """Pending tg-ctl inbox messages for this Codex session, consumed and rendered as
+    block-reason text (agent-tools#526); "" when nothing / on any failure (fail-open).
+
+    Codex has no ``--name``, so the key is ALWAYS the cwd hash — computed directly with
+    ``agent_key(None, cwd)``, never via ``agent_key_for_process``: a Codex started from a
+    Claude-owned shell inherits ``CLAUDE_PID`` and would otherwise key on the Claude
+    session's name.
+    """
+    if hook_event_name != "Stop":
+        return ""
+    try:
+        from agenttools_tg_inbox import agent_key, stop_inbox_text
+    except Exception as exc:  # noqa: BLE001 - optional lib; never block a stop over it
+        _warn(f"tg inbox reader unavailable, skipping inbox check: {exc}")
+        return ""
+    cwd = codex_event.get("cwd") or os.getcwd()
+    session_id = str(_event_id(codex_event) or "")
+    return stop_inbox_text(lambda: agent_key(None, cwd), session_id=session_id, warn=_warn)
+
+
+def _combine_block(inbox_text: str, hook_reason: str | None) -> dict | None:
+    """One block for BOTH the inbox messages and a blocking hook's reason — the rule is
+    `agenttools_tg_inbox.combine_stop_parts`, shared with the CC bridge (an empty-reason
+    block still blocks); without the lib, a hook block passes through unchanged."""
+    try:
+        from agenttools_tg_inbox import combine_stop_parts
+    except Exception:  # noqa: BLE001 - optional lib: no inbox, plain hook semantics
+        return None if hook_reason is None else codex_block_output(hook_reason)
+    reason = combine_stop_parts(inbox_text, hook_reason)
+    return None if reason is None else codex_block_output(reason)
+
+
 def dispatch(hook_event_name: str, codex_event: dict) -> dict | None:
-    """Run the applicable v1 hooks for this Codex event."""
+    """Run the applicable v1 hooks for this Codex event; on Stop, pending tg-ctl inbox
+    messages ride in the same block as a blocking hook's reason (the hooks always run,
+    and run FIRST — consuming the inbox is irreversible, so it is the last step)."""
+    hook_reason = _first_hook_block(hook_event_name, codex_event)
+    return _combine_block(_inbox_text(hook_event_name, codex_event), hook_reason)
+
+
+def _first_hook_block(hook_event_name: str, codex_event: dict) -> str | None:
+    """The reason of the first blocking v1 hook for this event, or None."""
     tool_name = codex_event.get("tool_name")
     point = point_for_event(hook_event_name, tool_name)
     if point is None:
@@ -139,7 +180,7 @@ def dispatch(hook_event_name: str, codex_event: dict) -> dict | None:
         for v1_event in v1_events:
             outcome, reason = run_hook(spec, v1_event, warn=_warn)
             if outcome == "block":
-                return codex_block_output(reason)
+                return reason
     return None
 
 
