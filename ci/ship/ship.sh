@@ -2783,7 +2783,12 @@ _ship_code_names_this_pr() {  # $1 = candidate code; true (exit 0) iff it is thi
     [Gg][Hh]-*) n="${n#*-}" ;;
   esac
   case "$n" in '' | *[!0-9]*) return 1 ;; esac
-  [ -n "$PR" ] && [ "$n" = "$PR" ]
+  # Compare NUMERIC values, not strings (review round 2, Codex P2): `#01`/`GH-01` under PR #1
+  # passes the grammar above, and a literal `"01" = "1"` string compare would call it "not this
+  # PR" — handing the gate the PR itself, the exact #499 hole this guard closes. `10#` forces
+  # base 10 so a zero-padded code is never read as octal. Both sides are digits-only here ($PR
+  # is ship.sh's numeric first positional), so the arithmetic cannot fail.
+  [ -n "$PR" ] && [ "$((10#$n))" = "$((10#$PR))" ]
 }
 
 # One candidate's full admission test, so every source below applies the SAME two rules.

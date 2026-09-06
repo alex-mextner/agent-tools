@@ -845,6 +845,23 @@ def test_acceptance_gate_rejects_the_bare_pull_request_number_as_a_ticket_code(r
     assert _task_calls(tmp_path) == ["gate HYP-931 --json"], _task_calls(tmp_path)
 
 
+def test_acceptance_gate_rejects_a_zero_padded_pull_request_number(repo, tmp_path):
+    """`#01` / `GH-01` under PR #1 are the SAME pull request, but a literal string compare would
+    call them "not this PR" and gate the PR against itself — the #499 hole, reopened by
+    zero-padding (review round 2, Codex P2). The comparison is numeric, so they are rejected."""
+    for code in ("#01", "GH-01", "001"):
+        r = _run(repo, tmp_path, branch="feat", env={
+            "TASK_CODE": code,
+            "SHIP_TEST_PR_TITLE": "feat: the thing",
+            "SHIP_TEST_PR_BODY": _FELL_THROUGH_BODY,
+            "SHIP_TEST_TASK_GATE_JSON": _NOT_ACCEPTED, "SHIP_TEST_TASK_GATE_EXIT": "1",
+        })
+        assert r.returncode == 1, f"{code}: STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+        assert _task_calls(tmp_path) == ["gate HYP-931 --json"], (code, _task_calls(tmp_path))
+        (tmp_path / "task.log").unlink(missing_ok=True)
+        (tmp_path / "audit.jsonl").unlink(missing_ok=True)
+
+
 def test_acceptance_gate_still_accepts_a_bare_issue_number(repo, tmp_path):
     """A bare `382` IS a task-cli id (GitHub issue) — the real shape must not over-reject it
     (the audit shows ship gating on exactly this form)."""
