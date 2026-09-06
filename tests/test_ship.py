@@ -6129,12 +6129,14 @@ def _ship_bash_functions(*names: str) -> str:
 
 
 def _extract_ticket_with_own_repo(bodies, *, cwd: Path, origin_repo: str, live_pr_url: str | None):
-    """Run `_review_quorum_extract_ticket` on each body inside ONE shell whose checkout origin
-    slug is `origin_repo` and whose `gh pr view --json url` prints `live_pr_url` (None = the
-    call fails). Returns the derived codes in order ("" = nothing derived)."""
+    """Run the candidate extractor on each body inside ONE shell whose checkout origin slug is
+    `origin_repo` and whose `gh pr view --json url` prints `live_pr_url` (None = the call
+    fails). Returns the FIRST derived code per body, in order ("" = nothing derived) — these
+    bodies carry only issue URLs, so the URL arm's at-most-one candidate is the whole list."""
     fns = _ship_bash_functions(
-        "_review_quorum_extract_ticket", "_ship_own_repo_issue_numbers",
-        "_ship_own_repo_slugs", "_ship_normalize_repo_slug",
+        "_review_quorum_extract_ticket_candidates", "_review_quorum_extract_github_issue_ref",
+        "_review_quorum_extract_own_repo_issue_url", "_ship_own_repo_issue_numbers",
+        "_ship_foreign_repo_issue_urls", "_ship_own_repo_slugs", "_ship_normalize_repo_slug",
     )
     gh_stub = "gh() { return 1; }" if live_pr_url is None else f"gh() {{ printf '%s\\n' '{live_pr_url}'; }}"
     script = "\n".join([
@@ -6142,7 +6144,7 @@ def _extract_ticket_with_own_repo(bodies, *, cwd: Path, origin_repo: str, live_p
         f"PR=7; GH_REPO=''; _CWD_ORIGIN_REPO='{origin_repo}'",
         "_SHIP_OWN_REPO_SLUGS=''; _SHIP_OWN_REPO_SLUGS_RESOLVED=0",
         gh_stub, fns,
-        'for b in "$@"; do printf \'%s\\n\' "$(_review_quorum_extract_ticket "$b")"; done',
+        'for b in "$@"; do printf \'%s\\n\' "$(_review_quorum_extract_ticket_candidates "$b" | head -1)"; done',
     ])
     r = _sh("bash", "-c", script, "extract", *bodies, cwd=cwd)
     assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"

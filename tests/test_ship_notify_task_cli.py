@@ -437,7 +437,7 @@ def test_looks_like_a_ticket_id_pins_task_cli_grammar(tmp_path):
 
 def test_notify_normalizes_a_gh_code_derived_literally_from_the_branch_name(repo_with_pr_worktree, tmp_path):
     """Regression on the SAME bug, reached via a DIFFERENT path than the $TASK_CODE reuse above:
-    a branch literally named "GH-105-..." is matched by _review_quorum_extract_ticket's generic
+    a branch literally named "GH-105-..." is matched by _review_quorum_extract_ticket_candidates's generic
     PREFIX-<n> arm (`[A-Z][A-Z]+-[0-9]+`, the same arm that matches this repo's own HYP-<n>
     convention) and derived as "GH-105" -- #511 only stopped that matcher from SYNTHESIZING
     "GH-<n>" out of a bare "Fixes #105"; it never taught the generic arm to reject a "GH-<n>"
@@ -623,7 +623,7 @@ def test_notify_skipped_when_pr_url_cannot_be_resolved(repo_with_pr_worktree, tm
 def test_notify_rejects_a_digit_free_false_positive_code(repo_with_pr_worktree, tmp_path):
     """A generic PR title can trip the matcher's purely-descriptive arm (e.g. "DO-NOT-MERGE
     experimental spike" -> "DO-NOT-MERGE", a documented accepted false positive of the
-    matcher — see ship.sh's own comment on _review_quorum_extract_ticket) — real task-cli
+    matcher — see ship.sh's own comment on _review_quorum_extract_github_issue_ref) — real task-cli
     ticket ids always carry a numeric suffix (HYP-931, #123), so a digit-free "code" must
     never reach `task mark-shipped` (review finding: it would either fail confusingly against
     an unrelated existing ticket, or in the worst case silently mark the WRONG ticket

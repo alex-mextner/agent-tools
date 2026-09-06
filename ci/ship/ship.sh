@@ -141,7 +141,15 @@
 #                          descriptive ALL-CAPS code, a keyword-anchored `Refs #<n>`, or a full
 #                          issue URL of THIS repo (https://github.com/<owner>/<repo>/issues/<n>
 #                          — the shape task-cli's links gate demands; both yield the literal
-#                          `#<n>`). If none is found, the gate refuses (fail-closed) with guidance.
+#                          `#<n>`). EVERY such token of a source is tried in order (an incidental
+#                          `UTF-8` or a `GH-<this PR>` ahead of the real code no longer hides it,
+#                          agent-tools#571), and a GitHub-issue code is looked up under BOTH
+#                          spellings, `#<n>` and `GH-<n>` (review-cli keys records by the literal
+#                          --task string; agents type GH-<n>, PR bodies say `Refs #<n>` —
+#                          agent-tools#572); the spelling that meets the bar is the one the
+#                          AUTHORITY line and the audit record name. An explicit REVIEW_TASK_CODE
+#                          gets the same dual lookup. If none is found, the gate refuses
+#                          (fail-closed) with guidance.
 #   SHIP_REVIEW_QUORUM_ENABLED / SHIP_REVIEW_QUORUM  set either to 0 to disable the
 #                          review-quorum gate entirely (default: enabled).
 #   SHIP_TASK_NOTIFY_ENABLED  set to 0/false/no to disable the post-merge task-cli notify step
@@ -2551,6 +2559,264 @@ _skip_ci_hatch_gate() {
   exit 1
 }
 
+# --- review-quorum lookup: candidate scan + spelling twins (agent-tools#571 / #572) ---------
+#
+# The gate used to take the FIRST ticket-like token of the branch (else the PR body) and query
+# review-cli for that one spelling. Two live failures on 2026-09-06: an incidental token ahead
+# of the real code hid it (#571 — the same shape the acceptance gate's derivation fixes further
+# down), and a `Refs #565` body derived `#565` while every review had been recorded as `GH-565`,
+# the spelling agents type because `#` needs quoting (#572). Now every candidate of a source is
+# tried in order, and each is looked up under BOTH spellings of a GitHub-issue code:
+#   - a candidate (either spelling) that MEETS the bar authorizes — under THAT spelling, which is
+#     what the AUTHORITY line and the audit record name (#572, acceptance criterion 2);
+#   - a candidate with a record that FALLS SHORT is THE task: refuse, never borrow a later
+#     candidate's (possibly already-shipped) record — the twin spelling is still tried first,
+#     since the reviews may all live under it;
+#   - a candidate with NO record under either spelling (review-cli answers `total_iterations: 0`
+#     plus `error: no recorded review iterations for …` — JSON on stdout, exit 1) is not this
+#     PR's review record: the scan moves to the next candidate, then to the next source (env →
+#     branch → body; the body is fetched only when no branch candidate has a record). Precedence
+#     is preserved because a record-less candidate could never have authorized anyway, and every
+#     later candidate must meet the bar on its own;
+#   - an EMPTY answer on every query tier ("could not query": store unreadable, ancient build) is
+#     a review-cli failure, not a verdict on the code — refuse at once, no continuation.
+# Admission here is "has a record", deliberately NOT the acceptance gate's task-cli id grammar
+# or self-PR rule: a descriptive review-check code (`SME-ROADMAP-WORKTREE-NOTE`) or a PR-number
+# key (`GH-560`) is a legitimate review-record key. Split records are NOT summed (2 iterations
+# under GH-565 plus 1 under #565 do not make 3): the bar must be met under ONE spelling —
+# summing would double-count the day review-cli normalizes at record time. When nothing is
+# found, the refusal names the first record-less candidate with its own zero counts and lists
+# every other spelling tried.
+
+# The other spelling of a GitHub-issue code, or nothing: `#565` ↔ `GH-565` (#572). Mirrors
+# _ship_normalize_gh_code_for_task_cli's `^[Gg][Hh]-<n>$` shape, so a hand-set `gh-565` gets
+# its twin too. Every other code shape has no twin. ALWAYS exits 0.
+_review_quorum_twin_code() {  # $1 = code -> prints the twin spelling, or nothing
+  if [[ "$1" =~ ^#([0-9]+)$ ]]; then printf 'GH-%s' "${BASH_REMATCH[1]}"
+  elif [[ "$1" =~ ^[Gg][Hh]-([0-9]+)$ ]]; then printf '#%s' "${BASH_REMATCH[1]}"
+  fi
+  return 0
+}
+
+# Asks review-cli about ONE spelling. Sets QUORUM_JSON (empty = could not query on any tier)
+# and QUORUM_ROLES_REQUESTED (whether the tier that answered included --min-roles).
+#
+# Role-based coverage (--min-roles) is ALWAYS requested — it is the primary/default gate now
+# (review-cli#246). --min-models is passed ONLY when the operator explicitly set
+# SHIP_REVIEW_QUORUM_MIN_MODELS: passing it unconditionally would make review-cli treat the
+# model floor as EXPLICITLY requested too (a subprocess CLI flag can't carry "this is just
+# ship's internal default"), which would silently reinstate a default model floor via
+# review-cli's own AND logic (review-cli#246) — exactly what this change removes.
+#
+# Three-tier query, oldest-compatible-flag-set-last, because review-cli's own history proves
+# --min-roles and --quorum-check were NEVER both supported by the same build: --quorum-check
+# was renamed to --check on 2026-07-09 (review-cli#135), a full six weeks before --min-roles
+# existed at all (added 2026-08-21, review-cli#246). So sending --min-roles on a --quorum-check
+# attempt can never succeed against any real build — it would only misdiagnose "review-cli is
+# too old for role checking" as "could not query review-cli" (a real finding from review, since
+# a --check-supporting-but-pre-#246 build, built in that six-week window, would otherwise fail
+# BOTH the --check-with-roles attempt and the --quorum-check-with-roles fallback, landing on
+# the wrong, confusing refusal message):
+#   1. --check WITH --min-roles (+ --min-models if explicit) — the current/target shape.
+#   2. --check WITHOUT --min-roles (+ --min-models if explicit) — a build that has the --check
+#      rename but predates role support; succeeds with real iter/model data and NO role keys
+#      (review-cli only emits distinct_roles_passed/roles when --min-roles was actually asked),
+#      so the gate reads 0 roles and refuses with an honest "0/N distinct roles" instead of a
+#      hollow "could not query" — accurate, still fail-closed (role coverage is mandatory now,
+#      so an old review-cli genuinely cannot satisfy this gate until upgraded).
+#   3. --quorum-check WITHOUT --min-roles (+ --min-models if explicit) — genuinely ancient,
+#      pre-rename builds; same honest 0-roles refusal as tier 2 if it succeeds.
+# In --json mode review-cli always prints JSON to stdout (pass or fail) — only an
+# unsupported-flag argparse error leaves stdout empty, which is each tier's trigger.
+#
+# QUORUM_ROLES_REQUESTED tracks whether the tier that actually produced QUORUM_JSON included
+# --min-roles, so a genuine "0 distinct roles" (tier 1: review-cli understood the request and
+# simply found no role-tagged history) can be told apart from "this review-cli cannot report
+# roles at all" (tier 2/3: the request never even asked) — the two have different remedies
+# (re-review with roles vs. upgrade review-cli).
+_review_quorum_query() {  # $1 = code
+  QUORUM_ROLES_REQUESTED=1
+  QUORUM_JSON=$(review task "$1" --check "${REVIEW_CHECK_ARGS[@]}" --json 2>/dev/null) || true
+  if [ -z "$QUORUM_JSON" ]; then
+    QUORUM_ROLES_REQUESTED=0
+    QUORUM_JSON=$(review task "$1" --check "${REVIEW_CHECK_ARGS_NOROLES[@]}" --json 2>/dev/null) || true
+  fi
+  if [ -z "$QUORUM_JSON" ]; then
+    QUORUM_JSON=$(review task "$1" --quorum-check "${REVIEW_CHECK_ARGS_NOROLES[@]}" --json 2>/dev/null) || true
+  fi
+  return 0
+}
+
+# Reads $QUORUM_JSON into the Q* vars and re-derives the verdict as QUORUM_BAR_MET (0/1).
+#
+# review-cli's quorum_check emits `passed_iterations` / `distinct_models_passed` /
+# `distinct_roles_passed` — the COUNT of PASSED iterations and the distinct models / BOARD
+# ROLES among them. An earlier revision read `.iterations` / `.distinct_models`, keys
+# review-cli NEVER emits, so both parsed to 0 (the "0 iterations across 0 models" in the
+# #242 incident log). Read ONLY the real keys — do NOT fall back to the never-emitted
+# legacy names: a payload carrying only `.iterations` / `.distinct_models` is not
+# review-cli's output (old build or hostile `review` on PATH), so it reads as 0/0 and fails
+# closed, never authorizes via a laxer key. `total_iterations` (every recorded iteration,
+# passed or not) is the "has a record at all" discriminator for the candidate scan.
+_review_quorum_read_payload() {
+  QPASSED=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed // false' 2>/dev/null || echo false)
+  QITER=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed_iterations // 0' 2>/dev/null || echo 0)
+  QTOTAL=$(printf '%s' "$QUORUM_JSON" | jq -r '.total_iterations // 0' 2>/dev/null || echo 0)
+  QMODELS_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_models_passed // 0' 2>/dev/null || echo 0)
+  QMODELS=$(printf '%s' "$QUORUM_JSON" | jq -r '(.models // []) | join(", ")' 2>/dev/null || echo "")
+  QROLES_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_roles_passed // 0' 2>/dev/null || echo 0)
+  QROLES=$(printf '%s' "$QUORUM_JSON" | jq -r '(.roles // []) | join(", ")' 2>/dev/null || echo "")
+  QERR=$(printf '%s' "$QUORUM_JSON" | jq -r '.error // empty' 2>/dev/null || echo "")
+  # Whether the ANSWER (not just what ship sent) actually carried role data — read from the
+  # payload's own shape (does it have the key at all?), not from QUORUM_ROLES_REQUESTED. A
+  # review-cli that tolerates an unrecognized --min-roles (e.g. argparse's parse_known_args,
+  # or a shim) could "succeed" on the roles-requesting tier while silently ignoring the flag —
+  # QUORUM_ROLES_REQUESTED would then be wrong (it only tracks what ship attempted), but the
+  # payload shape is still honest. Used ONLY for the disambiguating hint in the refusal; the
+  # authorize gate keeps requiring QUORUM_ROLES_REQUESTED independently (defense-in-depth).
+  QUORUM_HAS_ROLE_KEY=$(printf '%s' "$QUORUM_JSON" | jq -r 'has("distinct_roles_passed")' 2>/dev/null || echo false)
+  # Non-numeric / missing counts collapse to 0 so the arithmetic gate below fails closed
+  # (jq can hand back "null" as text if a key holds JSON null).
+  case "$QITER" in ''|*[!0-9]*) QITER=0 ;; esac
+  case "$QTOTAL" in ''|*[!0-9]*) QTOTAL=0 ;; esac
+  case "$QMODELS_N" in ''|*[!0-9]*) QMODELS_N=0 ;; esac
+  case "$QROLES_N" in ''|*[!0-9]*) QROLES_N=0 ;; esac
+
+  # The model floor gates ONLY when the operator explicitly asked for it — vacuously
+  # satisfied otherwise, mirroring review-cli's own explicit-vs-default AND logic
+  # (review-cli#246): an explicit request is always honored, but there is no default model
+  # floor any more now that role-based coverage is the primary/default mechanism.
+  MODELS_GATE_OK=1
+  if [ "$MIN_MODELS_EXPLICIT" = "1" ]; then
+    MODELS_GATE_OK=0
+    [ "$QMODELS_N" -gt 0 ] && [ "$QMODELS_N" -ge "$MIN_MODELS" ] && MODELS_GATE_OK=1
+  fi
+
+  # FAIL-CLOSED authorization (#242): NEVER authorize on the subprocess's `.passed` boolean
+  # alone. ship re-derives the verdict from the numbers it read and its own hard floors, so a
+  # review-cli that returns `passed:true` with a hollow 0/0 record (an older build without the
+  # min>=1 guard, a task-code miss, or an attacker-controlled `review` on PATH) is refused.
+  # Authorize ONLY when EVERY condition holds: the subprocess agreed (passed==true), there is
+  # NO error key, ship itself actually ASKED for role coverage on the query that answered
+  # (QUORUM_ROLES_REQUESTED — never trust an external contract that review-cli only emits
+  # role keys when asked; re-derive that independently too, same #242 philosophy), the
+  # iteration and role counts are strictly positive and independently meet their >=3 floors,
+  # a genuine record always carries at least one model (QMODELS_N -gt 0 is a hollow-payload
+  # sanity check, not a diversity floor — kept unconditionally, same as the pre-existing #242
+  # guard, independent of whether an explicit model floor is even in play), and (only when
+  # explicitly requested) the model floor is met too.
+  QUORUM_BAR_MET=0
+  if [ "$QPASSED" = "true" ] && [ -z "$QERR" ] \
+     && [ "$QUORUM_ROLES_REQUESTED" = "1" ] \
+     && [ "$QITER" -gt 0 ] && [ "$QROLES_N" -gt 0 ] && [ "$QMODELS_N" -gt 0 ] \
+     && [ "$QITER" -ge "$MIN_ITER" ] && [ "$QROLES_N" -ge "$MIN_ROLES" ] \
+     && [ "$MODELS_GATE_OK" = "1" ]; then
+    QUORUM_BAR_MET=1
+  fi
+  return 0
+}
+
+# Looks ONE candidate up under its spellings (the code, then its twin if it has one).
+# Exit 0: a spelling met the bar — TASK_CODE/QUORUM_JSON are that spelling's.
+# Exit 1: a spelling has a record that falls short — TASK_CODE/QUORUM_JSON are the FIRST such
+#         spelling's (the refusal anchor); QUORUM_NOTES lists what else was tried.
+# Exit 2: no spelling has a record — the first record-less answer is kept in
+#         QUORUM_NORECORD_{CODE,JSON,ROLES_REQUESTED} (for the final refusal, if nothing is
+#         ever found) and every spelling is appended to QUORUM_TRIED.
+# Exit 3: review-cli could not be queried for a spelling (TASK_CODE = that spelling).
+_review_quorum_lookup_candidate() {  # $1 = candidate code
+  local spelling anchor_code="" anchor_json="" anchor_roles=1 twin
+  twin=$(_review_quorum_twin_code "$1")
+  for spelling in "$1" $twin; do
+    _review_quorum_query "$spelling"
+    if [ -z "$QUORUM_JSON" ]; then TASK_CODE="$spelling"; return 3; fi
+    _review_quorum_read_payload
+    if [ "$QUORUM_BAR_MET" = "1" ]; then TASK_CODE="$spelling"; return 0; fi
+    if [ "$QTOTAL" -gt 0 ] || [ "$QITER" -gt 0 ]; then
+      if [ -z "$anchor_code" ]; then
+        anchor_code="$spelling"; anchor_json="$QUORUM_JSON"; anchor_roles="$QUORUM_ROLES_REQUESTED"
+      else
+        QUORUM_NOTES="${QUORUM_NOTES}; also tried ${spelling} (${QITER}/${MIN_ITER} iterations, ${QROLES_N}/${MIN_ROLES} distinct roles)"
+      fi
+      continue
+    fi
+    # No record under this spelling.
+    if [ -n "$anchor_code" ]; then
+      QUORUM_NOTES="${QUORUM_NOTES}; also tried ${spelling} (${QERR:-no recorded review iterations})"
+    else
+      if [ -z "$QUORUM_NORECORD_CODE" ]; then
+        QUORUM_NORECORD_CODE="$spelling"; QUORUM_NORECORD_JSON="$QUORUM_JSON"
+        QUORUM_NORECORD_ROLES_REQUESTED="$QUORUM_ROLES_REQUESTED"
+      fi
+      QUORUM_TRIED="${QUORUM_TRIED:+${QUORUM_TRIED}, }${spelling}"
+      echo "[ship] review-quorum: ${QERR:-no recorded review iterations for ${spelling}}; trying the next candidate." >&2
+    fi
+  done
+  [ -n "$anchor_code" ] || return 2
+  TASK_CODE="$anchor_code"; QUORUM_JSON="$anchor_json"; QUORUM_ROLES_REQUESTED="$anchor_roles"
+  _review_quorum_read_payload
+  return 1
+}
+
+# Scans the candidates of ONE source (newline-separated, $1) in order, with
+# _review_quorum_lookup_candidate's exit protocol: 0 found, 1 short record (stop — THE task),
+# 2 no record anywhere in this source (the caller moves to the next source), 3 could not query.
+_review_quorum_scan_source() {  # $1 = candidates
+  local candidate rc
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    rc=0; _review_quorum_lookup_candidate "$candidate" || rc=$?
+    [ "$rc" = "2" ] || return "$rc"
+  done <<< "$1"
+  return 2
+}
+
+# The candidate scan across the sources — explicit $REVIEW_TASK_CODE (alone: an operator who
+# names the code gets exactly that lookup, twin included), else the branch name, else the PR
+# body (fetched only when the branch yields no record). Same exit protocol as the per-source
+# scan; exit 4 when no source carries a candidate at all ("could not derive").
+_review_quorum_find_task() {
+  local rc candidates
+  if [ -n "${REVIEW_TASK_CODE:-}" ]; then
+    rc=0; _review_quorum_scan_source "$REVIEW_TASK_CODE" || rc=$?
+    return "$rc"
+  fi
+  local any=0
+  candidates=$(_review_quorum_extract_ticket_candidates "$BRANCH")
+  if [ -n "$candidates" ]; then
+    any=1
+    rc=0; _review_quorum_scan_source "$candidates" || rc=$?
+    [ "$rc" = "2" ] || return "$rc"
+  fi
+  PR_BODY_QC=$(gh pr view "$PR" --json body -q '.body // ""' 2>/dev/null) || PR_BODY_QC=""
+  candidates=$(_review_quorum_extract_ticket_candidates "$PR_BODY_QC")
+  if [ -n "$candidates" ]; then
+    any=1
+    rc=0; _review_quorum_scan_source "$candidates" || rc=$?
+    [ "$rc" = "2" ] || return "$rc"
+  fi
+  [ "$any" = "1" ] && return 2
+  return 4
+}
+
+# The refusal text for a record that falls short (or, when nothing was found at all, for the
+# first record-less candidate) — from the Q* vars of the anchor.
+_review_quorum_refusal_summary() {
+  local models_summary="" roles_hint=""
+  [ "$MIN_MODELS_EXPLICIT" = "1" ] && models_summary=", ${QMODELS_N}/${MIN_MODELS} distinct models${QMODELS:+ (models seen: ${QMODELS})}"
+  # A response whose OWN shape carries no role key at all means this review-cli build cannot
+  # report role coverage — a version problem, not "reviews genuinely carry no role labels" (a
+  # modern build that WAS asked always echoes the key, even as 0). Driven off the payload shape
+  # (QUORUM_HAS_ROLE_KEY), not off what ship merely attempted (QUORUM_ROLES_REQUESTED) — a build
+  # that silently tolerates an unrecognized --min-roles would otherwise "succeed" on the
+  # roles-requesting tier while still omitting the key, which QUORUM_HAS_ROLE_KEY catches and
+  # QUORUM_ROLES_REQUESTED alone would miss.
+  if [ "$QUORUM_HAS_ROLE_KEY" != "true" ]; then
+    roles_hint=" — the installed review-cli does not support --min-roles (predates review-cli#246); upgrade it to restore role-based coverage"
+  fi
+  printf '%s' "bar NOT met for ${TASK_CODE} — ${QITER}/${MIN_ITER} iterations, ${QROLES_N}/${MIN_ROLES} distinct roles${QROLES:+ (roles seen: ${QROLES})}${models_summary}${QERR:+ (${QERR})}${roles_hint}${QUORUM_NOTES}"
+}
+
 QUORUM_ENABLED=1
 case "${SHIP_REVIEW_QUORUM_ENABLED:-1}" in 0|false|no) QUORUM_ENABLED=0 ;; esac
 case "${SHIP_REVIEW_QUORUM:-1}" in 0|false|no) QUORUM_ENABLED=0 ;; esac
@@ -2582,149 +2848,42 @@ else
   # line and the hatch context.
   QITER=0; QMODELS_N=0; QMODELS=""; QROLES_N=0; QROLES=""; QERR=""; QPASSED=false
 
-  TASK_CODE="${REVIEW_TASK_CODE:-}"
-  [ -n "$TASK_CODE" ] || TASK_CODE=$(_review_quorum_extract_ticket "$BRANCH")
-  if [ -z "$TASK_CODE" ]; then
-    PR_BODY_QC=$(gh pr view "$PR" --json body -q '.body // ""' 2>/dev/null) || PR_BODY_QC=""
-    TASK_CODE=$(_review_quorum_extract_ticket "$PR_BODY_QC")
-  fi
+  TASK_CODE=""; QTOTAL=0; QUORUM_JSON=""; QUORUM_ROLES_REQUESTED=1; QUORUM_HAS_ROLE_KEY=false
+  QUORUM_BAR_MET=0; QUORUM_NOTES=""; QUORUM_TRIED=""
+  QUORUM_NORECORD_CODE=""; QUORUM_NORECORD_JSON=""; QUORUM_NORECORD_ROLES_REQUESTED=1
+  REVIEW_CHECK_ARGS_NOROLES=(--min-iter "$MIN_ITER")
+  [ "$MIN_MODELS_EXPLICIT" = "1" ] && REVIEW_CHECK_ARGS_NOROLES+=(--min-models "$MIN_MODELS")
+  REVIEW_CHECK_ARGS=("${REVIEW_CHECK_ARGS_NOROLES[@]}" --min-roles "$MIN_ROLES")
 
-  if [ -z "$TASK_CODE" ]; then
-    _review_quorum_refuse_or_hatch "could not derive a task code (set \$REVIEW_TASK_CODE, or put the ticket code e.g. HYP-931 — or a link to THIS repo's issue, https://github.com/<owner>/<repo>/issues/<n> — in the branch name or PR body)"
-  elif ! command -v review >/dev/null 2>&1; then
-    _review_quorum_refuse_or_hatch "'review' CLI not found on PATH — cannot verify the bar for ${TASK_CODE} (install review-cli)"
+  if ! command -v review >/dev/null 2>&1; then
+    _review_quorum_refuse_or_hatch "'review' CLI not found on PATH — cannot verify the bar for ${REVIEW_TASK_CODE:-this PR's task} (install review-cli)"
   elif ! command -v jq >/dev/null 2>&1; then
-    _review_quorum_refuse_or_hatch "jq not found — cannot evaluate the gate for ${TASK_CODE} (install jq)"
+    _review_quorum_refuse_or_hatch "jq not found — cannot evaluate the gate for ${REVIEW_TASK_CODE:-this PR's task} (install jq)"
   else
-    # Role-based coverage (--min-roles) is ALWAYS requested — it is the primary/default gate now
-    # (review-cli#246). --min-models is passed ONLY when the operator explicitly set
-    # SHIP_REVIEW_QUORUM_MIN_MODELS: passing it unconditionally would make review-cli treat the
-    # model floor as EXPLICITLY requested too (a subprocess CLI flag can't carry "this is just
-    # ship's internal default"), which would silently reinstate a default model floor via
-    # review-cli's own AND logic (review-cli#246) — exactly what this change removes.
-    #
-    # Three-tier query, oldest-compatible-flag-set-last, because review-cli's own history proves
-    # --min-roles and --quorum-check were NEVER both supported by the same build: --quorum-check
-    # was renamed to --check on 2026-07-09 (review-cli#135), a full six weeks before --min-roles
-    # existed at all (added 2026-08-21, review-cli#246). So sending --min-roles on a --quorum-check
-    # attempt can never succeed against any real build — it would only misdiagnose "review-cli is
-    # too old for role checking" as "could not query review-cli" (a real finding from review, since
-    # a --check-supporting-but-pre-#246 build, built in that six-week window, would otherwise fail
-    # BOTH the --check-with-roles attempt and the --quorum-check-with-roles fallback, landing on
-    # the wrong, confusing refusal message):
-    #   1. --check WITH --min-roles (+ --min-models if explicit) — the current/target shape.
-    #   2. --check WITHOUT --min-roles (+ --min-models if explicit) — a build that has the --check
-    #      rename but predates role support; succeeds with real iter/model data and NO role keys
-    #      (review-cli only emits distinct_roles_passed/roles when --min-roles was actually asked),
-    #      so the gate below reads 0 roles and refuses with an honest "0/N distinct roles" instead
-    #      of a hollow "could not query" — accurate, still fail-closed (role coverage is mandatory
-    #      now, so an old review-cli genuinely cannot satisfy this gate until upgraded).
-    #   3. --quorum-check WITHOUT --min-roles (+ --min-models if explicit) — genuinely ancient,
-    #      pre-rename builds; same honest 0-roles refusal as tier 2 if it succeeds.
-    # In --json mode review-cli always prints JSON to stdout (pass or fail) — only an
-    # unsupported-flag argparse error leaves stdout empty, which is each tier's trigger.
-    REVIEW_CHECK_ARGS_NOROLES=(--min-iter "$MIN_ITER")
-    [ "$MIN_MODELS_EXPLICIT" = "1" ] && REVIEW_CHECK_ARGS_NOROLES+=(--min-models "$MIN_MODELS")
-    REVIEW_CHECK_ARGS=("${REVIEW_CHECK_ARGS_NOROLES[@]}" --min-roles "$MIN_ROLES")
-
-    # QUORUM_ROLES_REQUESTED tracks whether the tier that actually produced QUORUM_JSON included
-    # --min-roles, so a genuine "0 distinct roles" (tier 1: review-cli understood the request and
-    # simply found no role-tagged history) can be told apart, below, from "this review-cli cannot
-    # report roles at all" (tier 2/3: the request never even asked) — the two have different
-    # remedies (re-review with roles vs. upgrade review-cli).
-    QUORUM_ROLES_REQUESTED=1
-    QUORUM_JSON=$(review task "$TASK_CODE" --check "${REVIEW_CHECK_ARGS[@]}" --json 2>/dev/null) || true
-    if [ -z "$QUORUM_JSON" ]; then
-      QUORUM_ROLES_REQUESTED=0
-      QUORUM_JSON=$(review task "$TASK_CODE" --check "${REVIEW_CHECK_ARGS_NOROLES[@]}" --json 2>/dev/null) || true
-    fi
-    if [ -z "$QUORUM_JSON" ]; then
-      QUORUM_JSON=$(review task "$TASK_CODE" --quorum-check "${REVIEW_CHECK_ARGS_NOROLES[@]}" --json 2>/dev/null) || true
-    fi
-
-    if [ -z "$QUORUM_JSON" ]; then
-      _review_quorum_refuse_or_hatch "could not query review-cli (store unreadable / task ${TASK_CODE} unknown)"
-    else
-      # review-cli's quorum_check emits `passed_iterations` / `distinct_models_passed` /
-      # `distinct_roles_passed` — the COUNT of PASSED iterations and the distinct models / BOARD
-      # ROLES among them. An earlier revision read `.iterations` / `.distinct_models`, keys
-      # review-cli NEVER emits, so both parsed to 0 (the "0 iterations across 0 models" in the
-      # #242 incident log). Read ONLY the real keys — do NOT fall back to the never-emitted
-      # legacy names: a payload carrying only `.iterations` / `.distinct_models` is not
-      # review-cli's output (old build or hostile `review` on PATH), so it reads as 0/0 and fails
-      # closed below, never authorizes via a laxer key.
-      QPASSED=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed // false' 2>/dev/null || echo false)
-      QITER=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed_iterations // 0' 2>/dev/null || echo 0)
-      QMODELS_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_models_passed // 0' 2>/dev/null || echo 0)
-      QMODELS=$(printf '%s' "$QUORUM_JSON" | jq -r '(.models // []) | join(", ")' 2>/dev/null || echo "")
-      QROLES_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_roles_passed // 0' 2>/dev/null || echo 0)
-      QROLES=$(printf '%s' "$QUORUM_JSON" | jq -r '(.roles // []) | join(", ")' 2>/dev/null || echo "")
-      QERR=$(printf '%s' "$QUORUM_JSON" | jq -r '.error // empty' 2>/dev/null || echo "")
-      # Whether the ANSWER (not just what ship sent) actually carried role data — read from the
-      # payload's own shape (does it have the key at all?), not from QUORUM_ROLES_REQUESTED. A
-      # review-cli that tolerates an unrecognized --min-roles (e.g. argparse's parse_known_args,
-      # or a shim) could "succeed" on the roles-requesting tier while silently ignoring the flag —
-      # QUORUM_ROLES_REQUESTED would then be wrong (it only tracks what ship attempted), but the
-      # payload shape is still honest. Used ONLY for the disambiguating hint below; the authorize
-      # gate keeps requiring QUORUM_ROLES_REQUESTED independently (defense-in-depth, not replaced).
-      QUORUM_HAS_ROLE_KEY=$(printf '%s' "$QUORUM_JSON" | jq -r 'has("distinct_roles_passed")' 2>/dev/null || echo false)
-      # Non-numeric / missing counts collapse to 0 so the arithmetic gate below fails closed
-      # (jq can hand back "null" as text if a key holds JSON null).
-      case "$QITER" in ''|*[!0-9]*) QITER=0 ;; esac
-      case "$QMODELS_N" in ''|*[!0-9]*) QMODELS_N=0 ;; esac
-      case "$QROLES_N" in ''|*[!0-9]*) QROLES_N=0 ;; esac
-
-      # The model floor gates ONLY when the operator explicitly asked for it — vacuously
-      # satisfied otherwise, mirroring review-cli's own explicit-vs-default AND logic
-      # (review-cli#246): an explicit request is always honored, but there is no default model
-      # floor any more now that role-based coverage is the primary/default mechanism.
-      MODELS_GATE_OK=1
-      if [ "$MIN_MODELS_EXPLICIT" = "1" ]; then
-        MODELS_GATE_OK=0
-        [ "$QMODELS_N" -gt 0 ] && [ "$QMODELS_N" -ge "$MIN_MODELS" ] && MODELS_GATE_OK=1
-      fi
-
-      # FAIL-CLOSED authorization (#242): NEVER authorize on the subprocess's `.passed` boolean
-      # alone. ship re-derives the verdict from the numbers it read and its own hard floors, so a
-      # review-cli that returns `passed:true` with a hollow 0/0 record (an older build without the
-      # min>=1 guard, a task-code miss, or an attacker-controlled `review` on PATH) is refused.
-      # Authorize ONLY when EVERY condition holds: the subprocess agreed (passed==true), there is
-      # NO error key, ship itself actually ASKED for role coverage on the query that answered
-      # (QUORUM_ROLES_REQUESTED — never trust an external contract that review-cli only emits
-      # role keys when asked; re-derive that independently too, same #242 philosophy), the
-      # iteration and role counts are strictly positive and independently meet their >=3 floors,
-      # a genuine record always carries at least one model (QMODELS_N -gt 0 is a hollow-payload
-      # sanity check, not a diversity floor — kept unconditionally, same as the pre-existing #242
-      # guard, independent of whether an explicit model floor is even in play), and (only when
-      # explicitly requested) the model floor is met too.
-      if [ "$QPASSED" = "true" ] && [ -z "$QERR" ] \
-         && [ "$QUORUM_ROLES_REQUESTED" = "1" ] \
-         && [ "$QITER" -gt 0 ] && [ "$QROLES_N" -gt 0 ] && [ "$QMODELS_N" -gt 0 ] \
-         && [ "$QITER" -ge "$MIN_ITER" ] && [ "$QROLES_N" -ge "$MIN_ROLES" ] \
-         && [ "$MODELS_GATE_OK" = "1" ]; then
+    QUORUM_RC=0; _review_quorum_find_task || QUORUM_RC=$?
+    case "$QUORUM_RC" in
+      0)
         if [ "$MIN_MODELS_EXPLICIT" = "1" ]; then
           echo "[ship] AUTHORITY CONFIRMED — review quorum met: ${QITER} iterations across ${QROLES_N} roles and ${QMODELS_N} models for ${TASK_CODE}. Self-merge authorized by the review-quorum gate."
         else
           echo "[ship] AUTHORITY CONFIRMED — review quorum met: ${QITER} iterations across ${QROLES_N} roles for ${TASK_CODE}. Self-merge authorized by the review-quorum gate."
         fi
-        _review_quorum_audit_log authorized "$TASK_CODE" "$QITER" "$QMODELS_N" "" "$QROLES_N" "$MIN_ROLES" "$AUDIT_MIN_MODELS"
-      else
-        MODELS_SUMMARY=""
-        [ "$MIN_MODELS_EXPLICIT" = "1" ] && MODELS_SUMMARY=", ${QMODELS_N}/${MIN_MODELS} distinct models${QMODELS:+ (models seen: ${QMODELS})}"
-        # A response whose OWN shape carries no role key at all means this review-cli build
-        # cannot report role coverage — a version problem, not "reviews genuinely carry no role
-        # labels" (a modern build that WAS asked always echoes the key, even as 0). Driven off
-        # the payload shape (QUORUM_HAS_ROLE_KEY), not off what ship merely attempted
-        # (QUORUM_ROLES_REQUESTED) — a build that silently tolerates an unrecognized --min-roles
-        # would otherwise "succeed" on the roles-requesting tier while still omitting the key,
-        # which QUORUM_HAS_ROLE_KEY catches and QUORUM_ROLES_REQUESTED alone would miss.
-        ROLES_UNAVAILABLE_HINT=""
-        if [ "$QUORUM_HAS_ROLE_KEY" != "true" ]; then
-          ROLES_UNAVAILABLE_HINT=" — the installed review-cli does not support --min-roles (predates review-cli#246); upgrade it to restore role-based coverage"
-        fi
-        _review_quorum_refuse_or_hatch "bar NOT met for ${TASK_CODE} — ${QITER}/${MIN_ITER} iterations, ${QROLES_N}/${MIN_ROLES} distinct roles${QROLES:+ (roles seen: ${QROLES})}${MODELS_SUMMARY}${QERR:+ (${QERR})}${ROLES_UNAVAILABLE_HINT}"
-      fi
-    fi
+        _review_quorum_audit_log authorized "$TASK_CODE" "$QITER" "$QMODELS_N" "" "$QROLES_N" "$MIN_ROLES" "$AUDIT_MIN_MODELS" ;;
+      1) _review_quorum_refuse_or_hatch "$(_review_quorum_refusal_summary)" ;;
+      2)
+        # Every candidate of every source answered "no record": refuse on the FIRST one, with its
+        # own zero counts, naming the rest — the shipper sees every spelling that was looked up.
+        TASK_CODE="$QUORUM_NORECORD_CODE"; QUORUM_JSON="$QUORUM_NORECORD_JSON"
+        QUORUM_ROLES_REQUESTED="$QUORUM_NORECORD_ROLES_REQUESTED"
+        _review_quorum_read_payload
+        QUORUM_NOTES=""
+        case "$QUORUM_TRIED" in
+          *", "*) QUORUM_NOTES="; also tried: ${QUORUM_TRIED#*, } (no recorded review iterations for any of them)" ;;
+        esac
+        _review_quorum_refuse_or_hatch "$(_review_quorum_refusal_summary)" ;;
+      3) _review_quorum_refuse_or_hatch "could not query review-cli (store unreadable / task ${TASK_CODE} unknown)" ;;
+      *) _review_quorum_refuse_or_hatch "could not derive a task code (set \$REVIEW_TASK_CODE, or put the ticket code e.g. HYP-931 — or a link to THIS repo's issue, https://github.com/<owner>/<repo>/issues/<n> — in the branch name or PR body)" ;;
+    esac
   fi
 fi
 

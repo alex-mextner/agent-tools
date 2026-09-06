@@ -63,7 +63,9 @@ case "$sub" in
         elif printf '%s' "$args" | grep -q statusCheckRollup; then
           printf '%s\\n' '[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI"}]'
         elif printf '%s' "$args" | grep -q -- '--json title,body'; then
-          printf '%s\\t%s\\n' "$(cat "$TITLE_FILE")" "$(cat "$BODY_FILE")"
+          # Mirrors the real query's `gsub("\\n";" ")`: ship reads ONE tab-separated line, so a
+          # multi-line body (the PR #560 fixture) must be flattened here as jq flattens it live.
+          printf '%s\\t%s\\n' "$(tr '\\n' ' ' < "$TITLE_FILE")" "$(tr '\\n' ' ' < "$BODY_FILE")"
         elif printf '%s' "$args" | grep -q -- '--json title'; then
           if [ "${SHIP_TEST_GH_PR_VIEW_TITLE_FAIL:-0}" = "1" ]; then exit 1; fi
           cat "$TITLE_FILE"; echo
@@ -933,8 +935,8 @@ def test_acceptance_gate_scans_past_a_self_pr_candidate_to_the_refs_line_in_the_
     """The live 2026-09-06 incident, on PR #560's ORIGINAL body: an incidental `GH-560` (an
     example in the acceptance proofs) precedes the real `Refs #541`. The self-PR rule rightly
     rejects GH-560 — and the scan must go on to #541 in the same text instead of skipping the
-    gate. The body also links agent-tools#559 in full; under the fake gh the PR's own repo is
-    acme/widgets, so that URL is another repo's and is ignored (with a note), never derived."""
+    gate. The body also links agent-tools#559 in full; the keyword arm's single `Refs #541`
+    answers first, so the URL arm is never consulted and that link is never derived."""
     r = _run(repo, tmp_path, branch="fix/hook-doctrine-541-542-546", pr="560", env={
         "SHIP_TEST_PR_TITLE": "fix(agent-hooks): read-only sed -n, shared harness exemption, reconciled no-bg-longproc doctrine",
         "SHIP_TEST_PR_BODY": _PR560_BODY,
@@ -944,8 +946,22 @@ def test_acceptance_gate_scans_past_a_self_pr_candidate_to_the_refs_line_in_the_
     assert _task_calls(tmp_path) == ["gate #541 --json"], _task_calls(tmp_path)
     assert "rejected 'GH-560' from the PR body — it names this pull request (#560)" in r.stderr, r.stderr
     assert "Refusing: acceptance gate — ticket #541 is NOT accepted" in r.stderr
-    assert "ignoring" in r.stderr and "alex-mextner/agent-tools/issues/559" in r.stderr, r.stderr
+    assert "issues/559" not in r.stderr, r.stderr
     assert not _merged(tmp_path)
+
+
+def test_acceptance_gate_reports_a_foreign_repo_issue_link_it_ignores(repo, tmp_path):
+    """A full issue URL of ANOTHER repo is never this PR's ticket (agent-tools#564); with no
+    other candidate the gate skips — and the transcript says WHICH link was set aside, so a
+    "could not derive" is traceable to the text that caused it."""
+    r = _run(repo, tmp_path, branch="feat", env={
+        "SHIP_TEST_PR_BODY": "Companion of https://github.com/other-org/other-repo/issues/548.",
+    })
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "ignoring 1 issue link(s) of another repo" in r.stderr, r.stderr
+    assert "other-org/other-repo/issues/548" in r.stderr
+    assert _task_calls(tmp_path) == []
+    assert "could not derive a task code for #1 — skipping" in r.stderr
 
 
 def test_acceptance_gate_scans_past_a_grammar_rejected_candidate_in_the_same_body(repo, tmp_path):
@@ -962,16 +978,18 @@ def test_acceptance_gate_scans_past_a_grammar_rejected_candidate_in_the_same_bod
 
 def test_acceptance_gate_source_precedence_survives_the_continuation(repo, tmp_path):
     """Continuation is WITHIN a source: a surviving title candidate still beats a body one
-    (explicit env -> branch -> title -> body is unchanged)."""
+    (explicit env -> branch -> title -> body is unchanged). Both title tokens sit in the same
+    extractor arm (generic PREFIX-<n>), so they are tried in document order: GH-1 names this
+    PR (#1) and is rejected, PROJ-777 survives."""
     r = _run(repo, tmp_path, branch="feat", env={
-        "SHIP_TEST_PR_TITLE": "GH-1 then HYP-777: the thing",
+        "SHIP_TEST_PR_TITLE": "GH-1 then PROJ-777: the thing",
         "SHIP_TEST_PR_BODY": "Refs #77",
-        "SHIP_TEST_TASK_GATE_JSON": _NOT_ACCEPTED, "SHIP_TEST_TASK_GATE_EXIT": "1",
+        "SHIP_TEST_TASK_GATE_JSON": _NOT_ACCEPTED.replace("HYP-931", "PROJ-777"), "SHIP_TEST_TASK_GATE_EXIT": "1",
     })
     assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
-    assert _task_calls(tmp_path) == ["gate HYP-777 --json"], _task_calls(tmp_path)
+    assert _task_calls(tmp_path) == ["gate PROJ-777 --json"], _task_calls(tmp_path)
     assert "rejected 'GH-1' from the PR title" in r.stderr, r.stderr
-    assert "task-code: using 'HYP-777' from the PR title" in r.stderr, r.stderr
+    assert "task-code: using 'PROJ-777' from the PR title" in r.stderr, r.stderr
 
 
 def test_acceptance_gate_skips_when_every_candidate_in_every_source_is_rejected(repo, tmp_path):
