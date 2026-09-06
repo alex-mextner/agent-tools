@@ -61,10 +61,17 @@ orchestrator" to ``_is_subagent`` — including a bare Codex CLI session Alex ru
 is not a CC orchestrator refusing to delegate at all) and a Codex/opencode process spawned by
 another tool as a delegated worker (review-cli's read-only reviewer backend, a CC-dispatched
 subagent). Blocking either one is wrong, and the block message's remediation ("Dispatch a subagent
-... Agent tool with subagent_type: 'fork'") does not even apply outside Claude Code. So a v1 event
-tagged with a ``harness`` of ``codex`` or ``opencode`` specifically (set by the bridge, never by
+... Agent tool with subagent_type: 'fork'") does not even apply outside Claude Code. omp has the
+identical problem: it models its own subagent lifecycle via the ``task`` tool (item shape
+``{name?, agent?, task, ...}``, docs/tools/task.md), but ``lib/omp_hook_bridge`` exposes no
+TRUSTED per-tool-call subagent identity from omp's ``tool_call``/``tool_result`` extension events
+either (confirmed absent from the documented event shape) — so a bare omp CLI session run
+directly, and an omp process spawned as a delegated worker by another tool, would both look like
+"the orchestrator" to ``_is_subagent`` for the same reason the Codex/opencode cases do, and the
+CC-specific remediation text is equally inapplicable there. So a v1 event tagged with a
+``harness`` of ``codex``, ``opencode``, or ``omp`` specifically (set by the bridge, never by
 ``args`` — see ``EXEMPT_HARNESSES``) is exempt from this gate entirely, same as a dispatched
-subagent. Deliberately an ALLOWLIST of the two known-safe values, not "any non-CC harness": a
+subagent. Deliberately an ALLOWLIST of the three known-safe values, not "any non-CC harness": a
 future bridge (``HARNESS = "gemini"``, say) is UNPROVEN here and stays governed until someone
 reviews and adds it — a present-but-unrecognized value is not automatically evidence the gate's
 CC-specific premise doesn't apply to it, only that nobody has confirmed that yet. If a
@@ -155,7 +162,7 @@ HOOK_API = "agents-hooks/v1"
 # docstring's "Harness-exempt" section. Deliberately an ALLOWLIST, not `!= "claude-code"`: an
 # event with no `harness` field (every fixture written before this change, and any future bridge
 # that doesn't set one) stays GOVERNED — the relax direction fails closed, same as `_is_subagent`.
-EXEMPT_HARNESSES = frozenset({"codex", "opencode"})
+EXEMPT_HARNESSES = frozenset({"codex", "opencode", "omp"})
 
 MARKER_DIR = Path(os.path.expanduser(os.environ.get(
     "ORCH_THIN_MARKER_DIR", "~/.cache/agent-tools/orchestrator-thin")))
@@ -376,8 +383,9 @@ def _is_exempt_harness(event: dict) -> bool:
     (agent-tools#533 — see the module docstring's "Harness-exempt" section).
 
     TRUST BOUNDARY — read ONLY the TOP-LEVEL `event["harness"]`, never `args`. Each bridge
-    (lib/cc_hook_bridge, lib/codex_hook_bridge, lib/opencode_hook_bridge) sets this from a
-    hardcoded module constant (`HARNESS = "claude-code" | "codex" | "opencode"`) that is not
+    (lib/cc_hook_bridge, lib/codex_hook_bridge, lib/opencode_hook_bridge, lib/omp_hook_bridge)
+    sets this from a hardcoded module constant
+    (`HARNESS = "claude-code" | "codex" | "opencode" | "omp"`) that is not
     derived from ANY field of the underlying tool event — it cannot be forged by a model/
     tool_input value the way a same-named key sitting in `args` could be. Which bridge actually
     fires is decided by which harness's own hook system invoked it: a Claude Code session's Bash
@@ -1470,7 +1478,7 @@ def main() -> int:
         emit("allow")
         return 0
 
-    # Codex/opencode events → this gate's CC-specific orchestrator/subagent premise doesn't
+    # Codex/opencode/omp events → this gate's CC-specific orchestrator/subagent premise doesn't
     # apply, and its remediation (CC's Agent tool) doesn't exist there either (agent-tools#533).
     if _is_exempt_harness(event):
         emit("allow")

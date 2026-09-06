@@ -116,23 +116,25 @@ never writes a top-level `agent_id`; a non-CC carrier wiring this hook must repl
 or a forged `agent_id` self-exempts the orchestrator (see `background-subagent-gate/README.md` for
 the full contract). This matches the sibling `skills-read-gate`'s narrowed read (agent-tools#115).
 
-**Harness-exempt (agent-tools#533):** a Codex or opencode event is exempt from this gate
+**Harness-exempt (agent-tools#533):** a Codex, opencode, or omp event is exempt from this gate
 **entirely** — WARN, BLOCK, and the hatch escalation never fire — regardless of what the command
-or write looks like. `EXEMPT_HARNESSES = {"codex", "opencode"}`, checked against the top-level
-`event["harness"]` right after the subagent check, before any command/write is even classified.
+or write looks like. `EXEMPT_HARNESSES = {"codex", "opencode", "omp"}`, checked against the
+top-level `event["harness"]` right after the subagent check, before any command/write is even
+classified.
 
 Why the whole harness, not a signal review-cli sets: this gate's premise is Claude-Code-specific
 — "the top-level Claude Code session must delegate implementation work to a CC `Agent`/`Task`
-subagent instead of doing it inline." Codex and opencode DO model a subagent lifecycle of their
-own (Codex's `SubagentStart`/`SubagentStop` events, opencode's `task` tool), but neither bridge
-exposes a TRUSTED per-tool-call subagent identity from it today (a forged
-`args.agent_id`/`agent_type` is stripped by both `lib/codex_hook_bridge` and
-`lib/opencode_hook_bridge`, and neither repopulates it from anything authoritative — there is no
-CC-shaped top-level field to restore it from). So EVERY Codex/opencode-sourced event used to look
-like "the orchestrator" here, whether it was:
-- a bare Codex CLI session Alex runs directly (not a CC orchestrator refusing to delegate at all
-  — there is no CC session in the loop to be "thin"), or
-- a Codex/opencode process spawned by another tool as delegated work (review-cli's read-only
+subagent instead of doing it inline." Codex, opencode, and omp DO each model a subagent lifecycle
+of their own (Codex's `SubagentStart`/`SubagentStop` events, opencode's `task` tool, omp's own
+`task` tool), but none of the three bridges exposes a TRUSTED per-tool-call subagent identity from
+it today (a forged `args.agent_id`/`agent_type` is stripped by `lib/codex_hook_bridge`,
+`lib/opencode_hook_bridge`, and `lib/omp_hook_bridge` alike, and none repopulates it from anything
+authoritative — there is no CC-shaped top-level field to restore it from, and omp's `tool_call`/
+`tool_result` extension events document no such field either). So EVERY Codex/opencode/omp-sourced
+event used to look like "the orchestrator" here, whether it was:
+- a bare Codex/opencode/omp CLI session Alex runs directly (not a CC orchestrator refusing to
+  delegate at all — there is no CC session in the loop to be "thin"), or
+- a Codex/opencode/omp process spawned by another tool as delegated work (review-cli's read-only
   reviewer backend running `git status`/`git diff`/`sed -n` as part of its own review role; a
   CC-dispatched subagent that happens to shell out to `codex exec`).
 
@@ -141,26 +143,27 @@ hit the WARN→BLOCK tier running harmless read-only inspection, and separately 
 session doing real delegated work was hard-blocked mid-task). Blocking the first case is simply
 wrong — there is no orchestrator to keep thin. Blocking the second is wrong for a sharper reason:
 the block message's remediation ("Dispatch a subagent ... Agent tool with `subagent_type:
-'fork'`") **does not exist in Codex or opencode** — CC's `Agent` tool is a Claude-Code-only
-concept, so the gate would be telling a blocked Codex session to use tooling it doesn't have.
+'fork'`") **does not exist in Codex, opencode, or omp** — CC's `Agent` tool is a Claude-Code-only
+concept, so the gate would be telling a blocked session to use tooling it doesn't have. omp hits
+the identical failure mode for the identical reason, added when `lib/omp_hook_bridge` shipped.
 
 **Non-forgeability.** `event["harness"]` is set from a hardcoded module constant
 (`codex_hook_bridge.HARNESS = "codex"`, `opencode_hook_bridge.HARNESS = "opencode"`,
-`cc_hook_bridge.HARNESS = "claude-code"`) — a Python literal, not derived from any field of the
-underlying tool event, so nothing in `tool_input`/`args` can set or override it (unlike
-`args.agent_id`, which the bridges must actively strip a forged copy of). And which bridge fires
-at all is decided entirely by which product's own hook system invoked it: a Claude Code session's
-Bash call is dispatched by CC's PreToolUse machinery straight into `cc_hook_bridge` — it has no
-mechanism to reroute its own tool call through `codex_hook_bridge` instead, so a CC orchestrator
-cannot dodge this gate by claiming to be a different harness. If a CC orchestrator runs `codex
-exec …` inline as a Bash command, THAT Bash call is still judged as usual by `cc_hook_bridge`
-(harness `claude-code`); the exemption only reaches the codex CHILD process's own tool calls,
-which is by definition delegated work.
+`omp_hook_bridge.HARNESS = "omp"`, `cc_hook_bridge.HARNESS = "claude-code"`) — a Python literal,
+not derived from any field of the underlying tool event, so nothing in `tool_input`/`args` can
+set or override it (unlike `args.agent_id`, which the bridges must actively strip a forged copy
+of). And which bridge fires at all is decided entirely by which product's own hook system invoked
+it: a Claude Code session's Bash call is dispatched by CC's PreToolUse machinery straight into
+`cc_hook_bridge` — it has no mechanism to reroute its own tool call through `codex_hook_bridge`
+instead, so a CC orchestrator cannot dodge this gate by claiming to be a different harness. If a
+CC orchestrator runs `codex exec …` inline as a Bash command, THAT Bash call is still judged as
+usual by `cc_hook_bridge` (harness `claude-code`); the exemption only reaches the codex CHILD
+process's own tool calls, which is by definition delegated work.
 
 The read is deliberately an **allowlist** (`harness in EXEMPT_HARNESSES`), not `harness !=
 "claude-code"`: an event with no `harness` field (every pre-#533 fixture, and any future bridge
 that doesn't set one) stays **governed** — the relax direction fails closed, same discipline as
-the `agent_id` read above. If a Codex/opencode session is ever meant to function as a thin
+the `agent_id` read above. If a Codex/opencode/omp session is ever meant to function as a thin
 orchestrator dispatching its own subagents, that needs an explicit config knob, not a change to
 this hardcoded exemption.
 
