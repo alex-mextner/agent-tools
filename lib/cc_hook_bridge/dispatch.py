@@ -15,6 +15,10 @@ Confirmed CC contract (https://code.claude.com/docs/en/hooks, CC 2.1.177):
                        {"decision": "block", "reason": "..."} (surfaces the reason to the
                        model, not un-running the tool). Maps to the `post-write` point for
                        the file-edit tools (format-on-write, lint-on-write).
+  - Stop stdin       : {hook_event_name: "Stop", session_id, transcript_path, cwd,
+                       stop_hook_active, …} — `transcript_path` points at the session's
+                       JSONL transcript; forwarded into the v1 event so a `stop` hook can
+                       read what actually happened this turn.
   - Stop block       : exit 0 + {"decision": "block", "reason": "..."}.
   - matcher          : matched by CC against tool_name BEFORE we run; the settings.json entry
                        carries the matcher, so the dispatcher only needs the logical point.
@@ -33,6 +37,12 @@ import sys
 from pathlib import Path
 
 HOOK_API = "agents-hooks/v1"
+# The v1 event's `harness` tag for every event this bridge produces. A MODULE LITERAL, not
+# derived from any field of `cc_event` — so it cannot be forged by a model/tool_input value the
+# way `args.harness` could be. A hook that wants to scope itself to (or exempt) one harness reads
+# `event["harness"]`, never `args`. See orchestrator-stays-thin's EXEMPT_HARNESSES for the first
+# consumer (agent-tools#533).
+HARNESS = "claude-code"
 # CC events this bridge knows how to register/handle (typo guard in main()).
 _KNOWN_EVENTS = frozenset({"PreToolUse", "Stop", "PostToolUse"})
 
@@ -60,6 +70,28 @@ _AGENT_TOOLS = frozenset({"Agent", "Task"})
 # note as `_AGENT_TOOLS` above applies: this half only maps the point, rig-cli's
 # `hook_bridge_entries` must register a `Skill` PreToolUse matcher for it to actually fire.
 _SKILL_TOOLS = frozenset({"Skill"})
+# CC's Monitor tool (a background event-stream watch: `tail -f`, a poll loop, a websocket —
+# started, then the caller keeps working and gets a notification per output line/event). A
+# PreToolUse on it maps to `pre-monitor`, the point subagent-no-monitor uses to block a
+# SUBAGENT from ever calling it: Monitor is categorically fire-and-forget (that is the whole
+# point of the tool), and a dispatched subagent is NOT re-invoked by a MONITOR-EVENT
+# notification — only the main loop is (Monitor has no harness-tracked child at all, unlike a
+# Bash `run_in_background: true` child, which the harness DOES use to re-invoke its calling
+# subagent — verified empirically; see subagent_no_monitor.py's docstring). Hit in HYP-1350's
+# retrospective: a subagent called Monitor on its own spawned child process, then ended its
+# turn awaiting a notification that only the top-level orchestrator ever receives. NOTE: the
+# stated rationale of the sibling `subagent-no-bg-longproc` hook/AGENTS.md entry ("a subagent
+# is never re-invoked by a background-completion notification") is broader than what this
+# comment claims and does not hold for an ordinary backgrounded Bash command — tracked
+# separately as agent-tools#546, out of scope for this mapping. The orchestrator's own Monitor
+# use (watching a backgrounded subagent) is legitimate and unaffected — this point only
+# governs subagent tool calls. Same two-repo split as `_AGENT_TOOLS`/`_SKILL_TOOLS` above:
+# this half only maps the point, and rig-cli's `hook_bridge_entries` registers the `Monitor`
+# PreToolUse matcher that makes it actually fire (rig-cli#296, shipped) — a given machine
+# needs `rig apply` to have run after both merged, plus a fresh CC session (hook config is
+# read at session start, not live), and the bridge itself enabled at all (see this module's
+# README's Installation section) for the block to actually take effect.
+_MONITOR_TOOLS = frozenset({"Monitor"})
 
 
 def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
@@ -75,6 +107,8 @@ def point_for_event(hook_event_name: str, tool_name: str | None) -> str | None:
             return "pre-agent"
         if tool_name in _SKILL_TOOLS:
             return "pre-skill"
+        if tool_name in _MONITOR_TOOLS:
+            return "pre-monitor"
     if hook_event_name == "PostToolUse" and tool_name in _WRITE_TOOLS:
         # The write already landed on disk → the REACTIVE point (format-on-write,
         # lint-on-write). A post-write hook's exit-10 is FEEDBACK to the model, not
@@ -157,8 +191,18 @@ def to_v1_event(cc_event: dict, *, point: str) -> dict:
         "event_id": cc_event.get("session_id", ""),
         "tool": cc_event.get("tool_name"),
         "point": point,
+        "harness": HARNESS,
         "command": tool_input.get("command", ""),
         "cwd": cc_event.get("cwd", os.getcwd()),
+        # CC's Stop payload carries this pointing at the session's own JSONL transcript
+        # (https://code.claude.com/docs/en/hooks). Forwarded unconditionally (empty string
+        # when absent) so the `stop` point's hooks — currently only
+        # stop-completion-selfcheck — can read what actually happened this turn instead of
+        # firing the same static text regardless of content. Not part of the T2 identity
+        # loop above: it isn't attacker-controlled (no tool_input carries it for `stop`,
+        # which has no tool_input at all) and it isn't used to scope a gating DECISION, only
+        # to pick which prompt text to show.
+        "transcript_path": cc_event.get("transcript_path", ""),
         "args": args,
     }
 

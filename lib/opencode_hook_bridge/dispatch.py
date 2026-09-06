@@ -17,6 +17,14 @@ import sys
 from pathlib import Path
 
 HOOK_API = "agents-hooks/v1"
+# The v1 event's `harness` tag for every event this bridge produces — a MODULE LITERAL, not
+# derived from `opencode_event`, so it cannot be forged via tool args the way `args.harness`
+# could be. See `codex_hook_bridge.HARNESS` for the same reasoning: opencode exposes no TRUSTED
+# per-tool-call subagent identity in the plugin payload either (forged agent_id/agent_type keys
+# are stripped below). A hook can read `event["harness"]` to scope a policy to (or exempt) this
+# whole harness instead — see `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES` for the
+# first consumer (agent-tools#533).
+HARNESS = "opencode"
 _KNOWN_EVENTS = frozenset({"tool.execute.before", "tool.execute.after"})
 _WRITE_TOOLS = frozenset({"edit", "write", "apply_patch"})
 _TASK_TOOL = "task"
@@ -101,6 +109,7 @@ def to_v1_event(opencode_event: dict, *, point: str) -> dict:
         "event_id": _event_id(opencode_event),
         "tool": tool,
         "point": point,
+        "harness": HARNESS,
         "command": command,
         "cwd": _cwd(opencode_event),
         "args": args,

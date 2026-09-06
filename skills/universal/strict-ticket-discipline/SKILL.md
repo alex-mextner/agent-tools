@@ -1,6 +1,6 @@
 ---
 name: strict-ticket-discipline
-description: Use before starting any non-trivial change — a feature, a bugfix, a refactor — and whenever you file a ticket or tracked task, and before closing a ticket or checking off an acceptance criterion. Every change starts from a ticket (task-cli / GitHub Issue / Linear) written before work and referenced from the commit. The ticket must be self-explanatory cold: what is concretely wrong, evidence captured FIRST (a Playwright/Docker screenshot of the broken state, never screencapture; a failing run; a repro), where it came from, the user-facing consequence of not fixing it, provable acceptance criteria, and pseudocode when the fix is non-obvious. Plus five documentation rules: links-not-bare-ids, no close with unchecked acceptance boxes, no checked box without a visual proof, at least 2 criteria, and a plain-language user-impact.
+description: 'Use before starting any non-trivial change — a feature, a bugfix, a refactor — and whenever you file a ticket or tracked task, and before closing a ticket or checking off an acceptance criterion. Every change starts from a ticket (task-cli / GitHub Issue / Linear) written before work and referenced from the commit. The ticket must be self-explanatory cold: what is concretely wrong, evidence captured FIRST (a Playwright/Docker screenshot of the broken state, never screencapture; a failing run; a repro), where it came from, the user-facing consequence of not fixing it, provable acceptance criteria, and pseudocode when the fix is non-obvious. Plus five documentation rules: links-not-bare-ids, no close with unchecked acceptance boxes, no checked box without a visual proof, at least 2 criteria, and a plain-language user-impact.'
 ---
 
 # Every non-trivial change starts from a ticket
@@ -26,6 +26,16 @@ Linear) that states:
 Then reference that ticket from the work: in the commit message (`Refs #123`,
 `task:ABC-12`, a Linear `ENG-456`) and/or the PR. The `require-ticket-before-commit`
 agent-hook checks for that reference at commit time.
+
+**Write `Refs`, never `Closes`/`Fixes`/`Resolves` (or `closed`/`fixed`/`resolved`), before an
+issue number or ticket code — in the PR title and body as well as commits.** Those are
+GitHub's magic-close keywords, and Linear's GitHub integration honours the same words before
+a ticket code: the ticket flips to Done the instant the PR merges, behind every gate below
+(no criterion checked, no proof). `Refs` links the PR to the ticket without closing it; the
+ticket closes only through `task done` after acceptance. `gh ship` refuses a PR carrying a
+magic-close keyword (`--rewrite-magic-close` rewrites it to `Refs`), and runs
+`task gate <code>` before merging — the merge is refused while any criterion is unchecked or
+checked without a proof (see `ci/ship/README.md`).
 
 ## What a ticket must contain — the evidence-first standard
 

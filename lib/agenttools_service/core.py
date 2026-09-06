@@ -55,14 +55,23 @@ PAST BUGS THIS GUARDS AGAINST
     - Per-tool copies of this logic drift (slightly different pidfile formats, one forgets
       the systemd fallback, one launches on the bare command). One shared manager keeps every
       daemon's lifecycle identical.
+    - ``stop``/``disable`` used to report an unqualified success ("stopped" / "disabled and
+      stopped") purely from the pidfile's point of view — but the pidfile only tracks a
+      MANAGER-spawned instance. An ad-hoc, unmanaged process bound to the same port (e.g.
+      ``review dashboard run``) has no pidfile at all, so ``stop``/``disable`` could not see
+      it and still claimed success while it kept running and holding the port (agent-tools
+      review-cli#377). ``ServiceManager.probe_port`` now checks the port itself, after
+      acting, and ``run_action`` warns + exits nonzero instead of lying about success.
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Protocol, Sequence
@@ -319,6 +328,131 @@ class ServiceStatus:
             "url": self.url,
             "enabled": self.enabled,
         }
+
+
+@dataclass(frozen=True)
+class PortProbe:
+    """Whether something is currently listening on a service's port, independent of the
+    pidfile.
+
+    ``occupied`` is the authoritative signal (a live TCP accept on the port). ``pid`` is a
+    best-effort identification of the listener (via ``lsof``) — ``None`` when unresolvable
+    (no ``lsof`` on this host, a permission wall, or the listener exited between the connect
+    probe and the ``lsof`` call). ``addr`` is the loopback address the connect actually
+    succeeded against (``"127.0.0.1"`` or ``"::1"``) when known — ``None`` for a
+    caller-supplied fake probe that doesn't track it (message formatting falls back to
+    :func:`_loopback_for` in that case). Callers must treat ``occupied`` as ground truth and
+    ``pid``/``addr`` as a bonus, never require either.
+    """
+
+    occupied: bool
+    pid: Optional[int] = None
+    addr: Optional[str] = None
+
+
+# The two loopback addresses :func:`_default_port_prober` tries, in order.
+_LOOPBACK_ADDRS = ("127.0.0.1", "::1")
+
+
+def _loopback_for(host: str) -> str:
+    """A best-guess loopback address for DISPLAY when a probe result carries no ``addr`` of
+    its own (e.g. a test-supplied fake :class:`PortProbe`) — deliberately ignores ``host``
+    beyond an IPv6-vs-IPv4 hint; never dials ``host`` itself.
+
+    ``Service.host`` is documented as **display-only** (it feeds the ``url`` shown to a
+    human; nothing in ``Service``/``ServiceManager`` ever binds a socket to it — the actual
+    server process picks its own bind address independently), so this is a fallback for
+    WORDING a warning, not a connection target: :func:`_default_port_prober` dials both
+    loopback families directly (see ``_LOOPBACK_ADDRS``) rather than picking one via this
+    function — probing only the family this heuristic would have guessed, chosen from a
+    field that doesn't reliably say which family the daemon actually bound, was a proven
+    false-negative in an earlier revision (review-cli#377 review round 3: a foreign listener
+    on the OTHER family read as "port free"). This function's remaining job is cosmetic:
+    anything containing ``:`` (an IPv6 literal, incl. the ``::`` wildcard) guesses the IPv6
+    loopback (``::1``); everything else guesses the IPv4 loopback (``127.0.0.1``).
+    """
+    if ":" in host:
+        return "::1"
+    return "127.0.0.1"
+
+
+def _lsof_listener_pid(
+    port: int, *, runner: Optional[Callable[[Sequence[str]], "subprocess.CompletedProcess"]] = None
+) -> Optional[int]:
+    """Best-effort PID of the process LISTENing on ``port`` (macOS/Linux, via ``lsof``).
+
+    Returns ``None`` on anything short of a clean, UNAMBIGUOUS single-PID answer: no ``lsof``
+    binary, a nonzero/timed-out/malformed run, no output, OR **more than one** PID line
+    (``lsof -t`` prints one PID per matching socket — SO_REUSEPORT, or separate IPv4/IPv6
+    listeners on the same port from different processes, can legitimately produce several).
+    Guessing "the first one" in that case can name the WRONG process in the warning message,
+    which is worse than naming none — so this returns ``None`` and the caller falls back to
+    "(pid unknown)" instead of a plausible-looking lie. Never raises. The port-occupied signal
+    from :func:`_default_port_prober`'s connect probe is authoritative regardless; this is
+    purely a "name the culprit if we can" nicety for the warning message.
+
+    ``runner`` is an injectable ``Callable[[argv], CompletedProcess]`` (defaults to a real
+    ``subprocess.run``) so tests can exercise every branch (missing binary, timeout, 0/1/N
+    PID lines) without a real ``lsof`` process.
+    """
+    lsof = shutil.which("lsof")
+    if lsof is None:
+        return None
+    run = runner or _default_lsof_runner
+    try:
+        completed = run([lsof, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"])
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        # A nonzero exit (e.g. a partial/permission-walled run) means the docstring's "clean
+        # answer" bar isn't met even if stdout happens to carry a PID line — don't attribute
+        # a listener to output lsof itself flagged as unreliable.
+        return None
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+    try:
+        return int(lines[0])
+    except ValueError:
+        return None
+
+
+def _default_lsof_runner(cmd: Sequence[str]) -> "subprocess.CompletedProcess":
+    """Real ``lsof`` invocation for :func:`_lsof_listener_pid` (list-argv, no shell)."""
+    return subprocess.run(  # noqa: S603
+        list(cmd), check=False, capture_output=True, text=True, timeout=3
+    )
+
+
+def _default_port_prober(host: str, port: int) -> PortProbe:
+    """Real liveness probe: attempt a TCP connect to a service's port.
+
+    ``host`` is accepted (to match the ``Callable[[str, int], PortProbe]`` seam contract) but
+    deliberately UNUSED beyond the fact that a caller passed one — see :func:`_loopback_for`'s
+    docstring for why dialing it would be wrong. Instead this tries BOTH loopback address
+    families in turn, IPv4 (``127.0.0.1``) then IPv6 (``::1``): a service's descriptor doesn't
+    reliably say which family the daemon actually bound, and probing only one produced a
+    proven false-negative (review-cli#377 review round 3). Occupied if EITHER family accepts
+    a connection; a short timeout (0.5s) per attempt keeps ``stop``/``disable`` responsive
+    even when a port is filtered rather than refused.
+
+    Any connect failure on an address (``ConnectionRefusedError``, DNS/other ``OSError``, or a
+    ``UnicodeError`` — a ``ValueError`` subclass, NOT an ``OSError`` — from an address literal
+    that somehow fails to parse) means "nothing here", so the next family is tried; if BOTH
+    fail, "nothing is listening" — the common, fast case. (The ``UnicodeError`` catch is
+    defensive-only: both dialed literals are fixed ASCII constants, so IDNA encoding can't
+    actually fail for them today — kept because a caller-controlled probe target is not
+    inconceivable for a future revision of this seam, and the cost of catching a class that
+    can't currently fire is zero.)
+    """
+    for addr in _LOOPBACK_ADDRS:
+        try:
+            with socket.create_connection((addr, port), timeout=0.5):
+                pass
+        except (OSError, UnicodeError):
+            continue
+        return PortProbe(occupied=True, pid=_lsof_listener_pid(port), addr=addr)
+    return PortProbe(occupied=False, pid=None)
 
 
 # ---------------------------------------------------------------------------------------
@@ -762,6 +896,17 @@ class ServiceManager:
     foreground_runner
         ``Callable[[argv], int]`` used by ``run`` to block on the foreground process.
         Defaults to ``subprocess.call`` (returns the exit code). Injected in tests.
+    port_probe
+        ``Callable[[host, port], PortProbe]`` used by :meth:`probe_port` to check whether
+        something is listening on the service's port, independent of the pidfile. Defaults to
+        :func:`_default_port_prober` (a real TCP connect + best-effort ``lsof`` lookup).
+        Injected in tests so the suite never dials a real socket.
+    sleeper
+        ``Callable[[seconds], None]`` used ONLY by :func:`_run_action_disable`'s post-teardown
+        settle-and-re-probe (an OS-managed ``launchctl unload``/``systemctl disable --now``
+        can return before the process has actually released the port — see that function's
+        docstring). Defaults to ``time.sleep``. Injected in tests so the suite waits zero
+        wall-clock time while still asserting the retry happened.
     """
 
     service: Service
@@ -773,6 +918,8 @@ class ServiceManager:
     alive: Optional[Callable[[int], bool]] = None
     signaller: Optional[Callable[[int, int], None]] = None
     foreground_runner: Optional[Callable[[Argv], int]] = None
+    port_probe: Optional[Callable[[str, int], PortProbe]] = None
+    sleeper: Optional[Callable[[float], None]] = None
 
     _backend: AutostartBackend = field(init=False, repr=False)
     # Same-process record of whether the most recent enable's OS control command succeeded.
@@ -792,6 +939,10 @@ class ServiceManager:
             self.spawner = _default_detached_spawner
         if self.foreground_runner is None:
             self.foreground_runner = _default_foreground_runner
+        if self.port_probe is None:
+            self.port_probe = _default_port_prober
+        if self.sleeper is None:
+            self.sleeper = time.sleep
 
     # --- helpers ---------------------------------------------------------------------
 
@@ -891,6 +1042,21 @@ class ServiceManager:
         ``disable`` (via the backend's ``uninstall``), not here.
         """
         return self._supervisor().stop()
+
+    def probe_port(self) -> Optional[PortProbe]:
+        """Check whether something is listening on this service's port right now.
+
+        ``None`` when the service has no port (not a network server) — nothing to probe.
+        This is independent of the pidfile: it answers "is the PORT free", not "is the
+        MANAGER-spawned instance gone". The two differ exactly when an ad-hoc, unmanaged
+        process (e.g. ``review dashboard run``) is bound to the same port — ``stop``/
+        ``disable`` only ever touch the pidfile-tracked instance, so a foreign listener
+        survives them; :func:`run_action` calls this afterward to catch that case instead of
+        reporting an unqualified success.
+        """
+        if self.service.port is None:
+            return None
+        return self.port_probe(self.service.host, self.service.port)  # type: ignore[misc]
 
     def autostart_active(self) -> bool:
         """Whether OS autostart is BOTH installed AND was last set up successfully.
@@ -1061,11 +1227,15 @@ def run_action(manager: ServiceManager, action: str) -> int:
 
     Exit codes: ``0`` on success; ``3`` when ``status``/``stop`` find nothing running (so a
     script can branch on "was it up?"); ``4`` when ``enable``/``disable`` could not set up /
-    tear down OS autostart (the launchctl/systemctl command failed). NOTE: ``run`` returns the
-    RAW exit code of the foreground child, which may itself be ``3``/``4`` — the 3/4 contract
-    above applies only to the manager-driven actions, not to ``run``'s passthrough. Success
-    lines go to stdout; failure lines go to stderr (Unix convention). Kept tiny + side-effecting
-    so a consumer can call it directly or let :func:`dispatch` call it.
+    tear down OS autostart (the launchctl/systemctl command failed), OR when ``stop``/
+    ``disable`` acted on (or found nothing of) the MANAGER-spawned instance but something
+    else is still listening on the service's port afterward — an unmanaged/foreign process
+    (e.g. an ad-hoc ``run``) this manager does not own and did not stop; see
+    :meth:`ServiceManager.probe_port`. NOTE: ``run`` returns the RAW exit code of the
+    foreground child, which may itself be ``3``/``4`` — the 3/4 contract above applies only to
+    the manager-driven actions, not to ``run``'s passthrough. Success lines go to stdout;
+    failure lines go to stderr (Unix convention). Kept tiny + side-effecting so a consumer can
+    call it directly or let :func:`dispatch` call it.
     """
     svc = manager.service
     if action == "run":
@@ -1097,24 +1267,7 @@ def run_action(manager: ServiceManager, action: str) -> int:
         _print(f"{svc.name}: {st.state}")
         return 3
     if action == "stop":
-        stopped = manager.stop()
-        if stopped:
-            _print(f"{svc.name}: stopped")
-            return 0
-        # No pidfile-tracked instance. But if OS autostart owns the process (enabled on a
-        # launchd/systemd backend), a bare "was not running" is misleading — the service is
-        # very likely alive under the OS, and `stop` does not touch the OS-managed process
-        # (that's `disable`'s job). Warn on stderr so a script reading stdout/exit-3 isn't
-        # fooled into thinking nothing is up.
-        if manager.backend.manages_process and manager.status().enabled:
-            _eprint(
-                f"{svc.name}: no background instance to stop, but OS autostart "
-                f"({manager.backend.kind}) is enabled — run 'disable' to stop the "
-                f"OS-managed process"
-            )
-        else:
-            _print(f"{svc.name}: was not running")
-        return 3
+        return _run_action_stop(manager)
     if action == "enable":
         st = manager.enable()
         where = manager.backend.kind
@@ -1139,16 +1292,143 @@ def run_action(manager: ServiceManager, action: str) -> int:
         )
         return 0
     if action == "disable":
-        manager.disable()
-        if manager.last_disable_ok:
-            _print(f"{svc.name}: autostart disabled and stopped")
-            return 0
+        return _run_action_disable(manager)
+    raise ValueError(f"unknown service action: {action!r}")
+
+
+def _run_action_stop(manager: ServiceManager) -> int:
+    """``stop`` handler for :func:`run_action`.
+
+    Stops the MANAGER-spawned instance, then checks the port is actually free. Reporting
+    success (or a bare "was not running") while a foreign, unmanaged process is still bound
+    to the port is the exact false-confidence bug this guards against (review-cli#377).
+
+    NOT probed on the OS-autostart-enabled/no-pidfile branch below: there, an occupied port
+    is the EXPECTED, healthy state (the OS-owned process itself), and `stop` has no way to
+    tell that apart from a genuine foreign listener without identifying the OS process's own
+    pid (out of scope here) — probing there produced a real regression in an earlier
+    revision (a healthy `enable`d service made `stop` cry wolf; review-cli#377 review
+    round 2). `disable` is the action that actually removes the OS-managed process, so ITS
+    post-action probe (see :func:`_run_action_disable`) is the one that means something.
+    """
+    svc = manager.service
+    stopped = manager.stop()
+    if stopped:
+        foreign = _foreign_listener_fragment(manager)
+        if foreign:
+            _eprint(f"{svc.name}: stopped the managed instance, but {foreign}")
+            return 4
+        _print(f"{svc.name}: stopped")
+        return 0
+    # No pidfile-tracked instance. But if OS autostart owns the process (enabled on a
+    # launchd/systemd backend), a bare "was not running" is misleading — the service is
+    # very likely alive under the OS, and `stop` does not touch the OS-managed process
+    # (that's `disable`'s job). Warn on stderr so a script reading stdout/exit-3 isn't
+    # fooled into thinking nothing is up. Deliberately does NOT probe the port here (see the
+    # docstring above) — an occupied port in this exact state is expected, not a finding.
+    if manager.backend.manages_process and manager.status().enabled:
+        _eprint(
+            f"{svc.name}: no background instance to stop, but OS autostart "
+            f"({manager.backend.kind}) is enabled — run 'disable' to stop the "
+            f"OS-managed process"
+        )
+        return 3
+    foreign = _foreign_listener_fragment(manager)
+    if foreign:
+        # THE incident this guards against: an ad-hoc `run` process (no pidfile) is bound to
+        # the port. `stop` has nothing of its own to stop, but claiming "was not running"
+        # would be a false all-clear.
+        _eprint(f"{svc.name}: no managed instance was running, but {foreign}")
+        return 4
+    _print(f"{svc.name}: was not running")
+    return 3
+
+
+def _run_action_disable(manager: ServiceManager) -> int:
+    """``disable`` handler for :func:`run_action`.
+
+    Removes autostart + stops the managed instance, then checks the port is actually free
+    (see :func:`_run_action_stop` for why that check matters — unlike `stop`, an occupied
+    port HERE is always meaningful: `disable` is the action that actually tears down the
+    OS-managed process, so nothing of this service's own should be listening once it
+    returns).
+
+    SETTLE WINDOW: on the launchd backend, `uninstall` calls `launchctl unload`, which is not
+    guaranteed to have fully reaped the process (and released the port) by the time it
+    returns (`systemctl --user disable --now` is closer to synchronous). A daemon that takes
+    a moment to drain its listener would otherwise make this probe transiently read
+    "occupied" for an otherwise-successful disable — flapping a real success into a false
+    failure, AND misattributing the manager's own dying process as a foreign listener. So an
+    occupied first probe gets ONE settle-and-re-probe (:data:`_DISABLE_SETTLE_SECONDS` via
+    `manager.sleeper`, injectable in tests) before being reported; still occupied after that
+    is treated as a genuine finding.
+    """
+    svc = manager.service
+    manager.disable()
+    if not manager.last_disable_ok:
         _eprint(
             f"{svc.name}: FAILED to remove autostart ({manager.backend.kind}) — "
             f"the unit may still be loaded; check it manually"
         )
         return 4
-    raise ValueError(f"unknown service action: {action!r}")
+    foreign = _foreign_listener_fragment(manager)
+    if foreign:
+        # Give a slow-draining OS teardown one chance to actually finish before believing it.
+        manager.sleeper(_DISABLE_SETTLE_SECONDS)  # type: ignore[misc]
+        foreign = _foreign_listener_fragment(manager)
+    if foreign:
+        # Don't claim "the managed instance stopped" here — `disable` may have had nothing
+        # of its own to stop (was_installed=False, or the pidfile path was already empty);
+        # the only claim this branch is entitled to make is "autostart is removed".
+        _eprint(f"{svc.name}: autostart disabled, but {foreign}")
+        return 4
+    _print(f"{svc.name}: autostart disabled and stopped")
+    return 0
+
+
+# Grace window `_run_action_disable` waits, once, before believing an occupied port really
+# means a foreign listener rather than its own OS-managed process still draining after
+# `launchctl unload` returns. Short enough to keep `disable` responsive; long enough to cover
+# a normal process-exit drain (an unusually slow shutdown still gets the correct, if delayed,
+# verdict on the next manual `disable`/`status`).
+_DISABLE_SETTLE_SECONDS = 0.5
+
+
+def _foreign_listener_fragment(manager: ServiceManager) -> Optional[str]:
+    """A warning fragment naming the port (+ pid if resolvable) when something is still
+    listening on the service's port after ``stop``/``disable`` acted.
+
+    Returns ``None`` when the port is free or the service has no port (nothing to warn
+    about). Deliberately does NOT claim the listener "was not started by this manager": the
+    common case IS an ad-hoc/unmanaged process this manager never tracked, but two edge cases
+    make a flat "not ours" claim occasionally false — a forked child that inherited the
+    manager's own listening socket and outlived the parent's stop signal, or a stubborn
+    process that survived ``agenttools_daemon.Supervisor``'s SIGTERM/SIGKILL escalation
+    (``Supervisor.stop`` reports success once the *original* pid is confirmed dead, which does
+    not guarantee an inherited fd was closed). Either way the fact worth reporting is the same
+    — the port is occupied right now, regardless of `stop`/`disable`'s own success — so the
+    wording stays neutral about ownership rather than asserting a cause it cannot verify.
+    """
+    probe = manager.probe_port()
+    if probe is None or not probe.occupied:
+        return None
+    svc = manager.service
+    # Prefer the address the real probe actually connected on; fall back to a display guess
+    # only for a caller-supplied fake PortProbe that doesn't track it (tests).
+    addr = probe.addr or _loopback_for(svc.host)
+    # Bracket an IPv6 literal (`[::1]:7878`) so the address:port pair parses unambiguously —
+    # `::1:7878` is unparseable/misleading (looks like part of the address).
+    probed_addr = f"[{addr}]:{svc.port}" if ":" in addr else f"{addr}:{svc.port}"
+    pid_part = f" (pid {probe.pid})" if probe.pid is not None else " (pid unknown)"
+    # Match the docstring's own "stays neutral about ownership" promise: don't assert WHO the
+    # listener is (a prior wording said "likely a process this manager never tracked, e.g. an
+    # ad-hoc run" — which is exactly the claim the docstring above disavows, since a forked
+    # child or a stop-signal survivor can still be this manager's own). State only the fact
+    # the probe actually established: it wasn't stopped by this command.
+    return (
+        f"something is still listening on {probed_addr}{pid_part} — it was not stopped "
+        f"by this command"
+    )
 
 
 def _url_suffix(st: ServiceStatus) -> str:
@@ -1196,6 +1476,7 @@ __all__ = [
     "Service",
     "ServiceManager",
     "ServiceStatus",
+    "PortProbe",
     "AutostartBackend",
     "LaunchdBackend",
     "SystemdUserBackend",

@@ -64,6 +64,13 @@ trusted as a non-forgeable subagent identity in the plugin payload, so
 subagent-exempt hooks treat opencode tool calls as main-thread calls unless a future
 opencode contract exposes an authoritative identity field.
 
+Every translated v1 event also carries a top-level `harness: "opencode"` — a hardcoded
+module constant (`dispatch.HARNESS`), never derived from the opencode event, so it can't be
+forged via tool args the way the identity fields above must be actively stripped. A hook
+that needs to scope a policy to (or exempt) one harness reads `event["harness"]` directly
+(see `agent-hooks/orchestrator-stays-thin`'s harness-exempt list for the first consumer,
+agent-tools#533) instead of trying to reconstruct a trusted subagent identity.
+
 ## Descriptor directory
 
 By default the bridge reads:
