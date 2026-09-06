@@ -6104,6 +6104,66 @@ def test_review_quorum_issue_url_needs_a_known_own_repo(tmp_path):
     assert "could not derive a task code" in r.stderr, r.stderr
 
 
+def _ship_bash_functions(*names: str) -> str:
+    """The named top-level bash functions of ship.sh, verbatim, for sourcing under stubs."""
+    text = _SHIP.read_text(encoding="utf-8")
+    out = []
+    for name in names:
+        m = re.search(rf"^{re.escape(name)}\(\) \{{.*?^\}}$", text, re.MULTILINE | re.DOTALL)
+        assert m, f"{name} not found in ship.sh"
+        out.append(m.group(0))
+    return "\n".join(out)
+
+
+def _extract_ticket_with_own_repo(bodies, *, cwd: Path, origin_repo: str, live_pr_url: str | None):
+    """Run `_review_quorum_extract_ticket` on each body inside ONE shell whose checkout origin
+    slug is `origin_repo` and whose `gh pr view --json url` prints `live_pr_url` (None = the
+    call fails). Returns the derived codes in order ("" = nothing derived)."""
+    fns = _ship_bash_functions(
+        "_review_quorum_extract_ticket", "_ship_own_repo_issue_numbers",
+        "_ship_own_repo_slugs", "_ship_normalize_repo_slug",
+    )
+    gh_stub = "gh() { return 1; }" if live_pr_url is None else f"gh() {{ printf '%s\\n' '{live_pr_url}'; }}"
+    script = "\n".join([
+        "set -euo pipefail",
+        f"PR=7; GH_REPO=''; _CWD_ORIGIN_REPO='{origin_repo}'",
+        "_SHIP_OWN_REPO_SLUGS=''; _SHIP_OWN_REPO_SLUGS_RESOLVED=0",
+        gh_stub, fns,
+        'for b in "$@"; do printf \'%s\\n\' "$(_review_quorum_extract_ticket "$b")"; done',
+    ])
+    r = _sh("bash", "-c", script, "extract", *bodies, cwd=cwd)
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    return r.stdout.split("\n")[: len(bodies)]
+
+
+def test_review_quorum_issue_url_accepts_live_pr_slug_after_repo_rename(tmp_path):
+    """A renamed/transferred repo leaves the clone with the OLD, redirecting origin slug while the
+    live PR and its issue links carry the NEW one (codex review, PR #566). An issue URL under
+    EITHER slug names this PR's own repo, so a correct link is not refused as foreign; the same
+    issue under both slugs is ONE ticket; another repo's issue is still foreign."""
+    got = _extract_ticket_with_own_repo(
+        [
+            "Refs [#105](https://github.com/new-org/new-repo/issues/105)",
+            "Refs [#105](https://github.com/old-org/old-repo/issues/105)",
+            "https://github.com/old-org/old-repo/issues/12 https://github.com/new-org/new-repo/issues/12",
+            "https://github.com/other-org/other-repo/issues/105",
+        ],
+        cwd=tmp_path, origin_repo="old-org/old-repo",
+        live_pr_url="https://github.com/new-org/new-repo/pull/7",
+    )
+    assert got == ["#105", "#105", "#12", ""], got
+
+
+def test_review_quorum_issue_url_origin_slug_still_works_when_gh_url_lookup_fails(tmp_path):
+    """The live-PR-URL lookup is additive: when `gh pr view --json url` fails (offline), the
+    checkout origin alone still identifies the own repo, exactly as before."""
+    got = _extract_ticket_with_own_repo(
+        ["https://github.com/acme/widgets/issues/548", "https://github.com/acme/other/issues/548"],
+        cwd=tmp_path, origin_repo="acme/widgets", live_pr_url=None,
+    )
+    assert got == ["#548", ""], got
+
+
 def test_review_quorum_keyword_anchored_ref_takes_precedence_over_issue_url(tmp_path):
     """The URL arm is the LAST fallback: an explicit `Refs #12` wins over a same-repo issue URL
     mentioned elsewhere in the body."""

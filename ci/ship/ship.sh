@@ -2152,8 +2152,9 @@ _review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing
   # hand-set REVIEW_TASK_CODE, the manual step that gets forgotten. The URL yields the SAME
   # literal `#<n>` the keyword arm yields, so review-cli's quorum record and task-cli's routing
   # see one code regardless of body syntax. Rules, mirroring the keyword arm's hazards:
-  #   - the URL's owner/repo must equal the PR's own repo (_ship_own_repo_slug, compared
-  #     case-insensitively — GitHub slugs are); an issue of ANOTHER repo is never this PR's
+  #   - the URL's owner/repo must be one of the PR's own slugs (_ship_own_repo_slugs: explicit
+  #     --repo, checkout origin, live PR URL; compared case-insensitively — GitHub slugs are);
+  #     an issue of ANOTHER repo is never this PR's
   #     ticket (cross-repo companions like "tg-cli#301 <-> agent-tools#524" are routine here);
   #     an unknown own-repo (no github origin, no --repo, no PR url) derives nothing.
   #   - only `/issues/<n>` counts — a `/pull/<n>` link is a PR, not a ticket; `www.` and a
@@ -2170,21 +2171,30 @@ _review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE \
       'https?://(www\.)?github\.com/[^/[:space:]]+/[^/[:space:]]+/issues/[0-9]+[A-Za-z0-9_]?' || true)
   [ -n "$m" ] || return 0
-  local slug; slug=$(_ship_own_repo_slug)
-  [ -n "$slug" ] || return 0
-  local cand n issues=""
+  local issues; issues=$(_ship_own_repo_issue_numbers "$m" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
+  if [ "$(printf '%s\n' "$issues" | LC_ALL=C grep -c .)" -eq 1 ]; then printf '#%s' "$issues"; fi
+  return 0
+}
+
+# $1 = newline-separated GitHub issue URLs (as matched by the extractor above) -> prints the
+# issue NUMBER of every URL that names the PR's OWN repo, one per line (duplicates kept — the
+# caller dedups and applies the ambiguity rule); prints nothing when the own repo is unknown.
+# ALWAYS exits 0.
+_ship_own_repo_issue_numbers() {
+  local slugs cand slug n
+  slugs=$(_ship_own_repo_slugs)
+  [ -n "$slugs" ] || return 0
   while IFS= read -r cand; do
     [ -n "$cand" ] || continue
     cand=$(printf '%s' "$cand" | LC_ALL=C tr '[:upper:]' '[:lower:]' \
              | LC_ALL=C sed -E 's|^https?://(www\.)?github\.com/||')
-    case "$cand" in
-      "$slug"/issues/*) n="${cand##*/}"
-                        case "$n" in *[!0-9]*) continue ;; esac
-                        issues="${issues}${n}"$'\n' ;;
-    esac
-  done <<< "$m"
-  issues=$(printf '%s' "$issues" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
-  if [ "$(printf '%s\n' "$issues" | LC_ALL=C grep -c .)" -eq 1 ]; then printf '#%s' "$issues"; fi
+    while IFS= read -r slug; do
+      case "$cand" in
+        "$slug"/issues/*) n="${cand##*/}"
+                          case "$n" in *[!0-9]*) ;; *) printf '%s\n' "$n" ;; esac ;;
+      esac
+    done <<< "$slugs"
+  done <<< "$1"
   return 0
 }
 
@@ -2195,26 +2205,44 @@ _review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing
 # origin (_CWD_ORIGIN_REPO, free — the common path never pays a network call), then, only when
 # both are empty (a non-github origin; the test harness), the PR's own URL from `gh pr view`.
 # Memoized: one resolution per ship run, however many texts the matcher scans.
-_SHIP_OWN_REPO_SLUG=""; _SHIP_OWN_REPO_SLUG_RESOLVED=0
-_ship_own_repo_slug() {  # -> prints "owner/repo" (lowercase) or nothing; ALWAYS exits 0
-  if [ "$_SHIP_OWN_REPO_SLUG_RESOLVED" = "0" ]; then
-    _SHIP_OWN_REPO_SLUG_RESOLVED=1
-    local slug="${GH_REPO:-${_CWD_ORIGIN_REPO:-}}"
-    if [ -z "$slug" ]; then
-      slug=$(gh pr view "$PR" --json url -q '.url // ""' 2>/dev/null) || slug=""
-      slug=$(printf '%s\n' "$slug" | LC_ALL=C sed -E 's|/pull/[0-9]+.*$||')
-    fi
-    # gh accepts `--repo` as OWNER/REPO, HOST/OWNER/REPO or a full URL — reduce every form to
-    # owner/repo; anything that does not reduce to exactly two path segments is unusable.
-    slug=$(printf '%s\n' "$slug" | LC_ALL=C tr '[:upper:]' '[:lower:]' \
-             | LC_ALL=C sed -E 's|^https?://||; s|^(www\.)?github\.com[:/]||; s|\.git$||; s|/+$||')
-    case "$slug" in
-      */*/*|/*|*/|"") _SHIP_OWN_REPO_SLUG="" ;;
-      */*) _SHIP_OWN_REPO_SLUG="$slug" ;;
-      *) _SHIP_OWN_REPO_SLUG="" ;;
-    esac
+_SHIP_OWN_REPO_SLUGS=""; _SHIP_OWN_REPO_SLUGS_RESOLVED=0
+# -> prints every lowercase "owner/repo" slug that names the PR's OWN repo, one per line (none
+# when it cannot be told); resolved ONCE per run; ALWAYS exits 0. The set is the union of the
+# explicit `gh` target (GH_REPO, so a foreign `--repo` ship compares against the TARGET repo,
+# not this checkout), this checkout's GitHub origin, and the LIVE PR URL. All three are kept —
+# not first-non-empty — because after a repository rename/transfer an existing clone keeps the
+# OLD, redirecting origin slug while the live PR and its issue links carry the NEW one (codex
+# review, PR #566): trusting the origin alone would classify a correct same-repo issue link as
+# foreign and refuse. GitHub redirects the old slug to the same repository, so an issue URL
+# under either slug names this PR's own repo. The live URL costs one `gh pr view` on the URL
+# path only (the arms before it never call this).
+_ship_own_repo_slugs() {
+  if [ "$_SHIP_OWN_REPO_SLUGS_RESOLVED" = "0" ]; then
+    _SHIP_OWN_REPO_SLUGS_RESOLVED=1
+    local raw live
+    live=$(gh pr view "$PR" --json url -q '.url // ""' 2>/dev/null) || live=""
+    live=$(printf '%s\n' "$live" | LC_ALL=C sed -E 's|/pull/[0-9]+.*$||')
+    for raw in "${GH_REPO:-}" "${_CWD_ORIGIN_REPO:-}" "$live"; do
+      raw=$(_ship_normalize_repo_slug "$raw")
+      [ -n "$raw" ] || continue
+      _SHIP_OWN_REPO_SLUGS="${_SHIP_OWN_REPO_SLUGS}${raw}"$'\n'
+    done
+    _SHIP_OWN_REPO_SLUGS=$(printf '%s' "$_SHIP_OWN_REPO_SLUGS" | LC_ALL=C sort -u)
   fi
-  printf '%s' "$_SHIP_OWN_REPO_SLUG"
+  printf '%s' "$_SHIP_OWN_REPO_SLUGS"
+  return 0
+}
+# $1 = a repo reference in any form gh accepts (`OWNER/REPO`, `HOST/OWNER/REPO`, a full URL,
+# `.git` suffix) -> prints the lowercase `owner/repo`, or nothing when it does not reduce to
+# exactly two path segments (unusable). ALWAYS exits 0.
+_ship_normalize_repo_slug() {
+  local slug
+  slug=$(printf '%s\n' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+           | LC_ALL=C sed -E 's|^https?://||; s|^(www\.)?github\.com[:/]||; s|\.git$||; s|/+$||')
+  case "$slug" in
+    */*/*|/*|*/|"") ;;
+    */*) printf '%s' "$slug" ;;
+  esac
   return 0
 }
 
