@@ -71,9 +71,12 @@ def to_v1_event(omp_event: dict, *, point: str) -> dict:
     tool = _tool_name(omp_event)
     raw_args = _tool_args(omp_event)
     args = dict(raw_args)
-    # Normalize BEFORE stripping: `agent` is both the source field for `subagent_type` and a
-    # forged-identity key that must not survive into `args` itself.
-    _normalize_task_args(args)
+    # Task-only, and BEFORE stripping: `agent` is both the source field for `subagent_type`
+    # and a forged-identity key that must not survive into `args` itself. Gated on the tool
+    # so a bash/write call whose args happen to carry a `task` key never gets a pre-agent
+    # field (`run_in_background`) injected into a pre-bash/pre-write event.
+    if tool == _TASK_TOOL:
+        _normalize_task_args(args)
     for key in _FORGED_AGENT_KEYS:
         args.pop(key, None)
 
@@ -105,9 +108,8 @@ def hooks_dir() -> Path:
     """Where omp-installed v1 descriptors live, overridable for tests.
 
     Precedence: ``OMP_HOOKS_DIR`` (test/session override, highest priority) > the omp agent
-    root resolved the same way rig-cli's ``riglib.harness_skills.omp_agent_root`` resolves
-    it (``PI_CODING_AGENT_DIR`` full override > ``PI_CONFIG_DIR`` config-dirname rename >
-    default ``~/.omp/agent``) > ``hooks``.
+    root (``OMP_CODING_AGENT_DIR`` > ``PI_CODING_AGENT_DIR`` full override > ``PI_CONFIG_DIR``
+    config-dirname rename > default ``~/.omp/agent``) > ``hooks``.
     """
     override = os.environ.get("OMP_HOOKS_DIR")
     if override:
@@ -116,30 +118,42 @@ def hooks_dir() -> Path:
 
 
 def _omp_agent_root() -> str:
-    """omp's agent dir (unexpanded, ``~``-anchored), honoring omp's own env overrides.
+    """omp's agent dir (``~``-anchored string), honoring omp's own env overrides.
 
     Ported from ``riglib.harness_skills.omp_agent_root`` (rig-cli) — this dispatcher
-    cannot import rig-cli code, so the precedence logic is duplicated here. Keep the two
-    in lockstep if omp's env-var contract ever changes. In particular, both env vars are
-    expanded with ``$VAR``/``${VAR}`` substitution BEFORE ``~`` expansion (mirroring
-    rig-cli's own ``expand_user_path``, which is ``expanduser(expandvars(path))``) — a value
-    like ``PI_CODING_AGENT_DIR='$HOME/omp-agent'`` must resolve to the same real path rig
-    installs the descriptor dir and extension symlink into, or this dispatcher would load
-    zero descriptors from the wrong (unexpanded) path and silently allow everything.
+    cannot import rig-cli code, so the precedence logic is duplicated here; keep the two in
+    lockstep if omp's env-var contract changes. Two deliberate additions over that port:
+
+    - ``OMP_CODING_AGENT_DIR`` is checked BEFORE ``PI_CODING_AGENT_DIR``, matching this
+      repo's own omp resolver (``lib/checker/model_freshness.py::_omp_agent_db``), which
+      reads omp's primary OMP-prefixed override first and the legacy PI-prefixed one second.
+    - Each override is expanded with ``$VAR`` substitution then ``~`` (rig-cli's
+      ``expand_user_path`` = ``expanduser(expandvars(path))``) and, when the EXPANDED value is
+      relative, it is the expanded value that gets home-anchored — never the raw override
+      string, which would leave a literal ``$VAR`` path segment behind. Either slip makes the
+      bridge read a directory that does not exist, load zero descriptors, and silently allow
+      everything: rig installs the descriptor dir and extension symlink under the REAL path.
     """
-    agent_dir_override = os.environ.get("PI_CODING_AGENT_DIR")
-    if agent_dir_override:
-        p = Path(os.path.expanduser(os.path.expandvars(agent_dir_override)))
-        if p.is_absolute():
-            return str(p)
-        return f"~/{agent_dir_override}"
-    config_dir = os.environ.get("PI_CONFIG_DIR")
-    if config_dir:
-        p = Path(os.path.expanduser(os.path.expandvars(config_dir)))
-        if p.is_absolute():
-            return str(p / "agent")
-        return f"~/{config_dir}/agent"
+    for var in ("OMP_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"):
+        agent_dir = _expanded_override(var)
+        if agent_dir is not None:
+            return _home_anchored(agent_dir)
+    config_dir = _expanded_override("PI_CONFIG_DIR")
+    if config_dir is not None:
+        return _home_anchored(config_dir / "agent")
     return "~/.omp/agent"
+
+
+def _expanded_override(var: str) -> Path | None:
+    """The env override ``var`` with ``$VAR`` then ``~`` expanded, or None when unset/blank."""
+    raw = os.environ.get(var, "").strip()
+    if not raw:
+        return None
+    return Path(os.path.expanduser(os.path.expandvars(raw)))
+
+
+def _home_anchored(p: Path) -> str:
+    return str(p) if p.is_absolute() else f"~/{p}"
 
 
 def dispatch(event_name: str, omp_event: dict) -> dict | None:
@@ -155,8 +169,9 @@ def dispatch(event_name: str, omp_event: dict) -> dict | None:
     specs = load_descriptors(point, hooks_dir(), warn=_warn)
     if not specs:
         return None
+    v1_events = _v1_events_for_dispatch(omp_event, point=point)
     for spec in specs:
-        for v1_event in _v1_events_for_dispatch(omp_event, point=point):
+        for v1_event in v1_events:
             outcome, reason = run_hook(spec, v1_event, warn=_warn)
             if outcome == "block":
                 return omp_block_output(reason)
@@ -286,53 +301,122 @@ def _normalize_task_args(args: dict) -> None:
 
 
 def _normalize_write_args(tool: str, raw_args: dict, args: dict, *, point: str) -> None:
-    """Fill in `args.file_path`/`path`/`file_paths`(/`content`) for a write-shaped tool."""
+    """Set `args.file_path`/`path`/`file_paths`(/`content`) for a write-shaped tool.
+
+    Derived values OVERWRITE same-named keys copied from the raw tool args (never
+    `setdefault`): the parsed patch text is the truth about what gets written, and a stray
+    or forged `content: ""` / `file_path` riding along in the raw args must not shadow it —
+    the same reason `_FORGED_AGENT_KEYS` is stripped for every tool.
+    """
     if tool == "write":
-        path = raw_args.get("path")
-        if isinstance(path, str) and path:
-            args.setdefault("file_path", path)
-            args.setdefault("path", path)
-        if point == "pre-write" and not isinstance(args.get("content"), str):
+        _set_paths(args, _first_str(raw_args, "path", "filePath", "file_path"))
+        if point == "pre-write":
             content = raw_args.get("content")
             args["content"] = content if isinstance(content, str) else ""
         return
     if tool == "edit":
         text = _edit_patch_text(tool, raw_args)
         paths = _hashline_file_paths(text)
-        _apply_paths(args, paths)
-        if point == "pre-write":
-            args.setdefault("content", _hashline_added_content(text))
+        if paths:
+            _apply_paths(args, paths)
+            if point == "pre-write":
+                args["content"] = _hashline_added_content(text)
+            return
+        _normalize_non_hashline_edit(raw_args, args, point=point)
         return
     if tool == "apply_patch":
         text = _edit_patch_text(tool, raw_args)
-        args.setdefault("patch", text)
-        args.setdefault("patchText", text)
-        paths = _patch_file_paths(text)
-        _apply_paths(args, paths, move_target=_patch_move_target(text))
+        args["patch"] = text
+        args["patchText"] = text
+        _apply_paths(args, _patch_file_paths(text), move_target=_patch_move_target(text))
         if point == "pre-write":
             args["content"] = _patch_added_content(text)
         return
     # `notebook`: no confirmed omp tool schema for this today — best-effort passthrough of
     # whatever path-shaped field is present so a path-based hook is not blind to it.
-    for key in ("path", "notebook_path", "file_path"):
-        val = raw_args.get(key)
+    path = _first_str(raw_args, "path", "notebook_path", "file_path")
+    if path:
+        args["notebook_path"] = path
+        _set_paths(args, path)
+
+
+# Replacement-text keys an `edit` call may carry in its non-hashline `replace` mode (omp's
+# `resolveEditMode()` can select `replace`/`patch` per model or via `PI_EDIT_VARIANT`,
+# docs/tools/edit.md). The exact wire names are NOT pinned by the docs consulted, so this is
+# the same best-effort key family the opencode bridge's `_write_content` accepts, plus the
+# camel/snake variants — see README.md "Non-hashline edit modes".
+_REPLACE_CONTENT_KEYS = ("newText", "new_text", "newString", "new_string", "replacement", "text")
+_UNIFIED_DIFF_KEYS = ("patch", "diff")
+
+
+def _normalize_non_hashline_edit(raw_args: dict, args: dict, *, point: str) -> None:
+    """An `edit` call with no `[PATH#TAG]` section: omp's `replace` / `patch` edit modes.
+
+    Path from the `path` family (or the `+++ b/<path>` header of a unified diff); content
+    from the replacement-text family plus the added rows of a unified diff. Without this,
+    every non-hashline edit reached content scanners (`block-secrets-write`) with
+    `content == ""` and was allowed.
+    """
+    diff_texts = [raw_args[k] for k in _UNIFIED_DIFF_KEYS if isinstance(raw_args.get(k), str)]
+    path = _first_str(raw_args, "path", "filePath", "file_path")
+    if not path:
+        for text in diff_texts:
+            path = _unified_diff_path(text)
+            if path:
+                break
+    _set_paths(args, path)
+    if point != "pre-write":
+        return
+    parts = [raw_args[k] for k in _REPLACE_CONTENT_KEYS if isinstance(raw_args.get(k), str)]
+    if isinstance(raw_args.get("content"), str):
+        parts.append(raw_args["content"])
+    parts.extend(_unified_diff_added_content(text) for text in diff_texts)
+    args["content"] = "\n".join(parts)
+
+
+def _unified_diff_path(diff: str) -> str:
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            target = line[4:].strip()
+            if target.startswith("b/"):
+                target = target[2:]
+            return "" if target == "/dev/null" else target
+    return ""
+
+
+def _unified_diff_added_content(diff: str) -> str:
+    return "\n".join(
+        line[1:] for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++ ")
+    )
+
+
+def _first_str(args: dict, *keys: str) -> str:
+    for key in keys:
+        val = args.get(key)
         if isinstance(val, str) and val:
-            args.setdefault("notebook_path", val)
-            args.setdefault("file_path", val)
-            args.setdefault("path", val)
-            break
+            return val
+    return ""
+
+
+def _set_paths(args: dict, path: str) -> None:
+    if path:
+        args["file_path"] = path
+        args["path"] = path
 
 
 def _apply_paths(args: dict, paths: list[str], *, move_target: str = "") -> None:
     if not paths:
         return
-    args.setdefault("file_paths", paths)
+    args["file_paths"] = paths
     if len(paths) == 1:
-        args.setdefault("file_path", paths[0])
-        args.setdefault("path", paths[0])
+        _set_paths(args, paths[0])
     elif move_target:
-        args.setdefault("file_path", move_target)
-        args.setdefault("path", move_target)
+        _set_paths(args, move_target)
+    else:
+        # Multi-path, no single target: drop any raw single-path key so a forged `file_path`
+        # cannot shadow the per-path fan-out `_v1_events_for_dispatch` performs.
+        args.pop("file_path", None)
+        args.pop("path", None)
 
 
 def _hashline_file_paths(patch: str) -> list[str]:
@@ -424,8 +508,13 @@ def _hashline_content_by_path(patch: str) -> dict[str, str]:
     in_body = False
 
     def finish() -> None:
+        # ACCUMULATE, never replace: a later same-path section must not erase the rows of an
+        # earlier one, or a secret written in section 1 of `a.py` vanishes behind a benign
+        # section 3 of `a.py` and a content scanner never sees it.
         if current_path is not None:
-            content[current_path] = "\n".join(current_lines)
+            rows = [content[current_path]] if content.get(current_path) else []
+            rows.extend(current_lines)
+            content[current_path] = "\n".join(rows) if rows else content.get(current_path, "")
 
     for raw_line in patch.splitlines():
         line = raw_line.rstrip("\n")

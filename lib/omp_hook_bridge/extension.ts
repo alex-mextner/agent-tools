@@ -17,14 +17,18 @@ import { fileURLToPath } from "node:url";
 
 const extensionPath = realpathSync(fileURLToPath(import.meta.url));
 const libDir = resolve(dirname(extensionPath), "..");
-// MUST exceed the longest shipped descriptor budget (currently 960000 ms — every
-// hatch-capable descriptor, e.g. block-raw-pr-merge / worktree-only-writes /
-// orchestrator-stays-thin, uses this so a Telegram approval has time to land). This bridge
-// fails OPEN on a dispatcher failure (see the fail-policy comment on `runBridge` below and
-// README.md), so a timeout HERE is not a safe fallback the way it is for opencode's
-// fail-CLOSED plugin — it silently turns a fail-closed hatch-capable hook into an allow.
-// Mirrors opencode's own DEFAULT_DISPATCHER_TIMEOUT_MS (1,000,000 ms) for the same reason.
-const DEFAULT_DISPATCHER_TIMEOUT_MS = 1000000;
+// This bounds the WHOLE dispatch — every matching descriptor run serially for every
+// fanned-out file path — not one descriptor. It must exceed the longest shipped descriptor
+// budget (960,000 ms: every hatch-capable descriptor, e.g. block-raw-pr-merge /
+// worktree-only-writes / orchestrator-stays-thin, waits that long for a Telegram approval)
+// with room for more than one such wait in a single call, because this bridge fails OPEN on
+// a dispatcher failure (see `runBridge` below and README.md "Fail policy"): a timeout HERE
+// is not the safe fallback it is for opencode's fail-CLOSED plugin — it converts a still-
+// running fail-closed hook into an allow. 2,000,000 ms covers two serial full approval
+// windows plus margin (a hatch wait only happens when the agent set a RIG_HATCH_REQUEST_*
+// var, so two in one call is already the rare case); three or more in one call remain a
+// documented residual. Override with OMP_HOOK_BRIDGE_TIMEOUT_MS.
+const DEFAULT_DISPATCHER_TIMEOUT_MS = 2000000;
 const DISPATCHER_TIMEOUT_MS = resolveDispatcherTimeout();
 
 function resolveDispatcherTimeout(): number {

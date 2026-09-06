@@ -36,7 +36,7 @@ JSON to the extension:
 | omp event + toolName | v1 point | Notes |
 | --- | --- | --- |
 | `tool_call` + `bash` | `pre-bash` | `input.command` becomes `event.command` and `args.command`. |
-| `tool_call` + `edit` | `pre-write` | `input.input` (the hashline patch text) is parsed for every `[PATH#TAG]` section path → `args.file_path`/`path`/`file_paths`; a best-effort reconstruction of added body rows becomes `args.content`. |
+| `tool_call` + `edit` | `pre-write` | `input.input` (the hashline patch text) is parsed for every `[PATH#TAG]` section path → `args.file_path`/`path`/`file_paths`; a best-effort reconstruction of added body rows becomes `args.content` (same-path sections accumulate). No section found → the `replace`/`patch` fallback below. |
 | `tool_call` + `write` | `pre-write` | `input.path` / `input.content` normalize to `args.file_path`/`path`/`content` directly — same shape family as opencode's `write` tool. |
 | `tool_call` + `apply_patch` | `pre-write` | The wire name omp uses for `edit` in apply_patch custom-tool mode (docs/tools/edit.md); the payload is the classic `*** Update File:` / `*** Add File:` / `*** Delete File:` / `*** Move to:` envelope, not hashline. Parsed with logic ported from the opencode bridge (see below). |
 | `tool_call` + `notebook` | `pre-write` | omp has no confirmed public tool schema for a dedicated notebook tool in the docs consulted while building this bridge. Best-effort passthrough only: whichever of `path`/`notebook_path`/`file_path` is present in `input` is normalized onto `args.notebook_path`/`file_path`/`path`. Kept as a mapped point (not dropped) on the assumption that IF omp ships one, its shape is path-like enough for this passthrough to still work; revisit once the real schema is confirmed. |
@@ -90,6 +90,24 @@ This mirrors the same honesty the opencode bridge's README already states for it
 `apply_patch` added-content approximation — good enough for a path-based gate, not a
 patch applier.
 
+## Non-hashline `edit` modes (`replace` / `patch`)
+
+omp's `resolveEditMode()` can select `replace` or `patch` instead of `hashline` (per model,
+via `PI_EDIT_VARIANT`, or the model exclusion list — docs/tools/edit.md). Those payloads
+carry no `[PATH#TAG]` section, so when the hashline parser finds none the dispatcher falls
+back to a `write`-like normalization: the path from the `path`/`filePath`/`file_path` family
+(or the `+++ b/<path>` header of a unified diff), and `content` from the replacement-text
+family (`newText`/`new_text`/`newString`/`new_string`/`replacement`/`text`/`content`) plus
+the added rows of a unified diff (`patch`/`diff`). The exact wire field names of those two
+modes are NOT pinned by the docs consulted, so this is the same best-effort key family the
+opencode bridge accepts — without it a secret written through a replace-mode edit reached
+`block-secrets-write` as `content == ""` and was allowed.
+
+Derived values always OVERWRITE same-named keys that arrived in the raw tool args: the parsed
+patch is the truth about what gets written, and a stray or forged `content: ""` / `file_path`
+must not shadow it. For a multi-path edit with no single target the raw `file_path`/`path`
+keys are dropped so a forged single path cannot shadow the per-path fan-out.
+
 ## omp `task` dispatches are background by contract
 
 The only shipped `pre-agent` consumer, `agent-hooks/background-subagent-gate`, reads the
@@ -139,11 +157,19 @@ By default the bridge reads:
 Resolution honors omp's own environment overrides, in this precedence order:
 
 1. `OMP_HOOKS_DIR` — bridge-only override, for tests and manual runs.
-2. `PI_CODING_AGENT_DIR` — a full override of omp's agent directory (omp profiles
-   re-point the agent dir through it); `hooks` is appended to whatever it resolves to.
+2. `OMP_CODING_AGENT_DIR`, then the legacy `PI_CODING_AGENT_DIR` — a full override of omp's
+   agent directory (omp profiles re-point the agent dir through it); `hooks` is appended to
+   whatever it resolves to. The OMP-prefixed name is checked first, matching this repo's own
+   omp resolver in `lib/checker/model_freshness.py`.
 3. `PI_CONFIG_DIR` — renames the `.omp` config-root dirname under home; the agent dir
    becomes `~/<PI_CONFIG_DIR>/agent`, then `hooks` is appended.
 4. The default, `~/.omp/agent/hooks`.
+
+Every override is expanded `$VAR`-then-`~`; a value that expands to a relative path is
+home-anchored AFTER expansion (never the raw string, which would leave a literal `$VAR`
+segment). omp `--profile <name>` sessions live under `~/.omp/profiles/<name>/agent`; the
+bridge follows them only through the env overrides above (omp re-points the agent dir via
+`PI_CODING_AGENT_DIR` for a profile) — it does not read omp's profile config itself.
 
 This mirrors rig-cli's `riglib.harness_skills.omp_agent_root` precedence exactly (ported,
 not imported, since this dispatcher cannot depend on rig-cli). Tests and manual runs can
@@ -189,10 +215,17 @@ trade-off from opencode.** In opencode a short timeout degrades to a block (safe
 it degrades to an allow, silently converting an `on_error: closed` hook (a Telegram-approval
 hatch like `block-raw-pr-merge` or `worktree-only-writes`, budgeted at 960000 ms for tg-ctl's
 own approval window) into "no opinion" the moment the extension's own timeout fires first.
-`extension.ts`'s `DEFAULT_DISPATCHER_TIMEOUT_MS` is therefore `1000000` ms — matching
-opencode's own default and exceeding every shipped descriptor's `timeout_ms` — overridable
-via `OMP_HOOK_BRIDGE_TIMEOUT_MS` for tests. Re-verify this default against
-`agent-hooks/*/*.json` if a future descriptor ships a larger `timeout_ms`.
+The timeout bounds the WHOLE dispatch (every matching descriptor, run serially, for every
+fanned-out file path), not one descriptor. `extension.ts`'s `DEFAULT_DISPATCHER_TIMEOUT_MS`
+is therefore `2000000` ms — two full 960,000 ms approval windows plus margin, so two
+hatch-capable hooks (say `worktree-only-writes` and `orchestrator-stays-thin` on one
+pre-write) can each wait for a human in a single call without the extension's own timeout
+converting the second, still-running fail-closed hook into an allow. A hatch wait only
+happens when the agent explicitly set a `RIG_HATCH_REQUEST_*` variable, so even two in one
+call is the rare case; three or more serial approval waits in ONE tool call remain a
+documented residual of the fail-open design. Overridable via `OMP_HOOK_BRIDGE_TIMEOUT_MS`.
+Re-verify this default against `agent-hooks/*/*.json` if a future descriptor ships a larger
+`timeout_ms`.
 
 On the Python side, `main()` keeps the same fail-open contract as the codex/opencode
 dispatchers: malformed stdin, a missing `agent_hooks_v1` import, or any dispatcher-internal

@@ -368,6 +368,111 @@ def test_hashline_rem_and_mv_sections_still_surface_their_paths():
     assert v1["args"]["file_paths"] == ["old.py"]
 
 
+def test_hashline_repeated_same_path_sections_accumulate_content():
+    """Codex PR-thread P1: a later benign section for `a.py` must not ERASE an earlier
+    section's rows — otherwise a secret in section 1 hides behind section 3 and a content
+    scanner never sees it."""
+    patch = (
+        "[a.py#AAAA]\nPUT >$:\n+API_KEY = 'abcd1234abcd1234'\n"
+        "[b.py#BBBB]\nPUT >$:\n+print('b')\n"
+        "[a.py#AAAA]\nPUT <1:\n+import os\n"
+    )
+    omp_event = {"event": "tool_call", "toolName": "edit", "input": {"input": patch}, "cwd": "/repo"}
+    events = dispatch._v1_events_for_dispatch(omp_event, point="pre-write")
+    by_path = {e["args"]["file_path"]: e["args"]["content"] for e in events}
+    assert by_path["a.py"] == "API_KEY = 'abcd1234abcd1234'\nimport os"
+    assert by_path["b.py"] == "print('b')"
+    assert dispatch._hashline_file_paths(patch) == ["a.py", "b.py"]
+
+
+def test_edit_parsed_truth_overwrites_stray_content_and_forged_file_path():
+    """Sonnet review: the parsed patch is the truth about what gets written. A stray
+    `content: ""` or a forged `file_path` riding along in the raw args must not shadow it
+    (`block-secrets-write` reads `content`, `worktree-only-writes` reads `file_path`)."""
+    patch = "[src/x.py#A1B2]\nPUT >$:\n+API_KEY = 'abcd1234abcd1234'\n"
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "edit",
+        "input": {"input": patch, "content": "", "file_path": "/tmp/elsewhere.py", "path": "/tmp/elsewhere.py"},
+        "cwd": "/repo",
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-write")
+    assert v1["args"]["content"] == "API_KEY = 'abcd1234abcd1234'"
+    assert v1["args"]["file_path"] == "src/x.py"
+    assert v1["args"]["path"] == "src/x.py"
+
+
+def test_edit_multi_path_drops_forged_single_file_path():
+    patch = "[a.py#AAAA]\nPUT >$:\n+a\n[b.py#BBBB]\nPUT >$:\n+b\n"
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "edit",
+        "input": {"input": patch, "file_path": "decoy.py", "file_paths": ["decoy.py"]},
+        "cwd": "/repo",
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-write")
+    assert v1["args"]["file_paths"] == ["a.py", "b.py"]
+    assert "file_path" not in v1["args"]
+    events = dispatch._v1_events_for_dispatch(omp_event, point="pre-write")
+    assert [e["args"]["file_path"] for e in events] == ["a.py", "b.py"]
+
+
+# --- to_v1_event: edit (non-hashline `replace` / `patch` modes) ------------------------------
+
+
+def test_edit_replace_mode_maps_path_and_replacement_text():
+    """Codex review P1: omp can run `edit` in `replace` mode (no `[PATH#TAG]` section); such
+    a call must still surface its path and its replacement text as `content`, or a secret
+    written through it reaches `block-secrets-write` as `content == ""`."""
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "edit",
+        "input": {"path": "src/config.py", "oldText": "x = 1", "newText": "API_KEY = 'abcd1234abcd1234'"},
+        "cwd": "/repo",
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-write")
+    assert v1["args"]["file_path"] == "src/config.py"
+    assert v1["args"]["path"] == "src/config.py"
+    assert v1["args"]["content"] == "API_KEY = 'abcd1234abcd1234'"
+
+
+def test_edit_patch_mode_maps_unified_diff_path_and_added_rows():
+    diff = "--- a/src/config.py\n+++ b/src/config.py\n@@ -1 +1 @@\n-x = 1\n+API_KEY = 'abcd1234abcd1234'\n"
+    omp_event = {"event": "tool_call", "toolName": "edit", "input": {"patch": diff}, "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(omp_event, point="pre-write")
+    assert v1["args"]["file_path"] == "src/config.py"
+    assert v1["args"]["content"] == "API_KEY = 'abcd1234abcd1234'"
+
+
+def test_omp_bridge_blocks_secret_write_via_edit_replace_mode(tmp_path):
+    hooks_dir = tmp_path / "hooks"
+    _install_descriptor(hooks_dir, hook_id="block-secrets-write", point="pre-write", cmd=BLOCK_SECRETS_WRITE)
+    event = {
+        "event": "tool_call",
+        "toolName": "edit",
+        "input": {"path": "src/secret.py", "oldText": "x", "newText": "API_KEY = 'abcd1234abcd1234'\n"},
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("tool_call", event, hooks_dir=hooks_dir)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["decision"] == "block"
+
+
+def test_task_normalization_not_applied_to_non_task_tools_with_task_key():
+    """Sonnet review: a bash call whose args happen to carry a `task` key must not get the
+    pre-agent `run_in_background` field injected into its pre-bash event."""
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "bash",
+        "input": {"command": "sleep 300 &", "task": "background this", "agent": "x"},
+        "cwd": "/repo",
+    }
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+    assert "run_in_background" not in v1["args"]
+    assert "prompt" not in v1["args"]
+    assert "subagent_type" not in v1["args"]
+
+
 # --- to_v1_event: apply_patch (classic envelope) ------------------------------------------------
 
 
@@ -493,10 +598,42 @@ def test_hooks_dir_pi_coding_agent_dir_expands_dollar_var(monkeypatch):
 
 def test_hooks_dir_pi_config_dir_expands_dollar_var(monkeypatch):
     monkeypatch.delenv("OMP_HOOKS_DIR", raising=False)
+    monkeypatch.delenv("OMP_CODING_AGENT_DIR", raising=False)
     monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
     monkeypatch.setenv("PI_HOME_FOR_TEST", "/custom/home")
     monkeypatch.setenv("PI_CONFIG_DIR", "$PI_HOME_FOR_TEST/.omp-work")
     assert dispatch.hooks_dir() == Path("/custom/home/.omp-work/agent/hooks")
+
+
+def test_hooks_dir_omp_coding_agent_dir_wins_over_pi_coding_agent_dir(monkeypatch):
+    """omp's primary override is the OMP-prefixed var; `PI_CODING_AGENT_DIR` is the legacy
+    name. This repo's own omp resolver (`lib/checker/model_freshness.py::_omp_agent_db`)
+    checks OMP first — the bridge must agree or a relocated omp loads zero descriptors."""
+    monkeypatch.delenv("OMP_HOOKS_DIR", raising=False)
+    monkeypatch.setenv("OMP_CODING_AGENT_DIR", "/omp/primary")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", "/pi/legacy")
+    monkeypatch.delenv("PI_CONFIG_DIR", raising=False)
+    assert dispatch.hooks_dir() == Path("/omp/primary/hooks")
+
+
+@pytest.mark.parametrize(
+    ("var", "expected"),
+    [
+        ("OMP_CODING_AGENT_DIR", "~/custom-agent/hooks"),
+        ("PI_CODING_AGENT_DIR", "~/custom-agent/hooks"),
+        ("PI_CONFIG_DIR", "~/custom-agent/agent/hooks"),
+    ],
+)
+def test_hooks_dir_relative_dollar_var_expansion_is_anchored_expanded(monkeypatch, var, expected):
+    """A `$VAR` that expands to a RELATIVE path must be home-anchored AFTER expansion — the
+    raw override string would leave a literal `$PROFILE_ROOT` path segment behind and the
+    bridge would read a directory that does not exist (Codex/Sonnet review finding)."""
+    for name in ("OMP_HOOKS_DIR", "OMP_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("PROFILE_ROOT", "custom-agent")
+    monkeypatch.setenv(var, "$PROFILE_ROOT")
+    assert dispatch.hooks_dir() == Path(os.path.expanduser(expected))
+    assert "$" not in str(dispatch.hooks_dir())
 
 
 # --- main() fail-open behavior -----------------------------------------------------------------
@@ -700,7 +837,7 @@ def test_worktree_only_writes_reads_omp_edit_file_path(tmp_path, monkeypatch):
     sp.run(["git", "add", "."], cwd=repo, check=True)
     sp.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "init"], cwd=repo, check=True)
 
-    patch = f"*** Begin Patch\n[foo.py#A1B2]\nPUT >$:\n+print(1)\n*** End Patch\n"
+    patch = "*** Begin Patch\n[foo.py#A1B2]\nPUT >$:\n+print(1)\n*** End Patch\n"
     omp_event = {"event": "tool_call", "toolName": "edit", "input": {"input": patch}, "cwd": str(repo)}
     v1 = dispatch.to_v1_event(omp_event, point="pre-write")
     assert v1["args"]["file_path"] == "foo.py"
@@ -722,7 +859,7 @@ def test_worktree_only_writes_reads_omp_edit_file_path(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
-def test_extension_ts_type_checks_with_bun():
+def test_extension_ts_parses_with_bun():
     """A broken extension.ts would silently no-op every omp session (the extension loader
     just records a load error and continues) — cheap insurance that it at least parses."""
     proc = subprocess.run(
@@ -764,7 +901,6 @@ def test_extension_ts_registers_tool_call_and_blocks_via_stub_dispatcher(tmp_pat
 
     env = dict(os.environ)
     env["EXTENSION_PATH"] = str(_EXTENSION_TS)
-    env["OMP_HOOK_BRIDGE_PYTHON"] = sys.executable
     env["OMP_HOOK_BRIDGE_PYTHON"] = str(stub)
 
     proc = subprocess.run(["bun", "run", str(driver)], capture_output=True, text=True, env=env, timeout=30)
