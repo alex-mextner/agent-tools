@@ -516,7 +516,20 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
 
 _HOOK_DIR = Path(__file__).resolve().parents[1] / "agent-hooks" / "subagent-no-bg-longproc"
 _REPO = Path(__file__).resolve().parents[1]
-_BLANKET_CLAIM = "not re-invoked by a background-completion notification"
+# Every spelling of the retired blanket claim, checked on EVERY surface (review round 3, Opus +
+# Sonnet: the doctrine and catalog guards used to pin two different literals, and the surfaces
+# quoted the old sentence verbatim across a line wrap — the guard held only by luck of the wrap).
+_BLANKET_CLAIMS = (
+    "not re-invoked by a background-completion notification",
+    "never re-invoked by a background-completion notification",
+    "not re-invoked by a background-completion",
+)
+
+
+def _assert_no_blanket_claim(text: str, surface: str) -> None:
+    folded = " ".join(text.lower().split())  # collapse line wraps so a wrapped quote still matches
+    for claim in _BLANKET_CLAIMS:
+        assert claim not in folded, (surface, claim)
 
 
 def _doctrine_surfaces() -> dict[str, str]:
@@ -532,7 +545,7 @@ def _doctrine_surfaces() -> dict[str, str]:
 @pytest.mark.parametrize("surface", sorted(_doctrine_surfaces()))
 def test_doctrine_surface_states_the_precise_wake_mechanism(surface):
     text = _doctrine_surfaces()[surface]
-    assert _BLANKET_CLAIM not in text.lower(), surface
+    _assert_no_blanket_claim(text, surface)
     # The two halves of the verified mechanism: the tracked child that DOES resume a subagent,
     # and the two shapes (Monitor, a shell-detached job) that never do.
     assert "run_in_background" in text, surface
@@ -547,7 +560,7 @@ def test_catalog_entries_no_longer_carry_the_blanket_claim():
     for rel in ("agent-hooks/README.md", "AGENTS.md",
                 "agent-hooks/subagent-no-monitor/subagent-no-monitor.pre-monitor.json"):
         text = (_REPO / rel).read_text().lower()
-        assert "never re-invoked by a background-completion notification" not in text, rel
+        _assert_no_blanket_claim(text, rel)
         assert "broader than confirmed" not in text, rel
         assert "tracks reconciling" not in text, rel
 
@@ -573,5 +586,5 @@ def test_block_output_carries_the_reconciled_message(monkeypatch):
     assert code == hook.BLOCK_EXIT_CODE
     msg = json.loads(out)["message"]
     assert hook.HEARTBEAT_LOOP_EXAMPLE in msg
-    assert _BLANKET_CLAIM not in msg.lower()
+    _assert_no_blanket_claim(msg, "block output")
     assert "review diff" in msg or "review" in msg

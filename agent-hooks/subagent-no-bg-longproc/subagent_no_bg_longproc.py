@@ -9,8 +9,8 @@ never resumed. It idles FOREVER with uncommitted work and no PR, and the orchest
 catch the rest-notification, kill the stray process, and salvage the half-done work by hand.
 
 WHICH notifications re-invoke a subagent (the precise mechanism, agent-tools#546 — an earlier
-revision of this docstring claimed a blanket "a subagent is NOT re-invoked by a
-background-completion notification", which is FALSE for the general case; the sibling
+revision of this docstring claimed, as a blanket, that no background-completion notification
+ever re-invokes a subagent — FALSE for the general case; the sibling
 ``subagent-no-monitor`` gate (agent-tools#439) proved the split empirically):
   - a Bash tool call with ``run_in_background: true`` DOES resume the calling subagent with the
     command's output once the child exits — the harness tracks that child against the agent

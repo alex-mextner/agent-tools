@@ -35,8 +35,10 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   && git status --short && git diff -- a.py` is inspection on the first call, for every harness,
   instead of falling to the >=3-segment fallback; `sed -i` keeps tripping `BUILD_EDIT` exactly as
   before. GRANT-direction, so every ambiguity (unbalanced quotes, a `-l` cluster whose GNU/BSD
-  operand semantics differ, a script file) resolves to "not read-only" — i.e. to the pre-#541
-  behavior, never to a wider grant. The script walk honours POSIX bracket expressions in a regex
+  operand semantics differ, a script file, a shell-EXPANDED script — `sed -n "$S" f`,
+  `sed -n "$(cat s)" f`, a backtick — whose text is just as unknowable as `-f script`; a `$`
+  inside single quotes such as `sed -n '$p'` is literal and stays read-only) resolves to "not
+  read-only" — i.e. to the pre-#541 behavior, never to a wider grant. The script walk honours POSIX bracket expressions in a regex
   (an address, the `s` pattern) exactly as GNU and BSD sed do — `/[/]/w out.txt` is one address
   followed by a WRITE, not a print — and reads anything sed itself would reject (an unterminated
   regex/bracket/`s`, an address without a command) as a write.

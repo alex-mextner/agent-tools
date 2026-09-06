@@ -676,12 +676,19 @@ def _is_read_only_sed(segment: str) -> bool:
     GRANT-direction predicate, so every ambiguity resolves to "not read-only" (which merely leaves
     the segment to the pre-existing rules — the `sed -i` `BUILD_EDIT` signal, the >=3-segment
     fallback — exactly as before this predicate existed): an unbalanced-quote segment (shlex
-    raises), a `-l` cluster (GNU/BSD operand mismatch), a script file. Script scanning is a small
+    raises), a `-l` cluster (GNU/BSD operand mismatch), a script file, a SHELL-EXPANDED script
+    (review round 3, Opus): `shlex` does not expand `$VAR` / `$(…)` / backticks, so `sed -n "$S" f`
+    or `sed -n "$(cat s)" f` is exactly as unknowable as `-f script` and forfeits the grant the
+    same way — only a `$` OUTSIDE single quotes counts (`sed -n '$p' f`, sed's own last-line
+    address, is literal and stays read-only). Script scanning is a small
     hand-rolled walk over sed's grammar (addresses, `s`/`y` delimiters, bracket expressions in a
     regex, `a`/`i`/`c` text, `#` comments, labels/filenames to end-of-line) — a discipline
     heuristic like the rest of this file,
     not a sed parser; where it cannot tell, it errs toward "writes". Basename-exact head match
     (`sed`, `/usr/bin/sed`), never `\b`, so `sed-foo` is not `sed`."""
+    expandable = _blank_single_quoted(segment)
+    if "$" in expandable or "`" in expandable:
+        return False
     try:
         toks = shlex.split(segment)
     except ValueError:

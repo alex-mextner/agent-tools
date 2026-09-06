@@ -2568,6 +2568,10 @@ def test_literal_repro_chain_with_sed_n_is_read_only_on_first_offense(tmp_path, 
     "sed -n '/[[:alpha:]/]/p' f.txt",                        # a `[:class:]` member
     "sed 's/[/]/X/' f.txt",                                  # bracket in the `s` PATTERN
     "sed -n '\\,[,],p' f.txt",                               # custom delimiter inside a bracket
+    # review round 3 (Opus): a `$` INSIDE single quotes is literal to the shell — here it is sed's
+    # own last-line address, not an expansion — so the shell-expansion refusal must not fire.
+    "sed -n '$p' f.txt",
+    "sed -n '$=' f.txt",
 ])
 def test_read_only_sed_is_inspection(command, tmp_path, monkeypatch):
     """A `sed` that only prints (no in-place flag, no `w`/`W`/`e` script command, no script file)
@@ -2641,6 +2645,14 @@ def test_read_only_sed_is_inspection(command, tmp_path, monkeypatch):
     "sed -n '/[/w out.txt' f.txt",                # unterminated bracket = unterminated address regex
     "sed -n '/abc' f.txt",                        # unterminated address regex
     "sed -n '1' f.txt",                           # an address with no command (sed: missing command)
+    # review round 3 (Opus): a SHELL-EXPANDED script is as unknowable as `-f script` — shlex does
+    # not expand, and `S='w /tmp/out'` in the environment would turn the "print" into a write.
+    # Only a `$`/backtick OUTSIDE single quotes counts (see `sed -n '$p'` in the read-only matrix).
+    'sed -n "$S" f.txt',
+    'sed -n "$(cat s)" f.txt',
+    "sed -n `cat s` f.txt",
+    'sed -n "1,${N}p" f.txt',
+    "sed -n $S f.txt",
 ])
 def test_sed_that_edits_or_writes_is_not_read_only(command, tmp_path, monkeypatch):
     """The guard: an in-place edit, a `w`/`W`/`e` script command (or `s///w` / `s///e` flag), or

@@ -15,8 +15,8 @@ This gate makes a subagent run its **own** long work in the **foreground** and b
 
 ## Which notifications actually re-invoke a subagent (the precise mechanism)
 
-An earlier revision of this README claimed a blanket *"a subagent is NOT re-invoked by a
-background-completion notification"*. That is **false for the general case** — the sibling
+An earlier revision of this README claimed, as a blanket, that *no background-completion
+notification ever re-invokes a subagent*. That is **false for the general case** — the sibling
 `subagent-no-monitor` gate (agent-tools#439) proved the real split empirically, and
 agent-tools#546 reconciled this hook's wording to it:
 
