@@ -579,9 +579,11 @@ def main() -> int:
         "on it; do NOT background it. A subagent is NOT re-invoked by a background-completion "
         "notification "
         "(only the main loop is), so backgrounding this and ending your turn wedges you "
-        "FOREVER with uncommitted work and no PR. Remove `run_in_background: true` (and any "
-        "trailing `&` / `setsid`) and run it inline so this tool call blocks until it "
-        "finishes. There is NO self-service bypass. For a genuine exception, ASK the human, or "
+        "FOREVER with uncommitted work and no PR. "
+        # The remedy is picked by the TOP-LEVEL `harness` tag only (never `args`), agent-tools#573:
+        # only Claude Code's Bash tool has a `run_in_background` field to remove.
+        + hatch_escalation.foreground_recipe(event.get("harness"))
+        + " There is NO self-service bypass. For a genuine exception, ASK the human, or "
         "request a one-time Telegram approval by setting "
         "RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC=\"<written justification>\" "
         "(deny-by-default; a bare 1 is rejected)."

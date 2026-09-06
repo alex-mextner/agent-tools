@@ -22,13 +22,18 @@ import re
 import sys
 from pathlib import Path
 
+try:
+    from agent_hooks_v1 import subagent_identity
+except Exception:  # noqa: BLE001 - a missing helper must fail CLOSED (no identity → governed)
+    subagent_identity = None
+
 HOOK_API = "agents-hooks/v1"
 # The v1 event's `harness` tag for every event this bridge produces — a MODULE LITERAL,
-# never derived from `omp_event`, so it cannot be forged via tool args. See
-# `codex_hook_bridge.HARNESS` / `opencode_hook_bridge.HARNESS` for the same reasoning: omp
-# exposes no TRUSTED per-tool-call subagent identity either (forged agent_id/agent_type
-# keys are stripped below). `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES`
-# reads this tag to exempt the whole harness (agent-tools#533).
+# never derived from `omp_event`, so it cannot be forged via tool args. Hooks read it to pick
+# the delegation recipe for THIS harness in their refusal text (agent-tools#573) — never to
+# exempt the harness (the #533/#544 `EXEMPT_HARNESSES` shortcut is gone). The subagent
+# identity (`_apply_subagent_identity`) is what tells an orchestrator apart from a delegated
+# child; forged agent_id/agent_type keys in the tool args are stripped first.
 HARNESS = "omp"
 
 _KNOWN_EVENTS = frozenset({"tool_call", "tool_result"})
@@ -79,6 +84,7 @@ def to_v1_event(omp_event: dict, *, point: str) -> dict:
         _normalize_task_args(args)
     for key in _FORGED_AGENT_KEYS:
         args.pop(key, None)
+    _apply_subagent_identity(omp_event, args)
 
     command = _tool_command(tool, raw_args)
     if command:
@@ -97,6 +103,42 @@ def to_v1_event(omp_event: dict, *, point: str) -> dict:
         "cwd": _cwd(omp_event),
         "args": args,
     }
+
+
+def _apply_subagent_identity(omp_event: dict, args: dict) -> None:
+    """Populate ``args.agent_id``/``args.agent_type`` from the trusted sources ONLY (#573).
+
+    ``to_v1_event`` has already stripped every agent-shaped key from the tool INPUT (model-
+    authored, never trusted). Three sources may restore them, in order:
+
+    1. The TOP-LEVEL ``agentId``/``agentType`` of the payload ``extension.ts`` builds — set
+       from omp's own objects, never from ``event.input``. omp runs a ``task`` subagent IN the
+       same process and invokes the extension's default export once more for it; the extension
+       tags that registration's tool calls (a later-than-first registration whose
+       ``sessionManager.getSessionFile()`` is child-shaped — see ``extension.ts``). Nothing the
+       model puts in a tool call reaches those objects.
+    2. The launcher env markers ``RIG_AGENT_ID``/``RIG_DETACHED_AGENT`` — an ``omp -p`` child
+       started by the ``rig-detached-omp`` launcher skill (the extension spawns this dispatcher
+       with ``{...process.env}``).
+    3. Process ancestry — an ``omp`` process above the one that dispatched this hook (a child
+       ``omp -p`` run from a parent session's bash tool without the launcher).
+
+    See ``agent_hooks_v1.subagent_identity`` for why 2 and 3 are outside the tool input's
+    reach. No source → no key at all (never an empty string): fail closed in the relax
+    direction, the call stays the orchestrator's."""
+    native_id = omp_event.get("agentId")
+    if isinstance(native_id, str) and native_id.strip():
+        args["agent_id"] = native_id
+        native_type = omp_event.get("agentType")
+        if isinstance(native_type, str) and native_type:
+            args["agent_type"] = native_type
+        return
+    if subagent_identity is None:
+        return
+    agent_id, agent_type = subagent_identity.detect_subagent(HARNESS)
+    if agent_id:
+        args["agent_id"] = agent_id
+        args["agent_type"] = agent_type
 
 
 def omp_block_output(reason: str) -> dict:

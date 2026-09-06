@@ -17,15 +17,18 @@ import shlex
 import sys
 from pathlib import Path
 
+try:
+    from agent_hooks_v1 import subagent_identity
+except Exception:  # noqa: BLE001 - a missing helper must fail CLOSED (no identity → governed)
+    subagent_identity = None
+
 HOOK_API = "agents-hooks/v1"
 # The v1 event's `harness` tag for every event this bridge produces — a MODULE LITERAL, not
 # derived from `codex_event`, so it cannot be forged via tool_input the way `args.harness` could
-# be. Codex exposes no TRUSTED per-tool-call subagent identity today (`args.agent_id` is stripped
-# below and never repopulated — there is no top-level Codex field to restore it from, unlike CC's
-# `agent_id`/`agent_type`). A hook can read `event["harness"]` to scope a policy to (or exempt)
-# this whole harness instead of relying on a subagent identity Codex doesn't give it — see
-# `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES` for the first consumer
-# (agent-tools#533).
+# be. Hooks read it to pick the delegation recipe for THIS harness in their refusal text
+# (agent-tools#573) — never to exempt the harness (the #533/#544 `EXEMPT_HARNESSES` shortcut is
+# gone: every harness is governed identically, and the subagent identity below is what tells an
+# orchestrator apart from a delegated child).
 HARNESS = "codex"
 _KNOWN_EVENTS = frozenset(
     {"PreToolUse", "PostToolUse", "Stop", "SubagentStart", "SubagentStop"}
@@ -77,6 +80,7 @@ def to_v1_event(codex_event: dict, *, point: str) -> dict:
     for key in _METADATA_KEYS:
         if codex_event.get(key) is not None:
             args[key] = codex_event[key]
+    _apply_subagent_identity(codex_event, args)
 
     command = _tool_command(tool_input)
     if command:
@@ -106,6 +110,39 @@ def to_v1_event(codex_event: dict, *, point: str) -> dict:
         "cwd": codex_event.get("cwd") or os.getcwd(),
         "args": args,
     }
+
+
+def _apply_subagent_identity(codex_event: dict, args: dict) -> None:
+    """Populate ``args.agent_id``/``args.agent_type`` from the trusted sources ONLY (#573).
+
+    ``to_v1_event`` has already dropped any ``agent_id``/``agent_type`` that rode in via
+    ``tool_input`` (model-authored, never trusted). Three sources may restore them, in order:
+
+    1. Codex's OWN top-level ``agent_id``/``agent_type`` — present on every hook event fired
+       inside a ``collaboration.spawn_agent`` child thread (captured on codex 0.153.4: the
+       child's Bash PreToolUse carries them, the parent's does not), the same shape Claude Code
+       emits. Codex writes these from its thread bookkeeping; they are not part of the tool
+       call the model composed, so nothing in ``tool_input`` can set or change them.
+    2. The launcher env markers ``RIG_AGENT_ID``/``RIG_DETACHED_AGENT`` — a ``codex exec``
+       child started by the ``rig-detached-codex`` launcher skill.
+    3. Process ancestry — a ``codex`` process of the same harness above the one that dispatched
+       this hook (a child ``codex exec`` run from a parent session's shell tool).
+
+    See ``agent_hooks_v1.subagent_identity`` for why 2 and 3 are outside ``tool_input``'s reach.
+    No source → no key at all (never an empty string), so every ``_is_subagent`` reader treats
+    the call as the orchestrator's — fail closed in the relax direction."""
+    native_id = codex_event.get("agent_id")
+    if native_id is not None and str(native_id).strip():
+        args["agent_id"] = native_id
+        if codex_event.get("agent_type") is not None:
+            args["agent_type"] = codex_event["agent_type"]
+        return
+    if subagent_identity is None:
+        return
+    agent_id, agent_type = subagent_identity.detect_subagent(HARNESS)
+    if agent_id:
+        args["agent_id"] = agent_id
+        args["agent_type"] = agent_type
 
 
 def codex_block_output(reason: str) -> dict:

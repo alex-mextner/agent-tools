@@ -502,3 +502,39 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     assert code == 0 and _decision(out) == "allow"
     assert marker.exists()
     assert "self-managed watchdog, polls inline" in question.read_text()
+
+
+# ── harness-aware remedy (agent-tools#573) ───────────────────────────────────────────────
+
+def _run_event(event, monkeypatch) -> tuple[str, str, int]:
+    out, err = io.StringIO(), io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    monkeypatch.delenv("RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC", raising=False)
+    code = hook.main()
+    return out.getvalue(), err.getvalue(), code
+
+
+@pytest.mark.parametrize("harness", ["codex", "opencode", "omp"])
+def test_shell_backgrounded_suite_in_a_non_cc_subagent_is_blocked_with_shell_remedy(harness, monkeypatch):
+    """This gate now fires for codex `spawn_agent` children, launcher-detached opencode/omp
+    children and omp `task` children too (they carry a trusted agent_id since #573). None of
+    those harnesses has a `run_in_background` tool field, so the remedy must not tell them to
+    remove one — only the shell backgrounding they actually used."""
+    event = {"point": "pre-bash", "harness": harness, "cwd": "/repo",
+             "args": {"command": "pytest -q &", "agent_id": "child-1"}}
+    out, _e, code = _run_event(event, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE and _decision(out) == "block"
+    message = json.loads(out)["message"]
+    assert "run_in_background" not in message
+    assert "`&`" in message
+    assert "RIG_HATCH_REQUEST_SUBAGENT_NO_BG_LONGPROC" in message
+
+
+def test_claude_code_remedy_names_run_in_background(monkeypatch):
+    event = {"point": "pre-bash", "harness": "claude-code", "cwd": "/repo",
+             "args": {"command": "pytest -q", "agent_id": "child-1", "run_in_background": True}}
+    out, _e, code = _run_event(event, monkeypatch)
+    assert code == hook.BLOCK_EXIT_CODE
+    assert "run_in_background: true" in json.loads(out)["message"]

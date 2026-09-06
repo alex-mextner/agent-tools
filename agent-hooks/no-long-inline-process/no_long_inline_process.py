@@ -49,6 +49,11 @@ inside a NORMAL multi-word quoted message, `tg --title x "...review..."`) is ful
 fix means a quote-aware separator scan replacing punctuation_chars across this and the sibling hooks'
 shared parser (follow-up, not this change). Pinned by `test_quoted_token_equal_to_separator_*`.
 
+Every harness is governed identically (agent-tools#573): the refusal names the delegation
+recipe of the event's top-level ``harness`` tag (``delegation_recipe``), so a codex/opencode/omp
+session is told about ITS spawn tool / ``rig-detached-<harness>`` launcher, never about Claude
+Code's Agent tool; an untagged event gets every recipe.
+
 Subagent-exempt: a dispatched subagent (``agent_id`` present) is EXPECTED to run these in
 the background, so it is always allowed — this gate governs the orchestrator only.
 
@@ -548,8 +553,10 @@ def main() -> int:
     block_message = (
         f"Run this in a BACKGROUND subagent, not the orchestrator: `{matched}` is a "
         "long-running process (review / --watch / build-or-test suite / long sleep) that "
-        "would block the main thread. Dispatch it as an Agent with `subagent_type: \"fork\"` "
-        "or `isolation: \"remote\"` (both run in the background). There is NO self-service "
+        "would block the main thread. "
+        # The recipe is picked by the TOP-LEVEL `harness` tag only (never `args`), agent-tools#573.
+        + hatch_escalation.delegation_recipe(event.get("harness"))
+        + " There is NO self-service "
         "bypass. For a genuine exception, ASK the human, or "
         "request a one-time Telegram approval by setting "
         "RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS=\"<written justification>\" "

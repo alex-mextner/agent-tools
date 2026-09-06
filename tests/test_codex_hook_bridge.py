@@ -18,6 +18,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _REPO = Path(__file__).resolve().parent.parent
 _LIB = _REPO / "lib"
 if str(_LIB) not in sys.path:
@@ -943,3 +945,111 @@ def test_top_level_dispatcher_errors_fail_open(tmp_path):
     assert proc.returncode == 0
     assert proc.stdout.strip() == ""
     assert "failing OPEN" in proc.stderr
+
+
+# ── subagent identity (agent-tools#573) ──────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _no_host_identity(monkeypatch):
+    """Module-wide: the pytest process may itself run inside a rig-dispatched child (env
+    markers set) or under a codex session (ancestry); neutralize both so every in-process
+    `to_v1_event` assertion below sees ONLY the identity the test injects."""
+    monkeypatch.delenv("RIG_AGENT_ID", raising=False)
+    monkeypatch.delenv("RIG_DETACHED_AGENT", raising=False)
+    monkeypatch.setattr(dispatch.subagent_identity, "ancestor_agent_id", lambda harness: "")
+
+
+# Captured VERBATIM on this machine (codex 0.153.4, `codex exec` + `collaboration.spawn_agent`,
+# 2026-09-07): the Bash PreToolUse fired INSIDE the spawned child thread. `session_id` is the
+# PARENT's (documented: "Subagent hooks use the parent session id"); the child is identified by
+# the TOP-LEVEL `agent_id`/`agent_type` — the same shape Claude Code emits — and `transcript_path`
+# points at the child's own rollout. The parent's own Bash event carried NO agent_id/agent_type.
+_CODEX_CHILD_THREAD_BASH_EVENT = {
+    "session_id": "01a07892-678c-77b0-9809-6b8824798712",
+    "turn_id": "01a07892-b5fb-7613-89b9-b6a5d6c8933f",
+    "agent_id": "01a07892-b5aa-7b82-bb84-071da23eb340",
+    "agent_type": "default",
+    "transcript_path": "/tmp/codex-home/sessions/2026/09/07/rollout-2026-09-07T01-14-35-01a07892-b5aa-7b82-bb84-071da23eb340.jsonl",
+    "cwd": "/tmp/codex-capture/repo",
+    "hook_event_name": "PreToolUse",
+    "model": "gpt-5.6-sol",
+    "permission_mode": "bypassPermissions",
+    "tool_name": "Bash",
+    "tool_input": {"command": "echo child-here"},
+    "tool_use_id": "exec-1c3d184f-2d2b-4c7a-954c-fed3c1b867c7",
+}
+
+
+def test_to_v1_event_forwards_codex_top_level_agent_identity_from_a_spawned_thread():
+    v1 = dispatch.to_v1_event(_CODEX_CHILD_THREAD_BASH_EVENT, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "01a07892-b5aa-7b82-bb84-071da23eb340"
+    assert v1["args"]["agent_type"] == "default"
+    assert v1["harness"] == "codex"
+
+
+def test_to_v1_event_top_level_identity_overwrites_a_forged_tool_input_copy():
+    """T2 precedence, same as the CC bridge: codex's own top-level field is the ONLY authority —
+    a `tool_input.agent_id` can neither add an identity (the sibling drop test) nor replace one."""
+    codex_event = dict(_CODEX_CHILD_THREAD_BASH_EVENT)
+    codex_event["tool_input"] = {"command": "echo child-here", "agent_id": "forged", "agent_type": "forged"}
+
+    v1 = dispatch.to_v1_event(codex_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "01a07892-b5aa-7b82-bb84-071da23eb340"
+    assert v1["args"]["agent_type"] == "default"
+
+
+def test_to_v1_event_parent_thread_event_has_no_identity():
+    """The parent's own Bash event (no top-level agent fields, no env marker, no ancestry) stays
+    the orchestrator: no `agent_id` at all, not an empty one."""
+    parent = {k: v for k, v in _CODEX_CHILD_THREAD_BASH_EVENT.items() if k not in ("agent_id", "agent_type")}
+    parent["tool_input"] = {"command": "echo parent-here"}
+
+    v1 = dispatch.to_v1_event(parent, point="pre-bash")
+
+    assert "agent_id" not in v1["args"]
+    assert "agent_type" not in v1["args"]
+
+
+def test_to_v1_event_injects_agent_id_from_launcher_env_marker(monkeypatch):
+    """A `codex exec` child started by the rig-detached-codex launcher carries RIG_AGENT_ID in
+    its process env; the bridge (spawned by that codex with its env) injects it."""
+    monkeypatch.setenv("RIG_AGENT_ID", "probe-codex")
+    codex_event = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                   "tool_input": {"command": "pytest -q", "agent_id": "forged"}, "cwd": "/repo"}
+
+    v1 = dispatch.to_v1_event(codex_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "probe-codex"
+    assert v1["args"]["agent_type"] == "detached"
+
+
+def test_to_v1_event_injects_agent_id_from_process_ancestry(monkeypatch):
+    """A `codex exec` child started from a parent codex session's shell tool WITHOUT the launcher
+    has no env marker; the parent codex process above the bridge's own is the identity."""
+    monkeypatch.setattr(dispatch.subagent_identity, "ancestor_agent_id",
+                        lambda harness: f"ancestor:{harness}:4242")
+    codex_event = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                   "tool_input": {"command": "pytest -q"}, "cwd": "/repo"}
+
+    v1 = dispatch.to_v1_event(codex_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "ancestor:codex:4242"
+    assert v1["args"]["agent_type"] == "ancestor"
+
+
+def test_to_v1_event_codex_native_identity_wins_over_env_and_ancestry(monkeypatch):
+    monkeypatch.setenv("RIG_AGENT_ID", "probe-codex")
+    monkeypatch.setattr(dispatch.subagent_identity, "ancestor_agent_id", lambda harness: "ancestor:codex:1")
+
+    v1 = dispatch.to_v1_event(_CODEX_CHILD_THREAD_BASH_EVENT, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "01a07892-b5aa-7b82-bb84-071da23eb340"
+    assert v1["args"]["agent_type"] == "default"
+
+
+def test_subagent_start_and_stop_map_to_no_point_but_keep_identity():
+    """SubagentStart/Stop carry the same top-level identity; they still map to no v1 point
+    (no pre-agent mapping yet), so nothing dispatches — documented gap, unchanged."""
+    assert dispatch.point_for_event("SubagentStart", None) is None

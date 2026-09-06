@@ -428,3 +428,41 @@ def test_description_only_short_is_trivial(monkeypatch):
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ── harness-aware reminder (agent-tools#573) ─────────────────────────────────────────────
+
+_NON_TRIVIAL_PROMPT = "Refactor the whole bridge family:\n- keep the tests green\n- write a report"
+
+
+@pytest.mark.parametrize(
+    ("harness", "needle", "foreign"),
+    [
+        ("claude-code", 'subagent_type="fork"', "rig-detached-codex"),
+        ("codex", "collaboration.spawn_agent", 'subagent_type="fork"'),
+        ("opencode", "~/.agents/skills/rig-detached-opencode/rig-detached-opencode", "spawn_agent"),
+        ("omp", "~/.agents/skills/rig-detached-omp/rig-detached-omp", "rig-detached-codex"),
+    ],
+)
+def test_reminder_is_harness_aware(harness, needle, foreign, monkeypatch):
+    """The refusal tells THAT harness how to dispatch in the background; every harness is
+    governed the same way (a `harness` tag never exempts)."""
+    event = {"point": "pre-agent", "harness": harness, "cwd": "/repo",
+             "args": {"prompt": _NON_TRIVIAL_PROMPT, "description": "big refactor"}}
+    out, _e, code = _run(event, monkeypatch)
+    assert code == gate.BLOCK_EXIT_CODE and _decision(out) == "block"
+    message = json.loads(out)["message"]
+    assert needle in message
+    assert foreign not in message
+    assert "RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE" in message
+
+
+def test_reminder_without_harness_covers_every_harness(monkeypatch):
+    event = {"point": "pre-agent", "cwd": "/repo",
+             "args": {"prompt": _NON_TRIVIAL_PROMPT, "description": "big refactor", "harness": "omp"}}
+    out, _e, code = _run(event, monkeypatch)
+    assert code == gate.BLOCK_EXIT_CODE
+    message = json.loads(out)["message"]
+    for needle in ('subagent_type="fork"', "rig-detached-codex", "rig-detached-opencode", "rig-detached-omp"):
+        assert needle in message
+    assert message == gate.REMINDER

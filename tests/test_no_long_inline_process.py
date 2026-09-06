@@ -473,3 +473,106 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     assert code == 0 and _decision(out) == "allow"
     assert marker.exists()
     assert "one-shot review, output needed now" in question.read_text()
+
+
+# ── harness-aware refusal + real bridge identities (agent-tools#573) ─────────────────────
+
+def _run_event(event, monkeypatch) -> tuple[str, str, int]:
+    out, err = io.StringIO(), io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    monkeypatch.delenv("RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS", raising=False)
+    code = nlip.main()
+    return out.getvalue(), err.getvalue(), code
+
+
+_RECIPE_NEEDLE = {
+    "claude-code": 'subagent_type: "fork"',
+    "codex": "~/.agents/skills/rig-detached-codex/rig-detached-codex",
+    "opencode": "~/.agents/skills/rig-detached-opencode/rig-detached-opencode",
+    "omp": "~/.agents/skills/rig-detached-omp/rig-detached-omp",
+}
+
+
+@pytest.mark.parametrize("harness", sorted(_RECIPE_NEEDLE))
+def test_block_names_the_delegation_recipe_of_the_event_harness(harness, monkeypatch):
+    """Every harness is governed identically (no exemption), and the refusal tells THAT harness
+    how to delegate — the 184 refusals Alex's codex session collected all pointed at Claude
+    Code's Agent tool, which codex does not have."""
+    out, _e, code = _run_event({"point": "pre-bash", "harness": harness, "cwd": "/repo",
+                                "args": {"command": "review diff -C /repo"}}, monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE and _decision(out) == "block"
+    message = json.loads(out)["message"]
+    assert _RECIPE_NEEDLE[harness] in message
+    for other, needle in _RECIPE_NEEDLE.items():
+        if other != harness:
+            assert needle not in message
+    assert "RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS" in message
+
+
+def test_block_without_harness_lists_every_recipe(monkeypatch):
+    out, _e, code = _run_event({"point": "pre-bash", "cwd": "/repo",
+                                "args": {"command": "pytest -q"}}, monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE
+    message = json.loads(out)["message"]
+    for needle in _RECIPE_NEEDLE.values():
+        assert needle in message
+
+
+def test_forged_args_harness_does_not_select_a_recipe(monkeypatch):
+    out, _e, code = _run_event({"point": "pre-bash", "cwd": "/repo",
+                                "args": {"command": "pytest -q", "harness": "codex"}}, monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE
+    message = json.loads(out)["message"]
+    for needle in _RECIPE_NEEDLE.values():
+        assert needle in message
+
+
+def _bridge_event(bridge_module: str, monkeypatch, *, as_subagent: bool, command: str):
+    import importlib
+
+    dispatch = importlib.import_module(bridge_module)
+    monkeypatch.delenv("RIG_AGENT_ID", raising=False)
+    monkeypatch.delenv("RIG_DETACHED_AGENT", raising=False)
+    monkeypatch.setattr(dispatch.subagent_identity, "ancestor_agent_id", lambda harness: "")
+    if bridge_module == "codex_hook_bridge.dispatch":
+        raw = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+               "tool_input": {"command": command, "agent_id": "forged"}, "cwd": "/repo"}
+        if as_subagent:
+            raw.update({"agent_id": "01a07892-b5aa-7b82-bb84-071da23eb340", "agent_type": "default"})
+    elif bridge_module == "omp_hook_bridge.dispatch":
+        raw = {"event": "tool_call", "toolName": "bash",
+               "input": {"command": command, "agentId": "forged"}, "cwd": "/repo", "toolCallId": "c1"}
+        if as_subagent:
+            raw.update({"agentId": "01a0788d-6a3b-7175-8864-65126e03d2bb", "agentType": "task"})
+    else:
+        raw = {"hook": "tool.execute.before", "cwd": "/repo", "input": {"tool": "bash"},
+               "output": {"args": {"command": command, "agent_id": "forged"}}}
+        if as_subagent:
+            monkeypatch.setenv("RIG_AGENT_ID", "oc-worker")
+    return dispatch.to_v1_event(raw, point="pre-bash")
+
+
+_BRIDGES = ["codex_hook_bridge.dispatch", "opencode_hook_bridge.dispatch", "omp_hook_bridge.dispatch"]
+
+
+@pytest.mark.parametrize("bridge_module", _BRIDGES)
+def test_real_bridge_orchestrator_event_is_blocked_with_its_recipe(bridge_module, monkeypatch):
+    """A forged `agent_id` inside the tool args is stripped by every bridge; the orchestrator-level
+    `pytest` under codex/opencode/omp is refused with that harness's recipe."""
+    v1 = _bridge_event(bridge_module, monkeypatch, as_subagent=False, command="pytest -q")
+    assert "agent_id" not in v1["args"]
+    out, _e, code = _run_event(v1, monkeypatch)
+    assert code == nlip.BLOCK_EXIT_CODE and _decision(out) == "block"
+    assert _RECIPE_NEEDLE[v1["harness"]] in json.loads(out)["message"]
+
+
+@pytest.mark.parametrize("bridge_module", _BRIDGES)
+def test_real_bridge_subagent_event_is_allowed(bridge_module, monkeypatch):
+    """The same `pytest` from a dispatched child — codex's own top-level agent_id, opencode's
+    launcher env marker, omp's extension-set identity — is allowed: a subagent is EXPECTED to
+    run the suite."""
+    v1 = _bridge_event(bridge_module, monkeypatch, as_subagent=True, command="pytest -q")
+    out, _e, code = _run_event(v1, monkeypatch)
+    assert code == 0 and _decision(out) == "allow"

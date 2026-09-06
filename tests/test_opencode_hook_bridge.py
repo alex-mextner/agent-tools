@@ -480,9 +480,45 @@ def _no_host_agent_markers(monkeypatch):
 def _clear_agent_env_markers(monkeypatch) -> None:
     """Drop the detached-agent env markers — mandatory before any to_v1_event test,
     because a rig-dispatched opencode test run (the very process pytest lives in)
-    carries them and the dispatcher injects args.agent_id from process env."""
+    carries them and the dispatcher injects args.agent_id from process env. The
+    process-ancestry source (#573) is neutralized the same way: this pytest may run under
+    an opencode session."""
     monkeypatch.delenv("RIG_AGENT_ID", raising=False)
     monkeypatch.delenv("RIG_DETACHED_AGENT", raising=False)
+    monkeypatch.setattr(dispatch.subagent_identity, "ancestor_agent_id", lambda harness: "")
+
+
+def test_to_v1_event_injects_agent_id_from_process_ancestry(monkeypatch):
+    """#573: an `opencode run` child started from a parent opencode session's bash tool
+    WITHOUT the launcher has no env marker; the parent opencode process above the bridge's
+    own is the identity (shared helper, same as the codex/omp bridges)."""
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setattr(dispatch.subagent_identity, "ancestor_agent_id",
+                        lambda harness: f"ancestor:{harness}:777")
+    opencode_event = {
+        "hook": "tool.execute.before",
+        "cwd": "/repo",
+        "input": {"tool": "bash"},
+        "output": {"args": {"command": "pytest -q", "agent_id": "forged"}},
+    }
+
+    v1 = dispatch.to_v1_event(opencode_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "ancestor:opencode:777"
+    assert v1["args"]["agent_type"] == "ancestor"
+
+
+def test_to_v1_event_env_marker_wins_over_ancestry(monkeypatch):
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("RIG_AGENT_ID", "probe")
+    monkeypatch.setattr(dispatch.subagent_identity, "ancestor_agent_id", lambda harness: "ancestor:opencode:1")
+    opencode_event = {"hook": "tool.execute.before", "cwd": "/repo", "input": {"tool": "bash"},
+                      "output": {"args": {"command": "ls"}}}
+
+    v1 = dispatch.to_v1_event(opencode_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "probe"
+    assert v1["args"]["agent_type"] == "detached"
 
 
 def test_to_v1_event_injects_agent_id_from_env_marker(monkeypatch):
