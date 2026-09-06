@@ -44,7 +44,7 @@ happened, so a block decision is logged as feedback and the plugin fails open.
 | `tool.execute.before` + `bash` | `pre-bash` | `output.args.command` becomes `event.command` and `args.command`. |
 | `tool.execute.before` + `edit` / `write` | `pre-write` | `output.args.filePath` is normalized to `args.file_path` / `args.path`; proposed content is normalized to `args.content`. |
 | `tool.execute.before` + `apply_patch` | `pre-write` | `output.args.patchText` becomes raw `args.patch`; added patch lines become `args.content`; patch marker paths become `args.file_path` / `args.path`. |
-| `tool.execute.before` + `task` | `pre-agent` | Carries the task payload (`subagent_type`, `prompt`, `description`) for orchestration guards. opencode Task is inherently async and has no `background` field; `general`/`explore` therefore pass the background-subagent gate. |
+| `tool.execute.before` + `task` | `pre-agent` | Carries the task payload (`subagent_type`, `prompt`, `description`) for orchestration guards. opencode's task tool has no `background` field in a default build (foreground; the native field exists only behind `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS`, mapped to `run_in_background` only then); `general`/`explore` pass the background-subagent gate anyway because opencode has no in-tool background path — the truly-detached path is the `rig-detached-opencode` launcher. |
 | `tool.execute.after` + `edit` / `write` / `apply_patch` | `post-write` | Runs path-based hooks after the write; exit 10 is logged as feedback because opencode cannot un-run the completed write. |
 
 opencode has session events such as `session.idle`, but this bridge does not map
@@ -58,11 +58,38 @@ patches, both the source and destination paths are surfaced for path-based gates
 only the destination receives the added-content payload because the source path is
 not being written.
 
+## Identity contract (subagent exemption)
+
 The bridge strips all opencode tool-argument fields that look like agent identity
-(`agent_id`, `agent_type`, camelCase variants, and `agent`). Those fields are not
-trusted as a non-forgeable subagent identity in the plugin payload, so
-subagent-exempt hooks treat opencode tool calls as main-thread calls unless a future
-opencode contract exposes an authoritative identity field.
+(`agent_id`, `agent_type`, camelCase variants, and `agent`) — model-controlled tool args
+can never self-exempt a call, so a forged `agent_id` inside `tool_input` is dropped
+before anything else runs.
+
+The one authoritative identity source is the opencode PROCESS ENVIRONMENT, read at
+launch by `_detached_agent_id()`: `RIG_AGENT_ID=<name>` (identity) or
+`RIG_DETACHED_AGENT=1` (anonymous marker). When a marker is present the dispatcher
+injects `args.agent_id`, so every subagent-exempt hook
+(`orchestrator-stays-thin`, `background-subagent-gate`, `no-long-inline-process`,
+`subagent-no-bg-longproc`) treats the session's tool calls as a dispatched subagent's
+instead of the orchestrator's. The markers are set by the canonical detached launcher
+shipped as the `rig-detached-opencode` universal skill (`plugin.js` spawns this
+dispatcher with `{...process.env}`, so the marker set at child launch is visible on
+every tool call).
+
+Trust reasoning: a running orchestrator cannot retroactively mutate its own process
+environment — it can only set these vars for a CHILD process, which is exactly the
+sanctioned act of dispatching a subagent. This matches the module family's
+cooperative-orchestrator threat model (`on_error: open` discipline gates, not security
+boundaries). A bare/whitespace `RIG_AGENT_ID` is not a marker; `RIG_DETACHED_AGENT=1`
+alone yields the anonymous id `detached`.
+
+Known limitation, by the same threat model: the markers are honored for the WHOLE
+session of any opencode process that inherits them. An `export RIG_AGENT_ID=...` left in
+an interactive shell (or persisted into a shell rc file) makes the next interactive
+opencode session subagent-exempt too. That is a self-inflicted misconfiguration, not a
+bypass an adversarial model can reach from inside a governed session (it cannot edit its
+own environment; an rc-file write is itself a governed `pre-write`) — never export the
+markers by hand, let the launcher set them for the child only.
 
 Every translated v1 event also carries a top-level `harness: "opencode"` — a hardcoded
 module constant (`dispatch.HARNESS`), never derived from the opencode event, so it can't be

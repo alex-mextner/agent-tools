@@ -21,9 +21,12 @@ HOOK_API = "agents-hooks/v1"
 # derived from `opencode_event`, so it cannot be forged via tool args the way `args.harness`
 # could be. See `codex_hook_bridge.HARNESS` for the same reasoning: opencode exposes no TRUSTED
 # per-tool-call subagent identity in the plugin payload either (forged agent_id/agent_type keys
-# are stripped below). A hook can read `event["harness"]` to scope a policy to (or exempt) this
-# whole harness instead — see `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES` for the
-# first consumer (agent-tools#533).
+# are stripped below). The ONE trusted identity source is the process environment set by the rig
+# detached launcher (`_detached_agent_id`, agent-tools#476) — and that covers only a rig-launched
+# detached child; a plain opencode session still carries no identity. So a hook that wants to
+# scope a policy to (or exempt) this WHOLE harness reads `event["harness"]` instead — see
+# `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES` for the first consumer
+# (agent-tools#533).
 HARNESS = "opencode"
 _KNOWN_EVENTS = frozenset({"tool.execute.before", "tool.execute.after"})
 _WRITE_TOOLS = frozenset({"edit", "write", "apply_patch"})
@@ -65,6 +68,38 @@ def point_for_event(hook_name: str, tool_name: str | None) -> str | None:
     return None
 
 
+def _detached_agent_id() -> str:
+    """The ONE authoritative subagent identity source for opencode sessions.
+
+    The forge-strip in ``to_v1_event`` removes any model/tool-supplied agent_id
+    (the same trust boundary as the CC bridge's T2 precedence: an event may carry
+    model-influenced fields, so they can never self-exempt). CC has an
+    authoritative top-level agent field to restore it from; opencode has NONE —
+    which made every opencode session, including a rig-dispatched detached
+    ``opencode run`` agent, look like "the orchestrator" to every gate.
+
+    The sanctioned source here is the opencode PROCESS ENVIRONMENT, read at
+    launch: ``RIG_AGENT_ID=<name>`` (identity) or ``RIG_DETACHED_AGENT=1``
+    (anonymous marker), set by the rig detached-agent launcher. plugin.js spawns
+    this dispatcher with ``{...process.env}``, so the marker set when the child
+    opencode was launched is visible here on every tool call.
+
+    Trust reasoning: a running orchestrator cannot retroactively mutate its own
+    process environment — it can only set these vars for a CHILD process it
+    dispatches, which is exactly the sanctioned act of dispatching a subagent
+    (and the very act the delegation gates exist to encourage). This matches the
+    module family's stated threat model: a cooperative orchestrator, discipline
+    rather than a security boundary, on_error=open. A bare/whitespace value is
+    not a marker.
+    """
+    val = os.environ.get("RIG_AGENT_ID", "").strip()
+    if val:
+        return val
+    if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
+        return "detached"
+    return ""
+
+
 def to_v1_event(opencode_event: dict, *, point: str) -> dict:
     """Translate the opencode plugin payload into agents-hooks/v1."""
     tool = _tool_name(opencode_event)
@@ -72,6 +107,9 @@ def to_v1_event(opencode_event: dict, *, point: str) -> dict:
     args = dict(raw_args)
     for key in _FORGED_AGENT_KEYS:
         args.pop(key, None)
+    detached_id = _detached_agent_id()
+    if detached_id:
+        args["agent_id"] = detached_id
     _normalize_task_args(args)
 
     command = _tool_command(tool, raw_args)
@@ -245,11 +283,43 @@ def _event_id(event: dict) -> str:
     return ""
 
 
+_TRUTHY_ENV_FLAG = frozenset({"1", "true", "yes", "on"})
+
+
+def _background_subagents_enabled() -> bool:
+    """True when the opencode process hosting this bridge honors background subagents.
+
+    opencode 1.18.20's task tool carries a native ``background`` boolean (verified against
+    the v1.18.20 source, ``packages/opencode/src/tool/task.ts``), but it is EXPERIMENTAL:
+    the field is only advertised in the model-facing schema — and only honored at execute
+    time — when the server runs with ``OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=<truthy>``
+    or the broad ``OPENCODE_EXPERIMENTAL=<truthy>`` (``RuntimeFlags.enabledByExperimental``).
+    A default build both hides the field and fails a task that sets it anyway ("Background
+    subagents require OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true"). plugin.js spawns
+    this dispatcher with ``{...process.env}``, so the env of the hosting opencode process
+    is visible here. Truthiness accepts Effect ``Config.boolean`` spellings; anything else
+    reads as off (the safe direction: an unproven field is not a background signal).
+    """
+    def on(env: str) -> bool:
+        return os.environ.get(env, "").strip().lower() in _TRUTHY_ENV_FLAG
+
+    return on("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS") or on("OPENCODE_EXPERIMENTAL")
+
+
 def _normalize_task_args(args: dict) -> None:
+    """Normalize opencode task-tool spellings into the CC-shaped keys the gates read.
+
+    ``background`` -> ``run_in_background`` maps opencode's NATIVE task-tool field — which
+    exists only behind the experimental flag (see ``_background_subagents_enabled``). The
+    mapping is applied only in that configuration, so a default build's task tool (which
+    would reject ``background: true`` with an error) never gets presented to the gates as
+    a live background signal it does not actually have.
+    """
     if "subagent_type" not in args and isinstance(args.get("subagentType"), str):
         args["subagent_type"] = args["subagentType"]
     if not isinstance(args.get("run_in_background"), bool) and isinstance(args.get("background"), bool):
-        args["run_in_background"] = args["background"]
+        if _background_subagents_enabled():
+            args["run_in_background"] = args["background"]
 
 
 def _write_path(args: dict) -> str:
