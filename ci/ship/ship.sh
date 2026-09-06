@@ -2832,31 +2832,101 @@ fi
 # ticket code lives only in its title (a common shape — "HYP-931: fix the thing") would
 # otherwise never be found here even though a human reads it immediately.
 #
-# EACH candidate — including a reused $TASK_CODE — is validated (must contain a DIGIT) before
-# being accepted; a rejected one falls through to try the NEXT source rather than giving up
-# (review finding — an earlier version validated only the FINAL chosen source, so a digit-free
-# $TASK_CODE reuse — e.g. an explicit REVIEW_TASK_CODE=SME-ROADMAP-NOTE, or the branch matching
-# the matcher's descriptive arm — short-circuited past a title/body that DID carry a real,
-# numeric ticket id). The digit requirement itself: the matcher's third arm is a
-# purely-descriptive, digit-free pattern (`SME-ROADMAP-NOTE`) meant for review-cli's own
-# hand-picked task codes — safe for the quorum gate (an unknown code just fails closed, refusing
-# the merge) but NOT safe here, where a false positive gets executed as a real `task
-# mark-shipped <code>` call: a generic PR title like "Fix UTF-8 decoding" would derive `UTF-8`
-# and could silently mark an unrelated ticket "shipped" if that code happens to exist — exactly
-# the status-divergence class this feature exists to prevent, not cause. Every genuine ticket id
-# this project uses (HYP-931, PROJ-12, …) carries a numeric suffix, so this costs nothing on the
-# real path.
-_ship_looks_like_a_ticket_id() {  # $1 = candidate code; true (exit 0) iff it contains a digit
-  case "$1" in *[0-9]*) return 0 ;; *) return 1 ;; esac
+# EACH candidate — including a reused $TASK_CODE — is validated before being accepted; a
+# rejected one falls through to try the NEXT source rather than giving up (review finding — an
+# earlier version validated only the FINAL chosen source, so an invalid $TASK_CODE reuse — e.g.
+# an explicit REVIEW_TASK_CODE=SME-ROADMAP-NOTE, or the branch matching the matcher's
+# descriptive arm — short-circuited past a title/body that DID carry a real ticket id).
+#
+# The validation is task-cli's OWN id grammar (agent-tools#565), not a loose heuristic. It used
+# to be "contains a digit", which is not a shape at all: it admitted things that are not tickets
+# and that `task gate`/`task mark-shipped` can only 404 on. Two classes actually reached the
+# merge gate on 2026-09-06:
+#
+#   * review-cli CHECK codes — `rig-cli-341`, `rig-cli-342`, `OC476-OPENCODE-BACKGROUND-TRUTH`
+#     — a DIFFERENT entity from a ticket (a recorded review run). Each carries digits, so each
+#     passed. `task gate` 404s -> exit 2 -> the acceptance gate logs "could not evaluate" and
+#     SKIPS, so PRs 349, 556, 352 and 497 merged with the gate never actually run: it failed
+#     OPEN on the very input it was supposed to reject.
+#   * the PULL REQUEST's own number, as `GH-<PR>` or `#<PR>`. PR #499 carried its real ticket
+#     (#495) in BOTH its branch and its title, but a `GH-499` reuse won the first candidate slot;
+#     the gate judged issue #499 — unrelated, zero criteria — and refused. The merge was only
+#     unblocked by recording a false post-merge-acceptance opt-out on #499. A PR number is never
+#     a ticket id here, so it is rejected explicitly and derivation falls through.
+#
+# task-cli's grammar (tasklib/cli.py::_route_id_to_project) is exactly three shapes: `#<n>` and
+# a bare `<n>` route to GitHub issues; ONE alphanumeric team prefix + `-` + digits (`HYP-931`,
+# `PROJ-12`) routes to Linear by that prefix. Anything else cannot be routed at all.
+#
+# Known, deliberate limit: a prefix shape is indistinguishable from an ordinary hyphenated word
+# ending in digits, so a PR title like "Fix UTF-8 decoding" still derives `UTF-8` — it is a
+# well-formed id for a team that (almost certainly) does not exist, and task-cli answers exit 2.
+# Narrowing that further would need the registered team list, which ship.sh does not have.
+_ship_looks_like_a_ticket_id() {  # $1 = candidate code; true (exit 0) iff it has a task-cli id shape
+  # Exactly the three shapes, as ONE alternation so the grammar reads off the line: `#<n>` or a
+  # bare `<n>` (a GitHub issue), or one letter-led alphanumeric team prefix + a single hyphen +
+  # digits only (`HYP-931`, `PROJ-12`). `rig-cli-341` (two hyphens) and
+  # `OC476-OPENCODE-BACKGROUND-TRUTH` (non-numeric tail) both fail. `GH-<n>` is a member of the
+  # prefix shape like any other; only `_ship_code_names_this_pr` and
+  # `_ship_normalize_gh_code_for_task_cli` treat `GH-` as structurally special.
+  [[ "$1" =~ ^(#[0-9]+|[0-9]+|[A-Za-z][A-Za-z0-9]*-[0-9]+)$ ]]
+}
+
+# True when the candidate names THIS pull request rather than a ticket. Accepts the same three
+# spellings the code can arrive in — `#<n>`, a bare `<n>`, and the `GH-<n>` convention
+# `_ship_normalize_gh_code_for_task_cli` rewrites — so none of them can gate a PR against itself.
+# Rejecting the PR's own number can never discard a legitimate ticket: GitHub issues and pull
+# requests share ONE number sequence per repo, and `#<n>`/`<n>` route to this repo's issues.
+#
+# $PR is ship.sh's REQUIRED first positional argument, validated at startup long before any
+# derivation runs, so the digits-only `${PR:-}` guard below is a belt-and-braces assertion of
+# that invariant rather than a reachable branch (`${PR:-}`, not `$PR`: the script runs under
+# `set -u`, and an unset $PR must take this branch, not abort). It is written to fail OPEN (an
+# empty or non-numeric $PR means "not this PR", so the candidate survives) deliberately: an unset $PR would mean ship.sh is being
+# driven in a way this function cannot reason about at all, and silently discarding every
+# numeric candidate there would turn a broken invocation into a gate that quietly never runs —
+# the very failure mode agent-tools#565 is fixing.
+_ship_code_names_this_pr() {  # $1 = candidate code; true (exit 0) iff it is this PR's number
+  local n="$1"
+  case "$n" in
+    '#'*) n="${n#\#}" ;;
+    [Gg][Hh]-*) n="${n#*-}" ;;
+  esac
+  case "$n" in '' | *[!0-9]*) return 1 ;; esac
+  # Compare NUMERIC values, not strings (review round 2, Codex P2): `#01`/`GH-01` under PR #1
+  # passes the grammar above, and a literal `"01" = "1"` string compare would call it "not this
+  # PR" — handing the gate the PR itself, the exact #499 hole this guard closes. `10#` forces
+  # base 10 so a zero-padded code is never read as octal. Both sides are checked digits-only
+  # HERE, not by the startup invariant alone: a non-numeric operand makes `$(( ))` a fatal bash
+  # syntax error that would kill ship.sh outright rather than fail this one candidate.
+  case "${PR:-}" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$((10#$n))" = "$((10#$PR))" ]
+}
+
+# One candidate's full admission test, so every source below applies the SAME two rules. A
+# NON-EMPTY candidate that fails is reported on stderr with its source: an explicit $TASK_CODE
+# the operator typed would otherwise be replaced by a DIFFERENT ticket from the PR body with no
+# trace, and the merge gate would judge a ticket nobody named.
+_ship_task_code_candidate_ok() {  # $1 = candidate code  $2 = source label (for the rejection note)
+  [ -n "$1" ] || return 1
+  if ! _ship_looks_like_a_ticket_id "$1"; then
+    echo "[ship] task-code: rejected '$1' from $2 — not a task-cli id shape (#<n>, <n>, PREFIX-<n>); trying the next source." >&2
+    return 1
+  fi
+  if _ship_code_names_this_pr "$1"; then
+    echo "[ship] task-code: rejected '$1' from $2 — it names this pull request (#$PR), not a ticket; trying the next source." >&2
+    return 1
+  fi
+  return 0
 }
 _ship_derive_task_code_for_notify() {
   local candidate
 
   candidate="${TASK_CODE:-}"
-  [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
+  _ship_task_code_candidate_ok "$candidate" '$TASK_CODE' && { printf '%s' "$candidate"; return 0; }
 
   candidate=$(_review_quorum_extract_ticket "$BRANCH")
-  [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
+  _ship_task_code_candidate_ok "$candidate" "the branch name" && { printf '%s' "$candidate"; return 0; }
 
   local pr_title pr_body_local
   # One combined query for title+body (2 round trips instead of 2 separate `gh pr view` calls).
@@ -2875,10 +2945,10 @@ _ship_derive_task_code_for_notify() {
     || { pr_title=""; pr_body_local=""; }
 
   candidate=$(_review_quorum_extract_ticket "$pr_title")
-  [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
+  _ship_task_code_candidate_ok "$candidate" "the PR title" && { printf '%s' "$candidate"; return 0; }
 
   candidate=$(_review_quorum_extract_ticket "$pr_body_local")
-  [ -n "$candidate" ] && _ship_looks_like_a_ticket_id "$candidate" && { printf '%s' "$candidate"; return 0; }
+  _ship_task_code_candidate_ok "$candidate" "the PR body" && { printf '%s' "$candidate"; return 0; }
 
   return 0
 }

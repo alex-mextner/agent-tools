@@ -358,23 +358,81 @@ def test_notify_normalizes_a_reused_gh_synthetic_code_to_the_task_cli_id_format(
     assert "normalizing task-cli notify code: GH-301 -> #301" in r.stderr
 
 
-def test_notify_leaves_a_gh_prefixed_non_matching_code_unaffected(repo_with_pr_worktree, tmp_path):
-    """The normalization is anchored to "GH-" followed by digits and NOTHING ELSE
-    (`^[Gg][Hh]-([0-9]+)$`) -- pins the regex's `$` anchor and digits-only tail so a future edit
-    that loosens either doesn't silently start rewriting a code like "GH-105A" (has a digit, so
-    it survives the earlier digit check, but isn't the exact GH-<n> shape) into something
-    unroutable in a different way."""
+def test_notify_rejects_a_gh_prefixed_non_matching_code_as_a_ticket_shape(repo_with_pr_worktree, tmp_path):
+    """"GH-105A" is not a task-cli id in ANY of its three shapes (`#<n>`, `<n>`,
+    `<PREFIX>-<digits>`) -- its tail is not digits-only. Before agent-tools#565 the shape check
+    was merely "contains a digit", so this code survived it and was handed to `task
+    mark-shipped` verbatim, where it could only 404; now it is rejected at derivation and the
+    NEXT source is tried, exactly like any other rejected candidate.
+
+    The regex-anchor property this test used to pin (`^[Gg][Hh]-([0-9]+)$` must not rewrite
+    "GH-105A") is now pinned directly on the normalization function by
+    test_normalize_gh_code_only_rewrites_the_exact_gh_number_shape below -- a unit assertion,
+    since a code this malformed no longer reaches the normalization step at all."""
     main, _wt = repo_with_pr_worktree
     bindir = _bindir(tmp_path, with_task=True)
 
     r, calls = _run_ship(
         main, bindir, tmp_path, branch="fix-the-thing",
-        extra_env={"TASK_CODE": "GH-105A"},
+        extra_env={
+            "TASK_CODE": "GH-105A",
+            "SHIP_TEST_PR_TITLE": "fix the thing",
+            "SHIP_TEST_PR_BODY": "no ticket mentioned",
+        },
     )
 
     assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
-    assert len(calls) == 1, calls
-    assert "mark-shipped GH-105A" in calls[0]
+    assert calls == [], calls
+
+
+def test_normalize_gh_code_only_rewrites_the_exact_gh_number_shape(tmp_path):
+    """`_ship_normalize_gh_code_for_task_cli` rewrites ONLY `GH-<digits>` (case-insensitive) into
+    task-cli's `#<n>` form. Pins the `$` anchor and the digits-only tail directly, so a future
+    edit that loosens either is caught here rather than by a code shape that no longer reaches
+    this function."""
+    script = (
+        f'eval "$(sed -n \'/^_ship_normalize_gh_code_for_task_cli()/,/^}}/p\' {_SHIP})"\n'
+        'for c in GH-105 gh-105 GH-105A GH- GHX-105 HYP-931 "#105"; do '
+        'printf "%s=>%s\\n" "$c" "$(_ship_normalize_gh_code_for_task_cli "$c" 2>/dev/null)"; done\n'
+    )
+    r = _sh("bash", "-c", script, cwd=tmp_path, env=dict(os.environ))
+    assert r.returncode == 0, r.stderr
+    got = dict(line.split("=>", 1) for line in r.stdout.strip().splitlines())
+    assert got == {
+        "GH-105": "#105",      # the exact shape -> rewritten
+        "gh-105": "#105",      # case-insensitive
+        "GH-105A": "GH-105A",  # non-digit tail -> untouched ($ anchor)
+        "GH-": "GH-",          # no digits at all -> untouched
+        "GHX-105": "GHX-105",  # not the GH- prefix -> untouched
+        "HYP-931": "HYP-931",  # an ordinary Linear id -> untouched
+        "#105": "#105",        # already normalized -> untouched
+    }, got
+
+
+def test_looks_like_a_ticket_id_pins_task_cli_grammar(tmp_path):
+    """`_ship_looks_like_a_ticket_id` is a hand transcription of task-cli's id routing
+    (`tasklib/cli.py::_route_id_to_project`: `#<n>` / bare `<n>` -> GitHub issues, `PREFIX-<n>`
+    -> the Linear team named by the prefix), so it is pinned as a table here. Deliberate edges:
+    a lowercase prefix is accepted (task-cli upper-cases it before routing); a digit-led prefix
+    is rejected (Linear team keys are letter-led); `UTF-8` is well-formed for a team that does
+    not exist (the documented known limit) and is accepted."""
+    cases = [
+        "#105", "105", "007", "HYP-931", "hyp-931", "PROJ-12", "GH-105", "OC476-123", "UTF-8",
+        "", "#", "#12a", "-931", "HYP-", "HYP-931-2", "1X-5", "rig-cli-341",
+        "OC476-OPENCODE-BACKGROUND-TRUTH", "GH-105A", "SME-ROADMAP-NOTE-42", "HYP 931",
+    ]
+    quoted = " ".join(f"'{c}'" for c in cases)
+    script = (
+        f'eval "$(sed -n \'/^_ship_looks_like_a_ticket_id()/,/^}}/p\' {_SHIP})"\n'
+        f"for c in {quoted}; do "
+        'if _ship_looks_like_a_ticket_id "$c"; then v=yes; else v=no; fi; '
+        'printf "%s=>%s\\n" "$c" "$v"; done\n'
+    )
+    r = _sh("bash", "-c", script, cwd=tmp_path, env=dict(os.environ))
+    assert r.returncode == 0, r.stderr
+    got = dict(line.split("=>", 1) for line in r.stdout.splitlines())
+    accepted = {"#105", "105", "007", "HYP-931", "hyp-931", "PROJ-12", "GH-105", "OC476-123", "UTF-8"}
+    assert got == {c: ("yes" if c in accepted else "no") for c in cases}, got
 
 
 def test_notify_normalizes_a_gh_code_derived_literally_from_the_branch_name(repo_with_pr_worktree, tmp_path):
@@ -447,21 +505,31 @@ def test_notify_leaves_a_reused_hyp_code_unaffected_by_gh_normalization(repo_wit
     assert "mark-shipped HYP-931" in calls[0]
 
 
-def test_notify_leaves_a_reused_descriptive_code_unaffected_by_gh_normalization(repo_with_pr_worktree, tmp_path):
-    """A reused $TASK_CODE in review-cli's own hyphenated descriptive shape (not the HYP-<n>
-    convention, and not the GH-<n> synthetic shape either) must not be touched by the GH-<n>
-    normalization added for the regression above."""
+def test_notify_rejects_a_reused_descriptive_review_code(repo_with_pr_worktree, tmp_path):
+    """A reused $TASK_CODE in review-cli's hyphenated descriptive shape ("SME-ROADMAP-NOTE-42")
+    is a review CHECK code, not a task-cli ticket id -- a different entity, and unroutable by
+    `_route_id_to_project` (its prefix would have to be a Linear team, and a Linear identifier is
+    TEAM-<number>, never TEAM-WORD-WORD-<number>).
+
+    Before agent-tools#565 the "contains a digit" shape check passed it straight through to `task
+    mark-shipped`, which could only 404 -- the same class that made the ACCEPTANCE gate silently
+    skip on `rig-cli-341` / `OC476-OPENCODE-BACKGROUND-TRUTH` on 2026-09-06. It must now be
+    rejected, and with no other code anywhere the notify step skips rather than calling task-cli
+    with a code it cannot resolve."""
     main, _wt = repo_with_pr_worktree
     bindir = _bindir(tmp_path, with_task=True)
 
     r, calls = _run_ship(
         main, bindir, tmp_path, branch="fix-the-thing",
-        extra_env={"TASK_CODE": "SME-ROADMAP-NOTE-42"},
+        extra_env={
+            "TASK_CODE": "SME-ROADMAP-NOTE-42",
+            "SHIP_TEST_PR_TITLE": "fix the thing",
+            "SHIP_TEST_PR_BODY": "no ticket mentioned",
+        },
     )
 
     assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
-    assert len(calls) == 1, calls
-    assert "mark-shipped SME-ROADMAP-NOTE-42" in calls[0]
+    assert calls == [], calls
 
 
 def test_notify_skips_when_no_code_derivable_anywhere(repo_with_pr_worktree, tmp_path):
