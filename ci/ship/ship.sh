@@ -2752,15 +2752,13 @@ fi
 # well-formed id for a team that (almost certainly) does not exist, and task-cli answers exit 2.
 # Narrowing that further would need the registered team list, which ship.sh does not have.
 _ship_looks_like_a_ticket_id() {  # $1 = candidate code; true (exit 0) iff it has a task-cli id shape
-  case "$1" in
-    '#'*) case "${1#\#}" in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac ;;
-    '' ) return 1 ;;
-    *[!0-9]*) ;;                                   # not a bare number -> try the prefix shape
-    *) return 0 ;;                                 # bare `<n>` (GitHub issue)
-  esac
-  # ONE alphanumeric team prefix, a single hyphen, then digits only. `rig-cli-341` (two hyphens)
-  # and `OC476-OPENCODE-BACKGROUND-TRUTH` (non-numeric tail) both fail here.
-  [[ "$1" =~ ^[A-Za-z][A-Za-z0-9]*-[0-9]+$ ]]
+  # Exactly the three shapes, as ONE alternation so the grammar reads off the line: `#<n>` or a
+  # bare `<n>` (a GitHub issue), or one letter-led alphanumeric team prefix + a single hyphen +
+  # digits only (`HYP-931`, `PROJ-12`). `rig-cli-341` (two hyphens) and
+  # `OC476-OPENCODE-BACKGROUND-TRUTH` (non-numeric tail) both fail. `GH-<n>` is a member of the
+  # prefix shape like any other; only `_ship_code_names_this_pr` and
+  # `_ship_normalize_gh_code_for_task_cli` treat `GH-` as structurally special.
+  [[ "$1" =~ ^(#[0-9]+|[0-9]+|[A-Za-z][A-Za-z0-9]*-[0-9]+)$ ]]
 }
 
 # True when the candidate names THIS pull request rather than a ticket. Accepts the same three
@@ -2770,9 +2768,10 @@ _ship_looks_like_a_ticket_id() {  # $1 = candidate code; true (exit 0) iff it ha
 # requests share ONE number sequence per repo, and `#<n>`/`<n>` route to this repo's issues.
 #
 # $PR is ship.sh's REQUIRED first positional argument, validated at startup long before any
-# derivation runs, so the `[ -n "$PR" ]` guard below is a belt-and-braces assertion of that
-# invariant rather than a reachable branch. It is written to fail OPEN (an empty $PR means "not
-# this PR", so the candidate survives) deliberately: an unset $PR would mean ship.sh is being
+# derivation runs, so the digits-only `${PR:-}` guard below is a belt-and-braces assertion of
+# that invariant rather than a reachable branch (`${PR:-}`, not `$PR`: the script runs under
+# `set -u`, and an unset $PR must take this branch, not abort). It is written to fail OPEN (an
+# empty or non-numeric $PR means "not this PR", so the candidate survives) deliberately: an unset $PR would mean ship.sh is being
 # driven in a way this function cannot reason about at all, and silently discarding every
 # numeric candidate there would turn a broken invocation into a gate that quietly never runs —
 # the very failure mode agent-tools#565 is fixing.
@@ -2786,25 +2785,37 @@ _ship_code_names_this_pr() {  # $1 = candidate code; true (exit 0) iff it is thi
   # Compare NUMERIC values, not strings (review round 2, Codex P2): `#01`/`GH-01` under PR #1
   # passes the grammar above, and a literal `"01" = "1"` string compare would call it "not this
   # PR" — handing the gate the PR itself, the exact #499 hole this guard closes. `10#` forces
-  # base 10 so a zero-padded code is never read as octal. Both sides are digits-only here ($PR
-  # is ship.sh's numeric first positional), so the arithmetic cannot fail.
-  [ -n "$PR" ] && [ "$((10#$n))" = "$((10#$PR))" ]
+  # base 10 so a zero-padded code is never read as octal. Both sides are checked digits-only
+  # HERE, not by the startup invariant alone: a non-numeric operand makes `$(( ))` a fatal bash
+  # syntax error that would kill ship.sh outright rather than fail this one candidate.
+  case "${PR:-}" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$((10#$n))" = "$((10#$PR))" ]
 }
 
-# One candidate's full admission test, so every source below applies the SAME two rules.
-_ship_task_code_candidate_ok() {  # $1 = candidate code
+# One candidate's full admission test, so every source below applies the SAME two rules. A
+# NON-EMPTY candidate that fails is reported on stderr with its source: an explicit $TASK_CODE
+# the operator typed would otherwise be replaced by a DIFFERENT ticket from the PR body with no
+# trace, and the merge gate would judge a ticket nobody named.
+_ship_task_code_candidate_ok() {  # $1 = candidate code  $2 = source label (for the rejection note)
   [ -n "$1" ] || return 1
-  _ship_looks_like_a_ticket_id "$1" || return 1
-  ! _ship_code_names_this_pr "$1"
+  if ! _ship_looks_like_a_ticket_id "$1"; then
+    echo "[ship] task-code: rejected '$1' from $2 — not a task-cli id shape (#<n>, <n>, PREFIX-<n>); trying the next source." >&2
+    return 1
+  fi
+  if _ship_code_names_this_pr "$1"; then
+    echo "[ship] task-code: rejected '$1' from $2 — it names this pull request (#$PR), not a ticket; trying the next source." >&2
+    return 1
+  fi
+  return 0
 }
 _ship_derive_task_code_for_notify() {
   local candidate
 
   candidate="${TASK_CODE:-}"
-  _ship_task_code_candidate_ok "$candidate" && { printf '%s' "$candidate"; return 0; }
+  _ship_task_code_candidate_ok "$candidate" '$TASK_CODE' && { printf '%s' "$candidate"; return 0; }
 
   candidate=$(_review_quorum_extract_ticket "$BRANCH")
-  _ship_task_code_candidate_ok "$candidate" && { printf '%s' "$candidate"; return 0; }
+  _ship_task_code_candidate_ok "$candidate" "the branch name" && { printf '%s' "$candidate"; return 0; }
 
   local pr_title pr_body_local
   # One combined query for title+body (2 round trips instead of 2 separate `gh pr view` calls).
@@ -2823,10 +2834,10 @@ _ship_derive_task_code_for_notify() {
     || { pr_title=""; pr_body_local=""; }
 
   candidate=$(_review_quorum_extract_ticket "$pr_title")
-  _ship_task_code_candidate_ok "$candidate" && { printf '%s' "$candidate"; return 0; }
+  _ship_task_code_candidate_ok "$candidate" "the PR title" && { printf '%s' "$candidate"; return 0; }
 
   candidate=$(_review_quorum_extract_ticket "$pr_body_local")
-  _ship_task_code_candidate_ok "$candidate" && { printf '%s' "$candidate"; return 0; }
+  _ship_task_code_candidate_ok "$candidate" "the PR body" && { printf '%s' "$candidate"; return 0; }
 
   return 0
 }

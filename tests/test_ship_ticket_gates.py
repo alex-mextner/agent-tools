@@ -789,6 +789,9 @@ def test_acceptance_gate_rejects_a_review_check_code_and_falls_through(repo, tmp
     })
     assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
     assert _task_calls(tmp_path) == ["gate HYP-931 --json"], _task_calls(tmp_path)
+    # The substitution is announced, with the source, not made silently.
+    assert "rejected 'rig-cli-341' from $TASK_CODE" in r.stderr, r.stderr
+    assert "not a task-cli id shape" in r.stderr, r.stderr
 
 
 def test_acceptance_gate_rejects_a_descriptive_review_code_carrying_digits(repo, tmp_path):
@@ -815,6 +818,8 @@ def test_acceptance_gate_rejects_the_pull_request_number_as_a_ticket_code(repo, 
     })
     assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
     assert _task_calls(tmp_path) == ["gate HYP-931 --json"], _task_calls(tmp_path)
+    assert "rejected 'GH-1' from $TASK_CODE" in r.stderr, r.stderr
+    assert "names this pull request (#1)" in r.stderr, r.stderr
 
 
 def test_acceptance_gate_skips_when_only_the_pull_request_number_is_derivable(repo, tmp_path):
