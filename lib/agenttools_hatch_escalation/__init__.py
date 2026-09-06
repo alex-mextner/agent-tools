@@ -113,8 +113,9 @@ DELEGATION_HARNESSES: tuple[str, ...] = ("claude-code", "codex", "opencode", "om
 _DELEGATION_RECIPES: dict[str, str] = {
     "claude-code": (
         "Claude Code: dispatch a subagent with the Agent tool — `subagent_type: \"fork\"` or "
-        "`isolation: \"remote\"` (both run in the background; `run_in_background` is NOT a field "
-        "of the Agent tool) — or model it as a Workflow, then read its report."
+        "`isolation: \"remote\"` (both run in the background per CC's tool contract; "
+        "`run_in_background` is NOT a real field on the Agent tool — it does nothing) — or model "
+        "it as a Workflow, then read its report."
     ),
     "codex": (
         "codex: spawn a child agent with `collaboration.spawn_agent` (in-process; codex tags the "
@@ -128,10 +129,12 @@ _DELEGATION_RECIPES: dict[str, str] = {
         "opencode: run the provisioned launcher "
         "`~/.agents/skills/rig-detached-opencode/rig-detached-opencode <name> <brief-file> "
         "[workdir]` (a detached `opencode run` child carrying RIG_AGENT_ID) and poll the handoff "
-        "file named in the brief. A Task with subagent_type general or explore is tolerated "
-        "inline: its task tool has NO background field in a default build (1.18.20: only "
-        "description/prompt/subagent_type/task_id/command; the native background: true exists "
-        "only behind OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true) — do not invent one."
+        "file named in the brief; or dispatch with the Task tool, subagent_type general or "
+        "explore (the child session's tool calls pass every gate as a subagent's — the hook "
+        "bridge identifies it by opencode's own session parentID). The task tool has NO "
+        "background field in a default build (1.18.20: only description/prompt/subagent_type/"
+        "task_id/command; the native background: true exists only behind "
+        "OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true) — do not invent one."
     ),
     "omp": (
         "omp: dispatch with the `task` tool (in-process; the hook bridge identifies the child "

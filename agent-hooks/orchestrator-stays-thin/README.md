@@ -127,7 +127,9 @@ orchestrator on every harness:
   `collaboration.spawn_agent` child thread (captured on 0.153.4; the parent thread's events carry
   none), the same shape Claude Code emits; plus the `rig-detached-codex` launcher env markers and
   process ancestry (a `codex exec` started from a codex session's shell tool).
-- **opencode** — the `rig-detached-opencode` launcher env markers (#476) and process ancestry.
+- **opencode** — the plugin tags a `task` child SESSION's tool calls (opencode's own `parentID`
+  bookkeeping, from the `session.created` event or `client.session.get`); plus the
+  `rig-detached-opencode` launcher env markers (#476) and process ancestry.
 - **omp** — the hook-bridge extension tags a `task`-spawned in-process child session's tool calls
   with its session id (later-than-first registration AND a child-shaped session file, both omp's
   own bookkeeping); plus the `rig-detached-omp` launcher env markers and process ancestry.

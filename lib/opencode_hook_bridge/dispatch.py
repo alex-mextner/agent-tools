@@ -69,26 +69,35 @@ def point_for_event(hook_name: str, tool_name: str | None) -> str | None:
     return None
 
 
-def _apply_subagent_identity(args: dict) -> None:
+def _apply_subagent_identity(opencode_event: dict, args: dict) -> None:
     """Populate ``args.agent_id``/``args.agent_type`` from the trusted sources ONLY.
 
     ``to_v1_event`` has already stripped every model/tool-supplied agent key (the same trust
     boundary as the CC bridge's T2 precedence: an event may carry model-influenced fields, so
-    they can never self-exempt). opencode's plugin payload has NO authoritative identity of its
-    own to restore them from, so the two sources are the shared ones (#476, then #573):
+    they can never self-exempt). Three sources may restore them, in order (#476, then #573):
 
-    1. the launcher env markers ``RIG_AGENT_ID`` / ``RIG_DETACHED_AGENT`` set by the
+    1. the TOP-LEVEL ``agentId``/``agentType`` of the payload ``plugin.js`` builds — set for a
+       tool call made by a ``task`` CHILD SESSION, from opencode's own bookkeeping (the hook
+       input's ``sessionID`` plus the session's ``parentID`` from the ``session.created`` event
+       or ``client.session.get``), never from ``output.args``;
+    2. the launcher env markers ``RIG_AGENT_ID`` / ``RIG_DETACHED_AGENT`` set by the
        ``rig-detached-opencode`` launcher skill for a detached ``opencode run`` child —
        plugin.js spawns this dispatcher with ``{...process.env}``, so the marker set at launch is
        visible on every tool call; a running orchestrator cannot retroactively mutate its own
        environment, only a child's, which is exactly the sanctioned act of delegating;
-    2. process ancestry — an ``opencode`` process above the one that dispatched this hook (a
+    3. process ancestry — an ``opencode`` process above the one that dispatched this hook (a
        child ``opencode run`` started from a parent session's bash tool without the launcher).
 
-    See ``agent_hooks_v1.subagent_identity`` for the full trust reasoning. No source → no key
-    at all (never an empty string): the call stays the orchestrator's, fail closed in the relax
-    direction. opencode's own native ``task`` children run in-process with no marker of their
-    own — they remain identity-less (documented residual)."""
+    See ``agent_hooks_v1.subagent_identity`` for the full trust reasoning of 2 and 3. No source
+    → no key at all (never an empty string): the call stays the orchestrator's, fail closed in
+    the relax direction."""
+    native_id = opencode_event.get("agentId")
+    if isinstance(native_id, str) and native_id.strip():
+        args["agent_id"] = native_id
+        native_type = opencode_event.get("agentType")
+        if isinstance(native_type, str) and native_type:
+            args["agent_type"] = native_type
+        return
     if subagent_identity is None:
         return
     agent_id, agent_type = subagent_identity.detect_subagent(HARNESS)
@@ -104,7 +113,7 @@ def to_v1_event(opencode_event: dict, *, point: str) -> dict:
     args = dict(raw_args)
     for key in _FORGED_AGENT_KEYS:
         args.pop(key, None)
-    _apply_subagent_identity(args)
+    _apply_subagent_identity(opencode_event, args)
     _normalize_task_args(args)
 
     command = _tool_command(tool, raw_args)

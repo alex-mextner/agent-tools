@@ -133,30 +133,22 @@ _REMINDER_TAIL = (
     "RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE=\"<justification>\" (deny-by-default; bare "
     "\"1\" rejected)."
 )
-# Per-harness background-dispatch recipes for the pre-agent point (agent-tools#573). Claude
-# Code's is spelled with `=` (the Agent tool's field syntax the tests pin); the codex/opencode/omp
-# lines reuse the shared `delegation_recipe` table so the launcher paths stay pinned to the
-# provisioned carrier (`~/.agents/skills/<skill>/<launcher>`, PR #497).
-_CC_BACKGROUND_RECIPE = (
-    "Claude Code: subagent_type=\"fork\" or isolation=\"remote\" (both background per CC's "
-    "tool contract), or a dynamic Workflow. run_in_background is NOT a real field on CC's "
-    "Agent tool — it does nothing."
-)
+# Per-harness background-dispatch recipes for the pre-agent point (agent-tools#573) come from
+# the ONE shared table in `agenttools_hatch_escalation.delegation_recipe` — Claude Code's line
+# there already states that `run_in_background` is not a field of the Agent tool, and the
+# launcher paths stay pinned to the provisioned carrier (`~/.agents/skills/<skill>/<launcher>`,
+# PR #497) in one place instead of two.
+_EVERY_HARNESS = ("claude-code", "codex", "opencode", "omp")
 
 
 def reminder_for(harness: object) -> str:
     """The refusal for an event tagged with ``harness``: THAT harness's background-dispatch
     recipe between the shared head/tail. Only the TOP-LEVEL tag is ever passed in; a
     missing/unknown one lists every recipe."""
-    if harness == "claude-code":
-        recipe = _CC_BACKGROUND_RECIPE
-    elif harness in ("codex", "opencode", "omp"):
+    if harness in _EVERY_HARNESS:
         recipe = hatch_escalation.delegation_recipe(harness)
     else:
-        recipe = "\n".join(
-            [_CC_BACKGROUND_RECIPE]
-            + [hatch_escalation.delegation_recipe(h) for h in ("codex", "opencode", "omp")]
-        )
+        recipe = "\n".join(hatch_escalation.delegation_recipe(h) for h in _EVERY_HARNESS)
     return _REMINDER_HEAD + recipe + _REMINDER_TAIL
 
 

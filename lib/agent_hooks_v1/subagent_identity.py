@@ -97,15 +97,26 @@ def detect_subagent(harness: str, environ: "os._Environ[str] | dict[str, str] | 
     return "", ""
 
 
+# Interpreters whose argv[1] is the real program: `node /opt/homebrew/bin/codex` (the codex npm
+# wrapper) and `bun /path/opencode`. Only these promote argv[1]; `python3 codex` (a same-named
+# local script) or `sh omp` never count (review finding, #573 round 1).
+_INTERPRETER_WRAPPERS = frozenset({"node", "bun", "deno"})
+
+
 def _is_harness_process(args: str, harness: str) -> bool:
-    """True when the process's executable IS the harness: the basename of argv[0] — or of
-    argv[1], for a ``node /path/codex`` / ``bun /path/omp`` interpreter wrapper — equals the
-    harness name exactly. A substring or a hyphenated lookalike never matches."""
+    """True when the process's executable IS the harness: the basename of argv[0] equals the
+    harness name exactly, or argv[0] is a known JS interpreter wrapper and argv[1]'s basename
+    does. A substring or a hyphenated lookalike never matches."""
     tokens = args.split()
-    for tok in tokens[:2]:
-        if PurePosixPath(tok).name == harness:
-            return True
-    return False
+    if not tokens:
+        return False
+    if PurePosixPath(tokens[0]).name == harness:
+        return True
+    return (
+        len(tokens) > 1
+        and PurePosixPath(tokens[0]).name in _INTERPRETER_WRAPPERS
+        and PurePosixPath(tokens[1]).name == harness
+    )
 
 
 def _process_table() -> dict[int, tuple[int, str]]:

@@ -112,6 +112,17 @@ def test_ancestry_omp_under_omp_is_a_subagent():
     assert ident.ancestor_agent_id("omp", pid=700, table=_table(rows)) == "ancestor:omp:600"
 
 
+def test_ancestry_argv1_counts_only_behind_a_js_interpreter_wrapper():
+    """`node /opt/homebrew/bin/codex` is codex; `python3 codex` (a same-named local script) or
+    `sh omp` is not — argv[1] is promoted only behind a known interpreter wrapper."""
+    assert ident._is_harness_process("node /opt/homebrew/bin/codex exec", "codex")
+    assert ident._is_harness_process("bun /usr/local/lib/opencode/index.js", "opencode") is False
+    assert ident._is_harness_process("bun /usr/local/bin/opencode", "opencode")
+    assert ident._is_harness_process("python3 codex --serve", "codex") is False
+    assert ident._is_harness_process("sh omp", "omp") is False
+    assert ident._is_harness_process("", "omp") is False
+
+
 def test_ancestry_harness_name_must_be_a_whole_basename():
     """`omp-helper` / `codex-wrapper` / a path that merely CONTAINS the name is not the harness."""
     rows = [

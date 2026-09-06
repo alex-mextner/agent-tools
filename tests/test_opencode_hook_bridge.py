@@ -1317,3 +1317,107 @@ def test_opencode_bridge_skips_malformed_descriptor_and_runs_valid_hook(tmp_path
     recorded = json.loads(log.read_text(encoding="utf-8"))
     assert recorded["point"] == "pre-bash"
     assert recorded["command"] == "echo recorded"
+
+
+# ── opencode `task` child sessions (agent-tools#573) ─────────────────────────────────────
+
+def test_to_v1_event_forwards_plugin_set_top_level_identity(monkeypatch):
+    """plugin.js puts `agentId`/`agentType` on the payload's TOP level for a tool call made by a
+    `task` child session (derived from opencode's `sessionID` + `parentID`, never from
+    `output.args`). The dispatcher forwards them; a forged copy under the args is still stripped."""
+    _clear_agent_env_markers(monkeypatch)
+    opencode_event = {
+        "hook": "tool.execute.before", "cwd": "/repo",
+        "input": {"tool": "bash", "sessionID": "ses_child"},
+        "output": {"args": {"command": "pytest -q", "agentId": "forged", "agent_id": "forged2"}},
+        "agentId": "ses_child", "agentType": "task",
+    }
+
+    v1 = dispatch.to_v1_event(opencode_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "ses_child"
+    assert v1["args"]["agent_type"] == "task"
+    assert "agentId" not in v1["args"]
+
+
+def test_to_v1_event_plugin_identity_wins_over_env_marker(monkeypatch):
+    _clear_agent_env_markers(monkeypatch)
+    monkeypatch.setenv("RIG_AGENT_ID", "probe")
+    opencode_event = {"hook": "tool.execute.before", "cwd": "/repo", "input": {"tool": "bash"},
+                      "output": {"args": {"command": "ls"}}, "agentId": "ses_child", "agentType": "task"}
+
+    v1 = dispatch.to_v1_event(opencode_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "ses_child"
+
+
+def test_plugin_tags_task_child_session_tool_calls_with_top_level_identity(tmp_path):
+    """Captured on opencode 1.18.20: a `task` child is a CHILD SESSION in the same server —
+    its `session.created` event carries `info.parentID`, and its own tool calls arrive with the
+    child's `input.sessionID`. The plugin tags those (and only those) with top-level
+    `agentId`/`agentType`; a root session's calls carry nothing; a session the plugin never saw
+    created is looked up through `client.session.get`; a forged `output.args.agentId` is passed
+    through untouched for the dispatcher to strip, never promoted."""
+    log = tmp_path / "payloads.jsonl"
+    stub = _dispatcher_stub(
+        tmp_path,
+        "import sys, pathlib\n"
+        f"pathlib.Path({str(log)!r}).open('a').write(sys.stdin.read() + '\\n')\n",
+    )
+
+    proc = _run_plugin_js(
+        dedent(
+            """
+            const { AgentToolsHookBridge: plugin } = await import(process.env.PLUGIN_URL);
+            const known = { ses_root: {}, ses_child: { parentID: "ses_root" }, ses_late_child: { parentID: "ses_root" }, ses_late_root: {} };
+            const client = { session: { get: async ({ path }) => ({ data: { id: path.id, ...(known[path.id] || {}) } }) } };
+            const hooks = await plugin({ directory: "/repo", worktree: "/repo", client });
+            await hooks.event({ event: { type: "session.created", properties: { info: { id: "ses_root" } } } });
+            await hooks.event({ event: { type: "session.created", properties: { info: { id: "ses_child", parentID: "ses_root" } } } });
+            await hooks["tool.execute.before"]({ tool: "bash", sessionID: "ses_root", cwd: "/repo" }, { args: { command: "echo root", agentId: "forged" } });
+            await hooks["tool.execute.before"]({ tool: "bash", sessionID: "ses_child", cwd: "/repo" }, { args: { command: "echo child", agentId: "forged" } });
+            await hooks["tool.execute.before"]({ tool: "bash", sessionID: "ses_late_child", cwd: "/repo" }, { args: { command: "echo late child" } });
+            await hooks["tool.execute.before"]({ tool: "bash", sessionID: "ses_late_root", cwd: "/repo" }, { args: { command: "echo late root" } });
+            await hooks["tool.execute.before"]({ tool: "bash", cwd: "/repo" }, { args: { command: "echo no session" } });
+            """
+        ),
+        env={"OPENCODE_HOOK_BRIDGE_PYTHON": str(stub)},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    payloads = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    by_cmd = {p["output"]["args"]["command"]: p for p in payloads}
+    assert "agentId" not in by_cmd["echo root"] and "agentType" not in by_cmd["echo root"]
+    assert by_cmd["echo child"]["agentId"] == "ses_child" and by_cmd["echo child"]["agentType"] == "task"
+    assert by_cmd["echo late child"]["agentId"] == "ses_late_child"  # resolved via client.session.get
+    assert "agentId" not in by_cmd["echo late root"]
+    assert "agentId" not in by_cmd["echo no session"]
+    # the forged args key rides along untouched (the dispatcher strips it); never promoted
+    assert by_cmd["echo root"]["output"]["args"]["agentId"] == "forged"
+
+
+def test_plugin_treats_session_lookup_failure_as_root(tmp_path):
+    """No client / a throwing lookup → no identity (fail closed in the relax direction)."""
+    log = tmp_path / "payloads.jsonl"
+    stub = _dispatcher_stub(
+        tmp_path,
+        "import sys, pathlib\n"
+        f"pathlib.Path({str(log)!r}).open('a').write(sys.stdin.read() + '\\n')\n",
+    )
+    proc = _run_plugin_js(
+        dedent(
+            """
+            const { AgentToolsHookBridge: plugin } = await import(process.env.PLUGIN_URL);
+            const throwing = { session: { get: async () => { throw new Error("boom"); } } };
+            const hooks = await plugin({ directory: "/repo", worktree: "/repo", client: throwing });
+            await hooks["tool.execute.before"]({ tool: "bash", sessionID: "ses_x", cwd: "/repo" }, { args: { command: "echo x" } });
+            const noClient = await plugin({ directory: "/repo", worktree: "/repo" });
+            await noClient["tool.execute.before"]({ tool: "bash", sessionID: "ses_y", cwd: "/repo" }, { args: { command: "echo y" } });
+            """
+        ),
+        env={"OPENCODE_HOOK_BRIDGE_PYTHON": str(stub)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    payloads = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(payloads) == 2
+    assert all("agentId" not in p for p in payloads)

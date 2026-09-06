@@ -438,8 +438,8 @@ _NON_TRIVIAL_PROMPT = "Refactor the whole bridge family:\n- keep the tests green
 @pytest.mark.parametrize(
     ("harness", "needle", "foreign"),
     [
-        ("claude-code", 'subagent_type="fork"', "rig-detached-codex"),
-        ("codex", "collaboration.spawn_agent", 'subagent_type="fork"'),
+        ("claude-code", 'subagent_type: "fork"', "rig-detached-codex"),
+        ("codex", "collaboration.spawn_agent", 'subagent_type: "fork"'),
         ("opencode", "~/.agents/skills/rig-detached-opencode/rig-detached-opencode", "spawn_agent"),
         ("omp", "~/.agents/skills/rig-detached-omp/rig-detached-omp", "rig-detached-codex"),
     ],
@@ -463,6 +463,6 @@ def test_reminder_without_harness_covers_every_harness(monkeypatch):
     out, _e, code = _run(event, monkeypatch)
     assert code == gate.BLOCK_EXIT_CODE
     message = json.loads(out)["message"]
-    for needle in ('subagent_type="fork"', "rig-detached-codex", "rig-detached-opencode", "rig-detached-omp"):
+    for needle in ('subagent_type: "fork"', "rig-detached-codex", "rig-detached-opencode", "rig-detached-omp"):
         assert needle in message
     assert message == gate.REMINDER

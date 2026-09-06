@@ -65,9 +65,15 @@ The bridge strips all opencode tool-argument fields that look like agent identit
 can never self-exempt a call, so a forged `agent_id` inside `tool_input` is dropped
 before anything else runs.
 
-The authoritative identity sources are the ones the shared
-`lib/agent_hooks_v1/subagent_identity.py` reads (`_apply_subagent_identity`, agent-tools#573):
-the opencode PROCESS ENVIRONMENT — `RIG_AGENT_ID=<name>` (identity) or `RIG_DETACHED_AGENT=1`
+The authoritative identity sources (`_apply_subagent_identity`, agent-tools#573), in order:
+first the TOP-LEVEL `agentId`/`agentType` the plugin sets for a tool call made by a `task`
+CHILD SESSION — opencode runs a `task` subagent as a child session in the same server
+process; its `session.created` event carries `info.parentID` and its own tool calls arrive
+with the child's `input.sessionID` (captured on 1.18.20), so `plugin.js` tags a call from a
+session that has a parent (tracked via the `event` hook, or looked up with
+`client.session.get` when the plugin missed the creation) with `agentId: <sessionID>,
+agentType: "task"` — from opencode's own bookkeeping, never from `output.args`; then the two
+the shared `lib/agent_hooks_v1/subagent_identity.py` reads: the opencode PROCESS ENVIRONMENT — `RIG_AGENT_ID=<name>` (identity) or `RIG_DETACHED_AGENT=1`
 (anonymous marker) — and, failing that, PROCESS ANCESTRY (an `opencode` process above the one
 that dispatched this hook: a child `opencode run` started from a parent session's bash tool
 without the launcher). When either applies the dispatcher injects `args.agent_id`

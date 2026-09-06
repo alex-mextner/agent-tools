@@ -172,9 +172,9 @@ forged `agent_id` / `agent_type` values inside tool args and repopulates the ide
 trusted sources only (agent-tools#573): codex's own top-level `agent_id` on a `spawn_agent`
 child thread, omp's in-process `task` child session (tagged by the extension), the
 `rig-detached-<harness>` launcher env markers (`RIG_AGENT_ID` / `RIG_DETACHED_AGENT`), and
-process ancestry — shared in `lib/agent_hooks_v1/subagent_identity.py`; see each bridge's
-README "Identity contract". opencode's own native `task` children (in-process, no marker)
-remain identity-less.
+process ancestry — shared in `lib/agent_hooks_v1/subagent_identity.py`; opencode's own native
+`task` children are child SESSIONS whose `parentID` the plugin reads from opencode's session
+bookkeeping. See each bridge's README "Identity contract".
 
 ### `pre-skill` — record a skill invocation
 

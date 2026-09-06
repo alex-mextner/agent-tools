@@ -12,6 +12,11 @@ description: >-
 
 # rig-detached-opencode — canonical detached-agent launcher for opencode
 
+Since agent-tools#573 opencode has two sanctioned ways to delegate: the native Task tool
+(the child session's tool calls pass every gate as a subagent's — the hook bridge identifies
+it by opencode's own session `parentID`; foreground on a default build) and this launcher for
+a truly detached child process.
+
 The pre-agent gate `background-subagent-gate` blocks a non-trivial FOREGROUND subagent
 dispatch: it wedges the main thread until the child finishes. Claude Code has real
 background paths (`subagent_type: "fork"`, `isolation: "remote"`); a default opencode

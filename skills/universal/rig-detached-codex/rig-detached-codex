@@ -12,10 +12,10 @@
 
 set -euo pipefail
 
-self="$0"
-if command -v readlink >/dev/null 2>&1; then
-    self="$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")"
-fi
+# Resolve THIS file's real path portably: GNU `readlink -f` first, and on a platform whose
+# readlink lacks `-f` (stock BSD/macOS before 12.3) fall back to python3's realpath — python3
+# is a hard dependency of the hook family already (review finding, #573 round 1).
+self="$(readlink -f -- "$0" 2>/dev/null || python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$0")"
 core="$(dirname -- "$self")/../rig-detached-agent/rig-detached-agent"
 if [ ! -x "$core" ]; then
     echo "rig-detached-codex: launcher core '$core' is missing — provision the rig-detached-agent skill (rig apply commit)" >&2
