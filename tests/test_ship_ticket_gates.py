@@ -384,6 +384,24 @@ def test_acceptance_gate_exit_2_prefers_the_stderr_error_line_over_stdout(repo, 
     assert line["detail"] == "task gate exit 2: error: unknown ticket HYP-931", line
 
 
+def test_acceptance_gate_exit_2_refuses_when_stderr_cannot_be_captured(repo, tmp_path):
+    """mktemp fails (TMPDIR unusable) -> task-cli's stderr goes to /dev/null and its `error:`
+    line is never seen. That is not evidence of a foreign binary: with a derived code, exit 2
+    refuses and says the message could not be captured (codex review on PR #577)."""
+    bindir = tmp_path / "bin"   # _run's fake-binary dir (first on PATH); mkdir'd exist_ok by _bindir
+    bindir.mkdir(exist_ok=True)
+    (bindir / "mktemp").write_text("#!/usr/bin/env bash\necho 'mktemp: cannot create temp file' >&2; exit 1\n", encoding="utf-8")
+    (bindir / "mktemp").chmod(0o755)
+    r = _run(repo, tmp_path, env={
+        "SHIP_TEST_TASK_GATE_ERR": "error: unknown ticket HYP-931", "SHIP_TEST_TASK_GATE_EXIT": "2",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "could not resolve ticket HYP-931" in r.stderr and "could not be captured" in r.stderr, r.stderr
+    assert not _merged(tmp_path)
+    (line,) = _audit(tmp_path, "acceptance")
+    assert line["decision"] == "refused:unresolvable", line
+
+
 def test_acceptance_gate_exit_2_with_only_a_mid_line_error_mention_still_skips(repo, tmp_path):
     """The dropped substring match, pinned: "error:" MID-line (a foreign binary's usage text,
     a wrapper's chatter) on exit 2 is not task-cli's `error: …` line — the PATH-collision skip

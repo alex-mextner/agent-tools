@@ -3632,6 +3632,13 @@ _acceptance_gate() {
   # PATH-collision guard above still apply: a foreign `task` must not refuse every merge.
   local task_err=""
   [ "$rc" = "2" ] && task_err=$(_acceptance_gate_task_cli_error_line "$out" "$err_raw")
+  # No stderr capture at all (mktemp failed: a read-only or full temp dir) means task-cli's
+  # `error:` line — which it prints on stderr — was never seen. That must not read as "not
+  # task-cli" and skip (codex review on PR #577): with a derived code, an exit 2 whose message
+  # could not be captured is refused, saying so.
+  if [ "$rc" = "2" ] && [ -z "$task_err" ] && [ "$errfile" = "/dev/null" ]; then
+    _acceptance_gate_refuse_unresolvable "$code" "(task-cli's stderr could not be captured — mktemp failed, so its error line was not seen)"
+  fi
   if [ "$rc" = "2" ] && [ -z "$task_err" ]; then
     echo "[ship] WARNING: acceptance gate could not evaluate ${code} — '$(command -v task)' on PATH did not return task-cli's expected \`error:\` line on exit 2 (a DIFFERENT 'task' binary — e.g. Taskwarrior or go-task — may be shadowing task-cli). Skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
     _ticket_gate_audit_log acceptance skipped "$code" "'task' on PATH does not look like task-cli"
