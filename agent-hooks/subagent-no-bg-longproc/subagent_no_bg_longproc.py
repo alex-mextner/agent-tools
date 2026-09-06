@@ -4,9 +4,10 @@
 The wedge this exists to kill (agent-tools#52, seen ~6x in one session): a dispatched
 subagent runs a long process — a multi-model ``review``, a full build/test suite, a
 ``--watch`` loop, a long ``sleep`` — with ``run_in_background: true`` (or a shell ``&`` /
-``setsid``), then ENDS ITS TURN saying "I'll wait for the completion notification" — and is
-never resumed. It idles FOREVER with uncommitted work and no PR, and the orchestrator has to
-catch the rest-notification, kill the stray process, and salvage the half-done work by hand.
+``setsid``), then ENDS ITS TURN saying "I'll wait for the completion notification". For a
+detached job or a ``--watch`` loop no completion can ever arrive (the mechanism below), so it
+idles FOREVER with uncommitted work and no PR, and the orchestrator has to catch the
+rest-notification, kill the stray process, and salvage the half-done work by hand.
 
 WHICH notifications re-invoke a subagent (the precise mechanism, agent-tools#546 — an earlier
 revision of this docstring claimed, as a blanket, that no background-completion notification

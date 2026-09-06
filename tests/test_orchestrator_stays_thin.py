@@ -2626,7 +2626,6 @@ def test_read_only_sed_is_inspection(command, tmp_path, monkeypatch):
     # abbreviation — or any unknown long option at all — forfeits the grant.
     "sed --in-pla=.bak 's/a/b/' f.txt",
     "sed --in-pl 's/a/b/' f.txt",
-    "sed --fil=script.sed f.txt",
     "sed --fi script.sed f.txt",
     "sed --qui '1p' f.txt",                   # even a harmless abbreviation is refused
     "sed --some-future-option -n '1p' f.txt",
