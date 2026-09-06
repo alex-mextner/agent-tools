@@ -63,7 +63,9 @@ case "$sub" in
         elif printf '%s' "$args" | grep -q statusCheckRollup; then
           printf '%s\\n' '[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI"}]'
         elif printf '%s' "$args" | grep -q -- '--json title,body'; then
-          printf '%s\\t%s\\n' "$(cat "$TITLE_FILE")" "$(cat "$BODY_FILE")"
+          # Mirrors the real query's `gsub("\\n";" ")`: ship reads ONE tab-separated line, so a
+          # multi-line body (the PR #560 fixture) must be flattened here as jq flattens it live.
+          printf '%s\\t%s\\n' "$(tr '\\n' ' ' < "$TITLE_FILE")" "$(tr '\\n' ' ' < "$BODY_FILE")"
         elif printf '%s' "$args" | grep -q -- '--json title'; then
           if [ "${SHIP_TEST_GH_PR_VIEW_TITLE_FAIL:-0}" = "1" ]; then exit 1; fi
           cat "$TITLE_FILE"; echo
@@ -98,6 +100,7 @@ esac
 """
 
 # A fake `task`: logs its argv (one line) to $TASK_LOG; `task gate` prints $SHIP_TEST_TASK_GATE_JSON
+# (stdout) and $SHIP_TEST_TASK_GATE_ERR (stderr — where the real task-cli's `error: …` goes on exit 2)
 # and exits $SHIP_TEST_TASK_GATE_EXIT; `task done` exits $SHIP_TEST_TASK_DONE_EXIT (default 0);
 # every other subcommand exits 0 silently.
 _FAKE_TASK = """\
@@ -105,6 +108,7 @@ _FAKE_TASK = """\
 printf '%s\\n' "$*" >> "${TASK_LOG}"
 if [ "$1" = "gate" ]; then
   printf '%s\\n' "${SHIP_TEST_TASK_GATE_JSON:-}"
+  [ -n "${SHIP_TEST_TASK_GATE_ERR:-}" ] && printf '%s\\n' "${SHIP_TEST_TASK_GATE_ERR}" >&2
   exit "${SHIP_TEST_TASK_GATE_EXIT:-0}"
 fi
 if [ "$1" = "done" ]; then
@@ -195,7 +199,7 @@ def _path_without_real_task() -> str:
     return os.pathsep.join(d for d in dirs if not (d and Path(d, "task").exists()))
 
 
-def _run(main: Path, tmp_path: Path, *, branch="hyp-931-fix-thing", with_task=True, env=None, args=()):
+def _run(main: Path, tmp_path: Path, *, branch="hyp-931-fix-thing", with_task=True, env=None, args=(), pr="1"):
     bindir = _bindir(tmp_path, with_task=with_task)
     e = dict(os.environ)
     e["PATH"] = f"{bindir}{os.pathsep}{_path_without_real_task() if not with_task else e['PATH']}"
@@ -218,7 +222,7 @@ def _run(main: Path, tmp_path: Path, *, branch="hyp-931-fix-thing", with_task=Tr
     })
     if env:
         e.update(env)
-    r = _sh("bash", str(_SHIP), "1", "--no-screenshot-ok", "test", *args, cwd=main, env=e)
+    r = _sh("bash", str(_SHIP), pr, "--no-screenshot-ok", "test", *args, cwd=main, env=e)
     return r
 
 
@@ -338,16 +342,99 @@ def test_acceptance_gate_reuses_the_notify_derivation_title_then_body(repo, tmp_
     assert _task_calls(tmp_path) == ["gate HYP-777 --json"]
 
 
-def test_acceptance_gate_warns_and_skips_when_task_gate_cannot_evaluate(repo, tmp_path):
-    """Exit 2 = task-cli could not evaluate (unknown ticket, backend error) — not evidence that
-    the ticket is unaccepted; logged and skipped, never a refusal."""
-    r = _run(repo, tmp_path, env={"SHIP_TEST_TASK_GATE_JSON": "error: unknown ticket HYP-931", "SHIP_TEST_TASK_GATE_EXIT": "2"})
-    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
-    assert "WARNING: acceptance gate could not evaluate HYP-931 (task gate exit 2)" in r.stderr
+def test_acceptance_gate_refuses_when_task_gate_cannot_resolve_a_derived_code(repo, tmp_path):
+    """agent-tools#569: a code WAS derived (HYP-931, well-formed) but task-cli answers exit 2 —
+    a typo'd ticket, or a hyphenated word that passed the grammar. A PR that names a ticket
+    task-cli cannot find is a BROKEN PR, not an unguarded one: refuse, name the code and the
+    exit, echo task-cli's own message, and point at the two remedies. Never a merge."""
+    r = _run(repo, tmp_path, env={"SHIP_TEST_TASK_GATE_JSON": "", "SHIP_TEST_TASK_GATE_ERR": "error: unknown ticket HYP-931", "SHIP_TEST_TASK_GATE_EXIT": "2"})
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "Refusing: acceptance gate — task-cli could not resolve ticket HYP-931 (task gate HYP-931 exit 2)" in r.stderr, r.stderr
     assert "unknown ticket HYP-931" in r.stderr
+    assert "REVIEW_TASK_CODE=" in r.stderr and "SHIP_ACCEPTANCE_GATE=0" in r.stderr, r.stderr
+    assert "The code came from the branch name." in r.stderr, r.stderr   # where the bad code came from
+    assert not _merged(tmp_path)
+    (line,) = _audit(tmp_path, "acceptance")
+    assert line["decision"] == "refused:unresolvable" and line["task_code"] == "HYP-931"
+    assert line["detail"] == "task gate exit 2: error: unknown ticket HYP-931"
+
+
+def test_acceptance_gate_exit_2_error_line_on_stdout_is_task_cli_too(repo, tmp_path):
+    """A shim that prints task-cli's `error: …` line on STDOUT (the real binary uses stderr)
+    is still task-cli's answer: the line is found on either stream, first occurrence, and a
+    mid-line "error:" mention elsewhere is not what identifies it."""
+    r = _run(repo, tmp_path, env={
+        "SHIP_TEST_TASK_GATE_JSON": "warning: cache miss (no error: yet)\nerror: unknown ticket HYP-931",
+        "SHIP_TEST_TASK_GATE_EXIT": "2",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    (line,) = _audit(tmp_path, "acceptance")
+    assert line["detail"] == "task gate exit 2: error: unknown ticket HYP-931", line
+    assert not _merged(tmp_path)
+
+
+def test_acceptance_gate_exit_2_prefers_the_stderr_error_line_over_stdout(repo, tmp_path):
+    """Both streams carry a `^error: ` line: stderr's wins (where the real binary prints it)."""
+    r = _run(repo, tmp_path, env={
+        "SHIP_TEST_TASK_GATE_JSON": "error: stdout chatter", "SHIP_TEST_TASK_GATE_ERR": "error: unknown ticket HYP-931",
+        "SHIP_TEST_TASK_GATE_EXIT": "2",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    (line,) = _audit(tmp_path, "acceptance")
+    assert line["detail"] == "task gate exit 2: error: unknown ticket HYP-931", line
+
+
+def test_acceptance_gate_exit_2_refuses_when_stderr_cannot_be_captured(repo, tmp_path):
+    """mktemp fails (TMPDIR unusable) -> task-cli's stderr goes to /dev/null and its `error:`
+    line is never seen. That is not evidence of a foreign binary: with a derived code, exit 2
+    refuses and says the message could not be captured (codex review on PR #577)."""
+    bindir = tmp_path / "bin"   # _run's fake-binary dir (first on PATH); mkdir'd exist_ok by _bindir
+    bindir.mkdir(exist_ok=True)
+    (bindir / "mktemp").write_text("#!/usr/bin/env bash\necho 'mktemp: cannot create temp file' >&2; exit 1\n", encoding="utf-8")
+    (bindir / "mktemp").chmod(0o755)
+    r = _run(repo, tmp_path, env={
+        "SHIP_TEST_TASK_GATE_ERR": "error: unknown ticket HYP-931", "SHIP_TEST_TASK_GATE_EXIT": "2",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "could not resolve ticket HYP-931" in r.stderr and "could not be captured" in r.stderr, r.stderr
+    assert not _merged(tmp_path)
+    (line,) = _audit(tmp_path, "acceptance")
+    assert line["decision"] == "refused:unresolvable", line
+
+
+def test_acceptance_gate_exit_2_with_only_a_mid_line_error_mention_still_skips(repo, tmp_path):
+    """The dropped substring match, pinned: "error:" MID-line (a foreign binary's usage text,
+    a wrapper's chatter) on exit 2 is not task-cli's `error: …` line — the PATH-collision skip
+    applies, not a refusal of every merge on that machine."""
+    r = _run(repo, tmp_path, env={
+        "SHIP_TEST_TASK_GATE_JSON": "usage: task <command> (see 'task help'; an unknown command is an error: it exits 2)",
+        "SHIP_TEST_TASK_GATE_ERR": "task: no such command 'gate' — error: unknown", "SHIP_TEST_TASK_GATE_EXIT": "2",
+    })
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "did not return task-cli's expected" in r.stderr, r.stderr
     assert _merged(tmp_path)
     (line,) = _audit(tmp_path, "acceptance")
-    assert line["decision"] == "skipped" and line["detail"] == "could not evaluate: exit 2"
+    assert line["decision"] == "skipped" and line["detail"] == "'task' on PATH does not look like task-cli"
+
+
+def test_acceptance_gate_exit_2_refusal_is_the_same_under_dry_run_without_audit(repo, tmp_path):
+    r = _run(repo, tmp_path, args=("--dry-run",), env={"SHIP_TEST_TASK_GATE_ERR": "error: unknown ticket HYP-931", "SHIP_TEST_TASK_GATE_EXIT": "2"})
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "task-cli could not resolve ticket HYP-931" in r.stderr
+    assert not (tmp_path / "audit.jsonl").exists()
+    assert "would append acceptance audit: decision=refused:unresolvable" in r.stderr
+
+
+def test_acceptance_gate_exit_2_without_task_cli_error_shape_still_skips_as_not_task_cli(repo, tmp_path):
+    """The PATH-collision guard keeps its reach: an exit 2 that carries NO `error:` line on
+    either stream is not task-cli's contract (task-cli always prints `error: …` on exit 2) —
+    a foreign `task` (Taskwarrior, go-task) must not turn into a refusal of every merge."""
+    r = _run(repo, tmp_path, env={"SHIP_TEST_TASK_GATE_JSON": "Unknown command 'gate'", "SHIP_TEST_TASK_GATE_EXIT": "2"})
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "did not return task-cli's expected" in r.stderr, r.stderr
+    assert _merged(tmp_path)
+    (line,) = _audit(tmp_path, "acceptance")
+    assert line["decision"] == "skipped" and line["detail"] == "'task' on PATH does not look like task-cli"
 
 
 # ── auto-close on full acceptance (agent-tools#521 follow-up, tg-cli#301/#305 incident) ─────
@@ -895,3 +982,79 @@ def test_acceptance_gate_still_accepts_a_bare_issue_number(repo, tmp_path):
     })
     assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
     assert _task_calls(tmp_path) == ["gate 382 --json"], _task_calls(tmp_path)
+
+
+# ── agent-tools#571: a rejected candidate never hides a later one in the SAME source ─────────
+
+_PR560_BODY = (Path(__file__).resolve().parent / "fixtures" / "pr560_body.md").read_text(encoding="utf-8")
+
+
+def test_acceptance_gate_scans_past_a_self_pr_candidate_to_the_refs_line_in_the_same_body(repo, tmp_path):
+    """The live 2026-09-06 incident, on PR #560's ORIGINAL body: an incidental `GH-560` (an
+    example in the acceptance proofs) precedes the real `Refs #541`. The self-PR rule rightly
+    rejects GH-560 — and the scan must go on to #541 in the same text instead of skipping the
+    gate. The body also links agent-tools#559 in full; the keyword arm's single `Refs #541`
+    answers first, so the URL arm is never consulted and that link is never derived."""
+    r = _run(repo, tmp_path, branch="fix/hook-doctrine-541-542-546", pr="560", env={
+        "SHIP_TEST_PR_TITLE": "fix(agent-hooks): read-only sed -n, shared harness exemption, reconciled no-bg-longproc doctrine",
+        "SHIP_TEST_PR_BODY": _PR560_BODY,
+        "SHIP_TEST_TASK_GATE_JSON": _NOT_ACCEPTED.replace("HYP-931", "#541"), "SHIP_TEST_TASK_GATE_EXIT": "1",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert _task_calls(tmp_path) == ["gate #541 --json"], _task_calls(tmp_path)
+    assert "rejected 'GH-560' from the PR body — it names this pull request (#560)" in r.stderr, r.stderr
+    assert "Refusing: acceptance gate — ticket #541 is NOT accepted" in r.stderr
+    assert "issues/559" not in r.stderr, r.stderr
+    assert not _merged(tmp_path)
+
+
+def test_acceptance_gate_reports_a_foreign_repo_issue_link_it_ignores(repo, tmp_path):
+    """A full issue URL of ANOTHER repo is never this PR's ticket (agent-tools#564); with no
+    other candidate the gate skips — and the transcript says WHICH link was set aside, so a
+    "could not derive" is traceable to the text that caused it."""
+    r = _run(repo, tmp_path, branch="feat", env={
+        "SHIP_TEST_PR_BODY": "Companion of https://github.com/other-org/other-repo/issues/548.",
+    })
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "ignoring 1 issue link(s) of another repo" in r.stderr, r.stderr
+    assert "other-org/other-repo/issues/548" in r.stderr
+    assert _task_calls(tmp_path) == []
+    assert "could not derive a task code for #1 — skipping" in r.stderr
+
+
+def test_acceptance_gate_scans_past_a_grammar_rejected_candidate_in_the_same_body(repo, tmp_path):
+    """A descriptive review-cli code (the extractor's third arm, ahead of the keyword arm) is
+    not a task-cli id; the keyword-anchored ref later in the SAME body must still be found."""
+    r = _run(repo, tmp_path, branch="feat", env={
+        "SHIP_TEST_PR_BODY": "Reviewed as SME-ROADMAP-WORKTREE-NOTE (3 rounds). Refs #77",
+        "SHIP_TEST_TASK_GATE_JSON": _NOT_ACCEPTED.replace("HYP-931", "#77"), "SHIP_TEST_TASK_GATE_EXIT": "1",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert _task_calls(tmp_path) == ["gate #77 --json"], _task_calls(tmp_path)
+    assert "rejected 'SME-ROADMAP-WORKTREE-NOTE' from the PR body — not a task-cli id shape" in r.stderr, r.stderr
+
+
+def test_acceptance_gate_source_precedence_survives_the_continuation(repo, tmp_path):
+    """Continuation is WITHIN a source: a surviving title candidate still beats a body one
+    (explicit env -> branch -> title -> body is unchanged). Both title tokens sit in the same
+    extractor arm (generic PREFIX-<n>), so they are tried in document order: GH-1 names this
+    PR (#1) and is rejected, PROJ-777 survives."""
+    r = _run(repo, tmp_path, branch="feat", env={
+        "SHIP_TEST_PR_TITLE": "GH-1 then PROJ-777: the thing",
+        "SHIP_TEST_PR_BODY": "Refs #77",
+        "SHIP_TEST_TASK_GATE_JSON": _NOT_ACCEPTED.replace("HYP-931", "PROJ-777"), "SHIP_TEST_TASK_GATE_EXIT": "1",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert _task_calls(tmp_path) == ["gate PROJ-777 --json"], _task_calls(tmp_path)
+    assert "rejected 'GH-1' from the PR title" in r.stderr, r.stderr
+    assert "task-code: using 'PROJ-777' from the PR title" in r.stderr, r.stderr
+
+
+def test_acceptance_gate_skips_when_every_candidate_in_every_source_is_rejected(repo, tmp_path):
+    r = _run(repo, tmp_path, branch="feat", env={
+        "SHIP_TEST_PR_TITLE": "GH-1: the thing", "SHIP_TEST_PR_BODY": "Refs #1 and SME-ROADMAP-WORKTREE-NOTE",
+    })
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "could not derive a task code for #1 — skipping" in r.stderr
+    assert _task_calls(tmp_path) == []
+    assert _audit(tmp_path, "acceptance")[0]["detail"] == "no task code"

@@ -141,7 +141,15 @@
 #                          descriptive ALL-CAPS code, a keyword-anchored `Refs #<n>`, or a full
 #                          issue URL of THIS repo (https://github.com/<owner>/<repo>/issues/<n>
 #                          — the shape task-cli's links gate demands; both yield the literal
-#                          `#<n>`). If none is found, the gate refuses (fail-closed) with guidance.
+#                          `#<n>`). EVERY such token of a source is tried in order (an incidental
+#                          `UTF-8` or a `GH-<this PR>` ahead of the real code no longer hides it,
+#                          agent-tools#571), and a GitHub-issue code is looked up under BOTH
+#                          spellings, `#<n>` and `GH-<n>` (review-cli keys records by the literal
+#                          --task string; agents type GH-<n>, PR bodies say `Refs #<n>` —
+#                          agent-tools#572); the spelling that meets the bar is the one the
+#                          AUTHORITY line and the audit record name. An explicit REVIEW_TASK_CODE
+#                          gets the same dual lookup. If none is found, the gate refuses
+#                          (fail-closed) with guidance.
 #   SHIP_REVIEW_QUORUM_ENABLED / SHIP_REVIEW_QUORUM  set either to 0 to disable the
 #                          review-quorum gate entirely (default: enabled).
 #   SHIP_TASK_NOTIFY_ENABLED  set to 0/false/no to disable the post-merge task-cli notify step
@@ -2043,7 +2051,8 @@ fi
 #
 # Runs independently of --skip-ci, same posture as the review-dwell gate above.
 
-# Prints the first ticket-like token found in $1, or nothing. Tries the repo's own HYP-<n>
+# Prints EVERY ticket-like token found in $1, one per line, in ARM-PRIORITY order (then
+# document order within an arm; duplicates removed), or nothing. Tries the repo's own HYP-<n>
 # convention first (case-insensitive, normalized to uppercase; a Linear URL such as
 # `https://linear.app/<team>/issue/HYP-1440/<slug>` carries the code in its path and is caught
 # by this same arm), then a generic UPPERCASE-PREFIX-<n> ticket token (2+ uppercase letters, a
@@ -2079,100 +2088,137 @@ fi
 #   - a digit fused directly onto (or hyphen-separated immediately before) the token's OWN first
 #     segment ("2FA-SETUP-FLOW", "123-ABC-DEF-GHI") isn't caught by the boundary-free `[A-Z]`
 #     start -- POSIX ERE has no lookbehind to assert "not preceded by a digit/letter" here;
-#   - the numeric arm above runs FIRST and returns on its first match anywhere in the text, so an
-#     incidental uppercase-acronym-plus-digit token that has nothing to do with the real ticket
-#     ("UTF-8", "SHA-256", "RFC-2119", "ISO-8601" all match `[A-Z][A-Z]+-[0-9]+`) can shadow a
-#     valid descriptive code appearing later in the same PR body -- the descriptive arm below then
-#     never even runs. Same fail-closed trade-off: review-cli has no record for "UTF-8" either, so
-#     ship still refuses, just without ever trying the real code (#384 review round 3).
-_review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing; ALWAYS exits 0
+#   - the numeric arm runs FIRST, so an incidental uppercase-acronym-plus-digit token that has
+#     nothing to do with the real ticket ("UTF-8", "SHA-256", "RFC-2119", "ISO-8601" all match
+#     `[A-Z][A-Z]+-[0-9]+`) is listed AHEAD of a valid descriptive code appearing later in the
+#     same PR body. It no longer HIDES it (agent-tools#571): every candidate is returned, and each
+#     caller filters by its own admission rule and takes the first survivor -- the review-quorum
+#     gate moves on when review-cli has no record at all for a candidate, the acceptance/notify
+#     derivation when task-cli's id grammar or the self-PR rule rejects it. Before #571 this
+#     function returned only the first match of the first matching arm, so PR #560's incidental
+#     `GH-560` (an example in its acceptance proofs, rejected as the PR's own number) hid the real
+#     `Refs #541` further down the SAME body, and the acceptance gate skipped instead of judging.
+#
+# Rejections inside this function are the two AMBIGUITY rules (two distinct keyword-anchored
+# refs, two distinct same-repo issue URLs) and the foreign-repo URL rule; each is reported on
+# stderr so a "could not derive" downstream is traceable to the text that caused it.
+_review_quorum_extract_ticket_candidates() {  # $1 = text -> candidates, one per line; ALWAYS exits 0
+  local text="$1"
+  # Each arm is guarded with `|| true`: this file runs under `set -euo pipefail`, and a grep with
+  # no match exits 1, which would otherwise abort the group (and the whole ship) on any text that
+  # simply lacks that arm's shape. The `awk` keeps the first occurrence of each candidate, so a
+  # HYP-<n> (matched by BOTH the HYP arm and the generic PREFIX arm) is listed once, in HYP's slot.
+  { printf '%s\n' "$text" | LC_ALL=C grep -oiE 'HYP-[0-9]+' | LC_ALL=C tr '[:lower:]' '[:upper:]' || true
+    printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z]+-[0-9]+' || true
+    printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z0-9]*(-[A-Z0-9]+)*' \
+      | LC_ALL=C grep -xE '[A-Z][A-Z]+(-[A-Z][A-Z]+){2,}' || true
+    _review_quorum_extract_github_issue_ref "$text"
+  } | LC_ALL=C awk 'NF && !seen[$0]++'
+  return 0
+}
+
+# The GitHub-issue tail of the candidate list: a keyword-anchored `#<n>` reference, else a full
+# issue URL of the PR's OWN repo. Prints at most ONE candidate; ALWAYS exits 0.
+#
+# GitHub issue reference (`Fixes #105`, `Refs #105`) — for repos (like conloca-landing) that
+# track work as GitHub issues rather than Linear/JIRA-style codes. Returned LITERAL, not
+# normalized: task-cli's own `_route_id_to_project` (tasklib/cli.py) routes a bare GitHub id
+# by checking `tid.startswith("#")` first — a `GH-<n>`-style rewrite doesn't match that check,
+# falls through to the Linear-team-prefix branch instead, and `task mark-shipped` fails with
+# an unroutable-id error. review-cli's own `normalize_task_code` (reviewlib/stats.py) accepts
+# any non-whitespace, non-control-character token — `#105` passes it unchanged, so there is no
+# downstream reason to rewrite it (the review-quorum gate looks up BOTH spellings anyway,
+# agent-tools#572).
+# Only a KEYWORD-ANCHORED local reference qualifies (`Closes|Fixes|Resolves|Refs|References`
+# immediately before the `#<n>`, GitHub's own closing-keyword grammar plus the `Refs` form used
+# when the ticket must NOT auto-close on merge). Three hazards rule out a bare `#<n>` anywhere
+# in the text, all of them concrete because this same helper feeds BOTH the review-quorum
+# record lookup and the post-merge `task mark-shipped` call:
+#   - GitHub's qualified cross-repo syntax (`other-org/other-repo#123`, incl. repo names ending
+#     in `-`/`.`) names an issue in ANOTHER repo; extracting its `#123` would mark an unrelated
+#     local issue shipped. The keyword form never matches it: `#` must follow the keyword
+#     directly, never a repo name.
+#   - a URL fragment (`https://example.org/docs/#105`) or a Markdown anchor is not an issue.
+#   - an incidental prose mention (`follow-up for #12`, `(#268)`) of an ALREADY-SHIPPED issue
+#     would resolve to that issue's OLD passed quorum record, granting an unreviewed PR merge
+#     authority — unlike a wrongly-derived HYP/PROJ token, a referenced GitHub issue routinely
+#     HAS a record in an issue-tracked repo, so the "fail-closed anyway" reasoning above does
+#     not hold here.
+# This arm is listed AFTER the generic PREFIX-<n> arm AND the descriptive ALL-CAPS arm above, so
+# a `Fixes #45` aside never outranks a real `PROJ-123` or `SME-ROADMAP-WORKTREE-NOTE` code in
+# the same body (for a descriptive-code repo that aside would otherwise be the very borrowing
+# path described above). The keyword itself must not be the TAIL of a repo path (`org/hot-fix#5`,
+# `org/fix#5`, `org/my.fix#5` are all qualified refs), so the char before it may not be a
+# repo-name char (`-`/`.`) or `/` either; the digits must end at a non-word boundary (`#123abc`
+# is not an issue ref). Two DISTINCT anchored refs in one text (`Partially fixes #12 ... Closes
+# #200`) are an ambiguous task code: every other branch of this gate is fail-closed, so nothing
+# is derived from them — and the URL arm below is suppressed too (never fall through an
+# ambiguity) — so ship refuses instead of silently taking the first in document order. The match
+# may swallow at most ONE trailing WORD char (to reject `#123abc` below) and never the non-word
+# char after the digits: `grep -o` matches don't overlap, so consuming a `,` in `closes
+# #12,fixes #200` would eat the second ref's leading boundary and hide the ambiguity. Known
+# limit (POSIX ERE has no lookahead): the guard sees honest ambiguity with realistic separators
+# (space, `,`, `;`, `.`+space, newline); a second ref glued on by a word char (`#34xrefs #56`) or
+# by a `/`/`.`/`-` (`#12/fixes #200`) keeps no admissible leading boundary and stays hidden — an
+# author who can craft that could as well omit the ref, so it is not defended against.
+# Trade-off, accepted: a bare `#105` with no keyword (a `fix/#105` branch name, a `#105 widget`
+# title) is NOT derived either — pass $REVIEW_TASK_CODE.
+_review_quorum_extract_github_issue_ref() {  # $1 = text -> at most one candidate; ALWAYS exits 0
   local text="$1" m
-  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE 'HYP-[0-9]+' | head -1 || true)
-  if [ -n "$m" ]; then printf '%s' "$m" | LC_ALL=C tr '[:lower:]' '[:upper:]'; return 0; fi
-  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z]+-[0-9]+' | head -1 || true)
-  if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
-  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z0-9]*(-[A-Z0-9]+)*' \
-        | LC_ALL=C grep -xE '[A-Z][A-Z]+(-[A-Z][A-Z]+){2,}' | head -1 || true)
-  if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
-  # GitHub issue reference (`Fixes #105`, `Refs #105`) — for repos (like conloca-landing) that
-  # track work as GitHub issues rather than Linear/JIRA-style codes. Returned LITERAL, not
-  # normalized: task-cli's own `_route_id_to_project` (tasklib/cli.py) routes a bare GitHub id
-  # by checking `tid.startswith("#")` first — a `GH-<n>`-style rewrite doesn't match that check,
-  # falls through to the Linear-team-prefix branch instead, and `task mark-shipped` fails with
-  # an unroutable-id error. review-cli's own `normalize_task_code` (reviewlib/stats.py) accepts
-  # any non-whitespace, non-control-character token — `#105` passes it unchanged, so there is no
-  # downstream reason to rewrite it.
-  # Only a KEYWORD-ANCHORED local reference qualifies (`Closes|Fixes|Resolves|Refs|References`
-  # immediately before the `#<n>`, GitHub's own closing-keyword grammar plus the `Refs` form used
-  # when the ticket must NOT auto-close on merge). Three hazards rule out a bare `#<n>` anywhere
-  # in the text, all of them concrete because this same helper feeds BOTH the review-quorum
-  # record lookup and the post-merge `task mark-shipped` call:
-  #   - GitHub's qualified cross-repo syntax (`other-org/other-repo#123`, incl. repo names ending
-  #     in `-`/`.`) names an issue in ANOTHER repo; extracting its `#123` would mark an unrelated
-  #     local issue shipped. The keyword form never matches it: `#` must follow the keyword
-  #     directly, never a repo name.
-  #   - a URL fragment (`https://example.org/docs/#105`) or a Markdown anchor is not an issue.
-  #   - an incidental prose mention (`follow-up for #12`, `(#268)`) of an ALREADY-SHIPPED issue
-  #     would resolve to that issue's OLD passed quorum record, granting an unreviewed PR merge
-  #     authority — unlike a wrongly-derived HYP/PROJ token, a referenced GitHub issue routinely
-  #     HAS a record in an issue-tracked repo, so the "fail-closed anyway" reasoning above does
-  #     not hold here.
-  # This arm is the LAST fallback — after the generic PREFIX-<n> arm AND the descriptive
-  # ALL-CAPS arm above — so a `Fixes #45` aside never shadows a real `PROJ-123` or
-  # `SME-ROADMAP-WORKTREE-NOTE` code in the same body (for a descriptive-code repo that aside
-  # would otherwise be the very borrowing path described above). The keyword itself must not be
-  # the TAIL of a repo path (`org/hot-fix#5`, `org/fix#5`, `org/my.fix#5` are all qualified refs),
-  # so the char before it may not be a repo-name char (`-`/`.`) or `/` either; the digits must end
-  # at a non-word boundary (`#123abc` is not an issue ref). Two DISTINCT anchored refs in one text
-  # (`Partially fixes #12 ... Closes #200`) are an ambiguous task code: every other branch of this
-  # gate is fail-closed, so nothing is derived and ship refuses instead of silently taking the
-  # first in document order. The match may swallow at most ONE trailing WORD char (to reject
-  # `#123abc` below) and never the non-word char after the digits: `grep -o` matches don't
-  # overlap, so consuming a `,` in `closes #12,fixes #200` would eat the second ref's leading
-  # boundary and hide the ambiguity. Known limit (POSIX ERE has no lookahead): the guard sees
-  # honest ambiguity with realistic separators (space, `,`, `;`, `.`+space, newline); a second
-  # ref glued on by a word char (`#34xrefs #56`) or by a `/`/`.`/`-` (`#12/fixes #200`) keeps no
-  # admissible leading boundary and stays hidden — an author who can craft that could as well
-  # omit the ref, so it is not defended against. Trade-off, accepted: a bare `#105` with no
-  # keyword (a `fix/#105` branch name, a `#105 widget` title) is NOT derived either — pass
-  # $REVIEW_TASK_CODE.
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE \
       '(^|[^A-Za-z0-9_./-])(close[sd]?|fix(e[sd])?|resolve[sd]?|refs?|references?)[[:space:]]*:?[[:space:]]*#[0-9]+[A-Za-z0-9_]?' \
       | LC_ALL=C grep -oE '#[0-9]+[A-Za-z0-9_]?$' | LC_ALL=C grep -xE '#[0-9]+' | LC_ALL=C sort -u || true)
-  # `|| true`: `grep -c` exits 1 when the count is 0 -- which under this script's
-  # `set -euo pipefail` is exactly the NEW path this change exists to serve (a body with no
-  # keyword-anchored ref, only a URL). Guarded like every other grep in this function.
+  # `|| true`: `grep -c` exits 1 when the count is 0 -- the path a body with no keyword-anchored
+  # ref, only a URL, takes. Guarded like every other grep in this function.
   local kw_n; kw_n=$(printf '%s\n' "$m" | LC_ALL=C grep -c '#') || true
-  if [ "$kw_n" -eq 1 ]; then printf '%s' "$m"; return 0; fi
-  [ "$kw_n" -gt 1 ] && return 0   # ambiguous anchored refs: fail closed, never fall through
-  # Full GitHub issue URL of the PR's OWN repo (agent-tools#564) — the LAST fallback. task-cli's
-  # `links` gate REQUIRES a ticket to be referenced as a markdown link / full URL (never a bare
-  # `#548`), so a PR body written correctly for that gate carried NO shape the arms above
-  # recognize and this gate refused it with "could not derive a task code"; agents then
-  # hand-set REVIEW_TASK_CODE, the manual step that gets forgotten. The URL yields the SAME
-  # literal `#<n>` the keyword arm yields, so review-cli's quorum record and task-cli's routing
-  # see one code regardless of body syntax. Rules, mirroring the keyword arm's hazards:
-  #   - the URL's owner/repo must be one of the PR's own slugs (_ship_own_repo_slugs: explicit
-  #     --repo, checkout origin, live PR URL; compared case-insensitively — GitHub slugs are);
-  #     an issue of ANOTHER repo is never this PR's
-  #     ticket (cross-repo companions like "tg-cli#301 <-> agent-tools#524" are routine here);
-  #     an unknown own-repo (no github origin, no --repo, no PR url) derives nothing.
-  #   - only `/issues/<n>` counts — a `/pull/<n>` link is a PR, not a ticket; `www.` and a
-  #     trailing `#issuecomment-…` anchor are tolerated; the digits must end at a non-word
-  #     boundary (`/issues/12abc` is not an issue), same as the `#123abc` rule above.
-  #   - two DISTINCT same-repo issue URLs are ambiguous → nothing (fail-closed); the same
-  #     issue linked twice is one ticket.
-  # No keyword anchor is required (unlike the `#<n>` arm): the links gate's own output shape is
-  # `Refs [#548](https://…/issues/548)`, where `[` sits between any keyword and the URL, so an
-  # anchor would defeat the purpose. Accepted residual: a body whose ONLY same-repo issue link
-  # is an incidental mention of some other, already-shipped issue derives that issue — such a
-  # body already violates the links discipline (it does not link its own ticket at all), and a
-  # second same-repo link (the real ticket) turns the case into the ambiguity refusal.
+  if [ "$kw_n" -eq 1 ]; then printf '%s\n' "$m"; return 0; fi
+  if [ "$kw_n" -gt 1 ]; then
+    echo "[ship] task-code: ambiguous — ${kw_n} distinct keyword-anchored issue refs in one text ($(printf '%s' "$m" | LC_ALL=C tr '\n' ' ' | LC_ALL=C sed 's/ $//')); deriving none of them (fail-closed)." >&2
+    return 0
+  fi
+  _review_quorum_extract_own_repo_issue_url "$text"
+  return 0
+}
+
+# Full GitHub issue URL of the PR's OWN repo (agent-tools#564) — the LAST fallback. task-cli's
+# `links` gate REQUIRES a ticket to be referenced as a markdown link / full URL (never a bare
+# `#548`), so a PR body written correctly for that gate carried NO shape the arms above
+# recognize and this gate refused it with "could not derive a task code"; agents then
+# hand-set REVIEW_TASK_CODE, the manual step that gets forgotten. The URL yields the SAME
+# literal `#<n>` the keyword arm yields, so review-cli's quorum record and task-cli's routing
+# see one code regardless of body syntax. Rules, mirroring the keyword arm's hazards:
+#   - the URL's owner/repo must be one of the PR's own slugs (_ship_own_repo_slugs: explicit
+#     --repo, checkout origin, live PR URL; compared case-insensitively — GitHub slugs are);
+#     an issue of ANOTHER repo is never this PR's
+#     ticket (cross-repo companions like "tg-cli#301 <-> agent-tools#524" are routine here);
+#     an unknown own-repo (no github origin, no --repo, no PR url) derives nothing.
+#   - only `/issues/<n>` counts — a `/pull/<n>` link is a PR, not a ticket; `www.` and a
+#     trailing `#issuecomment-…` anchor are tolerated; the digits must end at a non-word
+#     boundary (`/issues/12abc` is not an issue), same as the `#123abc` rule above.
+#   - two DISTINCT same-repo issue URLs are ambiguous → nothing (fail-closed); the same
+#     issue linked twice is one ticket.
+# No keyword anchor is required (unlike the `#<n>` arm): the links gate's own output shape is
+# `Refs [#548](https://…/issues/548)`, where `[` sits between any keyword and the URL, so an
+# anchor would defeat the purpose. Accepted residual: a body whose ONLY same-repo issue link
+# is an incidental mention of some other, already-shipped issue derives that issue — such a
+# body already violates the links discipline (it does not link its own ticket at all), and a
+# second same-repo link (the real ticket) turns the case into the ambiguity refusal.
+_review_quorum_extract_own_repo_issue_url() {  # $1 = text -> at most one candidate; ALWAYS exits 0
+  local text="$1" m
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE \
       'https?://(www\.)?github\.com/[^/[:space:]]+/[^/[:space:]]+/issues/[0-9]+[A-Za-z0-9_]?' || true)
   [ -n "$m" ] || return 0
-  local issues; issues=$(_ship_own_repo_issue_numbers "$m" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
-  if [ "$(printf '%s\n' "$issues" | LC_ALL=C grep -c .)" -eq 1 ]; then printf '#%s' "$issues"; fi
+  local issues foreign n
+  issues=$(_ship_own_repo_issue_numbers "$m" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
+  foreign=$(_ship_foreign_repo_issue_urls "$m" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
+  if [ -n "$foreign" ]; then
+    echo "[ship] task-code: ignoring $(printf '%s\n' "$foreign" | LC_ALL=C grep -c .) issue link(s) of another repo, never this PR's ticket: $(printf '%s' "$foreign" | LC_ALL=C tr '\n' ' ' | LC_ALL=C sed 's/ $//')" >&2
+  fi
+  n=$(printf '%s\n' "$issues" | LC_ALL=C grep -c .) || true
+  if [ "$n" -eq 1 ]; then printf '#%s\n' "$issues"
+  elif [ "$n" -gt 1 ]; then
+    echo "[ship] task-code: ambiguous — ${n} distinct same-repo issue links in one text ($(printf '%s' "$issues" | LC_ALL=C sed 's/^/#/' | LC_ALL=C tr '\n' ' ' | LC_ALL=C sed 's/ $//')); deriving none of them (fail-closed)." >&2
+  fi
   return 0
 }
 
@@ -2194,6 +2240,26 @@ _ship_own_repo_issue_numbers() {
                           case "$n" in *[!0-9]*) ;; *) printf '%s\n' "$n" ;; esac ;;
       esac
     done <<< "$slugs"
+  done <<< "$1"
+  return 0
+}
+
+# The complement of _ship_own_repo_issue_numbers: $1 = the same newline-separated issue URLs ->
+# prints every URL that names a repo OTHER than the PR's own (or every URL when the own repo is
+# unknown — then none can be told apart), one per line, for the rejection note. ALWAYS exits 0.
+_ship_foreign_repo_issue_urls() {
+  local slugs cand key slug own
+  slugs=$(_ship_own_repo_slugs)
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    key=$(printf '%s' "$cand" | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+            | LC_ALL=C sed -E 's|^https?://(www\.)?github\.com/||')
+    own=0
+    while IFS= read -r slug; do
+      [ -n "$slug" ] || continue
+      case "$key" in "$slug"/issues/*) own=1 ;; esac
+    done <<< "$slugs"
+    [ "$own" = "1" ] || printf '%s\n' "$cand"
   done <<< "$1"
   return 0
 }
@@ -2493,6 +2559,290 @@ _skip_ci_hatch_gate() {
   exit 1
 }
 
+# --- review-quorum lookup: candidate scan + spelling twins (agent-tools#571 / #572) ---------
+#
+# The gate used to take the FIRST ticket-like token of the branch (else the PR body) and query
+# review-cli for that one spelling. Two live failures on 2026-09-06: an incidental token ahead
+# of the real code hid it (#571 — the same shape the acceptance gate's derivation fixes further
+# down), and a `Refs #565` body derived `#565` while every review had been recorded as `GH-565`,
+# the spelling agents type because `#` needs quoting (#572). Now every candidate of a source is
+# tried in order, and each is looked up under BOTH spellings of a GitHub-issue code:
+#   - a candidate (either spelling) that MEETS the bar authorizes — under THAT spelling, which is
+#     what the AUTHORITY line and the audit record name (#572, acceptance criterion 2);
+#   - a candidate with a record that FALLS SHORT is THE task: refuse, never borrow a later
+#     candidate's (possibly already-shipped) record — the twin spelling is still tried first,
+#     since the reviews may all live under it;
+#   - a candidate with NO record under either spelling (review-cli answers `total_iterations: 0`
+#     plus `error: no recorded review iterations for …` — JSON on stdout, exit 1; BOTH the zero
+#     counts and the error line are required, zero counts alone are a short record) is not this
+#     PR's review record: the scan moves to the next candidate, then to the next source (env →
+#     branch → body; the body is fetched only when no branch candidate has a record). Precedence
+#     is preserved because a record-less candidate could never have authorized anyway, and every
+#     later candidate must meet the bar on its own;
+#   - an EMPTY answer on every query tier ("could not query": store unreadable, ancient build) is
+#     a review-cli failure, not a verdict on the code — refuse at once, no continuation.
+# Admission here is "has a record", deliberately NOT the acceptance gate's task-cli id grammar
+# or self-PR rule: a descriptive review-check code (`SME-ROADMAP-WORKTREE-NOTE`) or a PR-number
+# key (`GH-560`) is a legitimate review-record key. Split records are NOT summed (2 iterations
+# under GH-565 plus 1 under #565 do not make 3): the bar must be met under ONE spelling —
+# summing would double-count the day review-cli normalizes at record time. When nothing is
+# found, the refusal names the first record-less candidate with its own zero counts and lists
+# every other spelling tried.
+
+# The other spelling of a GitHub-issue code, or nothing: `#565` ↔ `GH-565` (#572). Mirrors
+# _ship_normalize_gh_code_for_task_cli's `^[Gg][Hh]-<n>$` shape, so a hand-set `gh-565` gets
+# its twin too. Every other code shape has no twin. ALWAYS exits 0.
+_review_quorum_twin_code() {  # $1 = code -> prints the twin spelling, or nothing
+  if [[ "$1" =~ ^#([0-9]+)$ ]]; then printf 'GH-%s' "${BASH_REMATCH[1]}"
+  elif [[ "$1" =~ ^[Gg][Hh]-([0-9]+)$ ]]; then printf '#%s' "${BASH_REMATCH[1]}"
+  fi
+  return 0
+}
+
+# Asks review-cli about ONE spelling. Sets QUORUM_JSON (empty = could not query on any tier)
+# and QUORUM_ROLES_REQUESTED (whether the tier that answered included --min-roles).
+#
+# Role-based coverage (--min-roles) is ALWAYS requested — it is the primary/default gate now
+# (review-cli#246). --min-models is passed ONLY when the operator explicitly set
+# SHIP_REVIEW_QUORUM_MIN_MODELS: passing it unconditionally would make review-cli treat the
+# model floor as EXPLICITLY requested too (a subprocess CLI flag can't carry "this is just
+# ship's internal default"), which would silently reinstate a default model floor via
+# review-cli's own AND logic (review-cli#246) — exactly what this change removes.
+#
+# Three-tier query, oldest-compatible-flag-set-last, because review-cli's own history proves
+# --min-roles and --quorum-check were NEVER both supported by the same build: --quorum-check
+# was renamed to --check on 2026-07-09 (review-cli#135), a full six weeks before --min-roles
+# existed at all (added 2026-08-21, review-cli#246). So sending --min-roles on a --quorum-check
+# attempt can never succeed against any real build — it would only misdiagnose "review-cli is
+# too old for role checking" as "could not query review-cli" (a real finding from review, since
+# a --check-supporting-but-pre-#246 build, built in that six-week window, would otherwise fail
+# BOTH the --check-with-roles attempt and the --quorum-check-with-roles fallback, landing on
+# the wrong, confusing refusal message):
+#   1. --check WITH --min-roles (+ --min-models if explicit) — the current/target shape.
+#   2. --check WITHOUT --min-roles (+ --min-models if explicit) — a build that has the --check
+#      rename but predates role support; succeeds with real iter/model data and NO role keys
+#      (review-cli only emits distinct_roles_passed/roles when --min-roles was actually asked),
+#      so the gate reads 0 roles and refuses with an honest "0/N distinct roles" instead of a
+#      hollow "could not query" — accurate, still fail-closed (role coverage is mandatory now,
+#      so an old review-cli genuinely cannot satisfy this gate until upgraded).
+#   3. --quorum-check WITHOUT --min-roles (+ --min-models if explicit) — genuinely ancient,
+#      pre-rename builds; same honest 0-roles refusal as tier 2 if it succeeds.
+# In --json mode review-cli always prints JSON to stdout (pass or fail) — only an
+# unsupported-flag argparse error leaves stdout empty, which is each tier's trigger.
+#
+# QUORUM_ROLES_REQUESTED tracks whether the tier that actually produced QUORUM_JSON included
+# --min-roles, so a genuine "0 distinct roles" (tier 1: review-cli understood the request and
+# simply found no role-tagged history) can be told apart from "this review-cli cannot report
+# roles at all" (tier 2/3: the request never even asked) — the two have different remedies
+# (re-review with roles vs. upgrade review-cli).
+_review_quorum_query() {  # $1 = code
+  QUORUM_ROLES_REQUESTED=1
+  QUORUM_JSON=$(review task "$1" --check "${REVIEW_CHECK_ARGS[@]}" --json 2>/dev/null) || true
+  if [ -z "$QUORUM_JSON" ]; then
+    QUORUM_ROLES_REQUESTED=0
+    QUORUM_JSON=$(review task "$1" --check "${REVIEW_CHECK_ARGS_NOROLES[@]}" --json 2>/dev/null) || true
+  fi
+  if [ -z "$QUORUM_JSON" ]; then
+    QUORUM_JSON=$(review task "$1" --quorum-check "${REVIEW_CHECK_ARGS_NOROLES[@]}" --json 2>/dev/null) || true
+  fi
+  return 0
+}
+
+# Reads $QUORUM_JSON into the Q* vars and re-derives the verdict as QUORUM_BAR_MET (0/1).
+#
+# review-cli's quorum_check emits `passed_iterations` / `distinct_models_passed` /
+# `distinct_roles_passed` — the COUNT of PASSED iterations and the distinct models / BOARD
+# ROLES among them. An earlier revision read `.iterations` / `.distinct_models`, keys
+# review-cli NEVER emits, so both parsed to 0 (the "0 iterations across 0 models" in the
+# #242 incident log). Read ONLY the real keys — do NOT fall back to the never-emitted
+# legacy names: a payload carrying only `.iterations` / `.distinct_models` is not
+# review-cli's output (old build or hostile `review` on PATH), so it reads as 0/0 and fails
+# closed, never authorizes via a laxer key. `total_iterations` (every recorded iteration,
+# passed or not) is the "has a record at all" discriminator for the candidate scan.
+_review_quorum_read_payload() {
+  QPASSED=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed // false' 2>/dev/null || echo false)
+  QITER=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed_iterations // 0' 2>/dev/null || echo 0)
+  QTOTAL=$(printf '%s' "$QUORUM_JSON" | jq -r '.total_iterations // 0' 2>/dev/null || echo 0)
+  # Whether the payload carries `total_iterations` AT ALL — a build that does not cannot make
+  # the "no record" claim (codex review finding, round 3): an absent key reads as 0 above.
+  QUORUM_HAS_TOTAL_KEY=$(printf '%s' "$QUORUM_JSON" | jq -r 'has("total_iterations")' 2>/dev/null || echo false)
+  QMODELS_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_models_passed // 0' 2>/dev/null || echo 0)
+  QMODELS=$(printf '%s' "$QUORUM_JSON" | jq -r '(.models // []) | join(", ")' 2>/dev/null || echo "")
+  QROLES_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_roles_passed // 0' 2>/dev/null || echo 0)
+  QROLES=$(printf '%s' "$QUORUM_JSON" | jq -r '(.roles // []) | join(", ")' 2>/dev/null || echo "")
+  QERR=$(printf '%s' "$QUORUM_JSON" | jq -r '.error // empty' 2>/dev/null || echo "")
+  # Whether the ANSWER (not just what ship sent) actually carried role data — read from the
+  # payload's own shape (does it have the key at all?), not from QUORUM_ROLES_REQUESTED. A
+  # review-cli that tolerates an unrecognized --min-roles (e.g. argparse's parse_known_args,
+  # or a shim) could "succeed" on the roles-requesting tier while silently ignoring the flag —
+  # QUORUM_ROLES_REQUESTED would then be wrong (it only tracks what ship attempted), but the
+  # payload shape is still honest. Used ONLY for the disambiguating hint in the refusal; the
+  # authorize gate keeps requiring QUORUM_ROLES_REQUESTED independently (defense-in-depth).
+  QUORUM_HAS_ROLE_KEY=$(printf '%s' "$QUORUM_JSON" | jq -r 'has("distinct_roles_passed")' 2>/dev/null || echo false)
+  # Non-numeric / missing counts collapse to 0 so the arithmetic gate below fails closed
+  # (jq can hand back "null" as text if a key holds JSON null).
+  case "$QITER" in ''|*[!0-9]*) QITER=0 ;; esac
+  case "$QTOTAL" in ''|*[!0-9]*) QTOTAL=0 ;; esac
+  case "$QMODELS_N" in ''|*[!0-9]*) QMODELS_N=0 ;; esac
+  case "$QROLES_N" in ''|*[!0-9]*) QROLES_N=0 ;; esac
+
+  # The model floor gates ONLY when the operator explicitly asked for it — vacuously
+  # satisfied otherwise, mirroring review-cli's own explicit-vs-default AND logic
+  # (review-cli#246): an explicit request is always honored, but there is no default model
+  # floor any more now that role-based coverage is the primary/default mechanism.
+  MODELS_GATE_OK=1
+  if [ "$MIN_MODELS_EXPLICIT" = "1" ]; then
+    MODELS_GATE_OK=0
+    [ "$QMODELS_N" -gt 0 ] && [ "$QMODELS_N" -ge "$MIN_MODELS" ] && MODELS_GATE_OK=1
+  fi
+
+  # FAIL-CLOSED authorization (#242): NEVER authorize on the subprocess's `.passed` boolean
+  # alone. ship re-derives the verdict from the numbers it read and its own hard floors, so a
+  # review-cli that returns `passed:true` with a hollow 0/0 record (an older build without the
+  # min>=1 guard, a task-code miss, or an attacker-controlled `review` on PATH) is refused.
+  # Authorize ONLY when EVERY condition holds: the subprocess agreed (passed==true), there is
+  # NO error key, ship itself actually ASKED for role coverage on the query that answered
+  # (QUORUM_ROLES_REQUESTED — never trust an external contract that review-cli only emits
+  # role keys when asked; re-derive that independently too, same #242 philosophy), the
+  # iteration and role counts are strictly positive and independently meet their >=3 floors,
+  # a genuine record always carries at least one model (QMODELS_N -gt 0 is a hollow-payload
+  # sanity check, not a diversity floor — kept unconditionally, same as the pre-existing #242
+  # guard, independent of whether an explicit model floor is even in play), and (only when
+  # explicitly requested) the model floor is met too.
+  QUORUM_BAR_MET=0
+  if [ "$QPASSED" = "true" ] && [ -z "$QERR" ] \
+     && [ "$QUORUM_ROLES_REQUESTED" = "1" ] \
+     && [ "$QITER" -gt 0 ] && [ "$QROLES_N" -gt 0 ] && [ "$QMODELS_N" -gt 0 ] \
+     && [ "$QITER" -ge "$MIN_ITER" ] && [ "$QROLES_N" -ge "$MIN_ROLES" ] \
+     && [ "$MODELS_GATE_OK" = "1" ]; then
+    QUORUM_BAR_MET=1
+  fi
+  return 0
+}
+
+# Whether the Q* vars (read from $QUORUM_JSON) are review-cli's OWN "no record" answer: zero
+# counts (with the `total_iterations` key PRESENT — an absent key is not a zero) AND its
+# specific `error` line ("no recorded review iterations for <code>", from reviewlib/stats.py).
+# Only THAT answer lets the candidate scan move on. Zero counts WITHOUT it (a build that lacks
+# `total_iterations`, unparseable stdout, a shim emitting `{"passed":false}`)
+# or with ANY OTHER error (a stats-read failure that still emits JSON) are a record that falls
+# short — refuse on it, never scan past it to a later candidate's passing record (Opus review
+# findings, rounds 1 and 2). The security-critical decision of the scan, kept in one place.
+_review_quorum_payload_is_no_record() {
+  [ "$QUORUM_HAS_TOTAL_KEY" = "true" ] || return 1
+  [ "$QTOTAL" -eq 0 ] && [ "$QITER" -eq 0 ] || return 1
+  case "$QERR" in 'no recorded review iterations'*) return 0 ;; esac
+  return 1
+}
+
+# Looks ONE candidate up under its spellings (the code, then its twin if it has one).
+# Exit 0: a spelling met the bar — TASK_CODE/QUORUM_JSON are that spelling's.
+# Exit 1: a spelling has a record that falls short — TASK_CODE/QUORUM_JSON are the FIRST such
+#         spelling's (the refusal anchor); QUORUM_NOTES lists what else was tried.
+# Exit 2: no spelling has a record — the first record-less answer is kept in
+#         QUORUM_NORECORD_{CODE,JSON,ROLES_REQUESTED} (for the final refusal, if nothing is
+#         ever found) and every spelling is appended to QUORUM_TRIED.
+# Exit 3: review-cli could not be queried for a spelling (TASK_CODE = that spelling).
+_review_quorum_lookup_candidate() {  # $1 = candidate code
+  # anchor_roles is always set together with anchor_code and never read before anchor_code is
+  # non-empty — so it needs no default of its own.
+  local spelling anchor_code="" anchor_json="" anchor_roles twin
+  twin=$(_review_quorum_twin_code "$1")
+  for spelling in "$1" $twin; do
+    _review_quorum_query "$spelling"
+    if [ -z "$QUORUM_JSON" ]; then
+      # Could not query this spelling. With a short record already in hand that record is the
+      # verdict (refuse on it, below) — a twin lookup that fails must not hide a real 1/3.
+      [ -n "$anchor_code" ] && break
+      TASK_CODE="$spelling"; return 3
+    fi
+    _review_quorum_read_payload
+    if [ "$QUORUM_BAR_MET" = "1" ]; then TASK_CODE="$spelling"; return 0; fi
+    if ! _review_quorum_payload_is_no_record; then
+      if [ -z "$anchor_code" ]; then
+        anchor_code="$spelling"; anchor_json="$QUORUM_JSON"; anchor_roles="$QUORUM_ROLES_REQUESTED"
+      else
+        QUORUM_NOTES="${QUORUM_NOTES}; also tried ${spelling} (${QITER}/${MIN_ITER} iterations, ${QROLES_N}/${MIN_ROLES} distinct roles)"
+      fi
+      continue
+    fi
+    # No record under this spelling.
+    if [ -n "$anchor_code" ]; then
+      QUORUM_NOTES="${QUORUM_NOTES}; also tried ${spelling} (${QERR})"
+    else
+      if [ -z "$QUORUM_NORECORD_CODE" ]; then
+        QUORUM_NORECORD_CODE="$spelling"; QUORUM_NORECORD_JSON="$QUORUM_JSON"
+        QUORUM_NORECORD_ROLES_REQUESTED="$QUORUM_ROLES_REQUESTED"
+      fi
+      QUORUM_TRIED="${QUORUM_TRIED:+${QUORUM_TRIED}, }${spelling}"
+      echo "[ship] review-quorum: ${QERR:-no recorded review iterations for ${spelling}}; trying the next candidate." >&2
+    fi
+  done
+  [ -n "$anchor_code" ] || return 2
+  TASK_CODE="$anchor_code"; QUORUM_JSON="$anchor_json"; QUORUM_ROLES_REQUESTED="$anchor_roles"
+  _review_quorum_read_payload
+  return 1
+}
+
+# Scans the candidates of ONE source (newline-separated, $1) in order, with
+# _review_quorum_lookup_candidate's exit protocol: 0 found, 1 short record (stop — THE task),
+# 2 no record anywhere in this source (the caller moves to the next source), 3 could not query.
+_review_quorum_scan_source() {  # $1 = candidates
+  local candidate rc
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    rc=0; _review_quorum_lookup_candidate "$candidate" || rc=$?
+    [ "$rc" = "2" ] || return "$rc"
+  done <<< "$1"
+  return 2
+}
+
+# The candidate scan across the sources — explicit $REVIEW_TASK_CODE (alone: an operator who
+# names the code gets exactly that lookup, twin included), else the branch name, else the PR
+# body (fetched only when the branch yields no record). Same exit protocol as the per-source
+# scan; exit 4 when no source carries a candidate at all ("could not derive").
+_review_quorum_find_task() {
+  local rc candidates
+  if [ -n "${REVIEW_TASK_CODE:-}" ]; then
+    rc=0; _review_quorum_scan_source "$REVIEW_TASK_CODE" || rc=$?
+    return "$rc"
+  fi
+  local any=0
+  candidates=$(_review_quorum_extract_ticket_candidates "$BRANCH")
+  if [ -n "$candidates" ]; then
+    any=1
+    rc=0; _review_quorum_scan_source "$candidates" || rc=$?
+    [ "$rc" = "2" ] || return "$rc"
+  fi
+  PR_BODY_QC=$(gh pr view "$PR" --json body -q '.body // ""' 2>/dev/null) || PR_BODY_QC=""
+  candidates=$(_review_quorum_extract_ticket_candidates "$PR_BODY_QC")
+  if [ -n "$candidates" ]; then
+    any=1
+    rc=0; _review_quorum_scan_source "$candidates" || rc=$?
+    [ "$rc" = "2" ] || return "$rc"
+  fi
+  [ "$any" = "1" ] && return 2
+  return 4
+}
+
+# The refusal text for a record that falls short (or, when nothing was found at all, for the
+# first record-less candidate) — from the Q* vars of the anchor.
+_review_quorum_refusal_summary() {
+  local models_summary="" roles_hint=""
+  [ "$MIN_MODELS_EXPLICIT" = "1" ] && models_summary=", ${QMODELS_N}/${MIN_MODELS} distinct models${QMODELS:+ (models seen: ${QMODELS})}"
+  # A response whose OWN shape carries no role key at all means this review-cli build cannot
+  # report role coverage — a version problem, not "reviews genuinely carry no role labels" (a
+  # modern build that WAS asked always echoes the key, even as 0). Driven off the payload shape
+  # (QUORUM_HAS_ROLE_KEY), not off what ship merely attempted (QUORUM_ROLES_REQUESTED) — a build
+  # that silently tolerates an unrecognized --min-roles would otherwise "succeed" on the
+  # roles-requesting tier while still omitting the key, which QUORUM_HAS_ROLE_KEY catches and
+  # QUORUM_ROLES_REQUESTED alone would miss.
+  if [ "$QUORUM_HAS_ROLE_KEY" != "true" ]; then
+    roles_hint=" — the installed review-cli does not support --min-roles (predates review-cli#246); upgrade it to restore role-based coverage"
+  fi
+  printf '%s' "bar NOT met for ${TASK_CODE} — ${QITER}/${MIN_ITER} iterations, ${QROLES_N}/${MIN_ROLES} distinct roles${QROLES:+ (roles seen: ${QROLES})}${models_summary}${QERR:+ (${QERR})}${roles_hint}${QUORUM_NOTES}"
+}
+
 QUORUM_ENABLED=1
 case "${SHIP_REVIEW_QUORUM_ENABLED:-1}" in 0|false|no) QUORUM_ENABLED=0 ;; esac
 case "${SHIP_REVIEW_QUORUM:-1}" in 0|false|no) QUORUM_ENABLED=0 ;; esac
@@ -2524,149 +2874,43 @@ else
   # line and the hatch context.
   QITER=0; QMODELS_N=0; QMODELS=""; QROLES_N=0; QROLES=""; QERR=""; QPASSED=false
 
-  TASK_CODE="${REVIEW_TASK_CODE:-}"
-  [ -n "$TASK_CODE" ] || TASK_CODE=$(_review_quorum_extract_ticket "$BRANCH")
-  if [ -z "$TASK_CODE" ]; then
-    PR_BODY_QC=$(gh pr view "$PR" --json body -q '.body // ""' 2>/dev/null) || PR_BODY_QC=""
-    TASK_CODE=$(_review_quorum_extract_ticket "$PR_BODY_QC")
-  fi
+  TASK_CODE=""; QTOTAL=0; QUORUM_JSON=""; QUORUM_ROLES_REQUESTED=1; QUORUM_HAS_ROLE_KEY=false
+  QUORUM_HAS_TOTAL_KEY=false
+  QUORUM_BAR_MET=0; QUORUM_NOTES=""; QUORUM_TRIED=""
+  QUORUM_NORECORD_CODE=""; QUORUM_NORECORD_JSON=""; QUORUM_NORECORD_ROLES_REQUESTED=1
+  REVIEW_CHECK_ARGS_NOROLES=(--min-iter "$MIN_ITER")
+  [ "$MIN_MODELS_EXPLICIT" = "1" ] && REVIEW_CHECK_ARGS_NOROLES+=(--min-models "$MIN_MODELS")
+  REVIEW_CHECK_ARGS=("${REVIEW_CHECK_ARGS_NOROLES[@]}" --min-roles "$MIN_ROLES")
 
-  if [ -z "$TASK_CODE" ]; then
-    _review_quorum_refuse_or_hatch "could not derive a task code (set \$REVIEW_TASK_CODE, or put the ticket code e.g. HYP-931 — or a link to THIS repo's issue, https://github.com/<owner>/<repo>/issues/<n> — in the branch name or PR body)"
-  elif ! command -v review >/dev/null 2>&1; then
-    _review_quorum_refuse_or_hatch "'review' CLI not found on PATH — cannot verify the bar for ${TASK_CODE} (install review-cli)"
+  if ! command -v review >/dev/null 2>&1; then
+    _review_quorum_refuse_or_hatch "'review' CLI not found on PATH — cannot verify the bar for ${REVIEW_TASK_CODE:-this PR's task} (install review-cli)"
   elif ! command -v jq >/dev/null 2>&1; then
-    _review_quorum_refuse_or_hatch "jq not found — cannot evaluate the gate for ${TASK_CODE} (install jq)"
+    _review_quorum_refuse_or_hatch "jq not found — cannot evaluate the gate for ${REVIEW_TASK_CODE:-this PR's task} (install jq)"
   else
-    # Role-based coverage (--min-roles) is ALWAYS requested — it is the primary/default gate now
-    # (review-cli#246). --min-models is passed ONLY when the operator explicitly set
-    # SHIP_REVIEW_QUORUM_MIN_MODELS: passing it unconditionally would make review-cli treat the
-    # model floor as EXPLICITLY requested too (a subprocess CLI flag can't carry "this is just
-    # ship's internal default"), which would silently reinstate a default model floor via
-    # review-cli's own AND logic (review-cli#246) — exactly what this change removes.
-    #
-    # Three-tier query, oldest-compatible-flag-set-last, because review-cli's own history proves
-    # --min-roles and --quorum-check were NEVER both supported by the same build: --quorum-check
-    # was renamed to --check on 2026-07-09 (review-cli#135), a full six weeks before --min-roles
-    # existed at all (added 2026-08-21, review-cli#246). So sending --min-roles on a --quorum-check
-    # attempt can never succeed against any real build — it would only misdiagnose "review-cli is
-    # too old for role checking" as "could not query review-cli" (a real finding from review, since
-    # a --check-supporting-but-pre-#246 build, built in that six-week window, would otherwise fail
-    # BOTH the --check-with-roles attempt and the --quorum-check-with-roles fallback, landing on
-    # the wrong, confusing refusal message):
-    #   1. --check WITH --min-roles (+ --min-models if explicit) — the current/target shape.
-    #   2. --check WITHOUT --min-roles (+ --min-models if explicit) — a build that has the --check
-    #      rename but predates role support; succeeds with real iter/model data and NO role keys
-    #      (review-cli only emits distinct_roles_passed/roles when --min-roles was actually asked),
-    #      so the gate below reads 0 roles and refuses with an honest "0/N distinct roles" instead
-    #      of a hollow "could not query" — accurate, still fail-closed (role coverage is mandatory
-    #      now, so an old review-cli genuinely cannot satisfy this gate until upgraded).
-    #   3. --quorum-check WITHOUT --min-roles (+ --min-models if explicit) — genuinely ancient,
-    #      pre-rename builds; same honest 0-roles refusal as tier 2 if it succeeds.
-    # In --json mode review-cli always prints JSON to stdout (pass or fail) — only an
-    # unsupported-flag argparse error leaves stdout empty, which is each tier's trigger.
-    REVIEW_CHECK_ARGS_NOROLES=(--min-iter "$MIN_ITER")
-    [ "$MIN_MODELS_EXPLICIT" = "1" ] && REVIEW_CHECK_ARGS_NOROLES+=(--min-models "$MIN_MODELS")
-    REVIEW_CHECK_ARGS=("${REVIEW_CHECK_ARGS_NOROLES[@]}" --min-roles "$MIN_ROLES")
-
-    # QUORUM_ROLES_REQUESTED tracks whether the tier that actually produced QUORUM_JSON included
-    # --min-roles, so a genuine "0 distinct roles" (tier 1: review-cli understood the request and
-    # simply found no role-tagged history) can be told apart, below, from "this review-cli cannot
-    # report roles at all" (tier 2/3: the request never even asked) — the two have different
-    # remedies (re-review with roles vs. upgrade review-cli).
-    QUORUM_ROLES_REQUESTED=1
-    QUORUM_JSON=$(review task "$TASK_CODE" --check "${REVIEW_CHECK_ARGS[@]}" --json 2>/dev/null) || true
-    if [ -z "$QUORUM_JSON" ]; then
-      QUORUM_ROLES_REQUESTED=0
-      QUORUM_JSON=$(review task "$TASK_CODE" --check "${REVIEW_CHECK_ARGS_NOROLES[@]}" --json 2>/dev/null) || true
-    fi
-    if [ -z "$QUORUM_JSON" ]; then
-      QUORUM_JSON=$(review task "$TASK_CODE" --quorum-check "${REVIEW_CHECK_ARGS_NOROLES[@]}" --json 2>/dev/null) || true
-    fi
-
-    if [ -z "$QUORUM_JSON" ]; then
-      _review_quorum_refuse_or_hatch "could not query review-cli (store unreadable / task ${TASK_CODE} unknown)"
-    else
-      # review-cli's quorum_check emits `passed_iterations` / `distinct_models_passed` /
-      # `distinct_roles_passed` — the COUNT of PASSED iterations and the distinct models / BOARD
-      # ROLES among them. An earlier revision read `.iterations` / `.distinct_models`, keys
-      # review-cli NEVER emits, so both parsed to 0 (the "0 iterations across 0 models" in the
-      # #242 incident log). Read ONLY the real keys — do NOT fall back to the never-emitted
-      # legacy names: a payload carrying only `.iterations` / `.distinct_models` is not
-      # review-cli's output (old build or hostile `review` on PATH), so it reads as 0/0 and fails
-      # closed below, never authorizes via a laxer key.
-      QPASSED=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed // false' 2>/dev/null || echo false)
-      QITER=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed_iterations // 0' 2>/dev/null || echo 0)
-      QMODELS_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_models_passed // 0' 2>/dev/null || echo 0)
-      QMODELS=$(printf '%s' "$QUORUM_JSON" | jq -r '(.models // []) | join(", ")' 2>/dev/null || echo "")
-      QROLES_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_roles_passed // 0' 2>/dev/null || echo 0)
-      QROLES=$(printf '%s' "$QUORUM_JSON" | jq -r '(.roles // []) | join(", ")' 2>/dev/null || echo "")
-      QERR=$(printf '%s' "$QUORUM_JSON" | jq -r '.error // empty' 2>/dev/null || echo "")
-      # Whether the ANSWER (not just what ship sent) actually carried role data — read from the
-      # payload's own shape (does it have the key at all?), not from QUORUM_ROLES_REQUESTED. A
-      # review-cli that tolerates an unrecognized --min-roles (e.g. argparse's parse_known_args,
-      # or a shim) could "succeed" on the roles-requesting tier while silently ignoring the flag —
-      # QUORUM_ROLES_REQUESTED would then be wrong (it only tracks what ship attempted), but the
-      # payload shape is still honest. Used ONLY for the disambiguating hint below; the authorize
-      # gate keeps requiring QUORUM_ROLES_REQUESTED independently (defense-in-depth, not replaced).
-      QUORUM_HAS_ROLE_KEY=$(printf '%s' "$QUORUM_JSON" | jq -r 'has("distinct_roles_passed")' 2>/dev/null || echo false)
-      # Non-numeric / missing counts collapse to 0 so the arithmetic gate below fails closed
-      # (jq can hand back "null" as text if a key holds JSON null).
-      case "$QITER" in ''|*[!0-9]*) QITER=0 ;; esac
-      case "$QMODELS_N" in ''|*[!0-9]*) QMODELS_N=0 ;; esac
-      case "$QROLES_N" in ''|*[!0-9]*) QROLES_N=0 ;; esac
-
-      # The model floor gates ONLY when the operator explicitly asked for it — vacuously
-      # satisfied otherwise, mirroring review-cli's own explicit-vs-default AND logic
-      # (review-cli#246): an explicit request is always honored, but there is no default model
-      # floor any more now that role-based coverage is the primary/default mechanism.
-      MODELS_GATE_OK=1
-      if [ "$MIN_MODELS_EXPLICIT" = "1" ]; then
-        MODELS_GATE_OK=0
-        [ "$QMODELS_N" -gt 0 ] && [ "$QMODELS_N" -ge "$MIN_MODELS" ] && MODELS_GATE_OK=1
-      fi
-
-      # FAIL-CLOSED authorization (#242): NEVER authorize on the subprocess's `.passed` boolean
-      # alone. ship re-derives the verdict from the numbers it read and its own hard floors, so a
-      # review-cli that returns `passed:true` with a hollow 0/0 record (an older build without the
-      # min>=1 guard, a task-code miss, or an attacker-controlled `review` on PATH) is refused.
-      # Authorize ONLY when EVERY condition holds: the subprocess agreed (passed==true), there is
-      # NO error key, ship itself actually ASKED for role coverage on the query that answered
-      # (QUORUM_ROLES_REQUESTED — never trust an external contract that review-cli only emits
-      # role keys when asked; re-derive that independently too, same #242 philosophy), the
-      # iteration and role counts are strictly positive and independently meet their >=3 floors,
-      # a genuine record always carries at least one model (QMODELS_N -gt 0 is a hollow-payload
-      # sanity check, not a diversity floor — kept unconditionally, same as the pre-existing #242
-      # guard, independent of whether an explicit model floor is even in play), and (only when
-      # explicitly requested) the model floor is met too.
-      if [ "$QPASSED" = "true" ] && [ -z "$QERR" ] \
-         && [ "$QUORUM_ROLES_REQUESTED" = "1" ] \
-         && [ "$QITER" -gt 0 ] && [ "$QROLES_N" -gt 0 ] && [ "$QMODELS_N" -gt 0 ] \
-         && [ "$QITER" -ge "$MIN_ITER" ] && [ "$QROLES_N" -ge "$MIN_ROLES" ] \
-         && [ "$MODELS_GATE_OK" = "1" ]; then
+    QUORUM_RC=0; _review_quorum_find_task || QUORUM_RC=$?
+    case "$QUORUM_RC" in
+      0)
         if [ "$MIN_MODELS_EXPLICIT" = "1" ]; then
           echo "[ship] AUTHORITY CONFIRMED — review quorum met: ${QITER} iterations across ${QROLES_N} roles and ${QMODELS_N} models for ${TASK_CODE}. Self-merge authorized by the review-quorum gate."
         else
           echo "[ship] AUTHORITY CONFIRMED — review quorum met: ${QITER} iterations across ${QROLES_N} roles for ${TASK_CODE}. Self-merge authorized by the review-quorum gate."
         fi
-        _review_quorum_audit_log authorized "$TASK_CODE" "$QITER" "$QMODELS_N" "" "$QROLES_N" "$MIN_ROLES" "$AUDIT_MIN_MODELS"
-      else
-        MODELS_SUMMARY=""
-        [ "$MIN_MODELS_EXPLICIT" = "1" ] && MODELS_SUMMARY=", ${QMODELS_N}/${MIN_MODELS} distinct models${QMODELS:+ (models seen: ${QMODELS})}"
-        # A response whose OWN shape carries no role key at all means this review-cli build
-        # cannot report role coverage — a version problem, not "reviews genuinely carry no role
-        # labels" (a modern build that WAS asked always echoes the key, even as 0). Driven off
-        # the payload shape (QUORUM_HAS_ROLE_KEY), not off what ship merely attempted
-        # (QUORUM_ROLES_REQUESTED) — a build that silently tolerates an unrecognized --min-roles
-        # would otherwise "succeed" on the roles-requesting tier while still omitting the key,
-        # which QUORUM_HAS_ROLE_KEY catches and QUORUM_ROLES_REQUESTED alone would miss.
-        ROLES_UNAVAILABLE_HINT=""
-        if [ "$QUORUM_HAS_ROLE_KEY" != "true" ]; then
-          ROLES_UNAVAILABLE_HINT=" — the installed review-cli does not support --min-roles (predates review-cli#246); upgrade it to restore role-based coverage"
-        fi
-        _review_quorum_refuse_or_hatch "bar NOT met for ${TASK_CODE} — ${QITER}/${MIN_ITER} iterations, ${QROLES_N}/${MIN_ROLES} distinct roles${QROLES:+ (roles seen: ${QROLES})}${MODELS_SUMMARY}${QERR:+ (${QERR})}${ROLES_UNAVAILABLE_HINT}"
-      fi
-    fi
+        _review_quorum_audit_log authorized "$TASK_CODE" "$QITER" "$QMODELS_N" "" "$QROLES_N" "$MIN_ROLES" "$AUDIT_MIN_MODELS" ;;
+      1) _review_quorum_refuse_or_hatch "$(_review_quorum_refusal_summary)" ;;
+      2)
+        # Every candidate of every source answered "no record": refuse on the FIRST one, with its
+        # own zero counts, naming the rest — the shipper sees every spelling that was looked up.
+        TASK_CODE="$QUORUM_NORECORD_CODE"; QUORUM_JSON="$QUORUM_NORECORD_JSON"
+        QUORUM_ROLES_REQUESTED="$QUORUM_NORECORD_ROLES_REQUESTED"
+        _review_quorum_read_payload
+        QUORUM_NOTES=""
+        case "$QUORUM_TRIED" in
+          *", "*) QUORUM_NOTES="; also tried: ${QUORUM_TRIED#*, } (no recorded review iterations for any of them)" ;;
+        esac
+        _review_quorum_refuse_or_hatch "$(_review_quorum_refusal_summary)" ;;
+      3) _review_quorum_refuse_or_hatch "could not query review-cli (store unreadable / task ${TASK_CODE} unknown)" ;;
+      *) _review_quorum_refuse_or_hatch "could not derive a task code (set \$REVIEW_TASK_CODE, or put the ticket code e.g. HYP-931 — or a link to THIS repo's issue, https://github.com/<owner>/<repo>/issues/<n> — in the branch name or PR body)" ;;
+    esac
   fi
 fi
 
@@ -2824,19 +3068,24 @@ fi
 
 # The ticket-code derivation is SHARED by the acceptance gate (pre-merge) and the task-cli
 # notify step (post-merge) — one matcher, defined once, here, before its first caller.
-# Task-code derivation reuses _review_quorum_extract_ticket (the same matcher the review-quorum
-# gate above uses) but tries MORE sources, each validated independently, falling through to the
-# next on rejection: the gate's own $TASK_CODE (if it already ran and found one — avoids a
-# redundant `gh pr view` on the common path) → branch → PR TITLE → PR body. The title is a
-# deliberate gap-fix over the quorum gate (which only ever tries branch → body): a PR whose
-# ticket code lives only in its title (a common shape — "HYP-931: fix the thing") would
-# otherwise never be found here even though a human reads it immediately.
+# Task-code derivation reuses _review_quorum_extract_ticket_candidates (the same matcher the
+# review-quorum gate above uses) but tries MORE sources, each candidate validated independently:
+# the gate's own $TASK_CODE (if it already ran and found one — avoids a redundant `gh pr view` on
+# the common path) → branch → PR TITLE → PR body. The title is a deliberate gap-fix over the
+# quorum gate (which only ever tries branch → body): a PR whose ticket code lives only in its
+# title (a common shape — "HYP-931: fix the thing") would otherwise never be found here even
+# though a human reads it immediately.
 #
-# EACH candidate — including a reused $TASK_CODE — is validated before being accepted; a
-# rejected one falls through to try the NEXT source rather than giving up (review finding — an
-# earlier version validated only the FINAL chosen source, so an invalid $TASK_CODE reuse — e.g.
-# an explicit REVIEW_TASK_CODE=SME-ROADMAP-NOTE, or the branch matching the matcher's
-# descriptive arm — short-circuited past a title/body that DID carry a real ticket id).
+# EACH candidate — including a reused $TASK_CODE — is validated before being accepted. Within a
+# source, EVERY candidate the matcher lists is tried in order and the first survivor wins; only
+# when a source has NO survivor does derivation fall to the next source (agent-tools#571: an
+# earlier version took only the matcher's first hit per source, so PR #560's incidental `GH-560`
+# — rejected as the PR's own number — hid the real `Refs #541` later in the SAME body and the
+# gate skipped). A rejected reused $TASK_CODE likewise falls through to the sources (review
+# finding on #565: an explicit REVIEW_TASK_CODE=SME-ROADMAP-NOTE, or the branch matching the
+# matcher's descriptive arm, used to short-circuit past a title/body that DID carry a real id).
+# Every rejection is reported on stderr with its source; the accepted code is reported too, so
+# the ship transcript shows which text named the ticket the gates then judge.
 #
 # The validation is task-cli's OWN id grammar (agent-tools#565), not a loose heuristic. It used
 # to be "contains a digit", which is not a shape at all: it admitted things that are not tickets
@@ -2910,23 +3159,44 @@ _ship_code_names_this_pr() {  # $1 = candidate code; true (exit 0) iff it is thi
 _ship_task_code_candidate_ok() {  # $1 = candidate code  $2 = source label (for the rejection note)
   [ -n "$1" ] || return 1
   if ! _ship_looks_like_a_ticket_id "$1"; then
-    echo "[ship] task-code: rejected '$1' from $2 — not a task-cli id shape (#<n>, <n>, PREFIX-<n>); trying the next source." >&2
+    echo "[ship] task-code: rejected '$1' from $2 — not a task-cli id shape (#<n>, <n>, PREFIX-<n>); trying the next candidate." >&2
     return 1
   fi
   if _ship_code_names_this_pr "$1"; then
-    echo "[ship] task-code: rejected '$1' from $2 — it names this pull request (#$PR), not a ticket; trying the next source." >&2
+    echo "[ship] task-code: rejected '$1' from $2 — it names this pull request (#$PR), not a ticket; trying the next candidate." >&2
     return 1
   fi
   return 0
 }
-_ship_derive_task_code_for_notify() {
+# The source label of the code `_ship_derive_task_code_for_notify` last accepted (empty when it
+# derived nothing) — read by the acceptance gate's refusals so the shipper is told WHICH text
+# named the ticket task-cli then could not resolve (agent-tools#569).
+# Both are set by a DIRECT call (never inside `$(…)` — a command substitution runs in a subshell
+# and its assignments never reach the caller; codex review finding, round 1): the acceptance gate
+# calls the derivation directly and reads _SHIP_TASK_CODE / _SHIP_TASK_CODE_SOURCE, the notify
+# step only needs the printed code.
+_SHIP_TASK_CODE_SOURCE=""
+_SHIP_TASK_CODE=""
+# $1 = newline-separated candidates from ONE source, $2 = its label -> prints the first candidate
+# that passes `_ship_task_code_candidate_ok` (exit 0), or nothing (exit 1) when none does.
+_ship_first_admissible_task_code() {
   local candidate
-
-  candidate="${TASK_CODE:-}"
-  _ship_task_code_candidate_ok "$candidate" '$TASK_CODE' && { printf '%s' "$candidate"; return 0; }
-
-  candidate=$(_review_quorum_extract_ticket "$BRANCH")
-  _ship_task_code_candidate_ok "$candidate" "the branch name" && { printf '%s' "$candidate"; return 0; }
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    if _ship_task_code_candidate_ok "$candidate" "$2"; then
+      echo "[ship] task-code: using '${candidate}' from $2." >&2
+      _SHIP_TASK_CODE_SOURCE="$2"
+      _SHIP_TASK_CODE="$candidate"
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done <<< "$1"
+  return 1
+}
+_ship_derive_task_code_for_notify() {
+  _SHIP_TASK_CODE_SOURCE=""; _SHIP_TASK_CODE=""
+  _ship_first_admissible_task_code "${TASK_CODE:-}" '$TASK_CODE' && return 0
+  _ship_first_admissible_task_code "$(_review_quorum_extract_ticket_candidates "$BRANCH")" "the branch name" && return 0
 
   local pr_title pr_body_local
   # One combined query for title+body (2 round trips instead of 2 separate `gh pr view` calls).
@@ -2944,12 +3214,8 @@ _ship_derive_task_code_for_notify() {
     -q '[(.title // ""), (.body // "")] | map(gsub("\n";" ")) | @tsv' 2>/dev/null) \
     || { pr_title=""; pr_body_local=""; }
 
-  candidate=$(_review_quorum_extract_ticket "$pr_title")
-  _ship_task_code_candidate_ok "$candidate" "the PR title" && { printf '%s' "$candidate"; return 0; }
-
-  candidate=$(_review_quorum_extract_ticket "$pr_body_local")
-  _ship_task_code_candidate_ok "$candidate" "the PR body" && { printf '%s' "$candidate"; return 0; }
-
+  _ship_first_admissible_task_code "$(_review_quorum_extract_ticket_candidates "$pr_title")" "the PR title" && return 0
+  _ship_first_admissible_task_code "$(_review_quorum_extract_ticket_candidates "$pr_body_local")" "the PR body" && return 0
   return 0
 }
 
@@ -3155,7 +3421,7 @@ fi
 # Skips (logged, never a refusal) when task-cli is absent, the invocation targets a foreign
 # --repo, or no ticket code is derivable — the same three "not every PR is tied to a tracked
 # ticket" cases the post-merge notify below already skips on; the code derivation IS
-# _ship_derive_task_code_for_notify (never a second matcher). Exit 2 is also a logged skip: an
+# _ship_derive_task_code_for_notify (never a second matcher). Exit 2 REFUSES (agent-tools#569): a
 # unknown ticket (the digit-check false positives that matcher documents — "UTF-8") or a
 # backend outage is not evidence that the ticket is unaccepted, and the ops off-switch exists
 # for the case where an operator wants the gate silent for other reasons.
@@ -3260,8 +3526,8 @@ _acceptance_gate_pass() {  # $1 = task code $2 = `task gate --json` STDOUT ONLY 
 # Rewrites a "GH-<n>" code (case-insensitive: "gh-105" too, matching
 # require-ticket-before-commit's `re.IGNORECASE` on the same pattern) into the literal "#<n>" form
 # task-cli's own id argument expects (task mark-shipped/done accept "#123" or "HYP-456", never
-# "GH-123" -- see the routing rationale on _review_quorum_extract_ticket's own comment, ~line
-# 2052). "GH-<n>" is a convention, not a task-cli id: agent-hooks' require-ticket-before-commit
+# "GH-123" -- see the routing rationale on _review_quorum_extract_github_issue_ref's own
+# comment). "GH-<n>" is a convention, not a task-cli id: agent-hooks' require-ticket-before-commit
 # recognizes it as a valid ticket reference (see
 # agent-hooks/require-ticket-before-commit/require_ticket_before_commit.py), and it's also the
 # shape review-quorum's own matcher used to SYNTHESIZE from a bare "Fixes #105" before #511
@@ -3314,7 +3580,10 @@ _acceptance_gate() {
     echo "[ship] acceptance gate: --repo targets a foreign remote — skipping (a local 'task' here reads the wrong project)." >&2
     _ticket_gate_audit_log acceptance skipped "" "foreign --repo"; return 0
   fi
-  local code; code=$(_ship_derive_task_code_for_notify)
+  # Direct call, not `$(…)`: the refusal below reports WHICH source named the code, and that
+  # label only survives outside a subshell.
+  _ship_derive_task_code_for_notify >/dev/null
+  local code="$_SHIP_TASK_CODE"
   if [ -z "$code" ]; then
     echo "[ship] acceptance gate: could not derive a task code for #$PR — skipping (not every PR is tied to a tracked ticket)." >&2
     _ticket_gate_audit_log acceptance skipped "" "no task code"; return 0
@@ -3335,8 +3604,10 @@ _acceptance_gate() {
   errfile=$(mktemp 2>/dev/null) || errfile=/dev/null
   # From "$ROOT", not via -C: task-cli's -C is a per-subcommand flag (see the notify step).
   out=$(cd "$ROOT" && task gate "$code" --json 2>"$errfile") || rc=$?
+  local err_raw=""
   if [ "$errfile" != "/dev/null" ] && [ -s "$errfile" ]; then
-    echo "[ship] acceptance gate: task-cli stderr: $(LC_ALL=C tr '\n' ' ' < "$errfile")" >&2
+    err_raw=$(cat "$errfile")
+    echo "[ship] acceptance gate: task-cli stderr: $(printf '%s' "$err_raw" | LC_ALL=C tr '\n' ' ' | LC_ALL=C sed 's/ *$//')" >&2
   fi
   [ "$errfile" != "/dev/null" ] && rm -f "$errfile"  # always, not only when -s (review finding: the file leaked on the common empty-stderr path)
   # `task` is a famously ambiguous command name (Taskwarrior, go-task also install as `task`)
@@ -3354,13 +3625,65 @@ _acceptance_gate() {
       return 0
     fi
   fi
+  # Exit 2 = task-cli could not resolve the code (unknown id, backend error). A code WAS derived
+  # from this PR, so this fails CLOSED (agent-tools#569): a PR that names a ticket task-cli
+  # cannot find is a BROKEN PR, not an unguarded one. Only when the answer does not even look
+  # like task-cli's (no `error:` line — task-cli always prints one on exit 2) does the
+  # PATH-collision guard above still apply: a foreign `task` must not refuse every merge.
+  local task_err=""
+  [ "$rc" = "2" ] && task_err=$(_acceptance_gate_task_cli_error_line "$out" "$err_raw")
+  # No stderr capture at all (mktemp failed: a read-only or full temp dir) means task-cli's
+  # `error:` line — which it prints on stderr — was never seen. That must not read as "not
+  # task-cli" and skip (codex review on PR #577): with a derived code, an exit 2 whose message
+  # could not be captured is refused, saying so.
+  if [ "$rc" = "2" ] && [ -z "$task_err" ] && [ "$errfile" = "/dev/null" ]; then
+    _acceptance_gate_refuse_unresolvable "$code" "(task-cli's stderr could not be captured — mktemp failed, so its error line was not seen)"
+  fi
+  if [ "$rc" = "2" ] && [ -z "$task_err" ]; then
+    echo "[ship] WARNING: acceptance gate could not evaluate ${code} — '$(command -v task)' on PATH did not return task-cli's expected \`error:\` line on exit 2 (a DIFFERENT 'task' binary — e.g. Taskwarrior or go-task — may be shadowing task-cli). Skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
+    _ticket_gate_audit_log acceptance skipped "$code" "'task' on PATH does not look like task-cli"
+    return 0
+  fi
   case "$rc" in
     0) _acceptance_gate_pass "$code" "$out" ;;
     1) _acceptance_gate_refuse "$code" "$out" ;;
+    2) _acceptance_gate_refuse_unresolvable "$code" "$task_err" ;;
     *)
-      echo "[ship] WARNING: acceptance gate could not evaluate ${code} (task gate exit ${rc}) — skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
+      # Outside task-cli's 0/1/2 contract entirely (a crash, a signal, a foreign binary's own
+      # convention) — not a verdict on the ticket; logged and skipped, as before.
+      echo "[ship] WARNING: acceptance gate could not evaluate ${code} (task gate exit ${rc}, outside task-cli's 0/1/2 contract) — skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
       _ticket_gate_audit_log acceptance skipped "$code" "could not evaluate: exit ${rc}" ;;
   esac
+}
+# task-cli's exit-2 contract is ONE line starting `error: …` (its `_UserError` handler prints
+# exactly that, on stderr; probed live 2026-09-07: `error: github: HTTP 404 for GET …/issues/<n>`
+# for an unknown ticket). $1 = stdout, $2 = raw stderr -> prints the FIRST such line (stderr
+# first — where the real binary puts it; stdout for a shim that prints it there), or nothing.
+# One predicate for both "is this task-cli's answer?" (non-empty) and "what did it say?", so the
+# two can never drift apart. Anchored at LINE START, not a substring (the earlier substring
+# match was dropped deliberately): a foreign `task` that merely mentions "error:" mid-line does
+# not turn every merge into a refusal. Two residuals, both accepted and both documented in the
+# README: a foreign binary that prints a line starting `error: ` AND exits 2 is refused too —
+# loud, never silent (the refusal names the binary path and the ops off-switch); and should
+# task-cli ever PREFIX its line (`task: error: …`, a timestamp), exit 2 would read as
+# "not task-cli" and skip again — the contract is pinned on task-cli's side (its README's gate
+# section is kept byte-identical with this one), so that is a two-repo change, not a drift.
+_acceptance_gate_task_cli_error_line() {
+  local line
+  line=$(printf '%s\n%s\n' "$2" "$1" | LC_ALL=C grep -m1 -E '^error: ' || true)
+  printf '%s' "$line"
+}
+# The fail-closed refusal for a derived-but-unresolvable code (agent-tools#569). $1 = code
+# $2 = task-cli's own error line; exits 1 (under --dry-run too — same refusal, audit only printed).
+_acceptance_gate_refuse_unresolvable() {
+  local where="${_SHIP_TASK_CODE_SOURCE:-the derived task code}"
+  { echo "Refusing: acceptance gate — task-cli could not resolve ticket ${1} (task gate ${1} exit 2): ${2}"
+    echo "  A PR that names a ticket task-cli cannot find is a broken PR, not an unguarded one: the merge would close (or skip) the wrong ticket."
+    echo "  The code came from ${where}. Fix the reference there (a typo'd id? a hyphenated word like UTF-8 read as a ticket?),"
+    echo "  or name the right ticket explicitly for this ship:  REVIEW_TASK_CODE=<code> gh ship ${PR}"
+    echo "  If task-cli's BACKEND is down rather than the code wrong, SHIP_ACCEPTANCE_GATE=0 (env, or a committed .ship-config line) is the ops off-switch."; } >&2
+  _ticket_gate_audit_log acceptance "refused:unresolvable" "$1" "task gate exit 2: ${2}"
+  exit 1
 }
 # Whether `$1` (task gate's stdout) looks like task-cli's OWN JSON contract, not just any
 # non-empty text — the discriminator for the PATH-collision guard above. With jq, requires the

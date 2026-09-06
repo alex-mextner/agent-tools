@@ -5431,6 +5431,32 @@ if [ "$flag" = "check" ] && [ "${SHIP_TEST_REVIEW_SUPPORTS_CHECK:-1}" = "0" ]; t
   exit 2
 fi
 [ -n "${SHIP_TEST_REVIEW_LOG:-}" ] && printf '%s\\n' "$flag" >> "${SHIP_TEST_REVIEW_LOG}"
+[ -n "${SHIP_TEST_REVIEW_CODE_LOG:-}" ] && printf '%s\\n' "$code" >> "${SHIP_TEST_REVIEW_CODE_LOG}"
+# SHIP_TEST_REVIEW_KNOWN_CODES (space-separated): when set, any OTHER code answers exactly what
+# the real review-cli answers for a code it has no iterations for (probed live 2026-09-07):
+# zero counts plus an `error` key — JSON on stdout, exit 1, never an empty stdout.
+if [ -n "${SHIP_TEST_REVIEW_KNOWN_CODES:-}" ]; then
+  known=0
+  for k in ${SHIP_TEST_REVIEW_KNOWN_CODES}; do [ "$k" = "$code" ] && known=1; done
+  if [ "$known" = "0" ]; then
+    total='"total_iterations":0,'
+    # SHIP_TEST_REVIEW_NO_RECORD_OMIT_TOTAL=1 simulates a build that never emits the key.
+    [ "${SHIP_TEST_REVIEW_NO_RECORD_OMIT_TOTAL:-0}" = "1" ] && total=""
+    printf '{"task_code":"%s","passed_iterations":0,%s"distinct_models_passed":0,"models":[],"min_iter":%s,"passed":false,"distinct_roles_passed":0,"roles":[],"min_roles":%s,"error":"no recorded review iterations for %s"}\\n' \\
+      "$code" "$total" "$minit" "$minroles" "$code"
+    exit 1
+  fi
+fi
+# SHIP_TEST_REVIEW_UNQUERYABLE_CODES (space-separated): review-cli cannot answer for these at
+# all — empty stdout on every tier (an argparse failure, an unreadable store), exit 2.
+for k in ${SHIP_TEST_REVIEW_UNQUERYABLE_CODES:-}; do
+  [ "$k" = "$code" ] && { echo "review task: error: store unreadable" >&2; exit 2; }
+done
+# SHIP_TEST_REVIEW_SHORT_CODES (space-separated): these codes have a record of exactly ONE
+# passed iteration / one role — a bar that falls short — whatever the global counts say.
+for k in ${SHIP_TEST_REVIEW_SHORT_CODES:-}; do
+  [ "$k" = "$code" ] && { SHIP_TEST_REVIEW_ITER=1; SHIP_TEST_REVIEW_ROLES=1; SHIP_TEST_REVIEW_MODELS=1; }
+done
 if [ "${SHIP_TEST_REVIEW_BROKEN:-0}" = "1" ]; then
   echo "internal error: stats store unreadable" >&2
   exit 1
@@ -6116,12 +6142,14 @@ def _ship_bash_functions(*names: str) -> str:
 
 
 def _extract_ticket_with_own_repo(bodies, *, cwd: Path, origin_repo: str, live_pr_url: str | None):
-    """Run `_review_quorum_extract_ticket` on each body inside ONE shell whose checkout origin
-    slug is `origin_repo` and whose `gh pr view --json url` prints `live_pr_url` (None = the
-    call fails). Returns the derived codes in order ("" = nothing derived)."""
+    """Run the candidate extractor on each body inside ONE shell whose checkout origin slug is
+    `origin_repo` and whose `gh pr view --json url` prints `live_pr_url` (None = the call
+    fails). Returns the FIRST derived code per body, in order ("" = nothing derived) — these
+    bodies carry only issue URLs, so the URL arm's at-most-one candidate is the whole list."""
     fns = _ship_bash_functions(
-        "_review_quorum_extract_ticket", "_ship_own_repo_issue_numbers",
-        "_ship_own_repo_slugs", "_ship_normalize_repo_slug",
+        "_review_quorum_extract_ticket_candidates", "_review_quorum_extract_github_issue_ref",
+        "_review_quorum_extract_own_repo_issue_url", "_ship_own_repo_issue_numbers",
+        "_ship_foreign_repo_issue_urls", "_ship_own_repo_slugs", "_ship_normalize_repo_slug",
     )
     gh_stub = "gh() { return 1; }" if live_pr_url is None else f"gh() {{ printf '%s\\n' '{live_pr_url}'; }}"
     script = "\n".join([
@@ -6129,7 +6157,7 @@ def _extract_ticket_with_own_repo(bodies, *, cwd: Path, origin_repo: str, live_p
         f"PR=7; GH_REPO=''; _CWD_ORIGIN_REPO='{origin_repo}'",
         "_SHIP_OWN_REPO_SLUGS=''; _SHIP_OWN_REPO_SLUGS_RESOLVED=0",
         gh_stub, fns,
-        'for b in "$@"; do printf \'%s\\n\' "$(_review_quorum_extract_ticket "$b")"; done',
+        'for b in "$@"; do printf \'%s\\n\' "$(_review_quorum_extract_ticket_candidates "$b" | head -1)"; done',
     ])
     r = _sh("bash", "-c", script, "extract", *bodies, cwd=cwd)
     assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
@@ -8320,3 +8348,210 @@ def test_resolve_eligible_jq_selects_only_addressed_bot_threads():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# --- agent-tools#572 / #571: the quorum lookup tries both spellings, and scans candidates ----
+
+
+def _quorum_audit(tmp_path: Path) -> list[dict]:
+    f = tmp_path / "audit.jsonl"
+    return [json.loads(l) for l in f.read_text(encoding="utf-8").splitlines()] if f.exists() else []
+
+
+def test_review_quorum_finds_a_record_keyed_gh_when_the_body_says_refs_hash(tmp_path):
+    """agent-tools#572: the PR body says `Refs #565` (derived `#565`) but every agent recorded
+    the reviews as GH-565 (the spelling that needs no quoting). Both spellings are looked up;
+    the bar met under GH-565 authorizes, and the audit line names THAT spelling."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    code_log = tmp_path / "codes.log"
+    r = _run_ship_quorum(main, gh, rv, env_extra={
+        "SHIP_TEST_PR_BODY": "Refs #565", "SHIP_TEST_REVIEW_KNOWN_CODES": "GH-565",
+        "SHIP_TEST_REVIEW_CODE_LOG": str(code_log), "SHIP_AUDIT_FILE": str(tmp_path / "audit.jsonl"),
+    })
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "GH-565" in r.stdout, r.stdout
+    assert code_log.read_text().split() == ["#565", "GH-565"]
+    (line,) = [l for l in _quorum_audit(tmp_path) if l.get("decision") == "authorized" and "gate" not in l]
+    assert line["task_code"] == "GH-565", line
+
+
+def test_review_quorum_finds_a_record_keyed_hash_when_the_branch_says_gh(tmp_path):
+    """The reverse: branch `GH-565-fix` derives GH-565; the record lives under `#565`."""
+    main, _wt = _make_repo_with_branch(tmp_path, "GH-565-fix")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    code_log = tmp_path / "codes.log"
+    r = _run_ship_quorum(main, gh, rv, branch="GH-565-fix", env_extra={
+        "SHIP_TEST_REVIEW_KNOWN_CODES": "#565", "SHIP_TEST_REVIEW_CODE_LOG": str(code_log),
+        "SHIP_AUDIT_FILE": str(tmp_path / "audit.jsonl"),
+    })
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "#565" in r.stdout, r.stdout
+    assert code_log.read_text().split() == ["GH-565", "#565"]
+    (line,) = [l for l in _quorum_audit(tmp_path) if l.get("decision") == "authorized" and "gate" not in l]
+    assert line["task_code"] == "#565", line
+
+
+def test_review_quorum_authorizes_under_the_twin_when_the_primary_record_falls_short(tmp_path):
+    """`#565` HAS a record (one iteration — say, one agent quoted it) and GH-565 carries the
+    real three: the bar is met under the twin, so authorize under GH-565 — a short primary is
+    not the last word while its other spelling is unread."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    code_log = tmp_path / "codes.log"
+    r = _run_ship_quorum(main, gh, rv, env_extra={
+        "SHIP_TEST_PR_BODY": "Refs #565", "SHIP_TEST_REVIEW_SHORT_CODES": "#565",
+        "SHIP_TEST_REVIEW_CODE_LOG": str(code_log), "SHIP_AUDIT_FILE": str(tmp_path / "audit.jsonl"),
+    })
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "for GH-565" in r.stdout, r.stdout
+    assert code_log.read_text().split() == ["#565", "GH-565"]
+    (line,) = [l for l in _quorum_audit(tmp_path) if l.get("decision") == "authorized" and "gate" not in l]
+    assert line["task_code"] == "GH-565" and line["iterations"] == 3, line
+
+
+def test_review_quorum_short_primary_is_the_verdict_when_the_twin_cannot_be_queried(tmp_path):
+    """`#565` has a real 1/3 record; the GH-565 lookup returns nothing at all. The short record
+    already in hand is the verdict — refuse on it with ITS counts, not "could not query GH-565"
+    and not the twin's empty numbers (Opus review, round 3: the anchor's payload is re-read)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    code_log = tmp_path / "codes.log"
+    r = _run_ship_quorum(main, gh, rv, env_extra={
+        "SHIP_TEST_PR_BODY": "Refs #565", "SHIP_TEST_REVIEW_SHORT_CODES": "#565",
+        "SHIP_TEST_REVIEW_UNQUERYABLE_CODES": "GH-565", "SHIP_TEST_REVIEW_CODE_LOG": str(code_log),
+    })
+    assert r.returncode != 0, f"{r.stdout}\n{r.stderr}"
+    assert "bar NOT met for #565 — 1/3 iterations, 1/3 distinct roles" in r.stderr, r.stderr
+    assert "could not query" not in r.stderr
+    log = code_log.read_text().split()   # the twin is retried on every query tier (3), as designed
+    assert log[0] == "#565" and set(log[1:]) == {"GH-565"}, log
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_no_record_claim_needs_the_total_iterations_key(tmp_path):
+    """A payload WITHOUT `total_iterations` (an old build, a shim) cannot claim "no record"
+    even with the error line: it is a short record — refuse, never scan on to #77."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    code_log = tmp_path / "codes.log"
+    r = _run_ship_quorum(main, gh, rv, env_extra={
+        "SHIP_TEST_PR_BODY": "HYP-100 follow-up. Refs #77", "SHIP_TEST_REVIEW_KNOWN_CODES": "#77",
+        "SHIP_TEST_REVIEW_NO_RECORD_OMIT_TOTAL": "1", "SHIP_TEST_REVIEW_CODE_LOG": str(code_log),
+    })
+    assert r.returncode != 0, f"{r.stdout}\n{r.stderr}"
+    assert "bar NOT met for HYP-100 — 0/3 iterations" in r.stderr, r.stderr
+    assert code_log.read_text().split() == ["HYP-100"], code_log.read_text()
+
+
+def test_review_quorum_zero_counts_without_the_no_record_error_are_a_short_record(tmp_path):
+    """Only review-cli's own no-record answer (zero counts AND the error line) lets the scan
+    move on. A 0/0 payload WITHOUT it (an old build lacking `total_iterations`, a shim) is a
+    record that falls short: refuse on THAT candidate, never borrow the later #77's record."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    code_log = tmp_path / "codes.log"
+    r = _run_ship_quorum(main, gh, rv, env_extra={
+        "SHIP_TEST_PR_BODY": "HYP-100 follow-up. Refs #77", "SHIP_TEST_REVIEW_ITER": "0",
+        "SHIP_TEST_REVIEW_ROLES": "0", "SHIP_TEST_REVIEW_MODELS": "0",
+        "SHIP_TEST_REVIEW_CODE_LOG": str(code_log),
+    })
+    assert r.returncode != 0, f"{r.stdout}\n{r.stderr}"
+    assert "bar NOT met for HYP-100 — 0/3 iterations" in r.stderr, r.stderr
+    assert code_log.read_text().split() == ["HYP-100"], code_log.read_text()
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_explicit_env_code_is_looked_up_under_both_spellings_too(tmp_path):
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, rv, env_extra={
+        "REVIEW_TASK_CODE": "#565", "SHIP_TEST_REVIEW_KNOWN_CODES": "GH-565",
+    })
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "GH-565" in r.stdout, r.stdout
+
+
+def test_review_quorum_refusal_names_both_spellings_when_neither_meets_the_bar(tmp_path):
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, rv, env_extra={
+        "SHIP_TEST_PR_BODY": "Refs #565", "SHIP_TEST_REVIEW_ITER": "1", "SHIP_TEST_REVIEW_ROLES": "1",
+    })
+    assert r.returncode != 0, f"{r.stdout}\n{r.stderr}"
+    assert "bar NOT met for #565" in r.stderr and "1/3 iterations" in r.stderr, r.stderr
+    assert "also tried GH-565" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_scans_past_a_candidate_with_no_record_in_the_same_body(tmp_path):
+    """agent-tools#571 (criterion 3): `UTF-8` (a well-formed but meaningless PREFIX-<n> token)
+    precedes the real `Refs #77` in the body. review-cli has NO record for UTF-8 (or its
+    absence of a twin), so the scan continues to #77 — the same continuation the acceptance
+    gate has, keyed on "no recorded iterations" since a PR-number key or a descriptive code
+    IS a legitimate review-record key here (12 authorized ships in the audit log)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    code_log = tmp_path / "codes.log"
+    r = _run_ship_quorum(main, gh, rv, env_extra={
+        "SHIP_TEST_PR_BODY": "Fix UTF-8 decoding. Refs #77", "SHIP_TEST_REVIEW_KNOWN_CODES": "#77",
+        "SHIP_TEST_REVIEW_CODE_LOG": str(code_log),
+    })
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "#77" in r.stdout, r.stdout
+    # The twin (GH-77) is never queried once #77 itself meets the bar.
+    assert code_log.read_text().split() == ["UTF-8", "#77"], code_log.read_text()
+    assert "no recorded review iterations for UTF-8" in r.stderr and "trying the next candidate" in r.stderr, r.stderr
+
+
+def test_review_quorum_does_not_scan_past_a_candidate_whose_record_falls_short(tmp_path):
+    """A candidate WITH a record is THE task: a short bar refuses — the scan never borrows a
+    later candidate's (possibly already-shipped) record."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    code_log = tmp_path / "codes.log"
+    r = _run_ship_quorum(main, gh, rv, env_extra={
+        "SHIP_TEST_PR_BODY": "HYP-100 follow-up. Refs #77", "SHIP_TEST_REVIEW_ITER": "1",
+        "SHIP_TEST_REVIEW_CODE_LOG": str(code_log),
+    })
+    assert r.returncode != 0, f"{r.stdout}\n{r.stderr}"
+    assert "bar NOT met for HYP-100" in r.stderr, r.stderr
+    assert code_log.read_text().split() == ["HYP-100"], code_log.read_text()
+
+
+def test_review_quorum_branch_candidates_are_exhausted_before_the_body_is_read(tmp_path):
+    """Precedence: the body is consulted only when NO branch candidate has a record."""
+    main, _wt = _make_repo_with_branch(tmp_path, "UTF-8-fix")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    code_log = tmp_path / "codes.log"
+    r = _run_ship_quorum(main, gh, rv, branch="UTF-8-fix", env_extra={
+        "SHIP_TEST_PR_BODY": "Refs #77", "SHIP_TEST_REVIEW_KNOWN_CODES": "#77",
+        "SHIP_TEST_REVIEW_CODE_LOG": str(code_log),
+    })
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "#77" in r.stdout, r.stdout
+    assert code_log.read_text().split()[0] == "UTF-8", code_log.read_text()
+
+
+def test_review_quorum_refuses_naming_every_candidate_when_none_has_a_record(tmp_path):
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, rv, env_extra={
+        "SHIP_TEST_PR_BODY": "Fix UTF-8 decoding. Refs #77", "SHIP_TEST_REVIEW_KNOWN_CODES": "NOPE-1",
+    })
+    assert r.returncode != 0, f"{r.stdout}\n{r.stderr}"
+    assert "bar NOT met for UTF-8" in r.stderr and "no recorded review iterations" in r.stderr, r.stderr
+    assert "#77" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
