@@ -2766,6 +2766,16 @@ _ship_looks_like_a_ticket_id() {  # $1 = candidate code; true (exit 0) iff it ha
 # True when the candidate names THIS pull request rather than a ticket. Accepts the same three
 # spellings the code can arrive in — `#<n>`, a bare `<n>`, and the `GH-<n>` convention
 # `_ship_normalize_gh_code_for_task_cli` rewrites — so none of them can gate a PR against itself.
+# Rejecting the PR's own number can never discard a legitimate ticket: GitHub issues and pull
+# requests share ONE number sequence per repo, and `#<n>`/`<n>` route to this repo's issues.
+#
+# $PR is ship.sh's REQUIRED first positional argument, validated at startup long before any
+# derivation runs, so the `[ -n "$PR" ]` guard below is a belt-and-braces assertion of that
+# invariant rather than a reachable branch. It is written to fail OPEN (an empty $PR means "not
+# this PR", so the candidate survives) deliberately: an unset $PR would mean ship.sh is being
+# driven in a way this function cannot reason about at all, and silently discarding every
+# numeric candidate there would turn a broken invocation into a gate that quietly never runs —
+# the very failure mode agent-tools#565 is fixing.
 _ship_code_names_this_pr() {  # $1 = candidate code; true (exit 0) iff it is this PR's number
   local n="$1"
   case "$n" in

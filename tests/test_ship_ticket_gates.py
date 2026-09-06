@@ -831,6 +831,20 @@ def test_acceptance_gate_skips_when_only_the_pull_request_number_is_derivable(re
     assert _audit(tmp_path, "acceptance")[0]["detail"] == "no task code"
 
 
+def test_acceptance_gate_rejects_the_bare_pull_request_number_as_a_ticket_code(repo, tmp_path):
+    """The self-PR check accepts three spellings — `#<n>`, `GH-<n>` and a BARE `<n>`. The bare
+    one is reached by falling through the `case` with no pattern matching, so it is the arm a
+    reordering refactor could break silently; pin it alongside the other two."""
+    r = _run(repo, tmp_path, branch="feat", env={
+        "TASK_CODE": "1",
+        "SHIP_TEST_PR_TITLE": "feat: the thing",
+        "SHIP_TEST_PR_BODY": _FELL_THROUGH_BODY,
+        "SHIP_TEST_TASK_GATE_JSON": _NOT_ACCEPTED, "SHIP_TEST_TASK_GATE_EXIT": "1",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert _task_calls(tmp_path) == ["gate HYP-931 --json"], _task_calls(tmp_path)
+
+
 def test_acceptance_gate_still_accepts_a_bare_issue_number(repo, tmp_path):
     """A bare `382` IS a task-cli id (GitHub issue) — the real shape must not over-reject it
     (the audit shows ship gating on exactly this form)."""
