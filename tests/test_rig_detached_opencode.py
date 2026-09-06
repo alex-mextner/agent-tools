@@ -19,6 +19,7 @@ Run from the repo root::
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -232,6 +233,42 @@ def test_relative_brief_with_different_workdir_reaches_the_child(tmp_path, monke
     recorded = marker.read_text(encoding="utf-8")
     assert f"PWD={workdir}" in recorded
     assert "relative-brief-sentinel must reach the child" in recorded
+
+
+def test_log_dir_is_private_and_symlink_log_is_refused(tmp_path):
+    """Review finding (GH-497 round 1): the log holds the brief + the child's transcript.
+    The launcher must create a 0700 log dir it owns, write a 0600 log, and refuse a
+    pre-planted symlink at the log path instead of following it."""
+    name = "oc476-test-private-log"
+    stub_dir = tmp_path / "bin"
+    marker = tmp_path / "stub-env.txt"
+    _stub_opencode(stub_dir, marker)
+    brief = tmp_path / "brief.md"
+    brief.write_text("private brief", encoding="utf-8")
+    log_dir = tmp_path / "agent-logs"
+
+    proc = _run_launcher(
+        name, str(brief), str(tmp_path), path_override=stub_dir,
+        extra_env={"RIG_AGENT_LOG_DIR": str(log_dir)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert stat.S_IMODE(log_dir.stat().st_mode) == 0o700
+    log = log_dir / f"{name}.log"
+    _poll_for(log)
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600
+
+    # a symlink planted at the log path of ANOTHER agent name must be refused, not followed
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not clobber", encoding="utf-8")
+    planted = log_dir / "oc476-test-planted.log"
+    planted.symlink_to(victim)
+    proc = _run_launcher(
+        "oc476-test-planted", str(brief), str(tmp_path), path_override=stub_dir,
+        extra_env={"RIG_AGENT_LOG_DIR": str(log_dir)},
+    )
+    assert proc.returncode == 2
+    assert "symlink" in proc.stderr
+    assert victim.read_text(encoding="utf-8") == "do not clobber"
 
 
 def test_happy_path_defaults_workdir_to_cwd(tmp_path, monkeypatch):

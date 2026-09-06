@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+
+import pytest
 import sys
 from pathlib import Path
 from textwrap import dedent
@@ -465,6 +467,14 @@ def test_to_v1_event_drops_forged_agent_identity_from_tool_args(monkeypatch):
     assert "agentId" not in v1["args"]
     assert "agentType" not in v1["args"]
     assert "agent" not in v1["args"]
+
+
+@pytest.fixture(autouse=True)
+def _no_host_agent_markers(monkeypatch):
+    """Module-wide: a rig-dispatched test run (this process) may carry RIG_AGENT_ID /
+    RIG_DETACHED_AGENT; strip them for every test so in-process to_v1_event asserts never
+    see an injected agent_id. Subprocess tests pass markers explicitly via `env=`."""
+    _clear_agent_env_markers(monkeypatch)
 
 
 def _clear_agent_env_markers(monkeypatch) -> None:
@@ -1112,7 +1122,13 @@ def test_opencode_bridge_env_marker_makes_nontrivial_task_subagent_exempt(tmp_pa
     """End-to-end pre-agent pipeline: with the launcher-set env marker present, the
     dispatcher injects args.agent_id and background-subagent-gate classifies the
     session as a dispatched subagent — the SAME non-trivial foreground task payload
-    that blocks without the marker passes with it (subagent-exempt path)."""
+    that BLOCKS without the marker passes with it (subagent-exempt path).
+
+    The payload uses a custom subagent_type on purpose: `general`/`explore` are
+    tolerated by the gate on their own (agent-tools#495), so a `general` payload would
+    pass with or without the marker and prove nothing about the env-derived exemption
+    (review finding, GH-497 round 1). The control run below pins that this payload
+    really does block without the marker."""
     hooks_dir = tmp_path / "hooks"
     _install_descriptor(
         hooks_dir,
@@ -1127,7 +1143,7 @@ def test_opencode_bridge_env_marker_makes_nontrivial_task_subagent_exempt(tmp_pa
         "input": {"tool": "task", "sessionID": "ses_1"},
         "output": {
             "args": {
-                "subagent_type": "general",
+                "subagent_type": "custom-worker",
                 "description": "implement the missing bridge and tests",
                 "prompt": (
                     "Inspect the provisioning code, implement the bridge, run tests, and report.\n"
@@ -1136,6 +1152,10 @@ def test_opencode_bridge_env_marker_makes_nontrivial_task_subagent_exempt(tmp_pa
             }
         },
     }
+
+    control = _run_dispatch("tool.execute.before", event, hooks_dir=hooks_dir)
+    assert control.returncode == 0, control.stderr
+    assert json.loads(control.stdout)["decision"] == "block", control.stdout
 
     proc = _run_dispatch(
         "tool.execute.before",

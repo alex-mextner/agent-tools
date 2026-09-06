@@ -129,15 +129,28 @@ These are the *logical* points; map them to your harness's actual tool-use event
 > landed. opencode `stop` is **not** mapped: documented session
 > events such as `session.idle` are notifications, not a pre-stop block contract.
 
+> **omp (oh-my-pi):** omp also needs a carrier bridge. `lib/omp_hook_bridge` ships a TS
+> extension (`pi.on(...)`) plus Python dispatcher: rig symlinks the extension into omp's
+> extension directory (default `~/.omp/agent/extensions`), and it calls the dispatcher for
+> `tool_call` (`bash` -> `pre-bash`, `edit`/`write`/`apply_patch`/`notebook` -> `pre-write`,
+> `task` -> `pre-agent`) and `tool_result` file edits (`post-write`). It reads descriptors
+> from `~/.omp/agent/hooks`. Unlike opencode's plugin, the extension does **not** throw to
+> fail closed on a bridge-infrastructure failure at the `tool_call` (pre-tool) point — it
+> always fails OPEN there, because a thrown error would block every tool call in Alex's
+> interactive omp session; only an explicit block decision from a loaded descriptor becomes
+> a real block. post-write exit 10 is logged as feedback, same as the other bridges, because
+> the write already landed. omp `stop` is **not** mapped: its documented session-lifecycle
+> events (`session_shutdown`, `agent_end`, ...) carry no pre-stop block contract either.
+
 | point          | fires when…                                  | hooks                                   |
 | -------------- | -------------------------------------------- | --------------------------------------- |
-| `pre-agent` **(live in Claude Code and opencode when rig provisions their bridges; NOT mapped in Codex yet)** | before a subagent dispatch (Agent/Task/opencode task tool) | background-subagent-gate                 |
+| `pre-agent` **(live in Claude Code and opencode when rig provisions their bridges; mapped by the omp bridge too; NOT mapped in Codex yet)** | before a subagent dispatch (Agent/Task/opencode or omp task tool) | background-subagent-gate                 |
 | `pre-bash`     | before a shell command runs                  | block-devserver-primary, block-no-verify, block-raw-pr-merge, block-reset-hard, pin-primary-worktree, pkill-guard, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash, orchestrator-stays-thin, no-long-inline-process, subagent-no-bg-longproc, no-shell-file-edit, skills-read-gate, visual-proof-gate, decision-request-format, heavy-op-memory-gate |
 | `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env, orchestrator-stays-thin, worktree-only-writes |
 | `pre-skill` **(live in Claude Code when rig provisions the bridge; NOT mapped in Codex/opencode yet)** | before a Skill-tool invocation | skills-marker-writer |
 | `pre-monitor` **(live in Claude Code when rig provisions the bridge; Codex/opencode have no Monitor-equivalent tool)** | before a Monitor-tool call | subagent-no-monitor |
 | `post-write`   | after a file write/edit has landed on disk   | format-on-write, lint-on-write          |
-| `stop`         | when the agent is about to end its turn      | stop-completion-selfcheck               |
+| `stop`         | when the agent is about to end its turn      | chat-dictionary-gate (priority 10), model-error-fallback (priority 20, advisory-only), stop-completion-selfcheck (priority 50) |
 
 ### `pre-agent` — gate a subagent dispatch
 

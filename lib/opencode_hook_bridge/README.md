@@ -83,6 +83,14 @@ cooperative-orchestrator threat model (`on_error: open` discipline gates, not se
 boundaries). A bare/whitespace `RIG_AGENT_ID` is not a marker; `RIG_DETACHED_AGENT=1`
 alone yields the anonymous id `detached`.
 
+Known limitation, by the same threat model: the markers are honored for the WHOLE
+session of any opencode process that inherits them. An `export RIG_AGENT_ID=...` left in
+an interactive shell (or persisted into a shell rc file) makes the next interactive
+opencode session subagent-exempt too. That is a self-inflicted misconfiguration, not a
+bypass an adversarial model can reach from inside a governed session (it cannot edit its
+own environment; an rc-file write is itself a governed `pre-write`) — never export the
+markers by hand, let the launcher set them for the child only.
+
 Every translated v1 event also carries a top-level `harness: "opencode"` — a hardcoded
 module constant (`dispatch.HARNESS`), never derived from the opencode event, so it can't be
 forged via tool args the way the identity fields above must be actively stripped. A hook

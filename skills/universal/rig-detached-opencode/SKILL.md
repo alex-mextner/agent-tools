@@ -57,6 +57,10 @@ gate (`orchestrator-stays-thin`, `background-subagent-gate`, `no-long-inline-pro
 `subagent-no-bg-longproc`) classifies the child session's tool calls as a dispatched
 subagent's.
 
+Never `export` these markers by hand in an interactive shell (or an rc file): every
+opencode process that inherits them is treated as a dispatched subagent for its whole
+session. The launcher sets them for the child process only.
+
 Trust reasoning: a running orchestrator cannot retroactively mutate its own process
 environment — it can only set these vars for a CHILD process, which is exactly the
 sanctioned act of dispatching a subagent. This matches the module family's

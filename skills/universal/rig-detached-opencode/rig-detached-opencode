@@ -29,7 +29,8 @@
 #   - <brief-file> is a UTF-8 markdown brief: the mission, acceptance criteria,
 #     and the HANDOFF FILE PATH the child must write before exiting (the
 #     orchestrator polls that file to collect the result).
-#   - stdout/stderr of the child append to /tmp/agent-logs/<name>.log.
+#   - stdout/stderr of the child append to $RIG_AGENT_LOG_DIR/<name>.log
+#     (default /tmp/agent-logs; dir 0700 + owner-checked, log 0600, symlink refused).
 #   - The launcher RETURNS immediately (child is nohup-detached): dispatching
 #     must not block the calling shell — that is the whole point of detaching.
 #
@@ -64,9 +65,22 @@ if ! command -v opencode >/dev/null 2>&1; then
     exit 127
 fi
 
-log_dir="/tmp/agent-logs"
+# Log hygiene (review finding, GH-497 round 1): the log carries the whole brief plus the
+# child's transcript, so it must not be world-readable, and on a shared host another
+# account must not be able to pre-plant the directory or a symlink at the log path.
+umask 077
+log_dir="${RIG_AGENT_LOG_DIR:-/tmp/agent-logs}"
 mkdir -p "$log_dir"
+if [ ! -O "$log_dir" ]; then
+    echo "rig-detached-opencode: log dir '$log_dir' is not owned by you — refusing (set RIG_AGENT_LOG_DIR)" >&2
+    exit 2
+fi
+chmod 700 "$log_dir"
 log="$log_dir/$name.log"
+if [ -L "$log" ] || { [ -e "$log" ] && [ ! -f "$log" ]; }; then
+    echo "rig-detached-opencode: log path '$log' is a symlink or not a regular file — refusing" >&2
+    exit 2
+fi
 
 # Read the brief BEFORE changing directory: a RELATIVE <brief-file> is validated
 # against the caller's cwd above, and `cd "$workdir"` would make the same path
