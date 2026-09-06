@@ -121,8 +121,46 @@ def hooks_dir() -> Path:
     return Path(os.path.expanduser("~/.codex/hooks"))
 
 
+def _inbox_text(hook_event_name: str, codex_event: dict) -> str:
+    """Pending tg-ctl inbox messages for this Codex session, consumed and rendered as
+    block-reason text (agent-tools#526); "" when nothing / on any failure (fail-open).
+
+    Codex has no ``--name``, so the key is ALWAYS the cwd hash — computed directly with
+    ``agent_key(None, cwd)``, never via ``agent_key_for_process``: a Codex started from a
+    Claude-owned shell inherits ``CLAUDE_PID`` and would otherwise key on the Claude
+    session's name (review finding).
+    """
+    if hook_event_name != "Stop":
+        return ""
+    try:
+        from agenttools_tg_inbox import agent_key, consume_pending, format_block_reason
+    except Exception as exc:  # noqa: BLE001 - optional lib; never block a stop over it
+        _warn(f"tg inbox reader unavailable, skipping inbox check: {exc}")
+        return ""
+    try:
+        cwd = codex_event.get("cwd") or os.getcwd()
+        key = agent_key(None, cwd)
+        entries = consume_pending(key, session_id=str(_event_id(codex_event) or ""))
+    except Exception as exc:  # noqa: BLE001 - fail-open
+        _warn(f"tg inbox check failed, skipping (fail-open): {exc}")
+        return ""
+    if not entries:
+        return ""
+    _warn(f"delivering {len(entries)} queued Telegram message(s) from the tg-ctl inbox ({key})")
+    return format_block_reason(entries)
+
+
 def dispatch(hook_event_name: str, codex_event: dict) -> dict | None:
-    """Run the applicable v1 hooks for this Codex event."""
+    """Run the applicable v1 hooks for this Codex event; on Stop, pending tg-ctl inbox
+    messages ride in the same block as a blocking hook's reason (the hooks always run)."""
+    inbox_text = _inbox_text(hook_event_name, codex_event)
+    hook_reason = _first_hook_block(hook_event_name, codex_event)
+    parts = [p for p in (inbox_text, hook_reason) if p]
+    return codex_block_output("\n\n".join(parts)) if parts else None
+
+
+def _first_hook_block(hook_event_name: str, codex_event: dict) -> str | None:
+    """The reason of the first blocking v1 hook for this event, or None."""
     tool_name = codex_event.get("tool_name")
     point = point_for_event(hook_event_name, tool_name)
     if point is None:
@@ -139,7 +177,7 @@ def dispatch(hook_event_name: str, codex_event: dict) -> dict | None:
         for v1_event in v1_events:
             outcome, reason = run_hook(spec, v1_event, warn=_warn)
             if outcome == "block":
-                return codex_block_output(reason)
+                return reason
     return None
 
 

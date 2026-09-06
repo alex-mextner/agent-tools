@@ -72,6 +72,28 @@ installed `rtk-rewrite.sh` PreToolUse hook's style.
   `on_error`: `closed` → **block** ("I couldn't check" means "don't do it", for security
   gates); `open` (default) → allow (advisory hooks stay out of the way).
 
+## The tg-ctl inbox on `Stop` (agent-tools#526 / tg-cli#306)
+
+Alongside the `stop` descriptors, the `Stop` dispatch checks the **tg-ctl Stop-hook
+inbox** — the tmux-free channel by which the Telegram bridge reaches an agent that runs
+OUTSIDE tmux (no pane → no `send-keys`). If `<tg-cli config dir>/inbox/<key>/pending.jsonl`
+holds entries for THIS agent, the dispatcher archives them and answers
+`{"decision":"block","reason":"<the queued messages>"}`, so CC feeds the text
+(`[TG from <name> tg#<id>] …`, the same wrap a tmux inject uses) to the agent as its next
+instruction. The daemon then reacts on the Telegram message.
+
+- `<key>` is the agent's `--name` (sanitized), else `cwd-<sha256(cwd)[:16]>` — the exact
+  algorithm, file layout and test vectors live in
+  [`lib/agenttools_tg_inbox/README.md`](../agenttools_tg_inbox/README.md) and are mirrored
+  byte-for-byte in tg-cli (`features/tg-ctl/unreachable.ts`). The agent process is found
+  via `CLAUDE_PID` (CC exports it to hooks), else the parent chain.
+- **Never blocks on an empty, missing or malformed inbox** (fail-open, one stderr line);
+  at-most-once (published as a complete `delivered-…jsonl` batch before the block is
+  emitted). The `stop` descriptors still run on the same `Stop`; a blocking one's reason
+  follows the messages in the same block — neither side is starved or deferred.
+- **Limit:** an idle agent gets the message only at its next turn end. The same check runs
+  in `codex_hook_bridge` (cwd key — Codex has no `--name`); opencode has no Stop point.
+
 ## Installation (via rig)
 
 `rig apply` registers the dispatcher in the harness `settings.json` (harness-keyed) when a
@@ -151,7 +173,8 @@ It also covers the pre-write normalization (a secret in a `MultiEdit`'s `edits[]
 is flattened into `args.content` so `block-secrets-write` catches it), fail-open (garbage
 stdin), fail-closed (a crashing security gate, a bad `timeout_ms` on a closed gate, a bad
 `priority` not crashing the dispatch), the Stop `decision:block` path, and first-block-wins
-ordering.
+ordering. `tests/test_tg_inbox.py` covers the tg-ctl inbox delivery on `Stop` (pending →
+block + archive, idempotent; empty/malformed never block) through both bridges.
 
 ```
 $ uv run --with pytest python -m pytest tests/test_cc_hook_bridge.py -q

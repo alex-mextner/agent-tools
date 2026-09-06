@@ -1,0 +1,266 @@
+"""The inbox key derivation + the consuming reader (see the package docstring)."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import subprocess  # noqa: S404 - reading the agent's argv via `ps` is the point
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
+_NAME_MAX = 64
+PENDING_FILE = "pending.jsonl"
+# One COMPLETE file per consumption (temp + rename), never a shared append target: the
+# daemon claims/unlinks what it reads, and an append into a file that was just unlinked
+# would land on a dead inode (review finding). `delivered-<pid>-<ns>.jsonl`.
+DELIVERED_PREFIX = "delivered-"
+DIR_MODE = 0o700
+FILE_MODE = 0o600
+# How many parent hops to climb looking for the agent process (hook -> sh -> agent).
+_ANCESTRY_HOPS = 6
+
+
+def _warn(msg: str) -> None:
+    sys.stderr.write(f"tg-inbox: {msg}\n")
+
+
+# --- key derivation (the shared contract) ---
+
+
+def sanitize_agent_name(name: str) -> str | None:
+    """Filesystem-safe key segment for a ``--name`` value; ``None`` when nothing is left.
+
+    ``.`` and ``-`` are allowed characters, so a value made only of dots (``.``, ``..``)
+    would otherwise survive and resolve ``inbox/<key>`` to the inbox root or its PARENT —
+    rejected here, the single gate between a user-typed value and a path (review finding).
+    """
+    safe = _SAFE_NAME.sub("_", name)[:_NAME_MAX]
+    if not safe or set(safe) == {"."}:
+        return None
+    return safe
+
+
+def _normalize_cwd(cwd: str) -> str:
+    stripped = cwd.rstrip("/")
+    return stripped or "/"
+
+
+def agent_key(name: str | None, cwd: str) -> str:
+    """THE shared key: the sanitized ``--name``, else ``cwd-<sha256(cwd)[:16]>``."""
+    safe = sanitize_agent_name(name) if name else None
+    if safe:
+        return safe
+    digest = hashlib.sha256(_normalize_cwd(cwd).encode("utf-8")).hexdigest()
+    return f"cwd-{digest[:16]}"
+
+
+def parse_agent_name(command: str) -> str | None:
+    """The ``--name <v>`` / ``--name=<v>`` value in an agent's argv line, as typed.
+
+    ``ps`` flattens argv into one space-joined string, so a multi-word value
+    (``--name "my agent"``) yields only its FIRST word (``my``). tg-cli's daemon reads the
+    same flattened ``ps`` line and splits the same way, so both sides agree; a name with
+    whitespace is simply not supported as a distinct key (documented in the README).
+    """
+    tokens = command.split()
+    for i, tok in enumerate(tokens):
+        if tok == "--name":
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+            return nxt if nxt and not nxt.startswith("-") else None
+        if tok.startswith("--name="):
+            value = tok[len("--name="):]
+            return value or None
+    return None
+
+
+# --- locating the agent process ---
+
+
+def _ps_line(pid: int) -> tuple[int, str] | None:
+    """``(ppid, args)`` of one process via ``ps``, or ``None`` when it is gone/unreadable."""
+    try:
+        out = subprocess.run(  # noqa: S603 - fixed argv, pid is an int
+            ["ps", "-o", "ppid=,args=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    line = out.strip()
+    if not line:
+        return None
+    parts = line.split(None, 1)
+    try:
+        ppid = int(parts[0])
+    except ValueError:
+        return None
+    return ppid, (parts[1] if len(parts) > 1 else "")
+
+
+def _looks_like_agent(args: str) -> bool:
+    """An interactive agent binary: ``claude``/``codex``/``opencode`` as argv0, OR the
+    Claude Code launcher shape ``node …/.claude/local/claude …`` where argv0 is ``node``
+    and the real entry point is a path ending in ``/claude`` — the same wrapper shape
+    tg-cli's ``matchAgentCommand`` accepts."""
+    argv0 = args.split(None, 1)[0] if args else ""
+    base = os.path.basename(argv0)
+    return base in {"claude", "codex", "opencode"} or "/claude " in f"{args} "
+
+
+def agent_argv(start_pid: int | None = None) -> str:
+    """The argv line of the agent process this hook runs under, or ``""``.
+
+    Claude Code exports ``CLAUDE_PID`` to its children (hooks included) — that is the
+    authoritative pid. Without it we climb the parent chain from ``start_pid`` (default:
+    our own parent) a few hops (the hook usually runs as ``sh -c`` under the agent) and
+    take the first process whose argv looks like an agent binary.
+    """
+    env_pid = os.environ.get("CLAUDE_PID", "")
+    if env_pid.isdigit():
+        found = _ps_line(int(env_pid))
+        if found is not None:
+            return found[1]
+    pid = start_pid if start_pid is not None else os.getppid()
+    seen: set[int] = set()
+    for _ in range(_ANCESTRY_HOPS):
+        if pid <= 1 or pid in seen:
+            break
+        seen.add(pid)
+        found = _ps_line(pid)
+        if found is None:
+            break
+        ppid, args = found
+        if _looks_like_agent(args):
+            return args
+        pid = ppid
+    return ""
+
+
+def agent_key_for_process(cwd: str, *, start_pid: int | None = None) -> str:
+    """The inbox key for the CLAUDE CODE agent this hook runs under: its ``--name``, else
+    the cwd hash. Codex/opencode have no ``--name`` — their bridges call
+    ``agent_key(None, cwd)`` directly and must NOT come here: an inherited ``CLAUDE_PID``
+    (a Codex started from a Claude-owned shell) would key them on the Claude session."""
+    return agent_key(parse_agent_name(agent_argv(start_pid)), cwd)
+
+
+# --- the inbox on disk ---
+
+
+def inbox_root() -> Path:
+    override = os.environ.get("TG_CTL_CONFIG_DIR")
+    base = Path(override) if override else Path(os.path.expanduser("~/.config/tg-cli"))
+    return base / "inbox"
+
+
+def inbox_dir(key: str) -> Path:
+    return inbox_root() / key
+
+
+def _parse_lines(text: str, *, stamp: str, session_id: str) -> tuple[list[dict], list[str], int]:
+    """One pass over the JSONL: ``(entries to deliver, archive lines, malformed count)``.
+
+    A valid entry is an object with a string ``wrapped``; it is archived stamped with
+    ``delivered_ts``/``session_id``. Anything else is archived flagged ``malformed`` (never
+    silently dropped) and not delivered.
+    """
+    entries: list[dict] = []
+    archived: list[str] = []
+    malformed = 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict) and isinstance(obj.get("wrapped"), str):
+            entries.append(obj)
+            obj = dict(obj, delivered_ts=stamp, session_id=session_id)
+        else:
+            malformed += 1
+            obj = {"malformed": True, "raw": line, "delivered_ts": stamp, "session_id": session_id}
+        archived.append(json.dumps(obj, ensure_ascii=False))
+    return entries, archived, malformed
+
+
+def _write_private(path: Path, text: str) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, FILE_MODE)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def _unique_name(prefix: str) -> str:
+    return f"{prefix}{os.getpid()}-{time.time_ns()}-{os.urandom(4).hex()}.jsonl"
+
+
+def consume_pending(key: str, *, session_id: str = "") -> list[dict]:
+    """Claim + archive the agent's pending inbox; return the entries to hand over.
+
+    CLAIM by rename (atomic): the daemon's appends after that land in a fresh
+    ``pending.jsonl`` and are picked up at the next Stop. The claim name is unique
+    (pid + nanoseconds + random), so a stale claim left by an earlier failure can never
+    be overwritten by a later rename (review finding). The claimed records are published
+    as ONE complete ``delivered-<pid>-<ns>-<rnd>.jsonl`` (written to a temp file, then
+    renamed — the daemon only ever sees whole batches) and the claim is removed — all
+    BEFORE the caller emits the block, so a message is never delivered twice.
+    Any problem → ``[]`` with a stderr line (fail-open: the stop proceeds normally).
+    """
+    directory = inbox_dir(key)
+    pending = directory / PENDING_FILE
+    if not pending.exists():
+        return []
+    claim = directory / _unique_name("claim-")
+    try:
+        os.rename(pending, claim)
+    except OSError as exc:
+        _warn(f"could not claim {pending}: {exc}")
+        return []
+    try:
+        text = claim.read_text(encoding="utf-8")
+    except OSError as exc:
+        _warn(f"could not read {claim}: {exc}")
+        return []
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    entries, archived, malformed = _parse_lines(text, stamp=stamp, session_id=session_id)
+    if malformed:
+        _warn(f"{malformed} malformed line(s) in {pending} — archived, not delivered")
+    if not archived:
+        try:
+            claim.unlink()
+        except OSError:
+            pass
+        return []
+    batch = directory / _unique_name(DELIVERED_PREFIX)
+    tmp = batch.with_suffix(".jsonl.tmp")
+    try:
+        try:
+            os.chmod(directory, DIR_MODE)
+        except OSError:
+            pass
+        _write_private(tmp, "".join(f"{line}\n" for line in archived))
+        os.rename(tmp, batch)
+        claim.unlink()
+    except OSError as exc:
+        # Archive failed: do NOT deliver (the claim file keeps the records on disk for a
+        # human to inspect) — delivering without a record could re-deliver on retry.
+        _warn(f"could not publish {batch}: {exc} — left {claim}")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return []
+    return entries
+
+
+def format_block_reason(entries: list[dict]) -> str:
+    """The Stop block reason: the pre-wrapped texts, oldest first, blank-line separated."""
+    return "\n\n".join(e["wrapped"] for e in entries)

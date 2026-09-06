@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenttools-tg-inbox"
+version = "0.1.0"
+description = "tg-ctl Stop-hook inbox reader: the tmux-free delivery channel for agents outside tmux (stdlib-only)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alex Mextner" }]
+keywords = ["telegram", "tg-ctl", "stop-hook", "inbox", "agent-tools"]
+# Intentionally ZERO runtime dependencies — stdlib only (hashlib + json + subprocess).
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/alex-mextner/agent-tools"
+
+# This pyproject lives INSIDE the package directory (same layout as agenttools_tmux_inject).
+[tool.setuptools]
+packages = ["agenttools_tg_inbox"]
+
+[tool.setuptools.package-dir]
+agenttools_tg_inbox = "."
+
+[tool.pytest.ini_options]
+testpaths = ["../../tests"]
