@@ -71,6 +71,9 @@ fi
 umask 077
 log_dir="${RIG_AGENT_LOG_DIR:-/tmp/agent-logs}"
 mkdir -p "$log_dir"
+# Absolute BEFORE the cd below: a relative RIG_AGENT_LOG_DIR would be checked here and
+# opened somewhere else after `cd "$workdir"` (review finding, GH-497 round 2).
+log_dir="$(cd "$log_dir" && pwd -P)"
 if [ ! -O "$log_dir" ]; then
     echo "rig-detached-opencode: log dir '$log_dir' is not owned by you — refusing (set RIG_AGENT_LOG_DIR)" >&2
     exit 2
@@ -81,6 +84,9 @@ if [ -L "$log" ] || { [ -e "$log" ] && [ ! -f "$log" ]; }; then
     echo "rig-detached-opencode: log path '$log' is a symlink or not a regular file — refusing" >&2
     exit 2
 fi
+# An EXISTING log (a re-launched agent name) may carry a looser mode from before; tighten it
+# rather than appending the brief into a world-readable file.
+touch "$log" && chmod 600 "$log"
 
 # Read the brief BEFORE changing directory: a RELATIVE <brief-file> is validated
 # against the caller's cwd above, and `cd "$workdir"` would make the same path
@@ -98,7 +104,27 @@ export RIG_DETACHED_AGENT=1
     echo "--- $(date -u '+%Y-%m-%dT%H:%M:%SZ') launching detached agent '$name' in '$workdir'"
 } >>"$log"
 
-nohup opencode run --title "$name" "$brief_text" >>"$log" 2>&1 &
+# Detach for real (review finding, GH-497 round 2), three parts:
+#   * `--` ends option parsing — opencode's CLI is yargs-based, so a brief that starts
+#     with `---` (frontmatter) or `- ` (a bullet) would otherwise be eaten as a flag and
+#     the child would start with an EMPTY message while the launcher still exits 0;
+#   * `</dev/null` — nohup only redirects stdin when it is a TTY; under a harness bash
+#     tool stdin is a pipe, and `opencode run` reads a non-TTY stdin, so the child would
+#     block on the caller's pipe;
+#   * a NEW SESSION (setsid) — nohup only masks SIGHUP; the child stayed in the caller's
+#     process group and a harness that tree-/group-kills its tool call on completion or
+#     timeout would kill the "detached" agent with it. macOS ships no `setsid(1)`, so
+#     fall back to python3 (a hard dependency of the hook family anyway): os.setsid()
+#     then exec. The forked `&` child is never a group leader, so setsid cannot fail.
+_new_session() {
+    if command -v setsid >/dev/null 2>&1; then
+        exec setsid "$@"
+    fi
+    exec python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
+}
+export -f _new_session
+nohup bash -c '_new_session "$@"' _ opencode run --title "$name" -- "$brief_text" \
+    </dev/null >>"$log" 2>&1 &
 pid=$!
 
 echo "detached agent '$name' launched (pid $pid, log $log, workdir $workdir)"

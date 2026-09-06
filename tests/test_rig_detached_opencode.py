@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -33,7 +34,8 @@ _LAUNCHER = (
     / "rig-detached-opencode"
     / "rig-detached-opencode"
 )
-_LOG_DIR = Path("/tmp/agent-logs")
+_ISOLATED_LOG_DIR = Path(tempfile.mkdtemp(prefix="rig-detached-opencode-test-logs-"))
+_LOG_DIR = _ISOLATED_LOG_DIR
 
 _STUB_SLEEP_S = 2.0
 
@@ -56,6 +58,8 @@ def _stub_opencode(bin_dir: Path, marker: Path) -> None:
         f'  echo "RIG_DETACHED_AGENT=$RIG_DETACHED_AGENT"\n'
         f'  echo "PWD=$PWD"\n'
         f'  echo "ARGS=$*"\n'
+        f'  echo "PID=$$ PGID=$(ps -o pgid= -p $$ | tr -d \' \')"\n'
+        f'  echo "STDIN_EOF=$(head -c1 </dev/stdin | wc -c | tr -d \' \')"\n'
         f'}} > "{marker}"\n'
         'echo "stub-opencode-started"\n'
         f"sleep {_STUB_SLEEP_S}\n"
@@ -71,6 +75,10 @@ def _run_launcher(
     extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     env = dict(os.environ)
+    # Isolate the log dir by default: on a shared host /tmp/agent-logs may be owned by
+    # another user and the launcher (correctly) refuses it. Tests that want the real
+    # default pass RIG_AGENT_LOG_DIR explicitly.
+    env.setdefault("RIG_AGENT_LOG_DIR", str(_ISOLATED_LOG_DIR))
     if path_override is not None:
         # Stub dir FIRST so the stub shadows any real opencode on PATH.
         env["PATH"] = str(path_override) + os.pathsep + env.get("PATH", "")
@@ -191,6 +199,13 @@ def test_happy_path_exports_markers_and_detaches(tmp_path):
     assert "run --title" in recorded
     assert name in recorded
     assert "write ok to the handoff file" in recorded
+    # A real detach: the child leads its OWN session/process group (pgid == its pid), so a
+    # harness that group-kills the launcher's tool call cannot take it down; and its stdin
+    # is /dev/null (a read returns EOF immediately instead of blocking on the caller's pipe).
+    pid_line = next(l for l in recorded.splitlines() if l.startswith("PID="))
+    pid, pgid = (part.split("=")[1] for part in pid_line.split())
+    assert pid == pgid, pid_line
+    assert "STDIN_EOF=0" in recorded
 
     # The child's stdout streams into the same log file.
     deadline = time.monotonic() + 10
@@ -269,6 +284,57 @@ def test_log_dir_is_private_and_symlink_log_is_refused(tmp_path):
     assert proc.returncode == 2
     assert "symlink" in proc.stderr
     assert victim.read_text(encoding="utf-8") == "do not clobber"
+
+
+def test_brief_starting_with_dashes_reaches_the_child_verbatim(tmp_path):
+    """A markdown brief that starts with `---` (frontmatter) or `- ` (a bullet) is an argv
+    entry starting with `-`; without `--` opencode's yargs CLI eats it as an option and the
+    child starts with an EMPTY message (review finding, GH-497 round 2)."""
+    name = "oc476-test-dash-brief"
+    stub_dir = tmp_path / "bin"
+    marker = tmp_path / "stub-env.txt"
+    _stub_opencode(stub_dir, marker)
+    brief = tmp_path / "brief.md"
+    brief.write_text("---\nmission: dash-brief-sentinel\n---\n- do the thing", encoding="utf-8")
+
+    proc = _run_launcher(name, str(brief), str(tmp_path), path_override=stub_dir)
+
+    assert proc.returncode == 0, proc.stderr
+    _poll_for(marker)
+    recorded = marker.read_text(encoding="utf-8")
+    args_line = next(l for l in recorded.splitlines() if l.startswith("ARGS="))
+    assert " -- ---" in args_line, args_line
+    # the brief is multi-line, so the sentinel lands on a later line of the same record
+    assert "dash-brief-sentinel" in recorded
+
+
+def test_relative_log_dir_is_resolved_before_cd(tmp_path, monkeypatch):
+    """A relative RIG_AGENT_LOG_DIR was owner-checked in the caller's cwd but opened after
+    `cd "$workdir"`, so the log redirect failed silently and no child launched while the
+    launcher exited 0 (review finding, GH-497 round 2)."""
+    name = "oc476-test-relative-logdir"
+    stub_dir = tmp_path / "bin"
+    marker = tmp_path / "stub-env.txt"
+    _stub_opencode(stub_dir, marker)
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    (caller / "logs").mkdir()
+    workdir = tmp_path / "elsewhere"
+    workdir.mkdir()
+    brief = tmp_path / "brief.md"
+    brief.write_text("relative log dir brief", encoding="utf-8")
+
+    monkeypatch.chdir(caller)
+    proc = _run_launcher(
+        name, str(brief), str(workdir), path_override=stub_dir,
+        extra_env={"RIG_AGENT_LOG_DIR": "logs"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    _poll_for(marker)
+    log = caller / "logs" / f"{name}.log"
+    _poll_for(log)
+    assert f"launching detached agent '{name}'" in log.read_text(encoding="utf-8")
 
 
 def test_happy_path_defaults_workdir_to_cwd(tmp_path, monkeypatch):
