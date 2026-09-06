@@ -8,12 +8,6 @@ path. It never consults ambient PATH.
 Every attempt where the hatch env var carried ANY value is also appended, best-effort, as one
 JSON line to `overrides.log` (retrospective 2026-07-01, section 5.2.3 item 3 / gap G-8: "escape
 hatches have no audit sink"). See `_append_overrides_log` for the record shape and trust model.
-
-It is ALSO the home of the one cross-hook policy helper the gates share, `is_exempt_harness` /
-`EXEMPT_HARNESSES` (agent-tools#533 / #542): every hatch-using gate already hard-loads this
-module through its hardened `_load_hatch_escalation` bootstrap, so a second repo-local module
-would mean a second copy of that bootstrap in every hook. Keep it stdlib-only and free of sibling
-`lib/` imports — `tests/test_hatch_import_hardening.py` pins both.
 """
 
 from __future__ import annotations
@@ -95,54 +89,6 @@ class HatchApprovalResult:
         """True when the hook should not fall through to later approval mechanisms."""
 
         return self.env_present
-
-
-# ── Harness exemption (agent-tools#533 / #542) ─────────────────────────────────────────────
-#
-# Harnesses whose events are NEVER subject to the orchestrator-vs-subagent gates
-# (orchestrator-stays-thin, background-subagent-gate, no-long-inline-process). Those gates relax
-# on `args.agent_id` — a signal only `lib/cc_hook_bridge` can populate from Claude Code's own
-# authoritative top-level field. `lib/codex_hook_bridge` and `lib/opencode_hook_bridge` STRIP any
-# forged `agent_id` and have nothing authoritative to repopulate it from (Codex's
-# SubagentStart/Stop and opencode's `task` tool expose no trusted per-tool-call identity), so under
-# an `agent_id`-only exemption EVERY event from those harnesses looked like "the CC orchestrator" —
-# a bare Codex CLI session, a review-cli-spawned `codex exec` reviewer, an opencode `task` worker
-# — and got blocked with a remedy (CC's Agent tool) that does not exist there. Tagging the whole
-# harness exempt, from the bridge-set TOP-LEVEL `event["harness"]`, is the fix.
-#
-# ONE constant for every consumer (agent-tools#542): a hook must read THIS set (at call time, via
-# `is_exempt_harness`), never keep a private copy — adding a harness is a one-line change here
-# that reaches every gate at once. `omp` (the oh-my-pi bridge, `lib/omp_hook_bridge`,
-# agent-tools#556) is exempt for the same reason as codex/opencode: its extension payload
-# carries no trusted per-tool-call subagent identity either (forged `agent_id` keys are stripped).
-#
-# Deliberately an ALLOWLIST, not `harness != "claude-code"`: a missing/blank/unrecognized value
-# (every fixture written before #533, any future bridge that doesn't set one, or one nobody has
-# reviewed yet) stays GOVERNED — the relax direction fails closed, same as the `agent_id` read. If
-# a Codex/opencode/omp session is ever meant to BE the thin orchestrator in someone's setup, that needs
-# an explicit config knob, not a change to this hardcoded exemption.
-EXEMPT_HARNESSES = frozenset({"codex", "opencode", "omp"})
-
-
-def is_exempt_harness(event: object) -> bool:
-    """True when ``event`` came from a bridge whose harness the orchestrator-vs-subagent gates
-    never govern (see ``EXEMPT_HARNESSES``).
-
-    TRUST BOUNDARY — reads ONLY the TOP-LEVEL ``event["harness"]``, never ``args``. Each bridge
-    sets that key from a hardcoded module literal (``HARNESS = "claude-code" | "codex" |
-    "opencode" | "omp"``) that is not derived from ANY field of the underlying tool event, so it cannot be
-    forged by a model/tool_input value the way a same-named key under ``args`` could be. Which
-    bridge fires is decided by which harness's own hook system invoked it: a Claude Code session's
-    tool call is dispatched by CC's PreToolUse machinery straight into ``cc_hook_bridge`` and has
-    no way to reroute itself through ``codex_hook_bridge``, so a CC orchestrator cannot dodge a
-    gate by claiming to be a different harness.
-
-    A non-dict ``event`` (a malformed producer) is simply not exempt — never an exception, so a
-    fail-open gate's own parse guard stays the only place that decides what to do with garbage."""
-    if not isinstance(event, dict):
-        return False
-    harness = event.get("harness")
-    return bool(harness) and str(harness) in EXEMPT_HARNESSES
 
 
 def hatch_env_var(hook_id: str) -> str:

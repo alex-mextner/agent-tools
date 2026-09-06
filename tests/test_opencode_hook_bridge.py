@@ -98,27 +98,6 @@ def _run_dispatch(
     )
 
 
-def _run_gate_ungoverned(v1_event: dict) -> subprocess.CompletedProcess:
-    """Feed a bridge-produced v1 event to background-subagent-gate DIRECTLY, with the bridge's
-    `harness` tag removed — the shape of an unknown/untagged harness, which the fail-closed
-    `EXEMPT_HARNESSES` allowlist keeps GOVERNED. Since agent-tools#542 every real opencode
-    pre-agent event is allowed outright, so this is the only way to prove what the gate would do
-    with the bridge's normalization / injected identity under a future explicit "opencode is the
-    orchestrator" knob (the knob would re-govern by tag; the args must already be right)."""
-    ungoverned = dict(v1_event)
-    ungoverned.pop("harness", None)
-    child = dict(os.environ)
-    child.pop("RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE", None)
-    return subprocess.run(
-        [sys.executable, str(BACKGROUND_SUBAGENT_GATE)],
-        input=json.dumps(ungoverned),
-        capture_output=True,
-        text=True,
-        env=child,
-        timeout=30,
-    )
-
-
 def _recording_hook(tmp_path: Path, log_path: Path) -> Path:
     script = tmp_path / "record_hook.py"
     script.write_text(
@@ -821,25 +800,6 @@ def test_opencode_bridge_blocks_raw_pr_merge_with_real_descriptor(tmp_path):
     assert "gh ship" in out["reason"]
 
 
-# ── background-subagent-gate through the REAL bridge ──────────────────────────────────────
-#
-# Two layers decide an opencode `task` dispatch here, and both are pinned so a regression in
-# EITHER direction is visible:
-#   * the gate's own classification (agent-tools#499: a `general` task with no explicit
-#     `background: false` is inherently async → allow; an explicit `background: false` used to
-#     BLOCK as a foreground dispatch), which the bridge feeds via its `background` →
-#     `run_in_background` normalization (`test_opencode_bridge_keeps_run_in_background_precedence`
-#     and friends still exercise that normalization);
-#   * the harness exemption (agent-tools#542): opencode is in the shared
-#     `agenttools_hatch_escalation.EXEMPT_HARNESSES` allowlist — the bridge cannot hand the gate a
-#     trusted `agent_id`, so an opencode `task`-spawned WORKER fanning out further was
-#     indistinguishable from the orchestrator and got blocked with a remedy (`fork`/`isolation:
-#     "remote"`) that does not exist in opencode — so EVERY opencode pre-agent event is now allowed
-#     before that classification runs. `test_opencode_bridge_background_false_is_still_normalized_
-#     but_harness_exempt` below pins that: the one shape #499 still blocked for opencode is allowed
-#     end-to-end, while the normalization the gate WOULD consult is still produced (kept as the
-#     correct signal for a future explicit "opencode is the orchestrator" knob).
-
 def test_opencode_bridge_allows_inherently_async_general_task(tmp_path):
     hooks_dir = tmp_path / "hooks"
     _install_descriptor(
@@ -939,19 +899,13 @@ def test_opencode_bridge_allows_background_nontrivial_task(tmp_path):
     assert proc.stdout == ""
 
 
-def test_opencode_bridge_default_build_background_arg_is_not_a_live_signal(tmp_path, monkeypatch):
+def test_opencode_bridge_default_build_background_arg_still_blocks(tmp_path):
     """A DEFAULT opencode build (no experimental flag) hides the native background field
     and rejects it at execute time ("Background subagents require
     OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true") — so the bridge must NOT present a
     smuggled background: true to the gates as a live background signal (a custom
-    subagent_type is used so the general/explore tolerance from #495 does not apply).
-
-    Through the real bridge the dispatch is ALLOWED outright since agent-tools#542 (opencode is
-    harness-exempt in background-subagent-gate, so the gate never reaches its classification).
-    The property this test guards is therefore pinned one layer down, where a future explicit
-    "opencode is the orchestrator" knob would read it: the v1 event carries NO
-    `run_in_background`, and that same event fed to the gate ungoverned still blocks and steers
-    to the sanctioned detached launcher."""
+    subagent_type is used so the general/explore tolerance from #495 does not apply): the dispatch
+    still blocks and the reminder steers to the sanctioned detached launcher."""
     hooks_dir = tmp_path / "hooks"
     _install_descriptor(
         hooks_dir,
@@ -979,18 +933,10 @@ def test_opencode_bridge_default_build_background_arg_is_not_a_live_signal(tmp_p
 
     proc = _run_dispatch("tool.execute.before", event, hooks_dir=hooks_dir)
 
-    assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == ""  # allow — harness-exempt (agent-tools#542)
-
-    monkeypatch.delenv("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS", raising=False)
-    monkeypatch.delenv("OPENCODE_EXPERIMENTAL", raising=False)
-    v1 = dispatch.to_v1_event(event, point="pre-agent")
-    assert v1["harness"] == "opencode"
-    assert "run_in_background" not in v1["args"]
-    gate = _run_gate_ungoverned(v1)
-    out = json.loads(gate.stdout)
-    assert out["decision"] == "block", gate.stdout
-    assert "~/.agents/skills/rig-detached-opencode/rig-detached-opencode" in out["message"]
+    assert proc.returncode == 0
+    out = json.loads(proc.stdout)
+    assert out["decision"] == "block"
+    assert "~/.agents/skills/rig-detached-opencode/rig-detached-opencode" in out["reason"]
 
 
 def _clear_background_env_flags(monkeypatch) -> None:
@@ -1133,7 +1079,7 @@ def test_opencode_bridge_preserves_native_run_in_background_flag(tmp_path):
     assert proc.stdout == ""
 
 
-def test_opencode_bridge_background_false_is_still_normalized_but_harness_exempt(tmp_path, monkeypatch):
+def test_opencode_bridge_treats_background_false_as_foreground(tmp_path):
     hooks_dir = tmp_path / "hooks"
     _install_descriptor(
         hooks_dir,
@@ -1167,34 +1113,22 @@ def test_opencode_bridge_background_false_is_still_normalized_but_harness_exempt
     )
 
     assert proc.returncode == 0
-    assert proc.stdout == ""  # allow — harness-exempt (agent-tools#542)
-    # The normalization the gate WOULD consult is still produced by the bridge (a future knob
-    # that re-governs opencode here needs it): `background: false` → `run_in_background: false`
-    # (only under the experimental flag, which is what makes the field a live signal).
-    monkeypatch.setenv("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS", "true")
-    v1 = dispatch.to_v1_event(event, point="pre-agent")
-    assert v1["args"]["run_in_background"] is False
-    assert v1["harness"] == "opencode"
-    # ...and the gate, given that event ungoverned, still reads it as a FOREGROUND dispatch.
-    gate = _run_gate_ungoverned(v1)
-    out = json.loads(gate.stdout)
-    assert out["decision"] == "block", gate.stdout
-    assert "BACKGROUND" in out["message"]
+    out = json.loads(proc.stdout)
+    assert out["decision"] == "block"
+    assert "BACKGROUND" in out["reason"]
 
 
-def test_opencode_bridge_env_marker_makes_nontrivial_task_subagent_exempt(tmp_path, monkeypatch):
+def test_opencode_bridge_env_marker_makes_nontrivial_task_subagent_exempt(tmp_path):
     """End-to-end pre-agent pipeline: with the launcher-set env marker present, the
-    dispatcher injects args.agent_id, and background-subagent-gate classifies the
-    session as a dispatched subagent (subagent-exempt path).
+    dispatcher injects args.agent_id and background-subagent-gate classifies the
+    session as a dispatched subagent — the SAME non-trivial foreground task payload
+    that BLOCKS without the marker passes with it (subagent-exempt path).
 
-    Through the real bridge BOTH runs are allowed since agent-tools#542 (opencode is
-    harness-exempt in this gate, checked before the subagent-exempt path), so the identity
-    mechanism is pinned where it still decides: the v1 event carries `agent_id` only with the
-    marker, and that same event fed to the gate ungoverned BLOCKS without the marker and passes
-    with it. The payload uses a custom subagent_type on purpose: `general`/`explore` are
-    tolerated by the gate on their own (agent-tools#495), so a `general` payload would pass
-    with or without the marker and prove nothing about the env-derived exemption (review
-    finding, GH-497 round 1)."""
+    The payload uses a custom subagent_type on purpose: `general`/`explore` are
+    tolerated by the gate on their own (agent-tools#495), so a `general` payload would
+    pass with or without the marker and prove nothing about the env-derived exemption
+    (review finding, GH-497 round 1). The control run below pins that this payload
+    really does block without the marker."""
     hooks_dir = tmp_path / "hooks"
     _install_descriptor(
         hooks_dir,
@@ -1221,7 +1155,7 @@ def test_opencode_bridge_env_marker_makes_nontrivial_task_subagent_exempt(tmp_pa
 
     control = _run_dispatch("tool.execute.before", event, hooks_dir=hooks_dir)
     assert control.returncode == 0, control.stderr
-    assert control.stdout == ""  # allow — harness-exempt (agent-tools#542)
+    assert json.loads(control.stdout)["decision"] == "block", control.stdout
 
     proc = _run_dispatch(
         "tool.execute.before",
@@ -1232,17 +1166,6 @@ def test_opencode_bridge_env_marker_makes_nontrivial_task_subagent_exempt(tmp_pa
 
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == ""
-
-    for key in ("RIG_AGENT_ID", "RIG_DETACHED_AGENT"):
-        monkeypatch.delenv(key, raising=False)
-    unmarked = dispatch.to_v1_event(event, point="pre-agent")
-    assert "agent_id" not in unmarked["args"]
-    assert json.loads(_run_gate_ungoverned(unmarked).stdout)["decision"] == "block"
-
-    monkeypatch.setenv("RIG_AGENT_ID", "rig-probe")
-    marked = dispatch.to_v1_event(event, point="pre-agent")
-    assert marked["args"]["agent_id"] == "rig-probe"
-    assert json.loads(_run_gate_ungoverned(marked).stdout)["decision"] == "allow"  # subagent-exempt
 
 
 def test_opencode_bridge_dispatches_post_write_descriptor(tmp_path):

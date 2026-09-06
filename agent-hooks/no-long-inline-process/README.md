@@ -34,18 +34,6 @@ must originate from a **trusted, transport-level** signal — never from model-c
 `tool_input`-forged copy; a non-CC carrier must replicate that filtering or a forged `agent_id`
 self-exempts the orchestrator (full contract in `background-subagent-gate/README.md`).
 
-**Harness-exempt (agent-tools#533/#542):** an event whose top-level `harness` is in the shared
-`lib/agenttools_hatch_escalation.EXEMPT_HARNESSES` allowlist (`codex`, `opencode`, `omp`) is allowed
-outright. None of those bridges can supply a trusted `agent_id` (all strip forged ones and have nothing
-authoritative to repopulate them from), so under the `agent_id`-only exemption a review-cli-spawned
-`codex exec` reviewer or an opencode `task`-spawned worker running `pytest`/`review` in the
-**foreground** — the correct worker shape — was blocked as "the orchestrator running a long
-process inline", with a remedy (CC's `subagent_type: "fork"`) that does not exist in those
-harnesses. The tag is set by the bridge from a module literal (never from `args`), and the read is
-a fail-closed allowlist: a missing/unknown value stays governed. Same helper, same constant as
-`orchestrator-stays-thin` and `background-subagent-gate` — see the former's README for the full
-non-forgeability argument.
-
 ## Why a hard block (not warn-first)
 
 The other delegation gates warn-then-block, but a long inline process is unambiguous: it WILL

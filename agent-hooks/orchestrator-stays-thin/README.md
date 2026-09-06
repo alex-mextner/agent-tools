@@ -136,11 +136,6 @@ the full contract). This matches the sibling `skills-read-gate`'s narrowed read 
 or write looks like. `EXEMPT_HARNESSES = {"codex", "opencode", "omp"}`, checked against the
 top-level `event["harness"]` right after the subagent check, before any command/write is even
 classified.
-The set is the **shared** `lib/agenttools_hatch_escalation.EXEMPT_HARNESSES` (agent-tools#542),
-consulted through its `is_exempt_harness(event)` by this gate AND by `background-subagent-gate`
-and `no-long-inline-process` — the same misclassification class hit all three, so a harness is
-added ONCE there (`omp`, the oh-my-pi bridge of agent-tools#556, lives there) and reaches every gate; this hook's
-`EXEMPT_HARNESSES` name is a re-export, not a private copy.
 
 Why the whole harness, not a signal review-cli sets: this gate's premise is Claude-Code-specific
 — "the top-level Claude Code session must delegate implementation work to a CC `Agent`/`Task`

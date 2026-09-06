@@ -47,17 +47,6 @@ Lets through:
 - a **trivial** one-liner dispatch (prompt/description `< 200` chars and single-line)
 - a dispatch made **by a subagent itself** (subagent-exempt — `agent_id` present): a worker
   may fan out further, and this gate governs the orchestrator, not the workers
-- an event tagged with an **exempt `harness`** (`codex`, `opencode`, `omp` — the shared
-  `lib/agenttools_hatch_escalation.EXEMPT_HARNESSES` allowlist, agent-tools#533/#542/#556). None
-  of those bridges can supply a trusted `agent_id` (all strip forged ones and have nothing authoritative to
-  repopulate them from), so under the `agent_id`-only exemption an opencode `task`-spawned
-  **worker** fanning out further looked exactly like the orchestrator and got blocked with a
-  remedy (`fork`/`isolation: "remote"`) that does not exist there. The tag is read from the
-  top-level `event["harness"]` the bridge sets from a module literal (never `args`), as a
-  fail-closed allowlist. Consequence worth stating plainly: the opencode `background: true`
-  normalization in the bullet above is now reached only if opencode is ever removed from that
-  allowlist — it is kept as the correct signal for a future explicit "opencode is the
-  orchestrator" config knob, not deleted.
 
 `isolation: "worktree"` is deliberately **not** treated as inherently background — worktree
 isolation is about workspace separation, not execution timing, so a `worktree`-isolated

@@ -34,16 +34,12 @@ nlip = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(nlip)
 
 
-def _run(command, monkeypatch, *, agent_id=None, env: dict | None = None,
-         harness: str | None = None, args_extra: dict | None = None) -> tuple[str, str, int]:
-    args = {"command": command, **(args_extra or {})}
+def _run(command, monkeypatch, *, agent_id=None, env: dict | None = None) -> tuple[str, str, int]:
+    args = {"command": command}
     if agent_id is not None:
         args["agent_id"] = agent_id
-    event = {"args": args}
-    if harness is not None:
-        event["harness"] = harness
     out, err = io.StringIO(), io.StringIO()
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"args": args})))
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
     for k in ("ALLOW_INLINE_PROCESS", "ALLOW_INLINE_PROCESS_REASON",
@@ -477,42 +473,3 @@ def test_hatch_inline_command_justification_allows(tmp_path, monkeypatch):
     assert code == 0 and _decision(out) == "allow"
     assert marker.exists()
     assert "one-shot review, output needed now" in question.read_text()
-
-
-# ── HARNESS-EXEMPT (agent-tools#542, the #533 class) ──────────────────────────────────────
-#
-# A review-cli-spawned `codex exec` reviewer, or an opencode `task`-spawned worker, running
-# `pytest`/`review` in the FOREGROUND is the CORRECT worker shape — but neither bridge can hand
-# this gate a trusted `agent_id`, so under the `agent_id`-only exemption they were blocked as "the
-# orchestrator running a long process inline", with a remedy (CC's Agent tool, `subagent_type:
-# "fork"`) that does not exist in those harnesses. The allowlist is the SHARED
-# `lib/agenttools_hatch_escalation.EXEMPT_HARNESSES`, read from the TOP-LEVEL `event["harness"]`.
-
-@pytest.mark.parametrize("harness", ["codex", "opencode", "omp"])
-@pytest.mark.parametrize("command", ["review diff -C /repo", "pytest tests/", "sleep 30"])
-def test_exempt_harness_allows_long_process_inline(command, harness, monkeypatch):
-    out, _e, code = _run(command, monkeypatch, harness=harness)
-    assert code == 0
-    assert _decision(out) == "allow"
-
-
-@pytest.mark.parametrize("kw", [
-    {},                                          # no tag at all
-    {"harness": "claude-code"},                  # the real CC shape
-    {"harness": "some-future-harness"},          # unknown → governed
-    {"harness": ""},                             # blank → governed
-    {"args_extra": {"harness": "codex"}},        # forged in args → ignored
-])
-def test_non_exempt_or_forged_harness_still_blocks(kw, monkeypatch):
-    out, _e, code = _run("review diff -C /repo", monkeypatch, **kw)
-    assert code == nlip.BLOCK_EXIT_CODE
-    assert _decision(out) == "block"
-
-
-def test_harness_allowlist_is_the_shared_lib_constant(monkeypatch):
-    """ONE allowlist for every harness-exempt gate (no private copy in this hook)."""
-    assert "opencode" in nlip.hatch_escalation.EXEMPT_HARNESSES
-    monkeypatch.setattr(nlip.hatch_escalation, "EXEMPT_HARNESSES", frozenset())
-    out, _e, code = _run("review diff -C /repo", monkeypatch, harness="opencode")
-    assert code == nlip.BLOCK_EXIT_CODE
-    assert _decision(out) == "block"

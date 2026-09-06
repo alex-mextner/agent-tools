@@ -57,10 +57,8 @@ TRUSTED per-tool-call subagent identity in the extension event either (confirmed
 from the documented `tool_call`/`tool_result` shape). Every translated v1 event also
 carries a top-level `harness: "omp"` — a hardcoded module constant (`dispatch.HARNESS`),
 never derived from the omp event, so it can't be forged the way the identity fields above
-must be actively stripped. The shared `lib/agenttools_hatch_escalation.EXEMPT_HARNESSES`
-allowlist (consulted by `orchestrator-stays-thin`, `background-subagent-gate` and
-`no-long-inline-process`, agent-tools#542) reads this tag to exempt omp from those gates
-(agent-tools#533) for the same reason it
+must be actively stripped. `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES`
+reads this tag to exempt omp from that gate (agent-tools#533) for the same reason it
 already exempts codex and opencode: none of the three expose a trusted per-call subagent
 identity, so the gate's "main thread must delegate to a CC subagent" premise does not
 transplant cleanly onto any of them.

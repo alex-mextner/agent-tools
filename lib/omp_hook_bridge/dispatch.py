@@ -27,9 +27,8 @@ HOOK_API = "agents-hooks/v1"
 # never derived from `omp_event`, so it cannot be forged via tool args. See
 # `codex_hook_bridge.HARNESS` / `opencode_hook_bridge.HARNESS` for the same reasoning: omp
 # exposes no TRUSTED per-tool-call subagent identity either (forged agent_id/agent_type
-# keys are stripped below). The shared `agenttools_hatch_escalation.EXEMPT_HARNESSES`
-# allowlist (consulted by orchestrator-stays-thin, background-subagent-gate and
-# no-long-inline-process) reads this tag to exempt the whole harness (agent-tools#533/#542).
+# keys are stripped below). `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES`
+# reads this tag to exempt the whole harness (agent-tools#533).
 HARNESS = "omp"
 
 _KNOWN_EVENTS = frozenset({"tool_call", "tool_result"})

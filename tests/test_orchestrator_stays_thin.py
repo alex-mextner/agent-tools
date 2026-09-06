@@ -269,11 +269,6 @@ def test_exempt_harnesses_constant_is_exactly_codex_opencode_omp():
     """Documents the allowlist's exact membership — `claude-code` (or anything else) must never
     be added here, or the gate would exempt the very orchestrator it exists to govern."""
     assert ost.EXEMPT_HARNESSES == frozenset({"codex", "opencode", "omp"})
-    # ONE allowlist for every harness-exempt gate (agent-tools#542): this hook re-exports the
-    # shared `lib/agenttools_hatch_escalation` constant rather than owning a private copy, so
-    # adding a harness (e.g. `omp`, agent-tools#556) is a one-line change that reaches
-    # background-subagent-gate and no-long-inline-process too.
-    assert ost.EXEMPT_HARNESSES is ost.hatch_escalation.EXEMPT_HARNESSES
 
 
 def test_exempt_bridge_harness_constants_are_pinned_to_the_allowlist():

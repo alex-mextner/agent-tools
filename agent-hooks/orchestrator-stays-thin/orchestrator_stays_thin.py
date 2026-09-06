@@ -162,14 +162,10 @@ BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 
 # Harnesses whose events are NEVER subject to this gate (agent-tools#533) — see the module
-# docstring's "Harness-exempt" section. The set itself lives in the SHARED
-# `lib/agenttools_hatch_escalation` (agent-tools#542): background-subagent-gate and
-# no-long-inline-process consult the very same constant, so a harness is added ONCE, there — this
-# name is a re-export for readers and tests, not a private copy. Deliberately an ALLOWLIST, not
-# `!= "claude-code"`: an event with no `harness` field (every fixture written before this change,
-# and any future bridge that doesn't set one) stays GOVERNED — the relax direction fails closed,
-# same as `_is_subagent`.
-EXEMPT_HARNESSES = hatch_escalation.EXEMPT_HARNESSES
+# docstring's "Harness-exempt" section. Deliberately an ALLOWLIST, not `!= "claude-code"`: an
+# event with no `harness` field (every fixture written before this change, and any future bridge
+# that doesn't set one) stays GOVERNED — the relax direction fails closed, same as `_is_subagent`.
+EXEMPT_HARNESSES = frozenset({"codex", "opencode", "omp"})
 
 MARKER_DIR = Path(os.path.expanduser(os.environ.get(
     "ORCH_THIN_MARKER_DIR", "~/.cache/agent-tools/orchestrator-thin")))
@@ -412,12 +408,9 @@ def _is_exempt_harness(event: dict) -> bool:
     Deliberately an ALLOWLIST (`harness in EXEMPT_HARNESSES`), not `harness != "claude-code"`: a
     missing/unrecognized `harness` (every event built before this change, and any future bridge
     that doesn't set one) must stay GOVERNED — the relax direction fails closed, same as
-    `_is_subagent` above.
-
-    Delegates to the shared `agenttools_hatch_escalation.is_exempt_harness` (agent-tools#542) so
-    this gate and its two siblings (background-subagent-gate, no-long-inline-process) can never
-    drift apart on WHICH harnesses are exempt or WHERE the tag is read from."""
-    return hatch_escalation.is_exempt_harness(event)
+    `_is_subagent` above."""
+    harness = event.get("harness")
+    return bool(harness) and str(harness) in EXEMPT_HARNESSES
 
 
 def _marker(event: dict) -> Path:
