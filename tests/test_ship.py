@@ -5322,6 +5322,7 @@ case "$sub" in
         case "$*" in
           *headRefName*) printf '%s\\tOPEN\\tMERGEABLE\\tfalse\\tCLEAN\\n' "${SHIP_TEST_BRANCH}" ;;
           *"--json reviews"*) echo "${SHIP_TEST_REVIEW_COUNT:-1}" ;;
+          *"--json url"*) printf '%s\\n' "${SHIP_TEST_PR_URL-https://github.com/acme/widgets/pull/1}" ;;
           *"--json body"*) printf '%s' "${SHIP_TEST_PR_BODY:-}" ;;
           *statusCheckRollup*) printf '%s\\n' '[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI"}]' ;;
           *) echo '[]' ;;
@@ -6029,6 +6030,172 @@ def test_review_quorum_invalid_github_issue_ref_does_not_count_toward_ambiguity(
     assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
     assert "AUTHORITY CONFIRMED" in r.stdout and "#200" in r.stdout, r.stdout
     assert "#12" not in r.stdout.replace("#12abc", ""), r.stdout
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        # task-cli's links gate demands a markdown link / full URL, never a bare `#548`
+        ("Refs [#548](https://github.com/acme/widgets/issues/548) — widget regression.", "#548"),
+        # a bare full URL, no keyword, no markdown
+        ("Ticket: https://github.com/acme/widgets/issues/548", "#548"),
+        # GitHub slugs are case-insensitive; a `www.` host and a trailing anchor/comment link too
+        ("See https://www.github.com/ACME/Widgets/issues/548#issuecomment-1 for context.", "#548"),
+        # the same issue linked twice is ONE ticket, not an ambiguity
+        ("https://github.com/acme/widgets/issues/548 and again https://github.com/acme/widgets/issues/548", "#548"),
+    ],
+)
+def test_review_quorum_derives_literal_code_from_same_repo_issue_url(tmp_path, body, expected):
+    """A full GitHub issue URL of the PR's OWN repo is a task code (agent-tools#564): task-cli's
+    `links` gate REQUIRES tickets to be referenced as markdown links / full URLs, so a PR body
+    written correctly for that gate used to fail this one with "could not derive a task code".
+    The URL yields the same literal `#<n>` a keyword-anchored `Refs #<n>` yields (#511), so
+    review-cli's quorum record and task-cli's routing see ONE code regardless of body syntax."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": body})
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and expected in r.stdout, r.stdout
+    assert "GH-548" not in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # an issue of ANOTHER repo (cross-repo companions are common: tg-cli#301 <-> agent-tools#524)
+        "Companion of https://github.com/other-org/other-repo/issues/548.",
+        # a PULL REQUEST link is not a ticket
+        "Follow-up to https://github.com/acme/widgets/pull/548.",
+        # a same-owner different-repo issue is still another repo
+        "See https://github.com/acme/widgets-docs/issues/548.",
+        # two DISTINCT same-repo issues are an ambiguous task code (fail-closed, like `#<n>`)
+        "https://github.com/acme/widgets/issues/12 and https://github.com/acme/widgets/issues/548",
+        # a non-GitHub host, and a GitHub URL that is not an issue path
+        "https://gitlab.com/acme/widgets/issues/548 https://github.com/acme/widgets/blob/main/issues/548",
+    ],
+)
+def test_review_quorum_ignores_foreign_pull_and_ambiguous_issue_urls(tmp_path, body):
+    """Only an issue URL of the PR's own repo qualifies: a link to another repo's issue must not
+    be mistaken for this PR's ticket (it would look up that repo's quorum record and later mark
+    the wrong local issue shipped), a `/pull/<n>` link is a PR, and two distinct same-repo
+    issue links are ambiguous — all fail closed with nothing else in the body."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": body})
+    assert r.returncode != 0, f"must not derive a task code from {body!r}\n{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_issue_url_needs_a_known_own_repo(tmp_path):
+    """Fail-closed when ship cannot tell which repo the PR belongs to (no github origin, no
+    --repo, and `gh pr view --json url` returns nothing usable): a same-looking issue URL is
+    NOT derived, because "same repo" cannot be verified."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"SHIP_TEST_PR_BODY": "https://github.com/acme/widgets/issues/548", "SHIP_TEST_PR_URL": ""},
+    )
+    assert r.returncode != 0, f"{r.stdout}\n{r.stderr}"
+    assert "could not derive a task code" in r.stderr, r.stderr
+
+
+def _ship_bash_functions(*names: str) -> str:
+    """The named top-level bash functions of ship.sh, verbatim, for sourcing under stubs."""
+    text = _SHIP.read_text(encoding="utf-8")
+    out = []
+    for name in names:
+        m = re.search(rf"^{re.escape(name)}\(\) \{{.*?^\}}$", text, re.MULTILINE | re.DOTALL)
+        assert m, f"{name} not found in ship.sh"
+        out.append(m.group(0))
+    return "\n".join(out)
+
+
+def _extract_ticket_with_own_repo(bodies, *, cwd: Path, origin_repo: str, live_pr_url: str | None):
+    """Run `_review_quorum_extract_ticket` on each body inside ONE shell whose checkout origin
+    slug is `origin_repo` and whose `gh pr view --json url` prints `live_pr_url` (None = the
+    call fails). Returns the derived codes in order ("" = nothing derived)."""
+    fns = _ship_bash_functions(
+        "_review_quorum_extract_ticket", "_ship_own_repo_issue_numbers",
+        "_ship_own_repo_slugs", "_ship_normalize_repo_slug",
+    )
+    gh_stub = "gh() { return 1; }" if live_pr_url is None else f"gh() {{ printf '%s\\n' '{live_pr_url}'; }}"
+    script = "\n".join([
+        "set -euo pipefail",
+        f"PR=7; GH_REPO=''; _CWD_ORIGIN_REPO='{origin_repo}'",
+        "_SHIP_OWN_REPO_SLUGS=''; _SHIP_OWN_REPO_SLUGS_RESOLVED=0",
+        gh_stub, fns,
+        'for b in "$@"; do printf \'%s\\n\' "$(_review_quorum_extract_ticket "$b")"; done',
+    ])
+    r = _sh("bash", "-c", script, "extract", *bodies, cwd=cwd)
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    return r.stdout.split("\n")[: len(bodies)]
+
+
+def test_review_quorum_issue_url_accepts_live_pr_slug_after_repo_rename(tmp_path):
+    """A renamed/transferred repo leaves the clone with the OLD, redirecting origin slug while the
+    live PR and its issue links carry the NEW one (codex review, PR #566). An issue URL under
+    EITHER slug names this PR's own repo, so a correct link is not refused as foreign; the same
+    issue under both slugs is ONE ticket; another repo's issue is still foreign."""
+    got = _extract_ticket_with_own_repo(
+        [
+            "Refs [#105](https://github.com/new-org/new-repo/issues/105)",
+            "Refs [#105](https://github.com/old-org/old-repo/issues/105)",
+            "https://github.com/old-org/old-repo/issues/12 https://github.com/new-org/new-repo/issues/12",
+            "https://github.com/other-org/other-repo/issues/105",
+        ],
+        cwd=tmp_path, origin_repo="old-org/old-repo",
+        live_pr_url="https://github.com/new-org/new-repo/pull/7",
+    )
+    assert got == ["#105", "#105", "#12", ""], got
+
+
+def test_review_quorum_issue_url_origin_slug_still_works_when_gh_url_lookup_fails(tmp_path):
+    """The live-PR-URL lookup is additive: when `gh pr view --json url` fails (offline), the
+    checkout origin alone still identifies the own repo, exactly as before."""
+    got = _extract_ticket_with_own_repo(
+        ["https://github.com/acme/widgets/issues/548", "https://github.com/acme/other/issues/548"],
+        cwd=tmp_path, origin_repo="acme/widgets", live_pr_url=None,
+    )
+    assert got == ["#548", ""], got
+
+
+def test_review_quorum_keyword_anchored_ref_takes_precedence_over_issue_url(tmp_path):
+    """The URL arm is the LAST fallback: an explicit `Refs #12` wins over a same-repo issue URL
+    mentioned elsewhere in the body."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(
+        main, gh, rv,
+        env_extra={"SHIP_TEST_PR_BODY": "Refs #12 — see also https://github.com/acme/widgets/issues/548"},
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "#12" in r.stdout, r.stdout
+    assert "#548" not in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ("Ticket: https://linear.app/hyperide/issue/HYP-1440/ship-url-task-code", "HYP-1440"),
+        ("Ticket: [ABC-12](https://linear.app/acme/issue/ABC-12/some-slug)", "ABC-12"),
+    ],
+)
+def test_review_quorum_derives_code_from_linear_issue_url(tmp_path, body, expected):
+    """A Linear issue URL (`https://linear.app/<team>/issue/<CODE>/<slug>`) carries the ticket
+    code in its path, so the HYP-<n> / PREFIX-<n> arms already derive it — pinned here (not a
+    fix) so the URL forms task-cli's links gate demands stay covered end to end."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    r = _run_ship_quorum(main, gh, rv, env_extra={"SHIP_TEST_PR_BODY": body})
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and expected in r.stdout, r.stdout
 
 
 def test_review_quorum_derives_descriptive_code_from_pr_body(tmp_path):

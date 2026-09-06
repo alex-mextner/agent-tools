@@ -136,8 +136,12 @@
 #                          time to FORM its comments. Default 600 (10 min). 0 disables the gate.
 #   REVIEW_TASK_CODE       the task/ticket code (e.g. HYP-931) this ship belongs to, for the
 #                          review-quorum gate. If unset, ship derives it from a ticket-like
-#                          token in the branch name, then the PR body. If none is found, the
-#                          gate refuses (fail-closed) with guidance.
+#                          token in the branch name, then the PR body: HYP-<n> / PROJ-<n> (also
+#                          inside a Linear URL, https://linear.app/<team>/issue/HYP-1440/…), a
+#                          descriptive ALL-CAPS code, a keyword-anchored `Refs #<n>`, or a full
+#                          issue URL of THIS repo (https://github.com/<owner>/<repo>/issues/<n>
+#                          — the shape task-cli's links gate demands; both yield the literal
+#                          `#<n>`). If none is found, the gate refuses (fail-closed) with guidance.
 #   SHIP_REVIEW_QUORUM_ENABLED / SHIP_REVIEW_QUORUM  set either to 0 to disable the
 #                          review-quorum gate entirely (default: enabled).
 #   SHIP_TASK_NOTIFY_ENABLED  set to 0/false/no to disable the post-merge task-cli notify step
@@ -2040,15 +2044,19 @@ fi
 # Runs independently of --skip-ci, same posture as the review-dwell gate above.
 
 # Prints the first ticket-like token found in $1, or nothing. Tries the repo's own HYP-<n>
-# convention first (case-insensitive, normalized to uppercase), then a generic
-# UPPERCASE-PREFIX-<n> ticket token (2+ uppercase letters, a hyphen, digits) so other repos'
-# conventions (JIRA-style PROJ-123, etc.) are also picked up, then a keyword-anchored GitHub
-# issue reference (`Fixes #105`, `Refs #105`) returned literal for repos that track work as
-# plain GitHub issues rather than a lettered ticket prefix, then a purely descriptive
-# review-cli task code (2+ uppercase letters, then 2-OR-MORE hyphen-joined 2+-letter uppercase
-# segments -- 3+ segments total, no digits) so hand-picked codes like `SME-ROADMAP-WORKTREE-NOTE`
-# or `WT-GITIGNORE-EXCLUDE` -- real task codes review-cli's own run-stats log records fine, just
-# without a numeric suffix -- are also auto-derived (#384). `LC_ALL=C` on every grep here: outside
+# convention first (case-insensitive, normalized to uppercase; a Linear URL such as
+# `https://linear.app/<team>/issue/HYP-1440/<slug>` carries the code in its path and is caught
+# by this same arm), then a generic UPPERCASE-PREFIX-<n> ticket token (2+ uppercase letters, a
+# hyphen, digits) so other repos' conventions (JIRA-style PROJ-123, etc.) are also picked up,
+# then a purely descriptive review-cli task code (2+ uppercase letters, then 2-OR-MORE
+# hyphen-joined 2+-letter uppercase segments -- 3+ segments total, no digits) so hand-picked
+# codes like `SME-ROADMAP-WORKTREE-NOTE` or `WT-GITIGNORE-EXCLUDE` -- real task codes
+# review-cli's own run-stats log records fine, just without a numeric suffix -- are also
+# auto-derived (#384), then, as the last fallbacks for repos that track work as plain GitHub
+# issues rather than a lettered ticket prefix, a keyword-anchored GitHub issue reference
+# (`Fixes #105`, `Refs #105`) returned literal as `#105`, and finally a full issue URL of the
+# PR's OWN repo (`https://github.com/<owner>/<repo>/issues/105`, also returned literal as
+# `#105`; see each arm's own comment). `LC_ALL=C` on every grep here: outside
 # the C locale, `[A-Z]` bracket ranges are collation-dependent (glibc's en_US.UTF-8 can interleave
 # case), which would make the "uppercase-only" guarantee below hold only by luck of the ambient
 # locale -- same fix idiom the `tr` calls elsewhere in this file already use.
@@ -2131,7 +2139,110 @@ _review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE \
       '(^|[^A-Za-z0-9_./-])(close[sd]?|fix(e[sd])?|resolve[sd]?|refs?|references?)[[:space:]]*:?[[:space:]]*#[0-9]+[A-Za-z0-9_]?' \
       | LC_ALL=C grep -oE '#[0-9]+[A-Za-z0-9_]?$' | LC_ALL=C grep -xE '#[0-9]+' | LC_ALL=C sort -u || true)
-  if [ "$(printf '%s\n' "$m" | LC_ALL=C grep -c '#')" -eq 1 ]; then printf '%s' "$m"; fi
+  # `|| true`: `grep -c` exits 1 when the count is 0 -- which under this script's
+  # `set -euo pipefail` is exactly the NEW path this change exists to serve (a body with no
+  # keyword-anchored ref, only a URL). Guarded like every other grep in this function.
+  local kw_n; kw_n=$(printf '%s\n' "$m" | LC_ALL=C grep -c '#') || true
+  if [ "$kw_n" -eq 1 ]; then printf '%s' "$m"; return 0; fi
+  [ "$kw_n" -gt 1 ] && return 0   # ambiguous anchored refs: fail closed, never fall through
+  # Full GitHub issue URL of the PR's OWN repo (agent-tools#564) — the LAST fallback. task-cli's
+  # `links` gate REQUIRES a ticket to be referenced as a markdown link / full URL (never a bare
+  # `#548`), so a PR body written correctly for that gate carried NO shape the arms above
+  # recognize and this gate refused it with "could not derive a task code"; agents then
+  # hand-set REVIEW_TASK_CODE, the manual step that gets forgotten. The URL yields the SAME
+  # literal `#<n>` the keyword arm yields, so review-cli's quorum record and task-cli's routing
+  # see one code regardless of body syntax. Rules, mirroring the keyword arm's hazards:
+  #   - the URL's owner/repo must be one of the PR's own slugs (_ship_own_repo_slugs: explicit
+  #     --repo, checkout origin, live PR URL; compared case-insensitively — GitHub slugs are);
+  #     an issue of ANOTHER repo is never this PR's
+  #     ticket (cross-repo companions like "tg-cli#301 <-> agent-tools#524" are routine here);
+  #     an unknown own-repo (no github origin, no --repo, no PR url) derives nothing.
+  #   - only `/issues/<n>` counts — a `/pull/<n>` link is a PR, not a ticket; `www.` and a
+  #     trailing `#issuecomment-…` anchor are tolerated; the digits must end at a non-word
+  #     boundary (`/issues/12abc` is not an issue), same as the `#123abc` rule above.
+  #   - two DISTINCT same-repo issue URLs are ambiguous → nothing (fail-closed); the same
+  #     issue linked twice is one ticket.
+  # No keyword anchor is required (unlike the `#<n>` arm): the links gate's own output shape is
+  # `Refs [#548](https://…/issues/548)`, where `[` sits between any keyword and the URL, so an
+  # anchor would defeat the purpose. Accepted residual: a body whose ONLY same-repo issue link
+  # is an incidental mention of some other, already-shipped issue derives that issue — such a
+  # body already violates the links discipline (it does not link its own ticket at all), and a
+  # second same-repo link (the real ticket) turns the case into the ambiguity refusal.
+  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE \
+      'https?://(www\.)?github\.com/[^/[:space:]]+/[^/[:space:]]+/issues/[0-9]+[A-Za-z0-9_]?' || true)
+  [ -n "$m" ] || return 0
+  local issues; issues=$(_ship_own_repo_issue_numbers "$m" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
+  if [ "$(printf '%s\n' "$issues" | LC_ALL=C grep -c .)" -eq 1 ]; then printf '#%s' "$issues"; fi
+  return 0
+}
+
+# $1 = newline-separated GitHub issue URLs (as matched by the extractor above) -> prints the
+# issue NUMBER of every URL that names the PR's OWN repo, one per line (duplicates kept — the
+# caller dedups and applies the ambiguity rule); prints nothing when the own repo is unknown.
+# ALWAYS exits 0.
+_ship_own_repo_issue_numbers() {
+  local slugs cand slug n
+  slugs=$(_ship_own_repo_slugs)
+  [ -n "$slugs" ] || return 0
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    cand=$(printf '%s' "$cand" | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+             | LC_ALL=C sed -E 's|^https?://(www\.)?github\.com/||')
+    while IFS= read -r slug; do
+      case "$cand" in
+        "$slug"/issues/*) n="${cand##*/}"
+                          case "$n" in *[!0-9]*) ;; *) printf '%s\n' "$n" ;; esac ;;
+      esac
+    done <<< "$slugs"
+  done <<< "$1"
+  return 0
+}
+
+# The PR's OWN "owner/repo" slug, lowercased, for the issue-URL arm above — or nothing when it
+# cannot be established (then that arm derives nothing: "same repo" is unverifiable). Sources, in
+# order: the explicit gh target (GH_REPO — set from --repo / GH_SHIP_REPO above, so a foreign
+# --repo ship compares against the TARGET repo, not this checkout), then this checkout's github
+# origin (_CWD_ORIGIN_REPO, free — the common path never pays a network call), then, only when
+# both are empty (a non-github origin; the test harness), the PR's own URL from `gh pr view`.
+# Memoized: one resolution per ship run, however many texts the matcher scans.
+_SHIP_OWN_REPO_SLUGS=""; _SHIP_OWN_REPO_SLUGS_RESOLVED=0
+# -> prints every lowercase "owner/repo" slug that names the PR's OWN repo, one per line (none
+# when it cannot be told); resolved ONCE per run; ALWAYS exits 0. The set is the union of the
+# explicit `gh` target (GH_REPO, so a foreign `--repo` ship compares against the TARGET repo,
+# not this checkout), this checkout's GitHub origin, and the LIVE PR URL. All three are kept —
+# not first-non-empty — because after a repository rename/transfer an existing clone keeps the
+# OLD, redirecting origin slug while the live PR and its issue links carry the NEW one (codex
+# review, PR #566): trusting the origin alone would classify a correct same-repo issue link as
+# foreign and refuse. GitHub redirects the old slug to the same repository, so an issue URL
+# under either slug names this PR's own repo. The live URL costs one `gh pr view` on the URL
+# path only (the arms before it never call this).
+_ship_own_repo_slugs() {
+  if [ "$_SHIP_OWN_REPO_SLUGS_RESOLVED" = "0" ]; then
+    _SHIP_OWN_REPO_SLUGS_RESOLVED=1
+    local raw live
+    live=$(gh pr view "$PR" --json url -q '.url // ""' 2>/dev/null) || live=""
+    live=$(printf '%s\n' "$live" | LC_ALL=C sed -E 's|/pull/[0-9]+.*$||')
+    for raw in "${GH_REPO:-}" "${_CWD_ORIGIN_REPO:-}" "$live"; do
+      raw=$(_ship_normalize_repo_slug "$raw")
+      [ -n "$raw" ] || continue
+      _SHIP_OWN_REPO_SLUGS="${_SHIP_OWN_REPO_SLUGS}${raw}"$'\n'
+    done
+    _SHIP_OWN_REPO_SLUGS=$(printf '%s' "$_SHIP_OWN_REPO_SLUGS" | LC_ALL=C sort -u)
+  fi
+  printf '%s' "$_SHIP_OWN_REPO_SLUGS"
+  return 0
+}
+# $1 = a repo reference in any form gh accepts (`OWNER/REPO`, `HOST/OWNER/REPO`, a full URL,
+# `.git` suffix) -> prints the lowercase `owner/repo`, or nothing when it does not reduce to
+# exactly two path segments (unusable). ALWAYS exits 0.
+_ship_normalize_repo_slug() {
+  local slug
+  slug=$(printf '%s\n' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+           | LC_ALL=C sed -E 's|^https?://||; s|^(www\.)?github\.com[:/]||; s|\.git$||; s|/+$||')
+  case "$slug" in
+    */*/*|/*|*/|"") ;;
+    */*) printf '%s' "$slug" ;;
+  esac
   return 0
 }
 
@@ -2421,7 +2532,7 @@ else
   fi
 
   if [ -z "$TASK_CODE" ]; then
-    _review_quorum_refuse_or_hatch "could not derive a task code (set \$REVIEW_TASK_CODE, or put the ticket code e.g. HYP-931 in the branch name or PR body)"
+    _review_quorum_refuse_or_hatch "could not derive a task code (set \$REVIEW_TASK_CODE, or put the ticket code e.g. HYP-931 — or a link to THIS repo's issue, https://github.com/<owner>/<repo>/issues/<n> — in the branch name or PR body)"
   elif ! command -v review >/dev/null 2>&1; then
     _review_quorum_refuse_or_hatch "'review' CLI not found on PATH — cannot verify the bar for ${TASK_CODE} (install review-cli)"
   elif ! command -v jq >/dev/null 2>&1; then

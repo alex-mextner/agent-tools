@@ -71,6 +71,8 @@ case "$sub" in
           cat "$BODY_FILE"; echo
         elif printf '%s' "$args" | grep -q -- '--json url,mergeCommit'; then
           printf '%s\\t%s\\n' "https://github.com/acme/widgets/pull/1" ""
+        elif printf '%s' "$args" | grep -q -- '--json url'; then
+          printf '%s\\n' "https://github.com/acme/widgets/pull/1"
         elif printf '%s' "$args" | grep -q -- '--json commits'; then
           printf '%s\\n' "${SHIP_TEST_PR_COMMITS:-}"
         else
@@ -309,6 +311,20 @@ def test_acceptance_gate_skips_when_no_ticket_code_is_derivable(repo, tmp_path):
     assert _task_calls(tmp_path) == []
     assert _merged(tmp_path)
     assert _audit(tmp_path, "acceptance")[0]["detail"] == "no task code"
+
+
+def test_acceptance_gate_derives_the_code_from_a_same_repo_issue_url(repo, tmp_path):
+    """A body that links the ticket as a full same-repo issue URL (agent-tools#564) gates on
+    that ticket: `task gate #115 --json` is asked, and a refusal names `#115`."""
+    r = _run(repo, tmp_path, branch="feat", env={
+        "SHIP_TEST_PR_BODY": "Refs [#115](https://github.com/acme/widgets/issues/115)",
+        "SHIP_TEST_TASK_GATE_JSON": _NOT_ACCEPTED.replace("HYP-931", "#115"),
+        "SHIP_TEST_TASK_GATE_EXIT": "1",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert _task_calls(tmp_path) == ["gate #115 --json"]
+    assert "Refusing: acceptance gate — ticket #115 is NOT accepted" in r.stderr
+    assert not _merged(tmp_path)
 
 
 def test_acceptance_gate_reuses_the_notify_derivation_title_then_body(repo, tmp_path):
@@ -703,6 +719,8 @@ def test_magic_close_rewrite_handles_the_github_full_url_close_form(repo, tmp_pa
 
 @pytest.mark.parametrize("text", [
     "Refs #115",
+    "Refs https://github.com/acme/widgets/issues/115",          # the full-URL form task-cli's links gate demands
+    "Refs [#115](https://github.com/acme/widgets/issues/115)",  # ... and its markdown-link shape
     "Refs HYP-1295 — see the ticket",
     "fixes the bug in the parser",           # keyword without a reference
     "prefixes #1 with a marker",             # not a word boundary

@@ -62,6 +62,8 @@ case "$sub" in
           printf '%s\\t%s\\n' "${SHIP_TEST_PR_TITLE:-}" "${SHIP_TEST_PR_BODY:-}"
         elif printf '%s' "$args" | grep -q -- '--json url,mergeCommit'; then
           printf '%s\\t%s\\n' "${SHIP_TEST_PR_URL-https://github.com/acme/widgets/pull/1}" "${SHIP_TEST_MERGE_SHA:-}"
+        elif printf '%s' "$args" | grep -q -- '--json url'; then
+          printf '%s\\n' "${SHIP_TEST_PR_URL-https://github.com/acme/widgets/pull/1}"
         else
           echo '[]'
         fi ;;
@@ -287,6 +289,47 @@ def test_notify_passes_github_issue_ref_literal_to_mark_shipped(repo_with_pr_wor
     assert len(calls) == 1, calls
     assert "mark-shipped #105" in calls[0]
     assert "GH-105" not in calls[0]
+
+
+def test_notify_passes_url_derived_issue_code_literal_to_mark_shipped(repo_with_pr_worktree, tmp_path):
+    """A PR body that links its ticket as a full same-repo issue URL (the shape task-cli's
+    `links` gate demands, agent-tools#564) reaches `task mark-shipped` as the literal `#105` —
+    the same code a bare `Fixes #105` yields — never a `GH-105` rewrite."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _bindir(tmp_path, with_task=True)
+
+    r, calls = _run_ship(
+        main, bindir, tmp_path, branch="fix-the-thing",
+        extra_env={
+            "SHIP_TEST_PR_TITLE": "fix the thing",
+            "SHIP_TEST_PR_BODY": "Refs [#105](https://github.com/acme/widgets/issues/105) for real.",
+            "SHIP_TEST_PR_URL": "https://github.com/acme/widgets/pull/1",
+        },
+    )
+
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert len(calls) == 1, calls
+    assert "mark-shipped #105" in calls[0]
+    assert "GH-105" not in calls[0]
+
+
+def test_notify_skips_an_issue_url_of_another_repo(repo_with_pr_worktree, tmp_path):
+    """A link to ANOTHER repo's issue (a cross-repo companion) is not this PR's ticket: nothing
+    is derived, so `task mark-shipped` is never called with a foreign issue number."""
+    main, _wt = repo_with_pr_worktree
+    bindir = _bindir(tmp_path, with_task=True)
+
+    r, calls = _run_ship(
+        main, bindir, tmp_path, branch="fix-the-thing",
+        extra_env={
+            "SHIP_TEST_PR_TITLE": "fix the thing",
+            "SHIP_TEST_PR_BODY": "Companion of https://github.com/other-org/tg-cli/issues/301.",
+            "SHIP_TEST_PR_URL": "https://github.com/acme/widgets/pull/1",
+        },
+    )
+
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert calls == [], calls
 
 
 def test_notify_normalizes_a_reused_gh_synthetic_code_to_the_task_cli_id_format(repo_with_pr_worktree, tmp_path):
