@@ -17,14 +17,17 @@ THE INBOX KEY CONTRACT — shared byte-for-byte with tg-cli ``features/tg-ctl/un
     cwd = the agent process's working directory with trailing "/" stripped ("/" stays).
     inbox dir = <tg-cli config dir>/inbox/<key>/
                 (config dir = $TG_CTL_CONFIG_DIR, else ~/.config/tg-cli)
-    pending.jsonl   -- appended by the tg-ctl daemon, one JSON object per line
-    delivered.jsonl -- appended by this reader after it handed the entries to the agent
-    acked.jsonl     -- appended by the daemon after reacting on the Telegram message
+    pending.jsonl                     -- appended by the tg-ctl daemon, one object per line
+    delivered-<pid>-<ns>-<rnd>.jsonl  -- ONE complete file per consumption by this reader
+                                         (written as tmp-…, then renamed — never appended)
+    acked.jsonl                       -- appended by the daemon after reacting on Telegram
 
 Assumptions: the inbox is a local file written by the user's own tg-ctl daemon; its
 content is DATA for the agent (rendered as the block reason), never executed here. A
 missing, empty or malformed inbox never blocks (fail-open, logged to stderr). Delivery is
-at-most-once: entries are archived to delivered.jsonl BEFORE the block reason is returned.
+at-most-once: entries are archived to a delivered-* batch BEFORE the block reason is
+returned, and the bridges consume the inbox as the LAST step of a Stop (after the v1 stop
+hooks ran), so a crashing hook cannot eat a message that was never shown.
 """
 
 from __future__ import annotations
@@ -32,21 +35,25 @@ from __future__ import annotations
 from .core import (
     agent_key,
     agent_key_for_process,
+    combine_stop_parts,
     consume_pending,
     format_block_reason,
     inbox_dir,
     inbox_root,
     parse_agent_name,
     sanitize_agent_name,
+    stop_inbox_text,
 )
 
 __all__ = [
     "agent_key",
     "agent_key_for_process",
+    "combine_stop_parts",
     "consume_pending",
     "format_block_reason",
     "inbox_dir",
     "inbox_root",
     "parse_agent_name",
     "sanitize_agent_name",
+    "stop_inbox_text",
 ]

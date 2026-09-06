@@ -9,6 +9,7 @@ import re
 import subprocess  # noqa: S404 - reading the agent's argv via `ps` is the point
 import sys
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,8 +18,11 @@ _NAME_MAX = 64
 PENDING_FILE = "pending.jsonl"
 # One COMPLETE file per consumption (temp + rename), never a shared append target: the
 # daemon claims/unlinks what it reads, and an append into a file that was just unlinked
-# would land on a dead inode (review finding). `delivered-<pid>-<ns>.jsonl`.
+# would land on a dead inode. `delivered-<pid>-<ns>-<rnd>.jsonl`; the in-flight temp file
+# carries a DIFFERENT prefix so no `delivered-*` glob on the daemon side can ever see a
+# half-written batch.
 DELIVERED_PREFIX = "delivered-"
+TMP_PREFIX = "tmp-"
 DIR_MODE = 0o700
 FILE_MODE = 0o600
 # How many parent hops to climb looking for the agent process (hook -> sh -> agent).
@@ -104,14 +108,23 @@ def _ps_line(pid: int) -> tuple[int, str] | None:
     return ppid, (parts[1] if len(parts) > 1 else "")
 
 
+_AGENT_BINARIES = {"claude", "codex", "opencode"}
+
+
 def _looks_like_agent(args: str) -> bool:
     """An interactive agent binary: ``claude``/``codex``/``opencode`` as argv0, OR the
-    Claude Code launcher shape ``node …/.claude/local/claude …`` where argv0 is ``node``
-    and the real entry point is a path ending in ``/claude`` — the same wrapper shape
-    tg-cli's ``matchAgentCommand`` accepts."""
-    argv0 = args.split(None, 1)[0] if args else ""
-    base = os.path.basename(argv0)
-    return base in {"claude", "codex", "opencode"} or "/claude " in f"{args} "
+    Claude Code launcher shape ``node …/.claude/local/claude …`` — a LATER token that is
+    a path whose basename is ``claude``. This mirrors tg-cli's ``matchAgentCommand``
+    (``argv0 basename`` or ``includes('/claude ')``) on purpose: the two matchers must
+    pick the same process or the shared inbox key splits. A bare ``claude`` argument
+    (``grep claude notes``) and a ``…/.claude`` directory are NOT the launcher shape.
+    """
+    tokens = args.split()
+    if not tokens:
+        return False
+    if os.path.basename(tokens[0]) in _AGENT_BINARIES:
+        return True
+    return any("/" in tok and os.path.basename(tok) == "claude" for tok in tokens[1:])
 
 
 def agent_argv(start_pid: int | None = None) -> str:
@@ -167,8 +180,9 @@ def inbox_dir(key: str) -> Path:
 def _parse_lines(text: str, *, stamp: str, session_id: str) -> tuple[list[dict], list[str], int]:
     """One pass over the JSONL: ``(entries to deliver, archive lines, malformed count)``.
 
-    A valid entry is an object with a string ``wrapped``; it is archived stamped with
-    ``delivered_ts``/``session_id``. Anything else is archived flagged ``malformed`` (never
+    A valid entry is an object with a non-blank string ``wrapped``; it is archived stamped
+    with ``delivered_ts``/``session_id``. Anything else (a blank ``wrapped`` included — it
+    would be consumed yet deliver nothing) is archived flagged ``malformed`` (never
     silently dropped) and not delivered.
     """
     entries: list[dict] = []
@@ -182,13 +196,13 @@ def _parse_lines(text: str, *, stamp: str, session_id: str) -> tuple[list[dict],
             obj = json.loads(line)
         except ValueError:
             obj = None
-        if isinstance(obj, dict) and isinstance(obj.get("wrapped"), str):
+        if isinstance(obj, dict) and isinstance(obj.get("wrapped"), str) and obj["wrapped"].strip():
             entries.append(obj)
-            obj = dict(obj, delivered_ts=stamp, session_id=session_id)
+            record = dict(obj, delivered_ts=stamp, session_id=session_id)
         else:
             malformed += 1
-            obj = {"malformed": True, "raw": line, "delivered_ts": stamp, "session_id": session_id}
-        archived.append(json.dumps(obj, ensure_ascii=False))
+            record = {"malformed": True, "raw": line, "delivered_ts": stamp, "session_id": session_id}
+        archived.append(json.dumps(record, ensure_ascii=False))
     return entries, archived, malformed
 
 
@@ -209,7 +223,7 @@ def consume_pending(key: str, *, session_id: str = "") -> list[dict]:
     ``pending.jsonl`` and are picked up at the next Stop. The claim name is unique
     (pid + nanoseconds + random), so a stale claim left by an earlier failure can never
     be overwritten by a later rename (review finding). The claimed records are published
-    as ONE complete ``delivered-<pid>-<ns>-<rnd>.jsonl`` (written to a temp file, then
+    as ONE complete ``delivered-<pid>-<ns>-<rnd>.jsonl`` (written to a ``tmp-…`` file, then
     renamed — the daemon only ever sees whole batches) and the claim is removed — all
     BEFORE the caller emits the block, so a message is never delivered twice.
     Any problem → ``[]`` with a stderr line (fail-open: the stop proceeds normally).
@@ -226,7 +240,7 @@ def consume_pending(key: str, *, session_id: str = "") -> list[dict]:
         return []
     try:
         text = claim.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, ValueError) as exc:  # ValueError: invalid UTF-8 — the claim stays on disk
         _warn(f"could not read {claim}: {exc}")
         return []
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -240,7 +254,7 @@ def consume_pending(key: str, *, session_id: str = "") -> list[dict]:
             pass
         return []
     batch = directory / _unique_name(DELIVERED_PREFIX)
-    tmp = batch.with_suffix(".jsonl.tmp")
+    tmp = directory / _unique_name(TMP_PREFIX)
     try:
         try:
             os.chmod(directory, DIR_MODE)
@@ -264,3 +278,39 @@ def consume_pending(key: str, *, session_id: str = "") -> list[dict]:
 def format_block_reason(entries: list[dict]) -> str:
     """The Stop block reason: the pre-wrapped texts, oldest first, blank-line separated."""
     return "\n\n".join(e["wrapped"] for e in entries)
+
+
+def combine_stop_parts(inbox_text: str, hook_reason: str | None) -> str | None:
+    """The ONE combining rule every bridge applies on Stop: the inbox messages first, a
+    blocking hook's reason after, blank-line separated; ``None`` when neither blocks.
+    A blocking hook with an EMPTY reason still blocks (``is not None``, never
+    truthiness) — a fail-closed gate that died without a message must not become an
+    allow. Shared here so the two bridges cannot drift on the safety-critical half."""
+    if not inbox_text and hook_reason is None:
+        return None
+    parts = [inbox_text] if inbox_text else []
+    if hook_reason is not None:
+        parts.append(hook_reason)
+    return "\n\n".join(parts)
+
+
+def stop_inbox_text(key_fn: Callable[[], str], *, session_id: str, warn: Callable[[str], None]) -> str:
+    """The fail-open Stop-side wrapper every harness bridge shares: the pending messages
+    for this agent, consumed (at-most-once) and rendered as block-reason text, or ``""``.
+
+    ``key_fn`` is called LAZILY, only when an inbox root exists at all — locating the agent
+    process costs up to a handful of ``ps`` calls, and a machine without tg-cli must not
+    pay that on every Stop. Any failure is one ``warn`` line and ``""`` (never blocks).
+    """
+    try:
+        if not inbox_root().exists():
+            return ""
+        key = key_fn()
+        entries = consume_pending(key, session_id=session_id)
+    except Exception as exc:  # noqa: BLE001 - fail-open: a broken inbox never wedges the agent
+        warn(f"tg inbox check failed, skipping (fail-open): {exc}")
+        return ""
+    if not entries:
+        return ""
+    warn(f"delivering {len(entries)} queued Telegram message(s) from the tg-ctl inbox ({key})")
+    return format_block_reason(entries)

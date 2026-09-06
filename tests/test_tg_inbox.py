@@ -33,8 +33,11 @@ from agenttools_tg_inbox import (  # noqa: E402
     inbox_dir,
     parse_agent_name,
     sanitize_agent_name,
+    stop_inbox_text,
 )
 from agenttools_tg_inbox import core as inbox_core  # noqa: E402
+from cc_hook_bridge import dispatch as cc_dispatch  # noqa: E402
+from codex_hook_bridge import dispatch as codex_dispatch  # noqa: E402
 
 
 def _entry(i: int, wrapped: str) -> str:
@@ -118,7 +121,7 @@ def test_consume_pending_returns_entries_and_archives_at_most_once(cfg):
     assert format_block_reason(entries) == "[TG from Alex tg#1] first\n\n[TG from Alex tg#2] second"
     assert not (d / "pending.jsonl").exists()
     assert not list(d.glob("claim-*"))
-    assert not list(d.glob("*.tmp"))
+    assert not list(d.glob("tmp-*"))
     batches = list(d.glob("delivered-*.jsonl"))
     assert len(batches) == 1  # ONE complete batch file per consumption
     assert batches[0].stat().st_mode & 0o777 == 0o600
@@ -292,3 +295,100 @@ def test_cc_bridge_stop_hook_block_and_inbox_ride_in_one_block(tmp_path):
     # empty inbox afterwards: the gate alone still blocks
     res2 = _run_bridge("cc_hook_bridge", {"hook_event_name": "Stop", "cwd": cwd}, cfg=cfg, home=home)
     assert json.loads(res2.stdout)["reason"].strip() == "stay: gate says no"
+
+
+# --- review-round hardening (PR #563, round 3) ---
+
+
+def test_consume_pending_invalid_utf8_keeps_claim_and_warns(cfg, capsys):
+    d = inbox_dir("landing")
+    d.mkdir(parents=True)
+    (d / "pending.jsonl").write_bytes(b'{"wrapped": "\xff\xfe broken"}\n')
+    assert consume_pending("landing") == []
+    assert "could not read" in capsys.readouterr().err
+    assert len(list(d.glob("claim-*"))) == 1  # kept on disk for a human, not lost
+
+
+def test_consume_pending_blank_wrapped_is_malformed_not_silently_eaten(cfg, capsys):
+    d = inbox_dir("landing")
+    d.mkdir(parents=True)
+    (d / "pending.jsonl").write_text(json.dumps({"id": 1, "wrapped": "   "}) + "\n")
+    assert consume_pending("landing") == []
+    assert "1 malformed" in capsys.readouterr().err
+    batch = next(d.glob("delivered-*.jsonl"))
+    assert json.loads(batch.read_text())["malformed"] is True
+
+
+def test_looks_like_agent_matches_whole_tokens_only():
+    assert inbox_core._looks_like_agent("claude --name landing")
+    assert inbox_core._looks_like_agent("node /Users/u/.claude/local/claude --name landing")
+    assert inbox_core._looks_like_agent("/opt/homebrew/bin/codex")
+    assert not inbox_core._looks_like_agent("grep -r pattern /Users/u/.claude /Users/u/projects")
+    assert not inbox_core._looks_like_agent("test -d /Users/u/.claude/settings.json")
+    assert not inbox_core._looks_like_agent("sh -c grep claude notes.txt")  # a bare word, not a path
+    assert not inbox_core._looks_like_agent("python foo.py claude")
+    assert not inbox_core._looks_like_agent("")
+
+
+def test_stop_inbox_text_never_locates_the_agent_without_an_inbox_root(cfg):
+    def boom() -> str:
+        raise AssertionError("key lookup must not run when no inbox exists")
+
+    warnings: list[str] = []
+    assert stop_inbox_text(boom, session_id="", warn=warnings.append) == ""
+    assert warnings == []
+
+
+def test_stop_inbox_text_is_fail_open_on_a_broken_key_lookup(cfg):
+    inbox_dir("x").mkdir(parents=True)
+
+    def boom() -> str:
+        raise RuntimeError("ps exploded")
+
+    warnings: list[str] = []
+    assert stop_inbox_text(boom, session_id="", warn=warnings.append) == ""
+    assert warnings and "fail-open" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    ("module", "event"),
+    [
+        (cc_dispatch, {"hook_event_name": "Stop", "cwd": "/Users/ultra/work/landing"}),
+        (codex_dispatch, {"hook_event_name": "Stop", "cwd": "/Users/ultra/work/landing", "session_id": "s"}),
+    ],
+)
+def test_dispatch_runs_the_stop_hooks_before_consuming_the_inbox(cfg, monkeypatch, module, event):
+    # Consuming is irreversible; a hook that raises must not eat a message the agent
+    # never saw (all three round-3 reviewers). pid 1 is never an agent → cwd key.
+    monkeypatch.setattr(inbox_core, "_ps_line", lambda pid: None)
+    d = inbox_dir("cwd-ccfe64bae2f277d7")
+    d.mkdir(parents=True)
+    (d / "pending.jsonl").write_text(_entry(1, "[TG from Alex tg#1] hi") + "\n")
+
+    def exploding_hooks(hook_event_name, ev):
+        raise RuntimeError("hook discovery crashed")
+
+    monkeypatch.setattr(module, "_first_hook_block", exploding_hooks)
+    with pytest.raises(RuntimeError):
+        module.dispatch("Stop", event)
+    assert (d / "pending.jsonl").exists()
+    assert not list(d.glob("delivered-*"))
+
+
+def test_combine_stop_parts_is_the_one_shared_rule():
+    from agenttools_tg_inbox import combine_stop_parts
+
+    assert combine_stop_parts("", None) is None
+    assert combine_stop_parts("", "") == ""  # an empty-reason block still blocks
+    assert combine_stop_parts("msg", None) == "msg"
+    assert combine_stop_parts("msg", "gate") == "msg\n\ngate"
+
+
+def test_combine_block_empty_hook_reason_still_blocks():
+    # `("block", "")` from a fail-closed gate must not become an allow (round-3 finding).
+    assert cc_dispatch._combine_block("Stop", "", "") == cc_dispatch.cc_block_output("Stop", "")
+    assert cc_dispatch._combine_block("Stop", "", None) is None
+    assert cc_dispatch._combine_block("Stop", "msg", None) == cc_dispatch.cc_block_output("Stop", "msg")
+    assert codex_dispatch._combine_block("", "") == codex_dispatch.codex_block_output("")
+    assert codex_dispatch._combine_block("", None) is None
+    assert codex_dispatch._combine_block("msg", "gate") == codex_dispatch.codex_block_output("msg\n\ngate")

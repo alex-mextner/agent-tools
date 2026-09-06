@@ -18,12 +18,19 @@ pane.
   (waiting at the prompt) receives it when it next finishes a turn — i.e. after the user
   types something locally. `tg-ctl`'s reply says so ("delivery deferred until the agent is
   active"); there is no way to wake an idle Claude Code without a tty.
-- Delivery is **at-most-once**: entries are archived to `delivered.jsonl` *before* the block
-  is emitted. If the harness ignores the block (it never does today), the message is not
-  retried — it is on disk in `delivered.jsonl` for a human.
+- Delivery is **at-most-once**: entries are archived to a `delivered-<pid>-<ns>-<rnd>.jsonl`
+  batch *before* the block is emitted. If the harness ignores the block (it never does
+  today), the message is not retried — it is on disk in that batch for a human. The bridges
+  consume the inbox as the **last** step of a Stop, after the v1 stop hooks ran: consuming
+  is irreversible, and a hook that raised would otherwise have eaten a message the agent
+  never saw.
+- **Two sessions sharing one key share one inbox.** Two unnamed agents in the same cwd (an
+  unnamed Claude next to a Codex included) both key on `cwd-<hash>`; whichever Stops first
+  consumes the other's messages. Inherent to the contract — tg-ctl refuses to queue when it
+  sees such a live collision, and distinct `--name` values avoid it.
 - Only harnesses with a Stop hook take part: Claude Code and Codex. opencode's plugin bridge
-  has no Stop point, so an opencode session outside tmux stays listed as unreachable with no
-  fallback.
+  and the omp bridge have no Stop point, so such a session outside tmux stays listed as
+  unreachable with no fallback.
 
 ## The inbox key contract (shared with tg-cli — keep both sides identical)
 
@@ -41,7 +48,7 @@ inbox dir    = <tg-cli config dir>/inbox/<key>/
 | file | writer | reader |
 | --- | --- | --- |
 | `pending.jsonl` | tg-ctl daemon (append, one JSON object per line) | this package (claims by rename) |
-| `delivered-<pid>-<ns>-<rnd>.jsonl` | this package — ONE complete file per consumption, written to a `.tmp` and renamed | tg-ctl daemon (reacts on the Telegram message, archives to `acked.jsonl`, unlinks) |
+| `delivered-<pid>-<ns>-<rnd>.jsonl` | this package — ONE complete file per consumption, written as `tmp-<pid>-<ns>-<rnd>.jsonl` and renamed | tg-ctl daemon (reacts on the Telegram message, archives to `acked.jsonl`, unlinks) |
 | `acked.jsonl` | tg-ctl daemon | humans |
 
 Directories are `0700`, files `0600` — the content is the user's private Telegram text.
