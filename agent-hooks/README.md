@@ -134,7 +134,7 @@ These are the *logical* points; map them to your harness's actual tool-use event
 | `pre-skill` **(live in Claude Code when rig provisions the bridge; NOT mapped in Codex/opencode yet)** | before a Skill-tool invocation | skills-marker-writer |
 | `pre-monitor` **(mapped by the bridge; NOT yet wired to a rig-cli matcher — inert until that ships, see below)** | before a Monitor-tool call | subagent-no-monitor |
 | `post-write`   | after a file write/edit has landed on disk   | format-on-write, lint-on-write          |
-| `stop`         | when the agent is about to end its turn      | stop-completion-selfcheck               |
+| `stop`         | when the agent is about to end its turn      | chat-dictionary-gate (priority 10), model-error-fallback (priority 20, advisory-only), stop-completion-selfcheck (priority 50) |
 
 ### `pre-agent` — gate a subagent dispatch
 
