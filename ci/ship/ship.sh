@@ -2139,7 +2139,10 @@ _review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE \
       '(^|[^A-Za-z0-9_./-])(close[sd]?|fix(e[sd])?|resolve[sd]?|refs?|references?)[[:space:]]*:?[[:space:]]*#[0-9]+[A-Za-z0-9_]?' \
       | LC_ALL=C grep -oE '#[0-9]+[A-Za-z0-9_]?$' | LC_ALL=C grep -xE '#[0-9]+' | LC_ALL=C sort -u || true)
-  local kw_n; kw_n=$(printf '%s\n' "$m" | LC_ALL=C grep -c '#')
+  # `|| true`: `grep -c` exits 1 when the count is 0 -- which under this script's
+  # `set -euo pipefail` is exactly the NEW path this change exists to serve (a body with no
+  # keyword-anchored ref, only a URL). Guarded like every other grep in this function.
+  local kw_n; kw_n=$(printf '%s\n' "$m" | LC_ALL=C grep -c '#') || true
   if [ "$kw_n" -eq 1 ]; then printf '%s' "$m"; return 0; fi
   [ "$kw_n" -gt 1 ] && return 0   # ambiguous anchored refs: fail closed, never fall through
   # Full GitHub issue URL of the PR's OWN repo (agent-tools#564) — the LAST fallback. task-cli's
