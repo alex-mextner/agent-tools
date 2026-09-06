@@ -170,6 +170,25 @@ def test_clean_turn_allows_and_resets_counter(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_zero_counter_is_represented_by_no_file_not_a_stale_zero_file(monkeypatch, tmp_path):
+    """Regression (PR review finding): a clean Stop and a cap reset both persist 0. Writing
+    a literal zero file would leave one stale JSON file per session in MARKER_DIR forever
+    (nothing cleans them up), so 0 must be represented by DELETING the file — a missing
+    file already reads as 0."""
+    _default_dict_path(monkeypatch, tmp_path, [POCHTIT_RULE])
+    event_id = "sess-zero-is-no-file"
+    sid = gate.session_id({"event_id": event_id})
+    bad = _write_transcript(tmp_path, [_user_msg("fix"), _assistant_text("почтил")], name="bad.jsonl")
+    out, code, err = _run({"event_id": event_id, "args": {"transcript_path": bad}}, monkeypatch)
+    assert out["decision"] == "block"
+    assert gate._counter_file(sid).exists(), "a live streak IS a file"
+    clean = _write_transcript(tmp_path, [_user_msg("ok"), _assistant_text("All good.")], name="clean.jsonl")
+    out, code, err = _run({"event_id": event_id, "args": {"transcript_path": clean}}, monkeypatch)
+    assert out["decision"] == "allow"
+    assert not gate._counter_file(sid).exists(), "a reset to 0 must remove the file, not write a zero"
+    assert gate._read_counter(sid) == 0
+
+
 def test_pochtit_violation_blocks_with_full_message_contract(monkeypatch, tmp_path):
     _default_dict_path(monkeypatch, tmp_path, [POCHTIT_RULE])
     transcript = _write_transcript(

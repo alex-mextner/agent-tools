@@ -228,6 +228,15 @@ def _write_counter(sid: str, n: int) -> bool:
     (`_read_counter` already treats a corrupt file as 0, but atomicity avoids relying on
     that safety net for an otherwise-avoidable failure mode)."""
     try:
+        if n == 0:
+            # Zero is represented by NO file (`_read_counter` already reads a missing file
+            # as 0): every clean Stop and every cap reset lands here, so writing a literal
+            # `{"consecutive_blocks": 0}` would leave one stale file per session in
+            # MARKER_DIR forever, with nothing ever cleaning them up (a PR review finding).
+            # Deleting instead means the directory only ever holds sessions with a LIVE
+            # streak, which is self-cleaning by construction.
+            _counter_file(sid).unlink(missing_ok=True)
+            return True
         MARKER_DIR.mkdir(parents=True, exist_ok=True)
         tmp = _counter_file(sid).with_suffix(f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps({"consecutive_blocks": n}), encoding="utf-8")
