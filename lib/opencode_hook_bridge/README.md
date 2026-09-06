@@ -96,10 +96,10 @@ markers by hand, let the launcher set them for the child only.
 
 Every translated v1 event also carries a top-level `harness: "opencode"` — a hardcoded
 module constant (`dispatch.HARNESS`), never derived from the opencode event, so it can't be
-forged via tool args the way the identity fields above must be actively stripped. A hook
-that needs to scope a policy to (or exempt) one harness reads `event["harness"]` directly
-(see `agent-hooks/orchestrator-stays-thin`'s harness-exempt list for the first consumer,
-agent-tools#533) instead of trying to reconstruct a trusted subagent identity.
+forged via tool args the way the identity fields above must be actively stripped. Hooks read
+it to name THIS harness's delegation recipe (`rig-detached-opencode`) in their refusal text
+(`agenttools_hatch_escalation.delegation_recipe`), never to exempt the harness — the #533/#544
+`EXEMPT_HARNESSES` shortcut is gone (agent-tools#573).
 
 ## Descriptor directory
 

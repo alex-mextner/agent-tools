@@ -177,8 +177,8 @@ def test_only_args_agent_id_exempts_not_top_level_or_tool_input(tmp_path, monkey
 # as a build/edit signal), so the chain falls through to the >=3-segment fallback and is judged
 # implementation-shaped on chain length alone — a real, separate READ_ONLY_BASH gap, filed
 # separately; not fixed here. It is used below BOTH as the control (proves the chain trips the
-# classifier at all) and as the harness-exempt case (proves tagging `harness` bypasses that
-# classifier entirely, regardless of what the command looks like).
+# classifier at all) and as the per-harness case (proves every `harness` tag is governed the same
+# way and only steers the recipe text, agent-tools#573).
 _REPRO_CHAIN = (
     "sed -n '1,240p' SKILL.md && git diff --check && git status --short && git diff -- a.py"
 )

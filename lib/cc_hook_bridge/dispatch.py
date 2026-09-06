@@ -39,9 +39,9 @@ from pathlib import Path
 HOOK_API = "agents-hooks/v1"
 # The v1 event's `harness` tag for every event this bridge produces. A MODULE LITERAL, not
 # derived from any field of `cc_event` — so it cannot be forged by a model/tool_input value the
-# way `args.harness` could be. A hook that wants to scope itself to (or exempt) one harness reads
-# `event["harness"]`, never `args`. See orchestrator-stays-thin's EXEMPT_HARNESSES for the first
-# consumer (agent-tools#533).
+# way `args.harness` could be. A hook reads `event["harness"]`, never `args`, for ONE purpose:
+# to name this harness's delegation recipe in its refusal text (agent-tools#573 —
+# `agenttools_hatch_escalation.delegation_recipe`); no hook exempts a harness on it.
 HARNESS = "claude-code"
 # CC events this bridge knows how to register/handle (typo guard in main()).
 _KNOWN_EVENTS = frozenset({"PreToolUse", "Stop", "PostToolUse"})
