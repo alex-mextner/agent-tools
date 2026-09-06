@@ -1,6 +1,13 @@
 ---
 name: rig-detached-opencode
-description: Use when an opencode orchestrator must dispatch a NON-TRIVIAL subagent in the background on a default opencode build — the build has no native background field on its task tool (that exists only behind OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true), and the background-subagent-gate pre-agent hook blocks a foreground dispatch. Run the bundled rig-detached-opencode launcher: it nohup-detaches an `opencode run` child carrying RIG_AGENT_ID/RIG_DETACHED_AGENT so the hook bridge classifies every tool call in the child session as a dispatched subagent's.
+description: >-
+  Use when an opencode orchestrator must dispatch a NON-TRIVIAL subagent in the background
+  on a default opencode build. That build has no native background field on its task tool
+  (the field exists only behind OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true), and the
+  background-subagent-gate pre-agent hook blocks a foreground dispatch. Run the bundled
+  rig-detached-opencode launcher - it nohup-detaches an `opencode run` child carrying
+  RIG_AGENT_ID/RIG_DETACHED_AGENT so the hook bridge classifies every tool call in the
+  child session as a dispatched subagent.
 ---
 
 # rig-detached-opencode — canonical detached-agent launcher for opencode
