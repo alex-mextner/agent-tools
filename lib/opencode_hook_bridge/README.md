@@ -44,7 +44,7 @@ happened, so a block decision is logged as feedback and the plugin fails open.
 | `tool.execute.before` + `bash` | `pre-bash` | `output.args.command` becomes `event.command` and `args.command`. |
 | `tool.execute.before` + `edit` / `write` | `pre-write` | `output.args.filePath` is normalized to `args.file_path` / `args.path`; proposed content is normalized to `args.content`. |
 | `tool.execute.before` + `apply_patch` | `pre-write` | `output.args.patchText` becomes raw `args.patch`; added patch lines become `args.content`; patch marker paths become `args.file_path` / `args.path`. |
-| `tool.execute.before` + `task` | `pre-agent` | Carries the task payload (`subagent_type`, `prompt`, `description`) for orchestration guards. |
+| `tool.execute.before` + `task` | `pre-agent` | Carries the task payload (`subagent_type`, `prompt`, `description`) for orchestration guards. opencode Task is inherently async and has no `background` field; `general`/`explore` therefore pass the background-subagent gate. |
 | `tool.execute.after` + `edit` / `write` / `apply_patch` | `post-write` | Runs path-based hooks after the write; exit 10 is logged as feedback because opencode cannot un-run the completed write. |
 
 opencode has session events such as `session.idle`, but this bridge does not map
