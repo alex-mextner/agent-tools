@@ -52,7 +52,12 @@ interface BridgeResult {
 // failure here always resolves to "no opinion" (return undefined => allow); only an EXPLICIT
 // `{"decision":"block","reason":...}` from the dispatcher becomes a real block. See README.md
 // "Fail policy" for the full reasoning.
-function runBridge(eventName: "tool_call" | "tool_result", event: any, ctx: any): BridgeResult | undefined {
+function runBridge(
+  eventName: "tool_call" | "tool_result",
+  event: any,
+  ctx: any,
+  registration: number,
+): BridgeResult | undefined {
   const python = process.env.OMP_HOOK_BRIDGE_PYTHON || "python3";
   const priorPythonPath = process.env.PYTHONPATH || "";
   let proc;
@@ -63,6 +68,9 @@ function runBridge(eventName: "tool_call" | "tool_result", event: any, ctx: any)
       input: event?.input ?? {},
       cwd: ctx?.cwd || process.cwd(),
       toolCallId: event?.toolCallId,
+      // TOP-LEVEL identity, computed from omp's own objects (never from `event.input`, which
+      // the dispatcher strips of every agent-shaped key). See `subagentIdentity` below.
+      ...subagentIdentity(registration, ctx),
     });
     proc = spawnSync(python, ["-m", "omp_hook_bridge", eventName], {
       input: payload,
@@ -114,10 +122,62 @@ function interpretDispatcherResult(eventName: string, proc: any): BridgeResult |
   return undefined;
 }
 
+// ── Subagent identity (agent-tools#573) ────────────────────────────────────────────────────
+//
+// omp runs a `task` subagent IN THIS PROCESS: it creates a child agent session and invokes every
+// extension's default export ONCE MORE for it, with a fresh `pi` (captured live on omp 18.0.11:
+// the module loads once, the export runs twice, the child's `tool_call`s arrive on the second
+// registration's handler). The child's `sessionManager` reports a different session id and a
+// CHILD-SHAPED session file — nested under the parent session's stem directory
+// (`<sessions>/<project>/<stamp>_<uuid>/<TaskName>.jsonl`) or, in `--no-session` mode, under an
+// `omp-task-*` temp directory — whereas a root session's file is a top-level sibling
+// (`<sessions>/<project>/<stamp>_<uuid>.jsonl`) or, with `--no-session`, absent.
+//
+// A tool call is tagged as a subagent's ONLY when BOTH hold: the registration is not the first
+// one in this process AND its session file is child-shaped. The conjunction is what makes the
+// root immune: an interactive `/new` (should it ever re-run the export) yields a fresh ROOT-shaped
+// file, so the second signal fails and the root stays the orchestrator (fail closed in the relax
+// direction). Everything read here is omp's own bookkeeping — the model cannot reach it from a
+// tool call's arguments — so the dispatcher trusts the top-level `agentId`/`agentType` the way
+// the Claude Code bridge trusts CC's top-level fields.
+let registrations = 0;
+
+const OMP_TASK_TEMP_DIR = /(^|\/)omp-task-[^/]+$/;
+const OMP_SESSION_STEM_DIR = /(^|\/)\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-f-]{36}$/;
+
+function isChildSessionFile(file: unknown): boolean {
+  if (typeof file !== "string" || !file) {
+    return false;
+  }
+  const dir = file.slice(0, Math.max(file.lastIndexOf("/"), 0));
+  return OMP_TASK_TEMP_DIR.test(dir) || OMP_SESSION_STEM_DIR.test(dir);
+}
+
+function subagentIdentity(registration: number, ctx: any): { agentId: string; agentType: string } | {} {
+  if (registration <= 1) {
+    return {};
+  }
+  let sessionId: unknown;
+  let sessionFile: unknown;
+  try {
+    const sm = ctx?.sessionManager;
+    sessionId = sm?.getSessionId?.();
+    sessionFile = sm?.getSessionFile?.();
+  } catch {
+    return {};
+  }
+  if (!isChildSessionFile(sessionFile)) {
+    return {};
+  }
+  const agentId = typeof sessionId === "string" && sessionId ? sessionId : `omp-task-${registration}`;
+  return { agentId, agentType: "task" };
+}
+
 export default function (pi: any): void {
+  const registration = ++registrations;
   pi.on("tool_call", async (event: any, ctx: any) => {
     try {
-      return runBridge("tool_call", event, ctx);
+      return runBridge("tool_call", event, ctx, registration);
     } catch (error: any) {
       // Belt-and-braces: runBridge already catches internally, but a bridge-infrastructure
       // bug must NEVER escape as a throw here — that would block the tool call (see the
@@ -131,7 +191,7 @@ export default function (pi: any): void {
     // Post-execution: the write already landed, so a block decision here is logged only
     // (matching opencode's `tool.execute.after` behavior), never surfaced as a real block.
     try {
-      const result = runBridge("tool_result", event, ctx);
+      const result = runBridge("tool_result", event, ctx, registration);
       if (result?.block) {
         console.error(`omp-hook-bridge: post-write hook would have blocked; write already landed: ${result.reason}`);
       }

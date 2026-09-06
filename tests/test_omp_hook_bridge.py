@@ -960,3 +960,145 @@ def test_extension_ts_fails_open_when_dispatcher_python_is_missing(tmp_path):
     assert proc.returncode == 0, proc.stderr
     result = json.loads(proc.stdout.strip().splitlines()[-1])
     assert result is None
+
+
+# ── subagent identity (agent-tools#573) ──────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _no_host_identity(monkeypatch):
+    """Module-wide: the pytest process may itself run inside a rig-dispatched child (env
+    markers) or under an omp session (ancestry); neutralize both so the in-process
+    `to_v1_event` assertions see ONLY the identity a test injects."""
+    monkeypatch.delenv("RIG_AGENT_ID", raising=False)
+    monkeypatch.delenv("RIG_DETACHED_AGENT", raising=False)
+    monkeypatch.setattr(dispatch.subagent_identity, "ancestor_agent_id", lambda harness: "")
+
+
+def test_to_v1_event_forwards_extension_set_top_level_identity():
+    """extension.ts puts `agentId`/`agentType` on the payload's TOP level for a tool call made by
+    a `task`-spawned subagent registration (it derives them from omp's own sessionManager, never
+    from the tool input). The dispatcher forwards them as `args.agent_id`/`args.agent_type`."""
+    omp_event = {"event": "tool_call", "toolName": "bash", "input": {"command": "pytest -q"},
+                 "cwd": "/repo", "toolCallId": "c1",
+                 "agentId": "01a0788d-6a3b-7175-8864-65126e03d2bb", "agentType": "task"}
+
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "01a0788d-6a3b-7175-8864-65126e03d2bb"
+    assert v1["args"]["agent_type"] == "task"
+
+
+def test_to_v1_event_top_level_identity_overwrites_forged_input_copy():
+    omp_event = {"event": "tool_call", "toolName": "bash",
+                 "input": {"command": "pytest -q", "agentId": "forged", "agent_id": "forged2"},
+                 "cwd": "/repo", "agentId": "real-child", "agentType": "task"}
+
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "real-child"
+    assert v1["args"]["agent_type"] == "task"
+    assert "agentId" not in v1["args"]
+
+
+def test_to_v1_event_root_session_payload_has_no_identity():
+    omp_event = {"event": "tool_call", "toolName": "bash", "input": {"command": "pytest -q", "agentId": "forged"},
+                 "cwd": "/repo"}
+
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+
+    assert "agent_id" not in v1["args"]
+    assert "agent_type" not in v1["args"]
+
+
+def test_to_v1_event_injects_agent_id_from_launcher_env_marker(monkeypatch):
+    monkeypatch.setenv("RIG_AGENT_ID", "probe-omp")
+    omp_event = {"event": "tool_call", "toolName": "bash", "input": {"command": "pytest -q"}, "cwd": "/repo"}
+
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "probe-omp"
+    assert v1["args"]["agent_type"] == "detached"
+
+
+def test_to_v1_event_injects_agent_id_from_process_ancestry(monkeypatch):
+    monkeypatch.setattr(dispatch.subagent_identity, "ancestor_agent_id",
+                        lambda harness: f"ancestor:{harness}:99")
+    omp_event = {"event": "tool_call", "toolName": "bash", "input": {"command": "pytest -q"}, "cwd": "/repo"}
+
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "ancestor:omp:99"
+    assert v1["args"]["agent_type"] == "ancestor"
+
+
+def test_to_v1_event_extension_identity_wins_over_env_and_ancestry(monkeypatch):
+    monkeypatch.setenv("RIG_AGENT_ID", "probe-omp")
+    monkeypatch.setattr(dispatch.subagent_identity, "ancestor_agent_id", lambda harness: "ancestor:omp:1")
+    omp_event = {"event": "tool_call", "toolName": "bash", "input": {"command": "ls"}, "cwd": "/repo",
+                 "agentId": "child-x", "agentType": "task"}
+
+    v1 = dispatch.to_v1_event(omp_event, point="pre-bash")
+
+    assert v1["args"]["agent_id"] == "child-x"
+
+
+_IDENTITY_DRIVER = (
+    "const mod = await import(process.env.EXTENSION_PATH!);\n"
+    "function reg() { const h: Record<string, Function> = {}; mod.default({ on: (n: string, cb: Function) => { h[n] = cb; } }); return h; }\n"
+    "const rootFile = '/home/u/.omp/agent/sessions/--repo--/2026-09-06T21-08-26-184Z_01a0788d-11c8-71cf-b07c-c30db542826f.jsonl';\n"
+    "const childFile = '/home/u/.omp/agent/sessions/--repo--/2026-09-06T21-08-26-184Z_01a0788d-11c8-71cf-b07c-c30db542826f/ChildEcho.jsonl';\n"
+    "const tmpChildFile = '/var/folders/1c/T/omp-task-157571173d69d530/EchoChild.jsonl';\n"
+    "const ctxFor = (sid: string, file: string | undefined) => ({ cwd: '/tmp', hasUI: false, sessionManager: { getSessionId: () => sid, getSessionFile: () => file } });\n"
+    "const call = async (h: Record<string, Function>, ctx: any) => { const r = await h['tool_call']({ toolName: 'bash', input: { command: 'ls', agentId: 'forged' }, toolCallId: 'c1' }, ctx); return JSON.parse(r.reason); };\n"
+    "const root = reg();\n"
+    "const child = reg();\n"
+    "const third = reg();\n"
+    "const out = {\n"
+    "  root: await call(root, ctxFor('root-sid', rootFile)),\n"
+    "  rootNoFile: await call(root, ctxFor('root-sid', undefined)),\n"
+    "  child: await call(child, ctxFor('child-sid', childFile)),\n"
+    "  tmpChild: await call(third, ctxFor('tmp-sid', tmpChildFile)),\n"
+    "  laterRegistrationWithRootShapedFile: await call(child, ctxFor('new-root-sid', rootFile)),\n"
+    "  laterRegistrationNoFile: await call(child, ctxFor('new-root-sid', undefined)),\n"
+    "};\n"
+    "console.log(JSON.stringify(out));\n"
+)
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun not on PATH")
+def test_extension_ts_marks_only_task_subagent_registrations_with_identity(tmp_path):
+    """omp runs a `task` subagent IN-PROCESS: the extension's default export is invoked once
+    more for it (with its own `pi`), and the child's sessionManager reports a session file
+    nested under the parent session's stem directory (or under an `omp-task-*` temp dir in
+    `--no-session` mode) — both captured live on omp 18.0.11. The extension tags a tool call as
+    a subagent's ONLY when BOTH hold: a later-than-first registration AND a child-shaped session
+    file — so an interactive `/new` (a fresh root session file, a top-level sibling) can never
+    make the root look like a subagent. The identity rides on the payload's TOP level, computed
+    from omp's own objects; a forged `input.agentId` is ignored."""
+    stub = tmp_path / "echo_dispatcher.py"
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "print(json.dumps({'decision': 'block', 'reason': sys.stdin.read()}))\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    driver = tmp_path / "driver.ts"
+    driver.write_text(_IDENTITY_DRIVER, encoding="utf-8")
+    env = dict(os.environ)
+    env["EXTENSION_PATH"] = str(_EXTENSION_TS)
+    env["OMP_HOOK_BRIDGE_PYTHON"] = str(stub)
+
+    proc = subprocess.run(["bun", "run", str(driver)], capture_output=True, text=True, env=env, timeout=30)
+
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    for key in ("root", "rootNoFile", "laterRegistrationWithRootShapedFile", "laterRegistrationNoFile"):
+        assert "agentId" not in out[key], (key, out[key])
+        assert "agentType" not in out[key], (key, out[key])
+    assert out["child"]["agentId"] == "child-sid"
+    assert out["child"]["agentType"] == "task"
+    assert out["tmpChild"]["agentId"] == "tmp-sid"
+    assert out["tmpChild"]["agentType"] == "task"
+    # the forged input key is passed through untouched for the dispatcher to strip — never promoted
+    assert out["child"]["input"] == {"command": "ls", "agentId": "forged"}

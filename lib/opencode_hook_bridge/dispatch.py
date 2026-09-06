@@ -16,17 +16,18 @@ import shlex
 import sys
 from pathlib import Path
 
+try:
+    from agent_hooks_v1 import subagent_identity
+except Exception:  # noqa: BLE001 - a missing helper must fail CLOSED (no identity → governed)
+    subagent_identity = None
+
 HOOK_API = "agents-hooks/v1"
 # The v1 event's `harness` tag for every event this bridge produces — a MODULE LITERAL, not
 # derived from `opencode_event`, so it cannot be forged via tool args the way `args.harness`
-# could be. See `codex_hook_bridge.HARNESS` for the same reasoning: opencode exposes no TRUSTED
-# per-tool-call subagent identity in the plugin payload either (forged agent_id/agent_type keys
-# are stripped below). The ONE trusted identity source is the process environment set by the rig
-# detached launcher (`_detached_agent_id`, agent-tools#476) — and that covers only a rig-launched
-# detached child; a plain opencode session still carries no identity. So a hook that wants to
-# scope a policy to (or exempt) this WHOLE harness reads `event["harness"]` instead — see
-# `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES` for the first consumer
-# (agent-tools#533).
+# could be. Hooks read it to pick the delegation recipe for THIS harness in their refusal text
+# (agent-tools#573) — never to exempt the harness (the #533/#544 `EXEMPT_HARNESSES` shortcut is
+# gone). The subagent identity (`_apply_subagent_identity`) is what tells an orchestrator apart
+# from a delegated child; forged agent_id/agent_type keys in the tool args are stripped first.
 HARNESS = "opencode"
 _KNOWN_EVENTS = frozenset({"tool.execute.before", "tool.execute.after"})
 _WRITE_TOOLS = frozenset({"edit", "write", "apply_patch"})
@@ -68,36 +69,41 @@ def point_for_event(hook_name: str, tool_name: str | None) -> str | None:
     return None
 
 
-def _detached_agent_id() -> str:
-    """The ONE authoritative subagent identity source for opencode sessions.
+def _apply_subagent_identity(opencode_event: dict, args: dict) -> None:
+    """Populate ``args.agent_id``/``args.agent_type`` from the trusted sources ONLY.
 
-    The forge-strip in ``to_v1_event`` removes any model/tool-supplied agent_id
-    (the same trust boundary as the CC bridge's T2 precedence: an event may carry
-    model-influenced fields, so they can never self-exempt). CC has an
-    authoritative top-level agent field to restore it from; opencode has NONE —
-    which made every opencode session, including a rig-dispatched detached
-    ``opencode run`` agent, look like "the orchestrator" to every gate.
+    ``to_v1_event`` has already stripped every model/tool-supplied agent key (the same trust
+    boundary as the CC bridge's T2 precedence: an event may carry model-influenced fields, so
+    they can never self-exempt). Three sources may restore them, in order (#476, then #573):
 
-    The sanctioned source here is the opencode PROCESS ENVIRONMENT, read at
-    launch: ``RIG_AGENT_ID=<name>`` (identity) or ``RIG_DETACHED_AGENT=1``
-    (anonymous marker), set by the rig detached-agent launcher. plugin.js spawns
-    this dispatcher with ``{...process.env}``, so the marker set when the child
-    opencode was launched is visible here on every tool call.
+    1. the TOP-LEVEL ``agentId``/``agentType`` of the payload ``plugin.js`` builds — set for a
+       tool call made by a ``task`` CHILD SESSION, from opencode's own bookkeeping (the hook
+       input's ``sessionID`` plus the session's ``parentID`` from the ``session.created`` event
+       or ``client.session.get``), never from ``output.args``;
+    2. the launcher env markers ``RIG_AGENT_ID`` / ``RIG_DETACHED_AGENT`` set by the
+       ``rig-detached-opencode`` launcher skill for a detached ``opencode run`` child —
+       plugin.js spawns this dispatcher with ``{...process.env}``, so the marker set at launch is
+       visible on every tool call; a running orchestrator cannot retroactively mutate its own
+       environment, only a child's, which is exactly the sanctioned act of delegating;
+    3. process ancestry — an ``opencode`` process above the one that dispatched this hook (a
+       child ``opencode run`` started from a parent session's bash tool without the launcher).
 
-    Trust reasoning: a running orchestrator cannot retroactively mutate its own
-    process environment — it can only set these vars for a CHILD process it
-    dispatches, which is exactly the sanctioned act of dispatching a subagent
-    (and the very act the delegation gates exist to encourage). This matches the
-    module family's stated threat model: a cooperative orchestrator, discipline
-    rather than a security boundary, on_error=open. A bare/whitespace value is
-    not a marker.
-    """
-    val = os.environ.get("RIG_AGENT_ID", "").strip()
-    if val:
-        return val
-    if os.environ.get("RIG_DETACHED_AGENT", "").strip() == "1":
-        return "detached"
-    return ""
+    See ``agent_hooks_v1.subagent_identity`` for the full trust reasoning of 2 and 3. No source
+    → no key at all (never an empty string): the call stays the orchestrator's, fail closed in
+    the relax direction."""
+    native_id = opencode_event.get("agentId")
+    if isinstance(native_id, str) and native_id.strip():
+        args["agent_id"] = native_id
+        native_type = opencode_event.get("agentType")
+        if isinstance(native_type, str) and native_type:
+            args["agent_type"] = native_type
+        return
+    if subagent_identity is None:
+        return
+    agent_id, agent_type = subagent_identity.detect_subagent(HARNESS)
+    if agent_id:
+        args["agent_id"] = agent_id
+        args["agent_type"] = agent_type
 
 
 def to_v1_event(opencode_event: dict, *, point: str) -> dict:
@@ -107,9 +113,7 @@ def to_v1_event(opencode_event: dict, *, point: str) -> dict:
     args = dict(raw_args)
     for key in _FORGED_AGENT_KEYS:
         args.pop(key, None)
-    detached_id = _detached_agent_id()
-    if detached_id:
-        args["agent_id"] = detached_id
+    _apply_subagent_identity(opencode_event, args)
     _normalize_task_args(args)
 
     command = _tool_command(tool, raw_args)

@@ -65,10 +65,19 @@ The bridge strips all opencode tool-argument fields that look like agent identit
 can never self-exempt a call, so a forged `agent_id` inside `tool_input` is dropped
 before anything else runs.
 
-The one authoritative identity source is the opencode PROCESS ENVIRONMENT, read at
-launch by `_detached_agent_id()`: `RIG_AGENT_ID=<name>` (identity) or
-`RIG_DETACHED_AGENT=1` (anonymous marker). When a marker is present the dispatcher
-injects `args.agent_id`, so every subagent-exempt hook
+The authoritative identity sources (`_apply_subagent_identity`, agent-tools#573), in order:
+first the TOP-LEVEL `agentId`/`agentType` the plugin sets for a tool call made by a `task`
+CHILD SESSION — opencode runs a `task` subagent as a child session in the same server
+process; its `session.created` event carries `info.parentID` and its own tool calls arrive
+with the child's `input.sessionID` (captured on 1.18.20), so `plugin.js` tags a call from a
+session that has a parent (tracked via the `event` hook, or looked up with
+`client.session.get` when the plugin missed the creation) with `agentId: <sessionID>,
+agentType: "task"` — from opencode's own bookkeeping, never from `output.args`; then the two
+the shared `lib/agent_hooks_v1/subagent_identity.py` reads: the opencode PROCESS ENVIRONMENT — `RIG_AGENT_ID=<name>` (identity) or `RIG_DETACHED_AGENT=1`
+(anonymous marker) — and, failing that, PROCESS ANCESTRY (an `opencode` process above the one
+that dispatched this hook: a child `opencode run` started from a parent session's bash tool
+without the launcher). When either applies the dispatcher injects `args.agent_id`
+(`args.agent_type` `detached` / `ancestor`), so every subagent-exempt hook
 (`orchestrator-stays-thin`, `background-subagent-gate`, `no-long-inline-process`,
 `subagent-no-bg-longproc`) treats the session's tool calls as a dispatched subagent's
 instead of the orchestrator's. The markers are set by the canonical detached launcher
@@ -93,10 +102,10 @@ markers by hand, let the launcher set them for the child only.
 
 Every translated v1 event also carries a top-level `harness: "opencode"` — a hardcoded
 module constant (`dispatch.HARNESS`), never derived from the opencode event, so it can't be
-forged via tool args the way the identity fields above must be actively stripped. A hook
-that needs to scope a policy to (or exempt) one harness reads `event["harness"]` directly
-(see `agent-hooks/orchestrator-stays-thin`'s harness-exempt list for the first consumer,
-agent-tools#533) instead of trying to reconstruct a trusted subagent identity.
+forged via tool args the way the identity fields above must be actively stripped. Hooks read
+it to name THIS harness's delegation recipe (`rig-detached-opencode`) in their refusal text
+(`agenttools_hatch_escalation.delegation_recipe`), never to exempt the harness — the #533/#544
+`EXEMPT_HARNESSES` shortcut is gone (agent-tools#573).
 
 ## Descriptor directory
 

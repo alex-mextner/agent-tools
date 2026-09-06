@@ -1398,3 +1398,60 @@ def test_internal_exception_is_still_logged_as_denied(tmp_path, monkeypatch):
     assert len(entries) == 1
     assert entries[0]["decision"] == "denied"
     assert "simulated internal failure" in entries[0]["detail"]
+
+
+# ── delegation recipes (agent-tools#573) ─────────────────────────────────────────────────
+
+from agenttools_hatch_escalation import (  # noqa: E402
+    DELEGATION_HARNESSES,
+    delegation_recipe,
+    foreground_recipe,
+)
+
+
+def test_delegation_harnesses_are_the_four_bridged_ones():
+    assert DELEGATION_HARNESSES == ("claude-code", "codex", "opencode", "omp")
+
+
+@pytest.mark.parametrize(
+    ("harness", "needle", "foreign"),
+    [
+        ("claude-code", 'subagent_type: "fork"', "rig-detached-codex"),
+        ("codex", "collaboration.spawn_agent", 'subagent_type: "fork"'),
+        ("codex", "~/.agents/skills/rig-detached-codex/rig-detached-codex", "rig-detached-omp"),
+        ("opencode", "~/.agents/skills/rig-detached-opencode/rig-detached-opencode", "spawn_agent"),
+        ("omp", "`task` tool", "rig-detached-codex"),
+        ("omp", "~/.agents/skills/rig-detached-omp/rig-detached-omp", 'subagent_type: "fork"'),
+    ],
+)
+def test_delegation_recipe_names_only_that_harness_mechanism(harness, needle, foreign):
+    text = delegation_recipe(harness)
+    assert needle in text
+    assert foreign not in text
+
+
+@pytest.mark.parametrize("harness", [None, "", "gemini", 42])
+def test_delegation_recipe_for_unknown_harness_lists_every_harness(harness):
+    """A governed event with no (or an unrecognized) tag must still be actionable: the text
+    carries every harness's recipe rather than guessing one."""
+    text = delegation_recipe(harness)
+    for known in DELEGATION_HARNESSES:
+        assert delegation_recipe(known) in text
+
+
+def test_delegation_recipe_launcher_paths_are_provisioned_skill_copies():
+    """The launcher must be named by its rig-provisioned path (the skill copy under
+    `~/.agents/skills/`), never a repo-relative `bin/` that does not exist on a provisioned
+    machine (the carrier rule from PR #497)."""
+    for harness in ("codex", "opencode", "omp"):
+        text = delegation_recipe(harness)
+        assert f"~/.agents/skills/rig-detached-{harness}/rig-detached-{harness}" in text
+        assert "bin/rig-detached" not in text
+
+
+def test_foreground_recipe_only_claude_code_mentions_run_in_background():
+    assert "run_in_background" in foreground_recipe("claude-code")
+    for harness in ("codex", "opencode", "omp"):
+        assert "run_in_background" not in foreground_recipe(harness)
+        assert "&" in foreground_recipe(harness)
+    assert "run_in_background" in foreground_recipe(None)

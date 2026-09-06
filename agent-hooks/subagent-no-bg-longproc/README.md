@@ -44,6 +44,10 @@ is "the long process *itself* is detached"), not the whole line — so `echo sta
 (the `echo` job is backgrounded, `review` runs **foreground**) is **allowed**, while `review …
 &` is blocked. A command counts as backgrounded when:
 
+- (the remedy text is harness-aware, agent-tools#573: only Claude Code's Bash tool has a
+  `run_in_background` field to remove; a codex `spawn_agent` child, an omp `task` child or a
+  launcher-detached child — all of which carry a trusted `agent_id` now — is told to drop the
+  shell backgrounding it actually used)
 - the CC Bash tool's **`run_in_background: true`** flag is set (forwarded into `args` by
   `lib/cc_hook_bridge`) — it backgrounds the **whole command line**, so every job is then
   detached; the primary, unambiguous wedge signal;

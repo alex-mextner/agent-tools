@@ -12,6 +12,11 @@ description: >-
 
 # rig-detached-opencode — canonical detached-agent launcher for opencode
 
+Since agent-tools#573 opencode has two sanctioned ways to delegate: the native Task tool
+(the child session's tool calls pass every gate as a subagent's — the hook bridge identifies
+it by opencode's own session `parentID`; foreground on a default build) and this launcher for
+a truly detached child process.
+
 The pre-agent gate `background-subagent-gate` blocks a non-trivial FOREGROUND subagent
 dispatch: it wedges the main thread until the child finishes. Claude Code has real
 background paths (`subagent_type: "fork"`, `isolation: "remote"`); a default opencode
@@ -23,12 +28,16 @@ The sanctioned background mechanism on a default build is this skill's bundled l
 
 ## Where the launcher lives (the carrier)
 
-This skill IS the carrier. rig copies the whole skill dir (launcher included) to the
-canonical skills dir — `~/.agents/skills/rig-detached-opencode/rig-detached-opencode`
-(default `skills_target`, default-on via `skills.universal.all`) — and opencode scans
-that dir natively. `bin/` in the agent-tools repo is NOT a rig-discovered carrier, so
-the launcher must not be referenced there: after `rig apply` on a provisioned machine
-only the skill-copy path exists. Gate REMINDER texts name the provisioned path.
+This skill IS the carrier: a thin wrapper over the shared core in the sibling
+`rig-detached-agent` universal skill (agent-tools#573: one launcher core, three harness
+wrappers — `rig-detached-opencode` / `rig-detached-codex` / `rig-detached-omp`; the child
+argv is the only difference). rig copies both skill dirs to the canonical skills dir —
+`~/.agents/skills/rig-detached-opencode/rig-detached-opencode` (default `skills_target`,
+default-on via `skills.universal.all`) — and opencode scans that dir natively; the wrapper
+resolves the core relative to its own real path. `bin/` in the agent-tools repo is NOT a
+rig-discovered carrier, so the launcher must not be referenced there: after `rig apply` on a
+provisioned machine only the skill-copy path exists. Gate REMINDER texts name the provisioned
+path.
 
 ## Usage
 
@@ -52,10 +61,11 @@ handoff file named in the brief — the launcher keeps no registry by design.
 The launcher exports `RIG_AGENT_ID=<name>` and `RIG_DETACHED_AGENT=1` into the child
 opencode process. The opencode hook bridge (`lib/opencode_hook_bridge/dispatch.py`) strips
 every model/tool-supplied `agent_id`-shaped key (forged args can never self-exempt) and
-injects `args.agent_id` from these markers instead, so every subagent-exempt delegation
-gate (`orchestrator-stays-thin`, `background-subagent-gate`, `no-long-inline-process`,
-`subagent-no-bg-longproc`) classifies the child session's tool calls as a dispatched
-subagent's.
+injects `args.agent_id` from these markers instead — through the shared
+`lib/agent_hooks_v1/subagent_identity.py`, the same source the codex and omp bridges read —
+so every subagent-exempt delegation gate (`orchestrator-stays-thin`,
+`background-subagent-gate`, `no-long-inline-process`, `subagent-no-bg-longproc`) classifies
+the child session's tool calls as a dispatched subagent's.
 
 Never `export` these markers by hand in an interactive shell (or an rc file): every
 opencode process that inherits them is treated as a dispatched subagent for its whole
@@ -66,4 +76,3 @@ environment — it can only set these vars for a CHILD process, which is exactly
 sanctioned act of dispatching a subagent. This matches the module family's
 cooperative-orchestrator threat model (`on_error: open` discipline gates, not security
 boundaries).
-

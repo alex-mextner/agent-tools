@@ -36,16 +36,42 @@ fan out descriptor execution so existing singular-path hooks receive one `args.f
 / `args.path` at a time. That keeps current path-scoped hooks useful without changing the
 v1 event contract.
 
-The bridge strips `agent_id` / `agent_type` from Codex `tool_input`. Those fields are not
-trusted until Codex has a captured, non-forgeable subagent identity fixture. Until that
-exists, subagent-exempt `pre-bash` hooks treat Codex calls as main-thread calls.
+## Identity contract (subagent exemption, agent-tools#573)
+
+The bridge strips `agent_id` / `agent_type` from Codex `tool_input` (model-authored, never
+trusted) and repopulates `args.agent_id` / `args.agent_type` from three trusted sources, in
+order (`_apply_subagent_identity`):
+
+1. **Codex's own top-level `agent_id` / `agent_type`.** Every hook event fired inside a
+   `collaboration.spawn_agent` child thread carries them at the TOP level of the hook JSON
+   (captured verbatim on codex 0.153.4 — `tests/test_codex_hook_bridge.py` keeps the fixture;
+   `session_id` stays the parent's, as documented, and `transcript_path` points at the child's
+   rollout). The parent thread's events carry neither. Codex writes these from its thread
+   bookkeeping; they are not part of the tool call the model composed, so nothing in
+   `tool_input` can set or change them — the same T2 precedence `cc_hook_bridge` applies.
+2. **Launcher env markers** `RIG_AGENT_ID` / `RIG_DETACHED_AGENT` — a `codex exec` child
+   started by the `rig-detached-codex` launcher skill (Codex runs hook commands with its own
+   environment, so the marker set at launch is visible on every tool call).
+3. **Process ancestry** — a `codex` process above the one that dispatched this hook, past the
+   dispatching invocation's own contiguous run (a codex invocation is two processes, the
+   `node` wrapper and the vendor binary): a child `codex exec` started from a parent session's
+   shell tool without the launcher.
+
+Sources 2 and 3 live in the shared `lib/agent_hooks_v1/subagent_identity.py` (read by the
+opencode and omp bridges too); its docstring carries the trust reasoning. No source → no key
+at all, so every `_is_subagent` reader treats the call as the orchestrator's (fail closed in
+the relax direction).
 
 Every translated v1 event also carries a top-level `harness: "codex"` — a hardcoded module
 constant (`dispatch.HARNESS`), never derived from the Codex event, so it can't be forged via
-`tool_input`. A hook that needs to scope a policy to (or exempt) one harness reads
-`event["harness"]` directly (see `agent-hooks/orchestrator-stays-thin`'s harness-exempt list
-for the first consumer, agent-tools#533) instead of trying to reconstruct a trusted subagent
-identity from the fields above.
+`tool_input`. Hooks read it to name THIS harness's delegation recipe in their refusal text
+(`agenttools_hatch_escalation.delegation_recipe`), never to exempt the harness — the #533/#544
+`EXEMPT_HARNESSES` shortcut is gone.
+
+**`codex exec` runs no hooks without `--dangerously-bypass-hook-trust`** (verified on
+0.153.4: no PreToolUse/Stop hook fires in exec mode, even in a trusted project, until that
+flag is passed). The `rig-detached-codex` launcher passes it so the child stays governed; a
+hand-run `codex exec` without it is simply ungoverned.
 
 Patch paths are extracted from patch text and are hints, not a trust boundary. Hook authors
 that use `args.file_path` / `args.path` for filesystem access must resolve and validate the

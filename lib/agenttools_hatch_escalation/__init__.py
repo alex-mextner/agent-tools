@@ -91,6 +91,102 @@ class HatchApprovalResult:
         return self.env_present
 
 
+# ── Delegation recipes (agent-tools#573) ──────────────────────────────────────────────────
+#
+# Every subagent-aware gate refuses with "delegate this" — and the way to delegate is DIFFERENT
+# per harness. Before #573 the refusal text named Claude Code's Agent tool only, so a codex/omp
+# session was told to use a tool it does not have (the origin of the 184 unusable refusals in
+# Alex's codex session, and of the #533/#544 harness-wide exemption that #573 removed). The gates
+# read the v1 event's top-level `harness` tag (a bridge-set module literal, never `args`) and ask
+# this ONE table for the recipe; a missing/unknown tag gets every recipe, because an event that is
+# governed must still be actionable. This module is the home for the same reason #560 chose it for
+# its (now withdrawn) allowlist: every gated hook already hard-loads it through the hardened
+# `_load_hatch_escalation` bootstrap, so no second bootstrap copy is needed. Stdlib-only, no
+# sibling `lib/` imports — `tests/test_hatch_import_hardening.py` pins that.
+#
+# The launcher paths are the rig-PROVISIONED skill copies (`~/.agents/skills/<skill>/<launcher>`,
+# the default `skills_target`, default-on via `skills.universal.all`) — `bin/` in the agent-tools
+# repo is not a rig-discovered carrier (PR #497). `tests/test_agenttools_hatch_escalation.py` and
+# `tests/test_background_subagent_gate.py` pin the paths to the carrier.
+DELEGATION_HARNESSES: tuple[str, ...] = ("claude-code", "codex", "opencode", "omp")
+
+_DELEGATION_RECIPES: dict[str, str] = {
+    "claude-code": (
+        "Claude Code: dispatch a subagent with the Agent tool — `subagent_type: \"fork\"` or "
+        "`isolation: \"remote\"` (both run in the background per CC's tool contract; "
+        "`run_in_background` is NOT a real field on the Agent tool — it does nothing) — or model "
+        "it as a Workflow, then read its report."
+    ),
+    "codex": (
+        "codex: spawn a child agent with `collaboration.spawn_agent` (in-process; codex tags the "
+        "child's tool calls with its own agent_id, so every gate sees them as a subagent's) and "
+        "collect it with `collaboration.wait_agent`; for a truly detached child run the "
+        "provisioned launcher `~/.agents/skills/rig-detached-codex/rig-detached-codex <name> "
+        "<brief-file> [workdir]` (a `codex exec` child carrying RIG_AGENT_ID, launched with hook "
+        "trust so it stays governed) and poll the handoff file named in the brief."
+    ),
+    "opencode": (
+        "opencode: run the provisioned launcher "
+        "`~/.agents/skills/rig-detached-opencode/rig-detached-opencode <name> <brief-file> "
+        "[workdir]` (a detached `opencode run` child carrying RIG_AGENT_ID) and poll the handoff "
+        "file named in the brief; or dispatch with the Task tool, subagent_type general or "
+        "explore (the child session's tool calls pass every gate as a subagent's — the hook "
+        "bridge identifies it by opencode's own session parentID). The task tool has NO "
+        "background field in a default build (1.18.20: only description/prompt/subagent_type/"
+        "task_id/command; the native background: true exists only behind "
+        "OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true) — do not invent one."
+    ),
+    "omp": (
+        "omp: dispatch with the `task` tool (in-process; the hook bridge identifies the child "
+        "session, so its tool calls pass as a subagent's) or run the provisioned launcher "
+        "`~/.agents/skills/rig-detached-omp/rig-detached-omp <name> <brief-file> [workdir]` (a "
+        "detached `omp -p` child carrying RIG_AGENT_ID) and poll the handoff file named in the "
+        "brief."
+    ),
+}
+
+_FOREGROUND_RECIPES: dict[str, str] = {
+    "claude-code": (
+        "Remove `run_in_background: true` from the Bash tool call (and any trailing `&` / "
+        "`setsid` / `nohup`) and run it inline so this tool call blocks until it finishes."
+    ),
+    "codex": (
+        "Remove the backgrounding from the command (a trailing `&`, `setsid`, `nohup`) and run "
+        "it inline so this shell call blocks until it finishes."
+    ),
+    "opencode": (
+        "Remove the backgrounding from the command (a trailing `&`, `setsid`, `nohup`) and run "
+        "it inline so this bash call blocks until it finishes."
+    ),
+    "omp": (
+        "Remove the backgrounding from the command (a trailing `&`, `setsid`, `nohup`) and run "
+        "it inline so this bash call blocks until it finishes."
+    ),
+}
+
+
+def delegation_recipe(harness: object) -> str:
+    """How to delegate work on ``harness`` (the v1 event's top-level tag).
+
+    A recognized harness gets its own recipe only; anything else (missing, blank, unknown,
+    non-string) gets every recipe joined by ``" | "`` — a governed event with no usable tag must
+    still tell the agent something it can act on, in whichever harness it turns out to be."""
+    key = harness if isinstance(harness, str) else ""
+    text = _DELEGATION_RECIPES.get(key)
+    if text is not None:
+        return text
+    return " | ".join(_DELEGATION_RECIPES[h] for h in DELEGATION_HARNESSES)
+
+
+def foreground_recipe(harness: object) -> str:
+    """How a SUBAGENT on ``harness`` runs a long process in the foreground (the remedy
+    ``subagent-no-bg-longproc`` prints). Only Claude Code's Bash tool has a
+    ``run_in_background`` field; the other harnesses background via the shell. An unknown
+    harness gets the Claude Code text, which also names the shell forms."""
+    key = harness if isinstance(harness, str) else ""
+    return _FOREGROUND_RECIPES.get(key, _FOREGROUND_RECIPES["claude-code"])
+
+
 def hatch_env_var(hook_id: str) -> str:
     """The env var that requests a Telegram hatch for a canonical hook id."""
 

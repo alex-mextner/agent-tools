@@ -51,34 +51,17 @@ the doctrine's "WARN then BLOCK" instead of a hard wall on the first inline edit
 Subagent-exempt: a dispatched subagent (``agent_id`` present) does the actual work, so it is
 always allowed — this gate governs the orchestrator only.
 
-Harness-exempt (agent-tools#533): this gate's whole premise — a main thread that must delegate
-implementation work to a CC ``Agent``/``Task`` subagent instead of doing it inline — is a Claude
-Code concept. Codex/opencode DO model a subagent lifecycle of their own (Codex's
-``SubagentStart``/``SubagentStop`` events, opencode's ``task`` tool) but NEITHER bridge exposes a
-TRUSTED per-tool-call subagent identity from the harness's OWN payload today — see
-``lib/codex_hook_bridge`` and ``lib/opencode_hook_bridge`` (the opencode bridge injects one only
-for a rig-launched DETACHED child, from the process env set by the ``rig-detached-opencode``
-launcher, agent-tools#476; a plain opencode session still has none) — so every Codex/opencode-sourced event used to look like "the
-orchestrator" to ``_is_subagent`` — including a bare Codex CLI session Alex runs directly (which
-is not a CC orchestrator refusing to delegate at all) and a Codex/opencode process spawned by
-another tool as a delegated worker (review-cli's read-only reviewer backend, a CC-dispatched
-subagent). Blocking either one is wrong, and the block message's remediation ("Dispatch a subagent
-... Agent tool with subagent_type: 'fork'") does not even apply outside Claude Code. omp has the
-identical problem: it models its own subagent lifecycle via the ``task`` tool (item shape
-``{name?, agent?, task, ...}``, docs/tools/task.md), but ``lib/omp_hook_bridge`` exposes no
-TRUSTED per-tool-call subagent identity from omp's ``tool_call``/``tool_result`` extension events
-either (confirmed absent from the documented event shape) — so a bare omp CLI session run
-directly, and an omp process spawned as a delegated worker by another tool, would both look like
-"the orchestrator" to ``_is_subagent`` for the same reason the Codex/opencode cases do, and the
-CC-specific remediation text is equally inapplicable there. So a v1 event tagged with a
-``harness`` of ``codex``, ``opencode``, or ``omp`` specifically (set by the bridge, never by
-``args`` — see ``EXEMPT_HARNESSES``) is exempt from this gate entirely, same as a dispatched
-subagent. Deliberately an ALLOWLIST of the three known-safe values, not "any non-CC harness": a
-future bridge (``HARNESS = "gemini"``, say) is UNPROVEN here and stays governed until someone
-reviews and adds it — a present-but-unrecognized value is not automatically evidence the gate's
-CC-specific premise doesn't apply to it, only that nobody has confirmed that yet. If a
-Codex/opencode session is ever meant to BE the thin orchestrator in someone's setup, that needs an
-explicit config knob, not a change to this hardcoded exemption.
+Every harness is governed identically (agent-tools#573; Alex 2026-09-06: no harness-wide
+exemptions). The #533/#544 ``EXEMPT_HARNESSES`` shortcut — "codex/opencode/omp have no trusted
+subagent identity, so exempt the whole harness" — is gone: each bridge now supplies one
+(codex's own top-level ``agent_id`` on a ``spawn_agent`` child thread, omp's in-process ``task``
+registration, the ``rig-detached-<harness>`` launcher env markers, process ancestry — see
+``lib/agent_hooks_v1/subagent_identity.py``), so ``_is_subagent`` tells a delegated child apart
+from the orchestrator on every harness. The top-level ``event["harness"]`` tag (a bridge-set
+module literal, never ``args``) is read for ONE purpose only: to put THAT harness's delegation
+recipe in the refusal (``agenttools_hatch_escalation.delegation_recipe``) — a codex session is
+told about ``collaboration.spawn_agent`` / ``rig-detached-codex``, not about Claude Code's
+Agent tool. A missing/unknown tag stays governed (fail closed) and gets every recipe.
 
 Per-repo opt-out (Alex tg#5743): default ON; a repo that legitimately works inline on main
 (e.g. 3d-cli) sets `agent_hooks.orchestrator_only: false` in its rig.yaml, or exports
@@ -159,12 +142,6 @@ hatch_escalation = _load_hatch_escalation()
 
 BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
-
-# Harnesses whose events are NEVER subject to this gate (agent-tools#533) — see the module
-# docstring's "Harness-exempt" section. Deliberately an ALLOWLIST, not `!= "claude-code"`: an
-# event with no `harness` field (every fixture written before this change, and any future bridge
-# that doesn't set one) stays GOVERNED — the relax direction fails closed, same as `_is_subagent`.
-EXEMPT_HARNESSES = frozenset({"codex", "opencode", "omp"})
 
 MARKER_DIR = Path(os.path.expanduser(os.environ.get(
     "ORCH_THIN_MARKER_DIR", "~/.cache/agent-tools/orchestrator-thin")))
@@ -327,24 +304,33 @@ FIND_MUTATION = re.compile(r"\s-(?:delete|exec|execdir|ok|okdir|fprintf|fprint0|
 # agents can, but BY DEFAULT agents do it"); CI/PR verification, every other gh subcommand, and a
 # `gh ship <PR#>` chained with anything else all stay delegated, so this MESSAGE still fires for
 # those.
-MESSAGE = (
+_MESSAGE_HEAD = (
     "By design, not a bug: this session is the orchestrator, and the operating model — agreed "
     "with the CTO — is that it never implements inline. Planning, dispatching, and reading "
     "reports back is its job; doing the Edit/Write/Bash itself is not — that includes an edit, a "
     "build, a raw `git commit`/`git push`, a test run, AND nearly all `gh` (CI/PR verification "
     "like `gh pr checks`/`gh run` are a subagent's job too, not the orchestrator's — an unchained "
     "`gh ship <PR#>`, alone on the line, is the one sanctioned exception, agent-tools#159/#363). "
-    "Dispatch a subagent to do this "
-    "(Claude Code: Agent tool with `subagent_type: \"fork\"` "
-    "or `isolation: \"remote\"` — both run in the background; opencode: Task with "
-    "subagent_type general or explore, or the rig-detached-opencode launcher for a truly "
-    "detached child) or model it as a Workflow, then "
-    "read its report. This isn't friction to route around — if it's "
+    "Dispatch a subagent to do this, then read its report. "
+)
+_MESSAGE_TAIL = (
+    " This isn't friction to route around — if it's "
     "genuinely wrong for a case, raise that, don't bypass it. There is NO self-service bypass; for "
     "a genuine exception ASK the human, or request a one-time Telegram approval by setting "
     "RIG_HATCH_REQUEST_ORCHESTRATOR_STAYS_THIN=\"<written justification>\" (deny-by-default; a "
     "bare 1 is rejected). (delegate-work-to-subagents, enforced.)"
 )
+
+
+def block_message(harness: object) -> str:
+    """The refusal for an event tagged with ``harness`` — the shared operating-model text around
+    THAT harness's delegation recipe (agent-tools#573). Only the TOP-LEVEL tag is ever passed in;
+    an unknown/missing one yields every recipe."""
+    return _MESSAGE_HEAD + hatch_escalation.delegation_recipe(harness) + _MESSAGE_TAIL
+
+
+# The harness-agnostic text (every recipe) — what an untagged event gets.
+MESSAGE = block_message(None)
 
 
 def emit(decision: str, message: str | None = None) -> None:
@@ -380,29 +366,6 @@ def _is_subagent(event: dict) -> bool:
     args = event.get("args") or {}
     aid = args.get("agent_id")
     return bool(aid and str(aid).strip())
-
-
-def _is_exempt_harness(event: dict) -> bool:
-    """True when the event came from a bridge whose harness this gate never governs
-    (agent-tools#533 — see the module docstring's "Harness-exempt" section).
-
-    TRUST BOUNDARY — read ONLY the TOP-LEVEL `event["harness"]`, never `args`. Each bridge
-    (lib/cc_hook_bridge, lib/codex_hook_bridge, lib/opencode_hook_bridge, lib/omp_hook_bridge)
-    sets this from a hardcoded module constant
-    (`HARNESS = "claude-code" | "codex" | "opencode" | "omp"`) that is not
-    derived from ANY field of the underlying tool event — it cannot be forged by a model/
-    tool_input value the way a same-named key sitting in `args` could be. Which bridge actually
-    fires is decided by which harness's own hook system invoked it: a Claude Code session's Bash
-    call is dispatched by CC's own PreToolUse machinery straight into `cc_hook_bridge` and has no
-    way to reroute itself through `codex_hook_bridge` instead, so an orchestrator cannot dodge
-    this gate by claiming to be a different harness.
-
-    Deliberately an ALLOWLIST (`harness in EXEMPT_HARNESSES`), not `harness != "claude-code"`: a
-    missing/unrecognized `harness` (every event built before this change, and any future bridge
-    that doesn't set one) must stay GOVERNED — the relax direction fails closed, same as
-    `_is_subagent` above."""
-    harness = event.get("harness")
-    return bool(harness) and str(harness) in EXEMPT_HARNESSES
 
 
 def _marker(event: dict) -> Path:
@@ -1482,12 +1445,6 @@ def main() -> int:
         emit("allow")
         return 0
 
-    # Codex/opencode/omp events → this gate's CC-specific orchestrator/subagent premise doesn't
-    # apply, and its remediation (CC's Agent tool) doesn't exist there either (agent-tools#533).
-    if _is_exempt_harness(event):
-        emit("allow")
-        return 0
-
     args = event.get("args") or {}
     point = event.get("point") or ""
     cwd = str(event.get("cwd") or "")
@@ -1516,6 +1473,9 @@ def main() -> int:
         emit("allow")
         return 0
 
+    # The recipe in the refusal is picked by the TOP-LEVEL `harness` tag only (never `args`).
+    message = block_message(event.get("harness"))
+
     # WARN first, BLOCK on repeat within the window. Only a would-be BLOCK consults the hatch —
     # a first-offense WARN is advisory (allow) and needs no escalation.
     if _is_repeat(event):
@@ -1536,12 +1496,12 @@ def main() -> int:
                 warn(f"orchestrator-stays-thin allowed via hatch escalation ({hatch.reason})")
                 emit("allow", f"allowed via hatch escalation ({hatch.reason})")
                 return 0
-            emit("block", f"hatch escalation denied: {hatch.reason}\n{MESSAGE}")
+            emit("block", f"hatch escalation denied: {hatch.reason}\n{message}")
             return BLOCK_EXIT_CODE
-        emit("block", MESSAGE)
+        emit("block", message)
         return BLOCK_EXIT_CODE
-    warn(MESSAGE)
-    emit("allow", MESSAGE)  # advisory first offense
+    warn(message)
+    emit("allow", message)  # advisory first offense
     return 0
 
 
