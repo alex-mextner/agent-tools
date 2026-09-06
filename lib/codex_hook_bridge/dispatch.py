@@ -23,9 +23,10 @@ HOOK_API = "agents-hooks/v1"
 # be. Codex exposes no TRUSTED per-tool-call subagent identity today (`args.agent_id` is stripped
 # below and never repopulated — there is no top-level Codex field to restore it from, unlike CC's
 # `agent_id`/`agent_type`). A hook can read `event["harness"]` to scope a policy to (or exempt)
-# this whole harness instead of relying on a subagent identity Codex doesn't give it — see
-# `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES` for the first consumer
-# (agent-tools#533).
+# this whole harness instead of relying on a subagent identity Codex doesn't give it — see the
+# shared `agenttools_hatch_escalation.EXEMPT_HARNESSES` allowlist (orchestrator-stays-thin was
+# the first consumer, agent-tools#533; background-subagent-gate and no-long-inline-process
+# joined via agent-tools#542).
 HARNESS = "codex"
 _KNOWN_EVENTS = frozenset(
     {"PreToolUse", "PostToolUse", "Stop", "SubagentStart", "SubagentStop"}

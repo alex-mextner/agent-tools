@@ -52,6 +52,17 @@ shared parser (follow-up, not this change). Pinned by `test_quoted_token_equal_t
 Subagent-exempt: a dispatched subagent (``agent_id`` present) is EXPECTED to run these in
 the background, so it is always allowed — this gate governs the orchestrator only.
 
+Harness-exempt (agent-tools#533/#542): an event tagged with an exempt ``harness`` (codex /
+opencode / omp — the SHARED allowlist ``agenttools_hatch_escalation.EXEMPT_HARNESSES``, read from
+the TOP-LEVEL ``event["harness"]`` the bridge sets from a module literal, never ``args``) is
+allowed outright. None of those bridges can supply a trusted ``agent_id`` (all strip forged ones and have
+nothing authoritative to repopulate them from), so under the ``agent_id``-only exemption a
+review-cli-spawned ``codex exec`` reviewer or an opencode ``task``-spawned worker running
+``pytest``/``review`` in the FOREGROUND — the correct worker shape — was blocked as "the
+orchestrator running a long process inline", with a remedy (CC's ``subagent_type: "fork"``)
+that does not exist in those harnesses. Same fail-closed allowlist as orchestrator-stays-thin
+and background-subagent-gate: a missing/unknown tag stays governed.
+
 External approval (deny-by-default): there is NO self-service bypass. For a genuine exception,
 ASK the human, or request a one-time Telegram approval by setting
 `RIG_HATCH_REQUEST_NO_LONG_INLINE_PROCESS="<written justification>"` — the hook asks via a
@@ -531,6 +542,12 @@ def main() -> int:
 
     # A subagent is EXPECTED to run these in the background → always allowed.
     if _is_subagent(event):
+        emit("allow")
+        return 0
+
+    # Codex/opencode/omp events → no trusted subagent identity exists to tell a worker from the
+    # orchestrator, and the remedy (CC's fork dispatch) doesn't exist there (#533/#542).
+    if hatch_escalation.is_exempt_harness(event):
         emit("allow")
         return 0
 

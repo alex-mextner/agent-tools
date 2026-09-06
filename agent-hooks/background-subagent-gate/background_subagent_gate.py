@@ -41,6 +41,17 @@ Allowed (let through):
   - a TRIVIAL one-liner dispatch (short, single-line prompt) — cheap enough to run inline
   - a dispatch made BY a subagent itself (subagent-exempt: ``agent_id`` present) — a subagent
     may fan out further, and this gate governs the orchestrator, not the workers
+  - an event tagged with an exempt ``harness`` (codex / opencode / omp — the SHARED allowlist
+    ``agenttools_hatch_escalation.EXEMPT_HARNESSES``, agent-tools#533/#542/#556): none of those
+    bridges can hand this gate a trusted ``agent_id`` (all strip forged ones and have nothing authoritative
+    to repopulate them from), so under the ``agent_id``-only exemption an opencode ``task``-spawned
+    WORKER fanning out further was indistinguishable from the orchestrator and got blocked with
+    a remedy (CC's ``fork``/``isolation: "remote"``) that does not exist there. The whole harness
+    is therefore exempt, read from the TOP-LEVEL ``event["harness"]`` the bridge sets from a
+    module literal (never ``args``). NOTE this means the opencode ``background: true``
+    normalization (below) is currently reached only if opencode is ever REMOVED from that
+    allowlist — it is kept as the correct signal for a future explicit "opencode is the
+    orchestrator" config knob, not deleted.
 
 NOTE (CC-specific): as of CC 2.1.177 the `Agent` tool's JSON schema carries no
 `run_in_background` property at all (only `description`, `isolation`, `model`, `prompt`,
@@ -247,6 +258,12 @@ def main() -> int:
 
     # A subagent may itself fan out — this gate governs the orchestrator, not the workers.
     if _is_subagent(event):
+        emit("allow")
+        return 0
+
+    # Codex/opencode/omp events → no trusted subagent identity exists to tell a worker from the
+    # orchestrator, and the remedy (CC's fork/remote dispatch) doesn't exist there (#533/#542).
+    if hatch_escalation.is_exempt_harness(event):
         emit("allow")
         return 0
 

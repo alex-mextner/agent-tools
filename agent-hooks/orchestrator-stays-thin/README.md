@@ -17,7 +17,7 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   redirect is **not** implementation on its own (`python foo.py > out.log` is allowed).
   Read-only inspection **and sanctioned orchestration** are **never** blocked — including a chain
   of **any length** where every segment's head is inspection (`git status`/`log`/`diff`/`show`/
-  `branch`, `ls`, `cat`, `grep`, `find`, `head`, `tail`, `wc`, …) **or** orchestration
+  `branch`, `ls`, `cat`, `grep`, `find`, `head`, `tail`, `wc`, a print-only `sed -n`, …) **or** orchestration
   (`tg`, `review`, `git worktree list`), across `|`, `&&`, `;`, `||` or newline
   (`git status && ls`, `tg 'a' && tg 'b'`, `review diff && tg done`). But a chain that merely
   *starts* allowed (`git status && sed -i ...`, `tg done && git commit`), or that mixes in any
@@ -25,6 +25,18 @@ One script binds two points via two descriptors; it branches on `event["point"]`
   Judgement is per-segment-**head**: a build token used only as an argument/needle of an allowed
   command (`cat tee.log`, `grep cargo notes`, `git log | rg gh`) stays allowed; only a
   build/edit/commit/`gh` *at a segment head* counts.
+
+  **Read-only `sed` (agent-tools#541).** `sed` is not in the head-only `READ_ONLY_BASH` regex
+  (a plain `sed\b` would also grant `sed -i` and `sed 'w file'`); instead `_is_read_only_sed`, a
+  shlex-based predicate, grants a `sed` that only PRINTS: no in-place flag (`-i`/`-i.bak`/
+  `--in-place`, BSD `-I`), no script from a file (`-f`/`--file` — unknowable), and no script
+  command that writes or executes (`w`/`W`/`e` at a command position, the `w`/`e` flags of an `s`
+  command). So the literal #533/#541 incident chain `sed -n '1,240p' SKILL.md && git diff --check
+  && git status --short && git diff -- a.py` is inspection on the first call, for every harness,
+  instead of falling to the >=3-segment fallback; `sed -i` keeps tripping `BUILD_EDIT` exactly as
+  before. GRANT-direction, so every ambiguity (unbalanced quotes, a `-l` cluster whose GNU/BSD
+  operand semantics differ, a script file) resolves to "not read-only" — i.e. to the pre-#541
+  behavior, never to a wider grant.
 
   **ALL `gh` is delegated (Alex tg#7103).** `gh ship`, `gh pr checks`/`view`, `gh run`, `gh api`
   — every gh subcommand — is implementation the orchestrator hands to a subagent, not inline work.
@@ -121,6 +133,11 @@ the full contract). This matches the sibling `skills-read-gate`'s narrowed read 
 or write looks like. `EXEMPT_HARNESSES = {"codex", "opencode", "omp"}`, checked against the
 top-level `event["harness"]` right after the subagent check, before any command/write is even
 classified.
+The set is the **shared** `lib/agenttools_hatch_escalation.EXEMPT_HARNESSES` (agent-tools#542),
+consulted through its `is_exempt_harness(event)` by this gate AND by `background-subagent-gate`
+and `no-long-inline-process` — the same misclassification class hit all three, so a harness is
+added ONCE there (`omp`, the oh-my-pi bridge of agent-tools#556, lives there) and reaches every gate; this hook's
+`EXEMPT_HARNESSES` name is a re-export, not a private copy.
 
 Why the whole harness, not a signal review-cli sets: this gate's premise is Claude-Code-specific
 — "the top-level Claude Code session must delegate implementation work to a CC `Agent`/`Task`

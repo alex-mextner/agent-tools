@@ -1398,3 +1398,28 @@ def test_internal_exception_is_still_logged_as_denied(tmp_path, monkeypatch):
     assert len(entries) == 1
     assert entries[0]["decision"] == "denied"
     assert "simulated internal failure" in entries[0]["detail"]
+
+
+# ── is_exempt_harness: the ONE harness allowlist shared by every harness-exempt gate (#542) ──
+
+def test_is_exempt_harness_reads_only_the_top_level_bridge_set_tag():
+    assert agenttools_hatch_escalation.is_exempt_harness({"harness": "codex"}) is True
+    assert agenttools_hatch_escalation.is_exempt_harness({"harness": "opencode"}) is True
+    assert agenttools_hatch_escalation.is_exempt_harness({"harness": "omp"}) is True
+    # CC's own harness is the one the gates exist to govern.
+    assert agenttools_hatch_escalation.is_exempt_harness({"harness": "claude-code"}) is False
+    # Missing / blank / unknown → governed (the relax direction fails closed).
+    assert agenttools_hatch_escalation.is_exempt_harness({}) is False
+    assert agenttools_hatch_escalation.is_exempt_harness({"harness": ""}) is False
+    assert agenttools_hatch_escalation.is_exempt_harness({"harness": None}) is False
+    assert agenttools_hatch_escalation.is_exempt_harness({"harness": "gemini"}) is False
+    # TRUST BOUNDARY: a same-named key under model-reachable `args` is never consulted.
+    assert agenttools_hatch_escalation.is_exempt_harness({"args": {"harness": "codex"}}) is False
+    # A non-dict event (a malformed producer) is simply not exempt, never an exception.
+    assert agenttools_hatch_escalation.is_exempt_harness(None) is False  # type: ignore[arg-type]
+    assert agenttools_hatch_escalation.is_exempt_harness(["codex"]) is False  # type: ignore[arg-type]
+
+
+def test_exempt_harnesses_never_contains_claude_code():
+    assert "claude-code" not in agenttools_hatch_escalation.EXEMPT_HARNESSES
+    assert agenttools_hatch_escalation.EXEMPT_HARNESSES == frozenset({"codex", "opencode", "omp"})
