@@ -83,18 +83,18 @@ function runBridge(eventName: "tool_call" | "tool_result", event: any, ctx: any)
 function interpretDispatcherResult(eventName: string, proc: any): BridgeResult | undefined {
   if (proc.error) {
     const label = proc.error.code === "ETIMEDOUT" ? "timed out" : "launch failed";
-    console.error(`omp-hook-bridge: dispatcher ${label}, allowing call: ${proc.error.message}`);
+    console.error(`omp-hook-bridge[${eventName}]: dispatcher ${label}, allowing call: ${proc.error.message}`);
     return undefined;
   }
   if (proc.stderr) {
     process.stderr.write(proc.stderr);
   }
   if (proc.signal) {
-    console.error(`omp-hook-bridge: dispatcher terminated by ${proc.signal}, allowing call`);
+    console.error(`omp-hook-bridge[${eventName}]: dispatcher terminated by ${proc.signal}, allowing call`);
     return undefined;
   }
   if (proc.status !== 0) {
-    console.error(`omp-hook-bridge: dispatcher exited ${proc.status}, allowing call`);
+    console.error(`omp-hook-bridge[${eventName}]: dispatcher exited ${proc.status}, allowing call`);
     return undefined;
   }
   const stdout = (proc.stdout || "").trim();
@@ -105,7 +105,7 @@ function interpretDispatcherResult(eventName: string, proc: any): BridgeResult |
   try {
     result = JSON.parse(stdout);
   } catch (error: any) {
-    console.error(`omp-hook-bridge: invalid dispatcher JSON, allowing call: ${error?.message}`);
+    console.error(`omp-hook-bridge[${eventName}]: invalid dispatcher JSON, allowing call: ${error?.message}`);
     return undefined;
   }
   if (result?.decision === "block") {

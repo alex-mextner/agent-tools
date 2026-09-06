@@ -361,6 +361,23 @@ def test_hashline_fan_out_splits_multi_file_content_per_path():
     assert all(e["harness"] == "omp" for e in events)
 
 
+def test_hashline_fan_out_ignores_a_forged_patch_key(monkeypatch):
+    """#556 review finding: on an `edit` call a stray/forged `patch` key in the raw args
+    must NOT shadow the real hashline `input` when fanning out per-path content — otherwise
+    every per-path `content` comes back "" and a secret-scanning pre-write hook sees nothing."""
+    omp_event = {
+        "event": "tool_call",
+        "toolName": "edit",
+        "input": {"input": _MULTI_FILE_HASHLINE, "patch": "x"},
+        "cwd": "/repo",
+    }
+
+    events = dispatch._v1_events_for_dispatch(omp_event, point="pre-write")
+
+    assert [e["args"]["file_path"] for e in events] == ["a.py", "b.py"]
+    assert [e["args"]["content"] for e in events] == ["print('a')", "print('b')"]
+
+
 def test_hashline_rem_and_mv_sections_still_surface_their_paths():
     patch = "*** Begin Patch\n[old.py#DEAD]\nMV new.py\n*** End Patch\n"
     omp_event = {"event": "tool_call", "toolName": "edit", "input": {"input": patch}, "cwd": "/repo"}
@@ -539,6 +556,14 @@ def test_apply_patch_fan_out_splits_multi_file_content():
 
 
 # --- hooks_dir() env precedence --------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_omp_dir_overrides(monkeypatch):
+    """Every hooks_dir() precedence test below starts from a clean env: a developer/CI shell
+    exporting any of these (OMP_CODING_AGENT_DIR is checked FIRST) would otherwise fail them."""
+    for name in ("OMP_HOOKS_DIR", "OMP_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_hooks_dir_default(monkeypatch):

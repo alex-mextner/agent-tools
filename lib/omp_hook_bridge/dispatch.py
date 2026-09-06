@@ -475,7 +475,12 @@ def _v1_events_for_dispatch(omp_event: dict, *, point: str) -> list[dict]:
         return [base]
 
     tool = base.get("tool")
-    text = str(args.get("patch") or args.get("input") or "")
+    # Re-split the SAME trusted text `_normalize_write_args` derived `file_paths`/`content`
+    # from — `base["command"]` is `_edit_patch_text(tool, raw_args)`. Re-picking a raw key here
+    # with a different precedence let a stray/forged `patch` key on an `edit` call shadow the
+    # real hashline `input`, so every fanned-out per-path `content` came back "" and a
+    # secret-scanning pre-write hook saw nothing (review finding on #556).
+    text = str(base.get("command") or "")
     content_by_path = (
         _patch_added_content_by_path(text) if tool == "apply_patch" else _hashline_content_by_path(text)
     )
