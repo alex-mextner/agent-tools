@@ -2043,7 +2043,8 @@ fi
 #
 # Runs independently of --skip-ci, same posture as the review-dwell gate above.
 
-# Prints the first ticket-like token found in $1, or nothing. Tries the repo's own HYP-<n>
+# Prints EVERY ticket-like token found in $1, one per line, in ARM-PRIORITY order (then
+# document order within an arm; duplicates removed), or nothing. Tries the repo's own HYP-<n>
 # convention first (case-insensitive, normalized to uppercase; a Linear URL such as
 # `https://linear.app/<team>/issue/HYP-1440/<slug>` carries the code in its path and is caught
 # by this same arm), then a generic UPPERCASE-PREFIX-<n> ticket token (2+ uppercase letters, a
@@ -2079,100 +2080,137 @@ fi
 #   - a digit fused directly onto (or hyphen-separated immediately before) the token's OWN first
 #     segment ("2FA-SETUP-FLOW", "123-ABC-DEF-GHI") isn't caught by the boundary-free `[A-Z]`
 #     start -- POSIX ERE has no lookbehind to assert "not preceded by a digit/letter" here;
-#   - the numeric arm above runs FIRST and returns on its first match anywhere in the text, so an
-#     incidental uppercase-acronym-plus-digit token that has nothing to do with the real ticket
-#     ("UTF-8", "SHA-256", "RFC-2119", "ISO-8601" all match `[A-Z][A-Z]+-[0-9]+`) can shadow a
-#     valid descriptive code appearing later in the same PR body -- the descriptive arm below then
-#     never even runs. Same fail-closed trade-off: review-cli has no record for "UTF-8" either, so
-#     ship still refuses, just without ever trying the real code (#384 review round 3).
-_review_quorum_extract_ticket() {  # $1 = text -> prints ticket code, or nothing; ALWAYS exits 0
+#   - the numeric arm runs FIRST, so an incidental uppercase-acronym-plus-digit token that has
+#     nothing to do with the real ticket ("UTF-8", "SHA-256", "RFC-2119", "ISO-8601" all match
+#     `[A-Z][A-Z]+-[0-9]+`) is listed AHEAD of a valid descriptive code appearing later in the
+#     same PR body. It no longer HIDES it (agent-tools#571): every candidate is returned, and each
+#     caller filters by its own admission rule and takes the first survivor -- the review-quorum
+#     gate moves on when review-cli has no record at all for a candidate, the acceptance/notify
+#     derivation when task-cli's id grammar or the self-PR rule rejects it. Before #571 this
+#     function returned only the first match of the first matching arm, so PR #560's incidental
+#     `GH-560` (an example in its acceptance proofs, rejected as the PR's own number) hid the real
+#     `Refs #541` further down the SAME body, and the acceptance gate skipped instead of judging.
+#
+# Rejections inside this function are the two AMBIGUITY rules (two distinct keyword-anchored
+# refs, two distinct same-repo issue URLs) and the foreign-repo URL rule; each is reported on
+# stderr so a "could not derive" downstream is traceable to the text that caused it.
+_review_quorum_extract_ticket_candidates() {  # $1 = text -> candidates, one per line; ALWAYS exits 0
+  local text="$1"
+  # Each arm is guarded with `|| true`: this file runs under `set -euo pipefail`, and a grep with
+  # no match exits 1, which would otherwise abort the group (and the whole ship) on any text that
+  # simply lacks that arm's shape. The `awk` keeps the first occurrence of each candidate, so a
+  # HYP-<n> (matched by BOTH the HYP arm and the generic PREFIX arm) is listed once, in HYP's slot.
+  { printf '%s\n' "$text" | LC_ALL=C grep -oiE 'HYP-[0-9]+' | LC_ALL=C tr '[:lower:]' '[:upper:]' || true
+    printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z]+-[0-9]+' || true
+    printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z0-9]*(-[A-Z0-9]+)*' \
+      | LC_ALL=C grep -xE '[A-Z][A-Z]+(-[A-Z][A-Z]+){2,}' || true
+    _review_quorum_extract_github_issue_ref "$text"
+  } | LC_ALL=C awk 'NF && !seen[$0]++'
+  return 0
+}
+
+# The GitHub-issue tail of the candidate list: a keyword-anchored `#<n>` reference, else a full
+# issue URL of the PR's OWN repo. Prints at most ONE candidate; ALWAYS exits 0.
+#
+# GitHub issue reference (`Fixes #105`, `Refs #105`) — for repos (like conloca-landing) that
+# track work as GitHub issues rather than Linear/JIRA-style codes. Returned LITERAL, not
+# normalized: task-cli's own `_route_id_to_project` (tasklib/cli.py) routes a bare GitHub id
+# by checking `tid.startswith("#")` first — a `GH-<n>`-style rewrite doesn't match that check,
+# falls through to the Linear-team-prefix branch instead, and `task mark-shipped` fails with
+# an unroutable-id error. review-cli's own `normalize_task_code` (reviewlib/stats.py) accepts
+# any non-whitespace, non-control-character token — `#105` passes it unchanged, so there is no
+# downstream reason to rewrite it (the review-quorum gate looks up BOTH spellings anyway,
+# agent-tools#572).
+# Only a KEYWORD-ANCHORED local reference qualifies (`Closes|Fixes|Resolves|Refs|References`
+# immediately before the `#<n>`, GitHub's own closing-keyword grammar plus the `Refs` form used
+# when the ticket must NOT auto-close on merge). Three hazards rule out a bare `#<n>` anywhere
+# in the text, all of them concrete because this same helper feeds BOTH the review-quorum
+# record lookup and the post-merge `task mark-shipped` call:
+#   - GitHub's qualified cross-repo syntax (`other-org/other-repo#123`, incl. repo names ending
+#     in `-`/`.`) names an issue in ANOTHER repo; extracting its `#123` would mark an unrelated
+#     local issue shipped. The keyword form never matches it: `#` must follow the keyword
+#     directly, never a repo name.
+#   - a URL fragment (`https://example.org/docs/#105`) or a Markdown anchor is not an issue.
+#   - an incidental prose mention (`follow-up for #12`, `(#268)`) of an ALREADY-SHIPPED issue
+#     would resolve to that issue's OLD passed quorum record, granting an unreviewed PR merge
+#     authority — unlike a wrongly-derived HYP/PROJ token, a referenced GitHub issue routinely
+#     HAS a record in an issue-tracked repo, so the "fail-closed anyway" reasoning above does
+#     not hold here.
+# This arm is listed AFTER the generic PREFIX-<n> arm AND the descriptive ALL-CAPS arm above, so
+# a `Fixes #45` aside never outranks a real `PROJ-123` or `SME-ROADMAP-WORKTREE-NOTE` code in
+# the same body (for a descriptive-code repo that aside would otherwise be the very borrowing
+# path described above). The keyword itself must not be the TAIL of a repo path (`org/hot-fix#5`,
+# `org/fix#5`, `org/my.fix#5` are all qualified refs), so the char before it may not be a
+# repo-name char (`-`/`.`) or `/` either; the digits must end at a non-word boundary (`#123abc`
+# is not an issue ref). Two DISTINCT anchored refs in one text (`Partially fixes #12 ... Closes
+# #200`) are an ambiguous task code: every other branch of this gate is fail-closed, so nothing
+# is derived from them — and the URL arm below is suppressed too (never fall through an
+# ambiguity) — so ship refuses instead of silently taking the first in document order. The match
+# may swallow at most ONE trailing WORD char (to reject `#123abc` below) and never the non-word
+# char after the digits: `grep -o` matches don't overlap, so consuming a `,` in `closes
+# #12,fixes #200` would eat the second ref's leading boundary and hide the ambiguity. Known
+# limit (POSIX ERE has no lookahead): the guard sees honest ambiguity with realistic separators
+# (space, `,`, `;`, `.`+space, newline); a second ref glued on by a word char (`#34xrefs #56`) or
+# by a `/`/`.`/`-` (`#12/fixes #200`) keeps no admissible leading boundary and stays hidden — an
+# author who can craft that could as well omit the ref, so it is not defended against.
+# Trade-off, accepted: a bare `#105` with no keyword (a `fix/#105` branch name, a `#105 widget`
+# title) is NOT derived either — pass $REVIEW_TASK_CODE.
+_review_quorum_extract_github_issue_ref() {  # $1 = text -> at most one candidate; ALWAYS exits 0
   local text="$1" m
-  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE 'HYP-[0-9]+' | head -1 || true)
-  if [ -n "$m" ]; then printf '%s' "$m" | LC_ALL=C tr '[:lower:]' '[:upper:]'; return 0; fi
-  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z]+-[0-9]+' | head -1 || true)
-  if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
-  m=$(printf '%s\n' "$text" | LC_ALL=C grep -oE '[A-Z][A-Z0-9]*(-[A-Z0-9]+)*' \
-        | LC_ALL=C grep -xE '[A-Z][A-Z]+(-[A-Z][A-Z]+){2,}' | head -1 || true)
-  if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
-  # GitHub issue reference (`Fixes #105`, `Refs #105`) — for repos (like conloca-landing) that
-  # track work as GitHub issues rather than Linear/JIRA-style codes. Returned LITERAL, not
-  # normalized: task-cli's own `_route_id_to_project` (tasklib/cli.py) routes a bare GitHub id
-  # by checking `tid.startswith("#")` first — a `GH-<n>`-style rewrite doesn't match that check,
-  # falls through to the Linear-team-prefix branch instead, and `task mark-shipped` fails with
-  # an unroutable-id error. review-cli's own `normalize_task_code` (reviewlib/stats.py) accepts
-  # any non-whitespace, non-control-character token — `#105` passes it unchanged, so there is no
-  # downstream reason to rewrite it.
-  # Only a KEYWORD-ANCHORED local reference qualifies (`Closes|Fixes|Resolves|Refs|References`
-  # immediately before the `#<n>`, GitHub's own closing-keyword grammar plus the `Refs` form used
-  # when the ticket must NOT auto-close on merge). Three hazards rule out a bare `#<n>` anywhere
-  # in the text, all of them concrete because this same helper feeds BOTH the review-quorum
-  # record lookup and the post-merge `task mark-shipped` call:
-  #   - GitHub's qualified cross-repo syntax (`other-org/other-repo#123`, incl. repo names ending
-  #     in `-`/`.`) names an issue in ANOTHER repo; extracting its `#123` would mark an unrelated
-  #     local issue shipped. The keyword form never matches it: `#` must follow the keyword
-  #     directly, never a repo name.
-  #   - a URL fragment (`https://example.org/docs/#105`) or a Markdown anchor is not an issue.
-  #   - an incidental prose mention (`follow-up for #12`, `(#268)`) of an ALREADY-SHIPPED issue
-  #     would resolve to that issue's OLD passed quorum record, granting an unreviewed PR merge
-  #     authority — unlike a wrongly-derived HYP/PROJ token, a referenced GitHub issue routinely
-  #     HAS a record in an issue-tracked repo, so the "fail-closed anyway" reasoning above does
-  #     not hold here.
-  # This arm is the LAST fallback — after the generic PREFIX-<n> arm AND the descriptive
-  # ALL-CAPS arm above — so a `Fixes #45` aside never shadows a real `PROJ-123` or
-  # `SME-ROADMAP-WORKTREE-NOTE` code in the same body (for a descriptive-code repo that aside
-  # would otherwise be the very borrowing path described above). The keyword itself must not be
-  # the TAIL of a repo path (`org/hot-fix#5`, `org/fix#5`, `org/my.fix#5` are all qualified refs),
-  # so the char before it may not be a repo-name char (`-`/`.`) or `/` either; the digits must end
-  # at a non-word boundary (`#123abc` is not an issue ref). Two DISTINCT anchored refs in one text
-  # (`Partially fixes #12 ... Closes #200`) are an ambiguous task code: every other branch of this
-  # gate is fail-closed, so nothing is derived and ship refuses instead of silently taking the
-  # first in document order. The match may swallow at most ONE trailing WORD char (to reject
-  # `#123abc` below) and never the non-word char after the digits: `grep -o` matches don't
-  # overlap, so consuming a `,` in `closes #12,fixes #200` would eat the second ref's leading
-  # boundary and hide the ambiguity. Known limit (POSIX ERE has no lookahead): the guard sees
-  # honest ambiguity with realistic separators (space, `,`, `;`, `.`+space, newline); a second
-  # ref glued on by a word char (`#34xrefs #56`) or by a `/`/`.`/`-` (`#12/fixes #200`) keeps no
-  # admissible leading boundary and stays hidden — an author who can craft that could as well
-  # omit the ref, so it is not defended against. Trade-off, accepted: a bare `#105` with no
-  # keyword (a `fix/#105` branch name, a `#105 widget` title) is NOT derived either — pass
-  # $REVIEW_TASK_CODE.
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE \
       '(^|[^A-Za-z0-9_./-])(close[sd]?|fix(e[sd])?|resolve[sd]?|refs?|references?)[[:space:]]*:?[[:space:]]*#[0-9]+[A-Za-z0-9_]?' \
       | LC_ALL=C grep -oE '#[0-9]+[A-Za-z0-9_]?$' | LC_ALL=C grep -xE '#[0-9]+' | LC_ALL=C sort -u || true)
-  # `|| true`: `grep -c` exits 1 when the count is 0 -- which under this script's
-  # `set -euo pipefail` is exactly the NEW path this change exists to serve (a body with no
-  # keyword-anchored ref, only a URL). Guarded like every other grep in this function.
+  # `|| true`: `grep -c` exits 1 when the count is 0 -- the path a body with no keyword-anchored
+  # ref, only a URL, takes. Guarded like every other grep in this function.
   local kw_n; kw_n=$(printf '%s\n' "$m" | LC_ALL=C grep -c '#') || true
-  if [ "$kw_n" -eq 1 ]; then printf '%s' "$m"; return 0; fi
-  [ "$kw_n" -gt 1 ] && return 0   # ambiguous anchored refs: fail closed, never fall through
-  # Full GitHub issue URL of the PR's OWN repo (agent-tools#564) — the LAST fallback. task-cli's
-  # `links` gate REQUIRES a ticket to be referenced as a markdown link / full URL (never a bare
-  # `#548`), so a PR body written correctly for that gate carried NO shape the arms above
-  # recognize and this gate refused it with "could not derive a task code"; agents then
-  # hand-set REVIEW_TASK_CODE, the manual step that gets forgotten. The URL yields the SAME
-  # literal `#<n>` the keyword arm yields, so review-cli's quorum record and task-cli's routing
-  # see one code regardless of body syntax. Rules, mirroring the keyword arm's hazards:
-  #   - the URL's owner/repo must be one of the PR's own slugs (_ship_own_repo_slugs: explicit
-  #     --repo, checkout origin, live PR URL; compared case-insensitively — GitHub slugs are);
-  #     an issue of ANOTHER repo is never this PR's
-  #     ticket (cross-repo companions like "tg-cli#301 <-> agent-tools#524" are routine here);
-  #     an unknown own-repo (no github origin, no --repo, no PR url) derives nothing.
-  #   - only `/issues/<n>` counts — a `/pull/<n>` link is a PR, not a ticket; `www.` and a
-  #     trailing `#issuecomment-…` anchor are tolerated; the digits must end at a non-word
-  #     boundary (`/issues/12abc` is not an issue), same as the `#123abc` rule above.
-  #   - two DISTINCT same-repo issue URLs are ambiguous → nothing (fail-closed); the same
-  #     issue linked twice is one ticket.
-  # No keyword anchor is required (unlike the `#<n>` arm): the links gate's own output shape is
-  # `Refs [#548](https://…/issues/548)`, where `[` sits between any keyword and the URL, so an
-  # anchor would defeat the purpose. Accepted residual: a body whose ONLY same-repo issue link
-  # is an incidental mention of some other, already-shipped issue derives that issue — such a
-  # body already violates the links discipline (it does not link its own ticket at all), and a
-  # second same-repo link (the real ticket) turns the case into the ambiguity refusal.
+  if [ "$kw_n" -eq 1 ]; then printf '%s\n' "$m"; return 0; fi
+  if [ "$kw_n" -gt 1 ]; then
+    echo "[ship] task-code: ambiguous — ${kw_n} distinct keyword-anchored issue refs in one text ($(printf '%s' "$m" | LC_ALL=C tr '\n' ' ' | LC_ALL=C sed 's/ $//')); deriving none of them (fail-closed)." >&2
+    return 0
+  fi
+  _review_quorum_extract_own_repo_issue_url "$text"
+  return 0
+}
+
+# Full GitHub issue URL of the PR's OWN repo (agent-tools#564) — the LAST fallback. task-cli's
+# `links` gate REQUIRES a ticket to be referenced as a markdown link / full URL (never a bare
+# `#548`), so a PR body written correctly for that gate carried NO shape the arms above
+# recognize and this gate refused it with "could not derive a task code"; agents then
+# hand-set REVIEW_TASK_CODE, the manual step that gets forgotten. The URL yields the SAME
+# literal `#<n>` the keyword arm yields, so review-cli's quorum record and task-cli's routing
+# see one code regardless of body syntax. Rules, mirroring the keyword arm's hazards:
+#   - the URL's owner/repo must be one of the PR's own slugs (_ship_own_repo_slugs: explicit
+#     --repo, checkout origin, live PR URL; compared case-insensitively — GitHub slugs are);
+#     an issue of ANOTHER repo is never this PR's
+#     ticket (cross-repo companions like "tg-cli#301 <-> agent-tools#524" are routine here);
+#     an unknown own-repo (no github origin, no --repo, no PR url) derives nothing.
+#   - only `/issues/<n>` counts — a `/pull/<n>` link is a PR, not a ticket; `www.` and a
+#     trailing `#issuecomment-…` anchor are tolerated; the digits must end at a non-word
+#     boundary (`/issues/12abc` is not an issue), same as the `#123abc` rule above.
+#   - two DISTINCT same-repo issue URLs are ambiguous → nothing (fail-closed); the same
+#     issue linked twice is one ticket.
+# No keyword anchor is required (unlike the `#<n>` arm): the links gate's own output shape is
+# `Refs [#548](https://…/issues/548)`, where `[` sits between any keyword and the URL, so an
+# anchor would defeat the purpose. Accepted residual: a body whose ONLY same-repo issue link
+# is an incidental mention of some other, already-shipped issue derives that issue — such a
+# body already violates the links discipline (it does not link its own ticket at all), and a
+# second same-repo link (the real ticket) turns the case into the ambiguity refusal.
+_review_quorum_extract_own_repo_issue_url() {  # $1 = text -> at most one candidate; ALWAYS exits 0
+  local text="$1" m
   m=$(printf '%s\n' "$text" | LC_ALL=C grep -oiE \
       'https?://(www\.)?github\.com/[^/[:space:]]+/[^/[:space:]]+/issues/[0-9]+[A-Za-z0-9_]?' || true)
   [ -n "$m" ] || return 0
-  local issues; issues=$(_ship_own_repo_issue_numbers "$m" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
-  if [ "$(printf '%s\n' "$issues" | LC_ALL=C grep -c .)" -eq 1 ]; then printf '#%s' "$issues"; fi
+  local issues foreign n
+  issues=$(_ship_own_repo_issue_numbers "$m" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
+  foreign=$(_ship_foreign_repo_issue_urls "$m" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
+  if [ -n "$foreign" ]; then
+    echo "[ship] task-code: ignoring $(printf '%s\n' "$foreign" | LC_ALL=C grep -c .) issue link(s) of another repo, never this PR's ticket: $(printf '%s' "$foreign" | LC_ALL=C tr '\n' ' ' | LC_ALL=C sed 's/ $//')" >&2
+  fi
+  n=$(printf '%s\n' "$issues" | LC_ALL=C grep -c .) || true
+  if [ "$n" -eq 1 ]; then printf '#%s\n' "$issues"
+  elif [ "$n" -gt 1 ]; then
+    echo "[ship] task-code: ambiguous — ${n} distinct same-repo issue links in one text ($(printf '%s' "$issues" | LC_ALL=C sed 's/^/#/' | LC_ALL=C tr '\n' ' ' | LC_ALL=C sed 's/ $//')); deriving none of them (fail-closed)." >&2
+  fi
   return 0
 }
 
@@ -2194,6 +2232,26 @@ _ship_own_repo_issue_numbers() {
                           case "$n" in *[!0-9]*) ;; *) printf '%s\n' "$n" ;; esac ;;
       esac
     done <<< "$slugs"
+  done <<< "$1"
+  return 0
+}
+
+# The complement of _ship_own_repo_issue_numbers: $1 = the same newline-separated issue URLs ->
+# prints every URL that names a repo OTHER than the PR's own (or every URL when the own repo is
+# unknown — then none can be told apart), one per line, for the rejection note. ALWAYS exits 0.
+_ship_foreign_repo_issue_urls() {
+  local slugs cand key slug own
+  slugs=$(_ship_own_repo_slugs)
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    key=$(printf '%s' "$cand" | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+            | LC_ALL=C sed -E 's|^https?://(www\.)?github\.com/||')
+    own=0
+    while IFS= read -r slug; do
+      [ -n "$slug" ] || continue
+      case "$key" in "$slug"/issues/*) own=1 ;; esac
+    done <<< "$slugs"
+    [ "$own" = "1" ] || printf '%s\n' "$cand"
   done <<< "$1"
   return 0
 }
@@ -2824,19 +2882,24 @@ fi
 
 # The ticket-code derivation is SHARED by the acceptance gate (pre-merge) and the task-cli
 # notify step (post-merge) — one matcher, defined once, here, before its first caller.
-# Task-code derivation reuses _review_quorum_extract_ticket (the same matcher the review-quorum
-# gate above uses) but tries MORE sources, each validated independently, falling through to the
-# next on rejection: the gate's own $TASK_CODE (if it already ran and found one — avoids a
-# redundant `gh pr view` on the common path) → branch → PR TITLE → PR body. The title is a
-# deliberate gap-fix over the quorum gate (which only ever tries branch → body): a PR whose
-# ticket code lives only in its title (a common shape — "HYP-931: fix the thing") would
-# otherwise never be found here even though a human reads it immediately.
+# Task-code derivation reuses _review_quorum_extract_ticket_candidates (the same matcher the
+# review-quorum gate above uses) but tries MORE sources, each candidate validated independently:
+# the gate's own $TASK_CODE (if it already ran and found one — avoids a redundant `gh pr view` on
+# the common path) → branch → PR TITLE → PR body. The title is a deliberate gap-fix over the
+# quorum gate (which only ever tries branch → body): a PR whose ticket code lives only in its
+# title (a common shape — "HYP-931: fix the thing") would otherwise never be found here even
+# though a human reads it immediately.
 #
-# EACH candidate — including a reused $TASK_CODE — is validated before being accepted; a
-# rejected one falls through to try the NEXT source rather than giving up (review finding — an
-# earlier version validated only the FINAL chosen source, so an invalid $TASK_CODE reuse — e.g.
-# an explicit REVIEW_TASK_CODE=SME-ROADMAP-NOTE, or the branch matching the matcher's
-# descriptive arm — short-circuited past a title/body that DID carry a real ticket id).
+# EACH candidate — including a reused $TASK_CODE — is validated before being accepted. Within a
+# source, EVERY candidate the matcher lists is tried in order and the first survivor wins; only
+# when a source has NO survivor does derivation fall to the next source (agent-tools#571: an
+# earlier version took only the matcher's first hit per source, so PR #560's incidental `GH-560`
+# — rejected as the PR's own number — hid the real `Refs #541` later in the SAME body and the
+# gate skipped). A rejected reused $TASK_CODE likewise falls through to the sources (review
+# finding on #565: an explicit REVIEW_TASK_CODE=SME-ROADMAP-NOTE, or the branch matching the
+# matcher's descriptive arm, used to short-circuit past a title/body that DID carry a real id).
+# Every rejection is reported on stderr with its source; the accepted code is reported too, so
+# the ship transcript shows which text named the ticket the gates then judge.
 #
 # The validation is task-cli's OWN id grammar (agent-tools#565), not a loose heuristic. It used
 # to be "contains a digit", which is not a shape at all: it admitted things that are not tickets
@@ -2910,23 +2973,38 @@ _ship_code_names_this_pr() {  # $1 = candidate code; true (exit 0) iff it is thi
 _ship_task_code_candidate_ok() {  # $1 = candidate code  $2 = source label (for the rejection note)
   [ -n "$1" ] || return 1
   if ! _ship_looks_like_a_ticket_id "$1"; then
-    echo "[ship] task-code: rejected '$1' from $2 — not a task-cli id shape (#<n>, <n>, PREFIX-<n>); trying the next source." >&2
+    echo "[ship] task-code: rejected '$1' from $2 — not a task-cli id shape (#<n>, <n>, PREFIX-<n>); trying the next candidate." >&2
     return 1
   fi
   if _ship_code_names_this_pr "$1"; then
-    echo "[ship] task-code: rejected '$1' from $2 — it names this pull request (#$PR), not a ticket; trying the next source." >&2
+    echo "[ship] task-code: rejected '$1' from $2 — it names this pull request (#$PR), not a ticket; trying the next candidate." >&2
     return 1
   fi
   return 0
 }
-_ship_derive_task_code_for_notify() {
+# The source label of the code `_ship_derive_task_code_for_notify` last accepted (empty when it
+# derived nothing) — read by the acceptance gate's refusals so the shipper is told WHICH text
+# named the ticket task-cli then could not resolve (agent-tools#569).
+_SHIP_TASK_CODE_SOURCE=""
+# $1 = newline-separated candidates from ONE source, $2 = its label -> prints the first candidate
+# that passes `_ship_task_code_candidate_ok` (exit 0), or nothing (exit 1) when none does.
+_ship_first_admissible_task_code() {
   local candidate
-
-  candidate="${TASK_CODE:-}"
-  _ship_task_code_candidate_ok "$candidate" '$TASK_CODE' && { printf '%s' "$candidate"; return 0; }
-
-  candidate=$(_review_quorum_extract_ticket "$BRANCH")
-  _ship_task_code_candidate_ok "$candidate" "the branch name" && { printf '%s' "$candidate"; return 0; }
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    if _ship_task_code_candidate_ok "$candidate" "$2"; then
+      echo "[ship] task-code: using '${candidate}' from $2." >&2
+      _SHIP_TASK_CODE_SOURCE="$2"
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done <<< "$1"
+  return 1
+}
+_ship_derive_task_code_for_notify() {
+  _SHIP_TASK_CODE_SOURCE=""
+  _ship_first_admissible_task_code "${TASK_CODE:-}" '$TASK_CODE' && return 0
+  _ship_first_admissible_task_code "$(_review_quorum_extract_ticket_candidates "$BRANCH")" "the branch name" && return 0
 
   local pr_title pr_body_local
   # One combined query for title+body (2 round trips instead of 2 separate `gh pr view` calls).
@@ -2944,12 +3022,8 @@ _ship_derive_task_code_for_notify() {
     -q '[(.title // ""), (.body // "")] | map(gsub("\n";" ")) | @tsv' 2>/dev/null) \
     || { pr_title=""; pr_body_local=""; }
 
-  candidate=$(_review_quorum_extract_ticket "$pr_title")
-  _ship_task_code_candidate_ok "$candidate" "the PR title" && { printf '%s' "$candidate"; return 0; }
-
-  candidate=$(_review_quorum_extract_ticket "$pr_body_local")
-  _ship_task_code_candidate_ok "$candidate" "the PR body" && { printf '%s' "$candidate"; return 0; }
-
+  _ship_first_admissible_task_code "$(_review_quorum_extract_ticket_candidates "$pr_title")" "the PR title" && return 0
+  _ship_first_admissible_task_code "$(_review_quorum_extract_ticket_candidates "$pr_body_local")" "the PR body" && return 0
   return 0
 }
 
@@ -3155,7 +3229,7 @@ fi
 # Skips (logged, never a refusal) when task-cli is absent, the invocation targets a foreign
 # --repo, or no ticket code is derivable — the same three "not every PR is tied to a tracked
 # ticket" cases the post-merge notify below already skips on; the code derivation IS
-# _ship_derive_task_code_for_notify (never a second matcher). Exit 2 is also a logged skip: an
+# _ship_derive_task_code_for_notify (never a second matcher). Exit 2 REFUSES (agent-tools#569): a
 # unknown ticket (the digit-check false positives that matcher documents — "UTF-8") or a
 # backend outage is not evidence that the ticket is unaccepted, and the ops off-switch exists
 # for the case where an operator wants the gate silent for other reasons.
@@ -3260,8 +3334,8 @@ _acceptance_gate_pass() {  # $1 = task code $2 = `task gate --json` STDOUT ONLY 
 # Rewrites a "GH-<n>" code (case-insensitive: "gh-105" too, matching
 # require-ticket-before-commit's `re.IGNORECASE` on the same pattern) into the literal "#<n>" form
 # task-cli's own id argument expects (task mark-shipped/done accept "#123" or "HYP-456", never
-# "GH-123" -- see the routing rationale on _review_quorum_extract_ticket's own comment, ~line
-# 2052). "GH-<n>" is a convention, not a task-cli id: agent-hooks' require-ticket-before-commit
+# "GH-123" -- see the routing rationale on _review_quorum_extract_github_issue_ref's own
+# comment). "GH-<n>" is a convention, not a task-cli id: agent-hooks' require-ticket-before-commit
 # recognizes it as a valid ticket reference (see
 # agent-hooks/require-ticket-before-commit/require_ticket_before_commit.py), and it's also the
 # shape review-quorum's own matcher used to SYNTHESIZE from a bare "Fixes #105" before #511
@@ -3335,8 +3409,10 @@ _acceptance_gate() {
   errfile=$(mktemp 2>/dev/null) || errfile=/dev/null
   # From "$ROOT", not via -C: task-cli's -C is a per-subcommand flag (see the notify step).
   out=$(cd "$ROOT" && task gate "$code" --json 2>"$errfile") || rc=$?
+  local err=""
   if [ "$errfile" != "/dev/null" ] && [ -s "$errfile" ]; then
-    echo "[ship] acceptance gate: task-cli stderr: $(LC_ALL=C tr '\n' ' ' < "$errfile")" >&2
+    err=$(LC_ALL=C tr '\n' ' ' < "$errfile" | LC_ALL=C sed 's/ $//')
+    echo "[ship] acceptance gate: task-cli stderr: ${err}" >&2
   fi
   [ "$errfile" != "/dev/null" ] && rm -f "$errfile"  # always, not only when -s (review finding: the file leaked on the common empty-stderr path)
   # `task` is a famously ambiguous command name (Taskwarrior, go-task also install as `task`)
@@ -3354,13 +3430,53 @@ _acceptance_gate() {
       return 0
     fi
   fi
+  # Exit 2 = task-cli could not resolve the code (unknown id, backend error). A code WAS derived
+  # from this PR, so this fails CLOSED (agent-tools#569): a PR that names a ticket task-cli
+  # cannot find is a BROKEN PR, not an unguarded one. Only when the answer does not even look
+  # like task-cli's (no `error:` line — task-cli always prints one on exit 2) does the
+  # PATH-collision guard above still apply: a foreign `task` must not refuse every merge.
+  if [ "$rc" = "2" ] && ! _acceptance_gate_looks_like_task_cli_error "$out" "$err"; then
+    echo "[ship] WARNING: acceptance gate could not evaluate ${code} — '$(command -v task)' on PATH did not return task-cli's expected \`error:\` line on exit 2 (a DIFFERENT 'task' binary — e.g. Taskwarrior or go-task — may be shadowing task-cli). Skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
+    _ticket_gate_audit_log acceptance skipped "$code" "'task' on PATH does not look like task-cli"
+    return 0
+  fi
   case "$rc" in
     0) _acceptance_gate_pass "$code" "$out" ;;
     1) _acceptance_gate_refuse "$code" "$out" ;;
+    2) _acceptance_gate_refuse_unresolvable "$code" "$(_acceptance_gate_task_cli_error "$out" "$err")" ;;
     *)
-      echo "[ship] WARNING: acceptance gate could not evaluate ${code} (task gate exit ${rc}) — skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
+      # Outside task-cli's 0/1/2 contract entirely (a crash, a signal, a foreign binary's own
+      # convention) — not a verdict on the ticket; logged and skipped, as before.
+      echo "[ship] WARNING: acceptance gate could not evaluate ${code} (task gate exit ${rc}, outside task-cli's 0/1/2 contract) — skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
       _ticket_gate_audit_log acceptance skipped "$code" "could not evaluate: exit ${rc}" ;;
   esac
+}
+# task-cli's exit-2 contract is one `error: …` line (its `_UserError` handler prints it, on
+# stderr for the real binary). $1 = stdout, $2 = stderr (newlines already flattened) -> true iff
+# either carries that line.
+_acceptance_gate_looks_like_task_cli_error() {
+  case "$1" in *'error: '*|'error:'*) return 0 ;; esac
+  case "$2" in *'error: '*|'error:'*) return 0 ;; esac
+  return 1
+}
+# $1 = stdout, $2 = stderr -> the `error: …` text task-cli printed (stderr first — that is where
+# the real binary puts it; stdout for a shim that prints it there), flattened to one line.
+_acceptance_gate_task_cli_error() {
+  local from="$2"
+  case "$2" in *error:*) ;; *) from="$1" ;; esac
+  printf '%s' "$from" | LC_ALL=C tr '\n' ' ' | LC_ALL=C sed -E 's/^.*(error: )/\1/; s/ $//'
+}
+# The fail-closed refusal for a derived-but-unresolvable code (agent-tools#569). $1 = code
+# $2 = task-cli's own error line; exits 1 (under --dry-run too — same refusal, audit only printed).
+_acceptance_gate_refuse_unresolvable() {
+  local where="${_SHIP_TASK_CODE_SOURCE:-the derived task code}"
+  { echo "Refusing: acceptance gate — task-cli could not resolve ticket ${1} (task gate ${1} exit 2): ${2}"
+    echo "  A PR that names a ticket task-cli cannot find is a broken PR, not an unguarded one: the merge would close (or skip) the wrong ticket."
+    echo "  The code came from ${where}. Fix the reference there (a typo'd id? a hyphenated word like UTF-8 read as a ticket?),"
+    echo "  or name the right ticket explicitly for this ship:  REVIEW_TASK_CODE=<code> gh ship ${PR}"
+    echo "  If task-cli's BACKEND is down rather than the code wrong, SHIP_ACCEPTANCE_GATE=0 (env, or a committed .ship-config line) is the ops off-switch."; } >&2
+  _ticket_gate_audit_log acceptance "refused:unresolvable" "$1" "task gate exit 2: ${2}"
+  exit 1
 }
 # Whether `$1` (task gate's stdout) looks like task-cli's OWN JSON contract, not just any
 # non-empty text — the discriminator for the PATH-collision guard above. With jq, requires the
