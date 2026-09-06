@@ -24,7 +24,7 @@ agent-tools#546 reconciled this hook's wording to it:
 | --- | --- |
 | Bash tool call with **`run_in_background: true`** | **Yes** — the harness tracks that child against the agent that started it and re-invokes it with the output once the child exits (verified: a 40 s backgrounded `python3` sleep resumed its subagent after ~43 s with no further message). An ORDINARY, non-labeled command backgrounded this way is a fine shape for a subagent, and this gate allows it. |
 | **Monitor** watch | **Never** — Monitor has no harness-tracked child at all. `subagent-no-monitor` blocks every subagent Monitor call for that reason. |
-| Shell-**detached** job — trailing `&`, `setsid`, `nohup … &` | **Never** — the harness knows nothing about a job the shell forked behind its back; the Bash call returns at once and no completion ever arrives. |
+| Shell-**detached** job — trailing `&`, `nohup … &`, or a `setsid` that forks (which it does, without `-w`, whenever the caller is a process-group leader; a `setsid` that merely execs is an ordinary foreground run) | **Never** — the harness knows nothing about a job the shell forked behind its back; the Bash call returns at once and no completion ever arrives. |
 | A `--watch` loop | **Never** by any route — it never exits. |
 
 What this gate blocks, given that: a subagent backgrounding a **labeled** long process

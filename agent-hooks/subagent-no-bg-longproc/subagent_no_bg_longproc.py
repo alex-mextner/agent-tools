@@ -19,9 +19,11 @@ ever re-invokes a subagent — FALSE for the general case; the sibling
     this way is a perfectly good shape for a subagent, and this gate allows it.
   - a **Monitor** watch NEVER resumes a subagent (Monitor has no harness-tracked child at all) —
     ``subagent-no-monitor`` blocks every subagent Monitor call for exactly that reason.
-  - a shell-DETACHED job — a trailing ``&``, ``setsid``, ``nohup … &`` — NEVER resumes a
-    subagent either: the harness knows nothing about a job the shell forked behind its back, so
-    the Bash call returns immediately and no completion ever arrives.
+  - a shell-DETACHED job — a trailing ``&``, ``nohup … &``, or a ``setsid`` that forks (which
+    it does, without ``-w``, whenever the caller is a process-group leader; a ``setsid`` that
+    merely execs is an ordinary foreground run) — NEVER resumes a subagent either: the harness
+    knows nothing about a job the shell forked behind its back, so the Bash call returns
+    immediately and no completion ever arrives.
   - a ``--watch`` loop never exits, so no completion can arrive by ANY route.
 
 What this gate BLOCKS, given that: a subagent backgrounding a LABELED long process — ``review``,
@@ -222,7 +224,7 @@ BLOCK_MESSAGE = (
     "You are a SUBAGENT — run this long process ({matched}) in the FOREGROUND and BLOCK on it; "
     "do NOT background it. Remove `run_in_background: true` (and any trailing `&` / `setsid` / "
     "`nohup … &`) and run it inline so this tool call blocks until it finishes. Why: a shell-"
-    "detached job (`&`/`setsid`/`nohup`) never wakes you — the harness knows nothing about it — "
+    "detached job (`&`/`nohup`/a forking `setsid`) never wakes you — the harness knows nothing about it — "
     "and a `--watch` loop never exits, so ending your turn on it wedges you FOREVER with "
     "uncommitted work and no PR; a labeled long process (review/--watch/build-test suite/long "
     "sleep) is blocked from backgrounding by ANY shape, `run_in_background: true` included. "
