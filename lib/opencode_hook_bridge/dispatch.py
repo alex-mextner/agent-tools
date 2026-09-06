@@ -21,9 +21,12 @@ HOOK_API = "agents-hooks/v1"
 # derived from `opencode_event`, so it cannot be forged via tool args the way `args.harness`
 # could be. See `codex_hook_bridge.HARNESS` for the same reasoning: opencode exposes no TRUSTED
 # per-tool-call subagent identity in the plugin payload either (forged agent_id/agent_type keys
-# are stripped below). A hook can read `event["harness"]` to scope a policy to (or exempt) this
-# whole harness instead — see `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES` for the
-# first consumer (agent-tools#533).
+# are stripped below). The ONE trusted identity source is the process environment set by the rig
+# detached launcher (`_detached_agent_id`, agent-tools#476) — and that covers only a rig-launched
+# detached child; a plain opencode session still carries no identity. So a hook that wants to
+# scope a policy to (or exempt) this WHOLE harness reads `event["harness"]` instead — see
+# `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES` for the first consumer
+# (agent-tools#533).
 HARNESS = "opencode"
 _KNOWN_EVENTS = frozenset({"tool.execute.before", "tool.execute.after"})
 _WRITE_TOOLS = frozenset({"edit", "write", "apply_patch"})

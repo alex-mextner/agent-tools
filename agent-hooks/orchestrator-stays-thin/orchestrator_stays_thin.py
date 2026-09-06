@@ -55,8 +55,10 @@ Harness-exempt (agent-tools#533): this gate's whole premise — a main thread th
 implementation work to a CC ``Agent``/``Task`` subagent instead of doing it inline — is a Claude
 Code concept. Codex/opencode DO model a subagent lifecycle of their own (Codex's
 ``SubagentStart``/``SubagentStop`` events, opencode's ``task`` tool) but NEITHER bridge exposes a
-TRUSTED per-tool-call subagent identity from it today — see ``lib/codex_hook_bridge`` and
-``lib/opencode_hook_bridge`` — so every Codex/opencode-sourced event used to look like "the
+TRUSTED per-tool-call subagent identity from the harness's OWN payload today — see
+``lib/codex_hook_bridge`` and ``lib/opencode_hook_bridge`` (the opencode bridge injects one only
+for a rig-launched DETACHED child, from the process env set by the ``rig-detached-opencode``
+launcher, agent-tools#476; a plain opencode session still has none) — so every Codex/opencode-sourced event used to look like "the
 orchestrator" to ``_is_subagent`` — including a bare Codex CLI session Alex runs directly (which
 is not a CC orchestrator refusing to delegate at all) and a Codex/opencode process spawned by
 another tool as a delegated worker (review-cli's read-only reviewer backend, a CC-dispatched
