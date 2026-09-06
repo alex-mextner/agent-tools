@@ -12,22 +12,32 @@ Allowed (let through):
     background... you get a completion notification", so it is inherently the desired shape
   - ``isolation: "remote"`` — CC's own tool description states this "always runs in
     background"
-  - a dispatch already marked ``run_in_background: true`` — dead on CC (see NOTE below), and
-    NOT a signal a default opencode build can produce either: opencode 1.18.20's task tool
-    advertises only description/prompt/subagent_type/task_id/command (no background field).
-    Its native ``background`` boolean exists ONLY behind the experimental runtime flag
-    ``OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true``, and the bridge
-    (`lib/opencode_hook_bridge/dispatch.py`) maps that field into ``run_in_background`` only
-    when the hosting opencode process carries the flag — so this allow path is live exactly
-    when opencode would actually honor it. For a default opencode build the sanctioned
-    background mechanism is the canonical detached launcher provisioned from the
+  - an opencode ``tool: "task"`` dispatch with ``subagent_type`` general or explore — the
+    discriminator is the exact lowercase tool name ``task``; CC uses ``Agent``/``Task`` and
+    still needs fork/remote. Verified truth (agent-tools#476, opencode 1.18.20): the task
+    tool's model-facing schema is ONLY description/prompt/subagent_type/task_id/command —
+    there is NO background field, a default-build dispatch runs in the FOREGROUND, and the
+    native ``background`` boolean exists ONLY behind
+    ``OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true``. It is allowed anyway, deliberately:
+    opencode has no in-tool background path at all, so demanding one left a plain opencode
+    session with NO executable dispatch (the deadlock in agent-tools#495). This gate's
+    thin-orchestrator premise is Claude-Code-specific — the same reasoning that exempts
+    opencode from orchestrator-stays-thin by ``event["harness"]`` (agent-tools#533/#544).
+    The sanctioned TRULY detached path on a default build is the ``rig-detached-opencode``
+    launcher (next bullet); an explicit ``run_in_background: false`` still counts as
+    foreground.
+  - a dispatch already marked ``run_in_background: true`` — dead on CC (see NOTE below); for
+    opencode live only in the experimental configuration: the bridge
+    (`lib/opencode_hook_bridge/dispatch.py`) maps the native ``background`` field into
+    ``run_in_background`` only when the hosting opencode process carries the flag, so this
+    allow path is live exactly when opencode would actually honor it. For a default opencode
+    build the sanctioned detached mechanism is the canonical launcher provisioned from the
     `rig-detached-opencode` universal skill to
     ``~/.agents/skills/rig-detached-opencode/rig-detached-opencode`` (the default
     skills_target — a machine that customizes it sees its own target in ``rig status``;
     `bin/` is not a rig-discovered carrier, so the REMINDER must name the provisioned
-    skill copy)
-    (RIG_AGENT_ID/RIG_DETACHED_AGENT markers -> bridge injects agent_id -> the detached
-    child session is subagent-exempt, not a foreground dispatch at all)
+    skill copy): RIG_AGENT_ID/RIG_DETACHED_AGENT markers -> bridge injects agent_id -> the
+    detached child session is subagent-exempt, not a foreground dispatch at all.
   - a TRIVIAL one-liner dispatch (short, single-line prompt) — cheap enough to run inline
   - a dispatch made BY a subagent itself (subagent-exempt: ``agent_id`` present) — a subagent
     may fan out further, and this gate governs the orchestrator, not the workers
@@ -120,13 +130,15 @@ REMINDER = (
     "Claude Code: subagent_type=\"fork\" or isolation=\"remote\" (both background per CC's "
     "tool contract), or a dynamic Workflow. run_in_background is NOT a real field on CC's "
     "Agent tool — it does nothing.\n"
-    "opencode: its task tool has NO background field in a default build (1.18.20: only\n"
-    "description/prompt/subagent_type/task_id/command). The native background: true exists\n"
-    "only behind OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true; otherwise dispatch via the\n"
-    "canonical detached launcher\n"
-    "~/.agents/skills/rig-detached-opencode/rig-detached-opencode (the rig-detached-opencode\n"
-    "skill's provisioned copy — default skills target, `rig status` shows yours; RIG_AGENT_ID\n"
-    "markers make the child session subagent-exempt).\n"
+    "opencode: dispatch with subagent_type general or explore — allowed as-is. Its task tool\n"
+    "has NO background field in a default build (1.18.20: only description/prompt/\n"
+    "subagent_type/task_id/command) and runs in the foreground; tolerated because opencode\n"
+    "has no in-tool background path — do not invent a background flag (the schema rejects\n"
+    "it; the native background: true exists only behind\n"
+    "OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true). For a truly detached child use the\n"
+    "canonical launcher ~/.agents/skills/rig-detached-opencode/rig-detached-opencode (the\n"
+    "rig-detached-opencode skill's provisioned copy — default skills target, `rig status`\n"
+    "shows yours; RIG_AGENT_ID markers make the child session subagent-exempt).\n"
     "No self-service bypass — ask the human, or request one-time Telegram approval via "
     "RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE=\"<justification>\" (deny-by-default; bare "
     "\"1\" rejected)."
@@ -152,7 +164,10 @@ def _is_subagent(event: dict) -> bool:
     return bool(aid and str(aid).strip())
 
 
-def _is_background(args: dict) -> bool:
+_OPENCODE_ASYNC_TYPES = frozenset({"general", "explore"})
+
+
+def _is_background(args: dict, event: dict | None = None) -> bool:
     """True for any dispatch shape that is inherently — or explicitly marked — background.
 
     `fork` and `isolation: "remote"` are background by CC's own `Agent` tool contract, so they
@@ -164,15 +179,44 @@ def _is_background(args: dict) -> bool:
     `run_in_background: true` is also honored — dead for a real CC dispatch, and for opencode
     live only in the experimental configuration (see the module docstring's "Allowed" list:
     the bridge maps the native `background` field only when the hosting opencode enables it).
+
+    An explicit `run_in_background: false` (bool or string) ALWAYS wins and stays foreground —
+    checked before the fork/remote/opencode inference, not after. A carrier that sends both a
+    `fork`/`remote` shape AND an explicit `false` is telling us the shape's usual background
+    guarantee does not apply this time; honoring the explicit signal over the inferred one is
+    the documented contract (README: "still counts as foreground"). Confirmed as a real gap by
+    review (2026-09-02, PR #499 GH-499 iteration): `{"subagent_type":"fork",
+    "run_in_background":false}` was being allowed because the fork check ran first.
+
+    opencode Task (`event["tool"] == "task"`, exact lowercase — CC uses `Agent`/`Task`) with
+    `subagent_type` general or explore is allowed WITHOUT a flag: that tool's schema has no
+    `background` field (a default build runs the task in the foreground — see the module
+    docstring for why the gate tolerates that), so demanding one deadlocked every dispatch.
     """
+    val = args.get("run_in_background")
+    explicit: bool | None
+    if isinstance(val, bool):
+        explicit = val
+    elif isinstance(val, str) and val.strip().lower() == "true":
+        explicit = True
+    elif isinstance(val, str) and val.strip().lower() == "false":
+        explicit = False
+    else:
+        explicit = None
+
+    if explicit is False:
+        return False
     if args.get("subagent_type") == "fork":
         return True
     if args.get("isolation") == "remote":
         return True
-    val = args.get("run_in_background")
-    if isinstance(val, bool):
-        return val
-    return isinstance(val, str) and val.strip().lower() == "true"
+    if explicit is True:
+        return True
+    tool = (event or {}).get("tool")
+    kind = args.get("subagent_type")
+    if tool == "task" and isinstance(kind, str) and kind.lower() in _OPENCODE_ASYNC_TYPES:
+        return True
+    return False
 
 
 def _is_trivial(args: dict) -> bool:
@@ -208,7 +252,7 @@ def main() -> int:
 
     args = event.get("args") or {}
 
-    if _is_background(args):
+    if _is_background(args, event):
         emit("allow")  # already the desired shape
         return 0
 

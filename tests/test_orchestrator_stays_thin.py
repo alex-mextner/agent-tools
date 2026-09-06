@@ -80,6 +80,33 @@ def test_block_impl_bash_on_repeat(tmp_path, monkeypatch):
     assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
 
 
+def test_blocked_attempts_do_not_refresh_ttl_window(tmp_path, monkeypatch):
+    """WARN -> BLOCK -> BLOCK must not bump the marker mtime. After the original
+    WARN ages past TTL, the next attempt WARNs again — otherwise a wedged
+    orchestrator retrying Edit every few minutes never leaves the BLOCK tier
+    (https://github.com/alex-mextner/agent-tools/issues/495)."""
+    import os
+
+    event = {"point": "pre-write", "cwd": "/repo", "args": {"file_path": "/repo/src/a.ts"}}
+    marker_dir = tmp_path / "m"
+    out1, _e1, c1 = _run(event, monkeypatch, marker_dir)
+    assert c1 == 0 and _decision(out1) == "allow"
+    markers = list(marker_dir.glob("*.warned"))
+    assert len(markers) == 1
+    warn_mtime = markers[0].stat().st_mtime
+
+    out2, _e2, c2 = _run(event, monkeypatch, marker_dir)
+    assert c2 == ost.BLOCK_EXIT_CODE and _decision(out2) == "block"
+    out3, _e3, c3 = _run(event, monkeypatch, marker_dir)
+    assert c3 == ost.BLOCK_EXIT_CODE and _decision(out3) == "block"
+    assert markers[0].stat().st_mtime == warn_mtime
+
+    expired = warn_mtime - ost.TTL_S - 1
+    os.utime(markers[0], (expired, expired))
+    out4, _e4, c4 = _run(event, monkeypatch, marker_dir)
+    assert c4 == 0 and _decision(out4) == "allow"
+
+
 # ── ALLOW (docs / read-only / non-offending) ───────────────────────────────────────────
 
 def test_allow_docs_write(tmp_path, monkeypatch):

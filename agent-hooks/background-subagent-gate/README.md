@@ -5,26 +5,38 @@
 Fires when the **main thread** dispatches a subagent (the CC `Agent`/`Task` tool). A
 non-trivial subagent run in the **foreground** blocks the orchestrator until it finishes —
 which defeats fanning work out. This gate **blocks** such a dispatch and tells the
-orchestrator to use `subagent_type: "fork"` or `isolation: "remote"` (or model the work as a
-dynamic Workflow).
+orchestrator to use `subagent_type: "fork"` or `isolation: "remote"` on Claude Code, or
+opencode task with `subagent_type` `general`/`explore` (no background field — tolerated, see below), or a
+dynamic Workflow.
 
 Lets through:
 
 - `subagent_type: "fork"` — CC's own `Agent` tool description states a fork runs in the
   background and reports back via a completion notification
 - `isolation: "remote"` — CC's own tool description states this always runs in background
+- an opencode `tool: "task"` dispatch with `subagent_type` `general` or `explore` —
+  opencode's task tool has no `background` field in a default build (its JSON schema
+  rejects one), and a default-build dispatch runs in the FOREGROUND (verified against
+  opencode 1.18.20, agent-tools#476). It is allowed anyway, deliberately: opencode has no
+  in-tool background path at all, so demanding one deadlocked every opencode dispatch
+  (agent-tools#495), and this gate's thin-orchestrator premise is Claude-Code-specific —
+  the same reasoning that exempts opencode from orchestrator-stays-thin by the bridge's
+  `harness` tag (agent-tools#533/#544). The discriminator is the exact lowercase tool name
+  `task`; CC uses `Agent`/`Task` and still needs fork/remote. An explicit
+  `run_in_background: false` (if a carrier ever sends one) still counts as foreground.
+  For a truly detached child use the `rig-detached-opencode` launcher (next bullet).
 - a dispatch already marked `run_in_background: true` — kept for forward-compat with any
   harness/carrier that exposes such a field. CC's own `Agent` tool schema, as of 2.1.177,
-  carries no such property, so this path is dead for CC specifically. **opencode** (1.18.20)
-  advertises no background field either: its task tool's model-facing schema is only
-  `description`/`prompt`/`subagent_type`/`task_id`/`command`. Its native `background`
-  boolean exists ONLY behind the experimental runtime flag
+  carries no such property, so this path is dead for CC specifically. For **opencode**
+  (1.18.20) it is live only in the experimental configuration: the task tool's model-facing
+  schema is only `description`/`prompt`/`subagent_type`/`task_id`/`command`; its native
+  `background` boolean exists ONLY behind the experimental runtime flag
   `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` (or the broad `OPENCODE_EXPERIMENTAL`),
   and the bridge (`lib/opencode_hook_bridge/dispatch.py`) maps that field into
   `run_in_background` only when the hosting opencode process carries the flag — so this
   allow path is live exactly when opencode would actually honor it (a default build
   rejects `background: true` with a task error). For a default opencode build the
-  sanctioned background mechanism is the canonical detached launcher provisioned from
+  sanctioned truly-detached mechanism is the canonical launcher provisioned from
   the `rig-detached-opencode` universal skill to
   `~/.agents/skills/rig-detached-opencode/rig-detached-opencode` (the default
   skills_target — a machine that customizes it sees its own target in `rig status`),
@@ -129,6 +141,12 @@ rc=$?; echo "exit=$rc"   # → decision":"block ...  exit=10  (worktree isolatio
 
 echo '{"args":{"isolation":"worktree","subagent_type":"fork","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
 rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (worktree is IGNORED, not a block signal — fork still wins)
+
+echo '{"tool":"task","args":{"subagent_type":"general","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
+rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (opencode task: no background field, tolerated)
+
+echo '{"tool":"task","args":{"subagent_type":"explore","prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
+rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0
 
 echo '{"args":{"run_in_background":true,"prompt":"'"$LONG"'"}}' | ./background_subagent_gate.py
 rc=$?; echo "exit=$rc"   # → decision":"allow"  exit=0  (forward-compat path; for opencode live

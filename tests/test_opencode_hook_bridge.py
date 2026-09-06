@@ -790,7 +790,7 @@ def test_opencode_bridge_blocks_raw_pr_merge_with_real_descriptor(tmp_path):
     assert "gh ship" in out["reason"]
 
 
-def test_opencode_bridge_blocks_foreground_nontrivial_task(tmp_path):
+def test_opencode_bridge_allows_inherently_async_general_task(tmp_path):
     hooks_dir = tmp_path / "hooks"
     _install_descriptor(
         hooks_dir,
@@ -818,9 +818,38 @@ def test_opencode_bridge_blocks_foreground_nontrivial_task(tmp_path):
     proc = _run_dispatch("tool.execute.before", event, hooks_dir=hooks_dir)
 
     assert proc.returncode == 0
-    out = json.loads(proc.stdout)
-    assert out["decision"] == "block"
-    assert "BACKGROUND" in out["reason"]
+    assert proc.stdout == ""
+
+
+def test_opencode_bridge_allows_inherently_async_explore_task(tmp_path):
+    hooks_dir = tmp_path / "hooks"
+    _install_descriptor(
+        hooks_dir,
+        hook_id="background-subagent-gate",
+        point="pre-agent",
+        cmd=BACKGROUND_SUBAGENT_GATE,
+        on_error="open",
+    )
+    event = {
+        "hook": "tool.execute.before",
+        "cwd": str(tmp_path),
+        "input": {"tool": "task", "sessionID": "ses_1"},
+        "output": {
+            "args": {
+                "subagent_type": "explore",
+                "description": "inspect the repo and report findings",
+                "prompt": (
+                    "Inspect the provisioning code, implement the bridge, run tests, and report.\n"
+                    "Include evidence for Claude, Codex, and opencode, and do not mutate unrelated files."
+                ),
+            }
+        },
+    }
+
+    proc = _run_dispatch("tool.execute.before", event, hooks_dir=hooks_dir)
+
+    assert proc.returncode == 0
+    assert proc.stdout == ""
 
 
 def test_opencode_bridge_allows_background_nontrivial_task(tmp_path):
@@ -864,7 +893,8 @@ def test_opencode_bridge_default_build_background_arg_still_blocks(tmp_path):
     """A DEFAULT opencode build (no experimental flag) hides the native background field
     and rejects it at execute time ("Background subagents require
     OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true") — so the bridge must NOT present a
-    smuggled background: true to the gates as a live background signal: the dispatch
+    smuggled background: true to the gates as a live background signal (a custom
+    subagent_type is used so the general/explore tolerance from #495 does not apply): the dispatch
     still blocks and the reminder steers to the sanctioned detached launcher."""
     hooks_dir = tmp_path / "hooks"
     _install_descriptor(
@@ -880,7 +910,7 @@ def test_opencode_bridge_default_build_background_arg_still_blocks(tmp_path):
         "input": {"tool": "task", "sessionID": "ses_1"},
         "output": {
             "args": {
-                "subagent_type": "general",
+                "subagent_type": "custom-worker",
                 "description": "implement the missing bridge and tests",
                 "prompt": (
                     "Inspect the provisioning code, implement the bridge, run tests, and report.\n"

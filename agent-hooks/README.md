@@ -143,12 +143,23 @@ These are the *logical* points; map them to your harness's actual tool-use event
 
 `pre-agent` fires before the orchestrator dispatches a subagent (CC's `Agent`/`Task` tool),
 so a hook can shape *how* work is fanned out — block a non-trivial **foreground** dispatch and
-require `run_in_background: true` (or a Workflow). The bridge maps it from CC's `PreToolUse`
-on `Agent`/`Task` and forwards CC's `agent_id`/`agent_type` (present only inside a dispatched
-subagent) into `args`, so a subagent-exempt gate can tell the orchestrator's dispatch apart
-from a worker's. opencode maps its `task` tool to the same logical point, but does not expose
-a trusted subagent identity in the plugin payload, so forged `agent_id` / `agent_type` values
-inside tool args are stripped.
+require a background shape (or a Workflow). The background shape is per harness, and it is
+NOT a `run_in_background: true` flag: Claude Code's `Agent` tool has no such field (its
+background shapes are `subagent_type: "fork"` and `isolation: "remote"`), and opencode's
+`task` tool has no `background` field in a default build either (the native one exists only
+behind `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true`; the bridge maps it to
+`run_in_background` only then). An opencode `task` with `subagent_type` `general`/`explore`
+passes the gate as-is (opencode has no in-tool background path, so blocking it deadlocked
+every dispatch — agent-tools#495); the truly-detached opencode path is the
+`rig-detached-opencode` launcher skill. See `background-subagent-gate/README.md` for the
+exact allow list. The bridge maps the point from CC's `PreToolUse` on `Agent`/`Task` and
+forwards CC's `agent_id`/`agent_type` (present only inside a dispatched subagent) into
+`args`, so a subagent-exempt gate can tell the orchestrator's dispatch apart from a worker's.
+opencode maps its `task` tool to the same logical point; its plugin payload exposes no
+trusted subagent identity, so forged `agent_id` / `agent_type` values inside tool args are
+stripped, and the ONE trusted source is the process env set by the `rig-detached-opencode`
+launcher (`RIG_AGENT_ID` / `RIG_DETACHED_AGENT`), which covers only a rig-launched detached
+child — see `lib/opencode_hook_bridge/README.md` "Identity contract".
 
 ### `pre-skill` — record a skill invocation
 
