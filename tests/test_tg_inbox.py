@@ -392,3 +392,28 @@ def test_combine_block_empty_hook_reason_still_blocks():
     assert codex_dispatch._combine_block("", "") == codex_dispatch.codex_block_output("")
     assert codex_dispatch._combine_block("", None) is None
     assert codex_dispatch._combine_block("msg", "gate") == codex_dispatch.codex_block_output("msg\n\ngate")
+
+
+def test_consume_pending_requeues_a_record_appended_to_the_claim_mid_consume(cfg, monkeypatch, capsys):
+    # The daemon appends with open-then-write; a claim rename between the two lands the
+    # record on the CLAIMED inode after the reader's snapshot (round-1 finding). It must
+    # come back as a fresh pending.jsonl, not die with the claim.
+    d = inbox_dir("landing")
+    d.mkdir(parents=True)
+    (d / "pending.jsonl").write_text(_entry(1, "[TG from Alex tg#1] first") + "\n")
+    real_write = inbox_core._write_private
+
+    def late_append_then_write(path, text):
+        claim = next(d.glob("claim-*"))
+        with claim.open("a") as fh:
+            fh.write(_entry(2, "[TG from Alex tg#2] late") + "\n")
+        real_write(path, text)
+
+    monkeypatch.setattr(inbox_core, "_write_private", late_append_then_write)
+    assert [e["id"] for e in consume_pending("landing")] == [1]
+    assert "requeued to pending.jsonl" in capsys.readouterr().err
+    assert not list(d.glob("claim-*"))
+    assert (d / "pending.jsonl").stat().st_mode & 0o777 == 0o600
+    monkeypatch.setattr(inbox_core, "_write_private", real_write)
+    assert [e["id"] for e in consume_pending("landing")] == [2]
+    assert not (d / "pending.jsonl").exists()

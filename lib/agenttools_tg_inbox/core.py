@@ -212,6 +212,23 @@ def _write_private(path: Path, text: str) -> None:
         fh.write(text)
 
 
+def _requeue_late_appends(claim: Path, pending: Path, consumed: int) -> None:
+    """Close the writer/claim race: the daemon appends with open-then-write, so a claim
+    rename between those two syscalls lands its record on the CLAIMED inode — after
+    this reader took its snapshot. Once the batch is published, re-read the claim: any
+    bytes past the snapshot go back to a fresh ``pending.jsonl`` (picked up at the next
+    Stop) instead of dying with the claim. Raises ``OSError`` when the requeue fails;
+    the caller then keeps the claim on disk (nothing is lost).
+    """
+    tail = claim.read_bytes()[consumed:]
+    if not tail:
+        return
+    fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_APPEND, FILE_MODE)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(tail)
+    _warn(f"{len(tail)} byte(s) reached {claim.name} after the snapshot — requeued to {pending.name}")
+
+
 def _unique_name(prefix: str) -> str:
     return f"{prefix}{os.getpid()}-{time.time_ns()}-{os.urandom(4).hex()}.jsonl"
 
@@ -239,7 +256,8 @@ def consume_pending(key: str, *, session_id: str = "") -> list[dict]:
         _warn(f"could not claim {pending}: {exc}")
         return []
     try:
-        text = claim.read_text(encoding="utf-8")
+        snapshot = claim.read_bytes()
+        text = snapshot.decode("utf-8")
     except (OSError, ValueError) as exc:  # ValueError: invalid UTF-8 — the claim stays on disk
         _warn(f"could not read {claim}: {exc}")
         return []
@@ -262,7 +280,6 @@ def consume_pending(key: str, *, session_id: str = "") -> list[dict]:
             pass
         _write_private(tmp, "".join(f"{line}\n" for line in archived))
         os.rename(tmp, batch)
-        claim.unlink()
     except OSError as exc:
         # Archive failed: do NOT deliver (the claim file keeps the records on disk for a
         # human to inspect) — delivering without a record could re-deliver on retry.
@@ -272,7 +289,19 @@ def consume_pending(key: str, *, session_id: str = "") -> list[dict]:
         except OSError:
             pass
         return []
+    _finish_claim(claim, pending, len(snapshot))
     return entries
+
+
+def _finish_claim(claim: Path, pending: Path, consumed: int) -> None:
+    """The batch is published, so the entries ARE delivered; the claim is now only a
+    carrier for a late append. Requeue that, then drop the claim — or leave it on disk
+    (nothing lost, said on stderr) if either step fails."""
+    try:
+        _requeue_late_appends(claim, pending, consumed)
+        claim.unlink()
+    except OSError as exc:
+        _warn(f"could not requeue/remove {claim.name}: {exc} — left on disk")
 
 
 def format_block_reason(entries: list[dict]) -> str:
