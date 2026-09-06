@@ -20,7 +20,12 @@ Allowed (let through):
     (`lib/opencode_hook_bridge/dispatch.py`) maps that field into ``run_in_background`` only
     when the hosting opencode process carries the flag — so this allow path is live exactly
     when opencode would actually honor it. For a default opencode build the sanctioned
-    background mechanism is the canonical detached launcher `bin/rig-detached-opencode`
+    background mechanism is the canonical detached launcher provisioned from the
+    `rig-detached-opencode` universal skill to
+    ``~/.agents/skills/rig-detached-opencode/rig-detached-opencode`` (the default
+    skills_target — a machine that customizes it sees its own target in ``rig status``;
+    `bin/` is not a rig-discovered carrier, so the REMINDER must name the provisioned
+    skill copy)
     (RIG_AGENT_ID/RIG_DETACHED_AGENT markers -> bridge injects agent_id -> the detached
     child session is subagent-exempt, not a foreground dispatch at all)
   - a TRIVIAL one-liner dispatch (short, single-line prompt) — cheap enough to run inline
@@ -118,8 +123,10 @@ REMINDER = (
     "opencode: its task tool has NO background field in a default build (1.18.20: only\n"
     "description/prompt/subagent_type/task_id/command). The native background: true exists\n"
     "only behind OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true; otherwise dispatch via the\n"
-    "canonical detached launcher bin/rig-detached-opencode (RIG_AGENT_ID markers make the\n"
-    "child session subagent-exempt).\n"
+    "canonical detached launcher\n"
+    "~/.agents/skills/rig-detached-opencode/rig-detached-opencode (the rig-detached-opencode\n"
+    "skill's provisioned copy — default skills target, `rig status` shows yours; RIG_AGENT_ID\n"
+    "markers make the child session subagent-exempt).\n"
     "No self-service bypass — ask the human, or request one-time Telegram approval via "
     "RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE=\"<justification>\" (deny-by-default; bare "
     "\"1\" rejected)."

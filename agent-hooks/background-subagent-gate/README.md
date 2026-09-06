@@ -24,9 +24,14 @@ Lets through:
   `run_in_background` only when the hosting opencode process carries the flag — so this
   allow path is live exactly when opencode would actually honor it (a default build
   rejects `background: true` with a task error). For a default opencode build the
-  sanctioned background mechanism is the canonical detached launcher
-  `bin/rig-detached-opencode` (RIG_AGENT_ID/RIG_DETACHED_AGENT markers → the bridge
-  injects `agent_id` → the detached child session is subagent-exempt)
+  sanctioned background mechanism is the canonical detached launcher provisioned from
+  the `rig-detached-opencode` universal skill to
+  `~/.agents/skills/rig-detached-opencode/rig-detached-opencode` (the default
+  skills_target — a machine that customizes it sees its own target in `rig status`),
+  which is the path the block REMINDER names. `bin/` is not a rig-discovered carrier,
+  so a launcher referenced there would not exist on a provisioned machine.
+  RIG_AGENT_ID/RIG_DETACHED_AGENT markers → the bridge
+  injects `agent_id` → the detached child session is subagent-exempt
 - a **trivial** one-liner dispatch (prompt/description `< 200` chars and single-line)
 - a dispatch made **by a subagent itself** (subagent-exempt — `agent_id` present): a worker
   may fan out further, and this gate governs the orchestrator, not the workers

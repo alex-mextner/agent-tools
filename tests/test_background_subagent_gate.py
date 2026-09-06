@@ -16,6 +16,8 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -149,8 +151,56 @@ def test_reminder_states_the_opencode_truth(monkeypatch):
     message = json.loads(out)["message"]
     assert "NO background field" in message
     assert "OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS" in message
-    assert "bin/rig-detached-opencode" in message
+    assert "~/.agents/skills/rig-detached-opencode/rig-detached-opencode" in message
     assert "set its native background: true flag" not in message
+
+
+def test_reminder_launcher_reference_matches_the_skill_carrier():
+    """The REMINDER's launcher path must be a rig-discovered carrier (P1, PR #497).
+
+    `bin/` is NOT a catalog carrier: nothing in rig scans or provisions it, so a
+    REMINDER naming `bin/rig-detached-opencode` recommends a command that does not
+    exist on a provisioned machine. The launcher now ships as the
+    `rig-detached-opencode` UNIVERSAL SKILL: rig copies the whole skill dir (launcher
+    included) to `<skills_target>/rig-detached-opencode/` (default
+    `~/.agents/skills`, default-on via `skills.universal.all`) — the dir opencode
+    scans natively — so the REMINDER's named path exists after `rig apply` on any
+    provisioned machine. This test pins the REMINDER text to that carrier."""
+    repo_root = Path(__file__).resolve().parents[1]
+    skill_dir = repo_root / "skills" / "universal" / "rig-detached-opencode"
+    launcher = skill_dir / "rig-detached-opencode"
+
+    # 1. the carrier exists on disk
+    assert launcher.is_file(), f"launcher missing from skill carrier: {launcher}"
+
+    # 2. the skill is discoverable + default-on: SKILL.md frontmatter name matches the
+    #    dir name, so the provisioned path segment the REMINDER names is the one rig
+    #    installs (`skills.universal.all: true` includes every universal skill).
+    skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    assert skill_md.lstrip().startswith("---")
+    assert re.search(r"^name: rig-detached-opencode[ \t]*$", skill_md, re.MULTILINE)
+
+    # 3. both carrier files are GIT-TRACKED — an untracked SKILL.md/launcher would let
+    #    the move commit delete `bin/` while the skill never ships, silently
+    #    reintroducing the "names a command that does not exist" bug (codex P1, PR #497).
+    tracked = subprocess.run(
+        ["git", "-C", str(repo_root), "ls-files", "--", str(launcher.relative_to(repo_root)), str((skill_dir / "SKILL.md").relative_to(repo_root))],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    assert sorted(tracked) == sorted(
+        [str(launcher.relative_to(repo_root)), str((skill_dir / "SKILL.md").relative_to(repo_root))]
+    ), f"skill carrier files not tracked: {tracked}"
+
+    # 4. the REMINDER names the provisioned path, not the undiscovered bin/ location.
+    #    This direct-constant assert intentionally overlaps the black-box REMINDER and
+    #    bridge-reason asserts elsewhere: THIS one is the carrier<->REMINDER pin.
+    assert "~/.agents/skills/rig-detached-opencode/rig-detached-opencode" in gate.REMINDER
+    assert "bin/rig-detached-opencode" not in gate.REMINDER
+
+    # 5. the stale non-carrier location is gone entirely
+    assert not (repo_root / "bin" / "rig-detached-opencode").exists()
 
 
 def test_allow_trivial_one_liner(monkeypatch):

@@ -1,5 +1,8 @@
-"""Tests for bin/rig-detached-opencode — the canonical rig-owned detached-agent
-launcher for opencode (#476).
+"""Tests for the rig-detached-opencode launcher — the canonical rig-owned detached-agent
+launcher for opencode (#476), shipped as the `rig-detached-opencode` universal SKILL
+(skills/universal/rig-detached-opencode/) so rig provisions it to
+~/.agents/skills/rig-detached-opencode/ on every managed machine (PR #497: `bin/` is not
+a rig-discovered carrier).
 
 The launcher exports RIG_AGENT_ID=<name> and RIG_DETACHED_AGENT=1 for a nohup-detached
 `opencode run` child, so the opencode hook bridge classifies the child session as a
@@ -22,7 +25,13 @@ from pathlib import Path
 
 import pytest
 
-_LAUNCHER = Path(__file__).resolve().parents[1] / "bin" / "rig-detached-opencode"
+_LAUNCHER = (
+    Path(__file__).resolve().parents[1]
+    / "skills"
+    / "universal"
+    / "rig-detached-opencode"
+    / "rig-detached-opencode"
+)
 _LOG_DIR = Path("/tmp/agent-logs")
 
 _STUB_SLEEP_S = 2.0
@@ -189,6 +198,40 @@ def test_happy_path_exports_markers_and_detaches(tmp_path):
             break
         time.sleep(0.1)
     assert "stub-opencode-started" in log.read_text(encoding="utf-8")
+
+
+def test_relative_brief_with_different_workdir_reaches_the_child(tmp_path, monkeypatch):
+    """A RELATIVE brief path + a DIFFERENT [workdir] must still deliver the brief's
+    content to the child (codex P1, PR #497).
+
+    Validation (`[ -s "$brief" ]`) ran against the caller's cwd, but the launcher then
+    `cd`s to workdir; a `$(cat "$brief")` evaluated AFTER the cd resolved the relative
+    path in the wrong directory, failed silently inside the backgrounded command
+    substitution, and launched opencode with an EMPTY prompt while exiting 0. The
+    launcher now reads the brief before changing directory."""
+    name = "oc476-test-relative-brief"
+    stub_dir = tmp_path / "bin"
+    marker = tmp_path / "stub-env.txt"
+    _stub_opencode(stub_dir, marker)
+
+    caller_cwd = tmp_path / "caller"
+    caller_cwd.mkdir()
+    (caller_cwd / "brief.md").write_text(
+        "Mission: relative-brief-sentinel must reach the child.", encoding="utf-8"
+    )
+    workdir = tmp_path / "elsewhere"
+    workdir.mkdir()
+    # Not in workdir: a post-cd `cat brief.md` would fail there.
+    assert not (workdir / "brief.md").exists()
+
+    monkeypatch.chdir(caller_cwd)
+    proc = _run_launcher(name, "brief.md", str(workdir), path_override=stub_dir)
+
+    assert proc.returncode == 0, proc.stderr
+    _poll_for(marker)
+    recorded = marker.read_text(encoding="utf-8")
+    assert f"PWD={workdir}" in recorded
+    assert "relative-brief-sentinel must reach the child" in recorded
 
 
 def test_happy_path_defaults_workdir_to_cwd(tmp_path, monkeypatch):

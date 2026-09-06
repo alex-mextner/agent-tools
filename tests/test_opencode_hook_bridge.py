@@ -872,7 +872,7 @@ def test_opencode_bridge_default_build_background_arg_still_blocks(tmp_path):
     assert proc.returncode == 0
     out = json.loads(proc.stdout)
     assert out["decision"] == "block"
-    assert "bin/rig-detached-opencode" in out["reason"]
+    assert "~/.agents/skills/rig-detached-opencode/rig-detached-opencode" in out["reason"]
 
 
 def _clear_background_env_flags(monkeypatch) -> None:

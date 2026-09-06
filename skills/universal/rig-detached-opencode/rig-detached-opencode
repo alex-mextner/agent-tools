@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 # rig-detached-opencode — the canonical rig-owned detached-agent launcher for opencode.
+# Carrier: this file ships as the `rig-detached-opencode` UNIVERSAL SKILL
+# (skills/universal/rig-detached-opencode/). rig copies the whole skill dir to
+# ~/.agents/skills/rig-detached-opencode/ (default skills_target, default-on via
+# skills.universal.all) — the directory opencode scans natively — so the
+# provisioned command on a rig-managed machine is
+# ~/.agents/skills/rig-detached-opencode/rig-detached-opencode
+# and the gate REMINDERs name exactly that path. `bin/` is NOT a rig-discovered
+# carrier: a launcher placed there would not exist on a provisioned machine.
 #
 # Usage: rig-detached-opencode <name> <brief-file> [workdir]
 #
@@ -60,6 +68,14 @@ log_dir="/tmp/agent-logs"
 mkdir -p "$log_dir"
 log="$log_dir/$name.log"
 
+# Read the brief BEFORE changing directory: a RELATIVE <brief-file> is validated
+# against the caller's cwd above, and `cd "$workdir"` would make the same path
+# resolve somewhere else. Reading it inside the backgrounded command substitution
+# below would then fail silently (set -e does not reach into `$(...)` on a
+# `nohup ... &` line) and launch opencode with an EMPTY prompt while still
+# exiting 0 (codex P1, PR #497).
+brief_text="$(cat -- "$brief")"
+
 cd "$workdir"
 export RIG_AGENT_ID="$name"
 export RIG_DETACHED_AGENT=1
@@ -68,7 +84,7 @@ export RIG_DETACHED_AGENT=1
     echo "--- $(date -u '+%Y-%m-%dT%H:%M:%SZ') launching detached agent '$name' in '$workdir'"
 } >>"$log"
 
-nohup opencode run --title "$name" "$(cat "$brief")" >>"$log" 2>&1 &
+nohup opencode run --title "$name" "$brief_text" >>"$log" 2>&1 &
 pid=$!
 
 echo "detached agent '$name' launched (pid $pid, log $log, workdir $workdir)"
