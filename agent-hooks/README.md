@@ -45,13 +45,12 @@ its own equivalent process/module isolation.
   + content for a write). `harness` is a bridge-set constant (`"claude-code"` / `"codex"` /
   `"opencode"`) identifying which product's hook system dispatched the event — set from a
   hardcoded module literal in each bridge, never derived from `args`/`tool_input`, so it cannot
-  be forged the way a same-named key sitting in `args` could be (agent-tools#533). A hook that
-  needs to scope itself to, or exempt, an entire harness reads `event["harness"]` directly; see
-  `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES` for the first consumer. **A hook
-  that RELAXES on `harness` must use a fail-closed allowlist** (`harness in {known-safe values}`),
-  never a `!=` exclusion: the field may be absent on an event from a bridge that predates it, or
-  from any future bridge that doesn't set one, and an absent/unrecognized value must stay
-  GOVERNED by default, exactly like this repo's `agent_id` subagent-exemption convention.
+  be forged the way a same-named key sitting in `args` could be (agent-tools#533). **No hook exempts a harness on it** (agent-tools#573 — the #533/#544 `EXEMPT_HARNESSES`
+  shortcut is gone; every harness is governed identically, and the subagent identity in
+  `args.agent_id` is what tells an orchestrator apart from a delegated child on every harness).
+  A gated hook reads `event["harness"]` for one purpose: to name THAT harness's delegation recipe
+  in its refusal (`agenttools_hatch_escalation.delegation_recipe`); an absent/unrecognized value
+  stays GOVERNED and gets every recipe.
 - **stdout**: protocol JSON only — `{ "hook_api": "agents-hooks/v1", "decision": "allow"
   | "block", "message": "..." }`. Empty stdout = allow.
 - **stderr**: human logs (never parsed).
@@ -168,11 +167,14 @@ every dispatch — agent-tools#495); the truly-detached opencode path is the
 exact allow list. The bridge maps the point from CC's `PreToolUse` on `Agent`/`Task` and
 forwards CC's `agent_id`/`agent_type` (present only inside a dispatched subagent) into
 `args`, so a subagent-exempt gate can tell the orchestrator's dispatch apart from a worker's.
-opencode maps its `task` tool to the same logical point; its plugin payload exposes no
-trusted subagent identity, so forged `agent_id` / `agent_type` values inside tool args are
-stripped, and the ONE trusted source is the process env set by the `rig-detached-opencode`
-launcher (`RIG_AGENT_ID` / `RIG_DETACHED_AGENT`), which covers only a rig-launched detached
-child — see `lib/opencode_hook_bridge/README.md` "Identity contract".
+opencode and omp map their `task` tools to the same logical point. Every non-CC bridge strips
+forged `agent_id` / `agent_type` values inside tool args and repopulates the identity from
+trusted sources only (agent-tools#573): codex's own top-level `agent_id` on a `spawn_agent`
+child thread, omp's in-process `task` child session (tagged by the extension), the
+`rig-detached-<harness>` launcher env markers (`RIG_AGENT_ID` / `RIG_DETACHED_AGENT`), and
+process ancestry — shared in `lib/agent_hooks_v1/subagent_identity.py`; see each bridge's
+README "Identity contract". opencode's own native `task` children (in-process, no marker)
+remain identity-less.
 
 ### `pre-skill` — record a skill invocation
 

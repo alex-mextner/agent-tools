@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# rig-detached-agent — the ONE detached-agent launcher core behind the per-harness wrappers
+# rig-detached-opencode / rig-detached-codex / rig-detached-omp (agent-tools#476, #573).
+#
+# Usage (via a wrapper): rig-detached-<harness> <name> <brief-file> [workdir]
+# Direct:                rig-detached-agent <harness> <name> <brief-file> [workdir]
+#
+# Launches a DETACHED child session of <harness> carrying the subagent identity markers
+# RIG_AGENT_ID=<name> and RIG_DETACHED_AGENT=1. Every hook bridge (lib/*_hook_bridge) reads
+# those markers from the process env — via the shared lib/agent_hooks_v1/subagent_identity.py
+# — and injects args.agent_id on every tool call, so every agents-hooks/v1 delegation gate
+# (orchestrator-stays-thin, background-subagent-gate, no-long-inline-process,
+# subagent-no-bg-longproc) classifies the child session as a dispatched subagent instead of
+# the orchestrator.
+#
+# Why the process env is the sanctioned identity source: a running orchestrator cannot
+# retroactively mutate its own process environment — it can only set these vars for a CHILD
+# process, which is exactly the sanctioned act of dispatching a subagent. Model-controlled
+# tool args can never self-exempt (the bridges strip forged agent_id keys before the env
+# injection).
+#
+# Carrier: this file ships as the `rig-detached-agent` UNIVERSAL SKILL; rig copies the whole
+# skill dir to ~/.agents/skills/rig-detached-agent/ (default skills_target, default-on via
+# skills.universal.all) next to the wrapper skills, and each wrapper resolves this core
+# relative to its own real path — so the provisioned wrappers work on any rig-managed
+# machine. `bin/` in the agent-tools repo is NOT a rig-discovered carrier.
+#
+# Per-harness child command (the only thing that differs between harnesses):
+#   opencode : opencode run --title <name> -- <brief>
+#   codex    : codex exec --dangerously-bypass-hook-trust --skip-git-repo-check -- <brief>
+#              `codex exec` runs NO hooks at all without `--dangerously-bypass-hook-trust`
+#              (verified on 0.153.4: no PreToolUse/Stop hook fires in exec mode, even in a
+#              trusted project, until that flag is passed). The rig-installed hooks ARE the
+#              vetted source the flag's help text has in mind, so the flag is what makes the
+#              child GOVERNED — without it the child would run every gate-less.
+#   omp      : omp -p --auto-approve -- <brief>
+#              a detached child cannot answer an approval prompt; the agent-hooks are the
+#              guards (the same reasoning rig applies to harness auto-mode).
+#
+# Conventions (shared by every wrapper):
+#   - <brief-file> is a UTF-8 markdown brief: the mission, acceptance criteria, and the
+#     HANDOFF FILE PATH the child must write before exiting (the orchestrator polls that
+#     file to collect the result).
+#   - `--` ends option parsing in every harness CLI, so a brief that starts with `---`
+#     (frontmatter) or `- ` (a bullet) is never eaten as a flag.
+#   - stdout/stderr of the child append to $RIG_AGENT_LOG_DIR/<name>.log
+#     (default /tmp/agent-logs; dir 0700 + owner-checked, log 0600, symlink refused).
+#   - The launcher RETURNS immediately (child is nohup-detached in a NEW SESSION with stdin
+#     from /dev/null): dispatching must not block the calling shell.
+#
+# Minimal by design: no manifest, no registry, no status tracking — the log file and the
+# handoff file named in the brief are the contract.
+
+set -euo pipefail
+
+harness="${1:-}"
+case "$harness" in
+    opencode|codex|omp) ;;
+    *)
+        echo "usage: rig-detached-agent <opencode|codex|omp> <name> <brief-file> [workdir]" >&2
+        exit 2
+        ;;
+esac
+shift
+label="rig-detached-$harness"
+
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+    echo "usage: $label <name> <brief-file> [workdir]" >&2
+    exit 2
+fi
+
+name="$1"
+brief="$2"
+workdir="${3:-$PWD}"
+
+if ! [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "$label: invalid agent name '$name' (letters, digits, '.', '_', '-' only)" >&2
+    exit 2
+fi
+if [ ! -f "$brief" ] || [ ! -s "$brief" ]; then
+    echo "$label: brief file '$brief' missing or empty" >&2
+    exit 2
+fi
+if [ ! -d "$workdir" ]; then
+    echo "$label: workdir '$workdir' is not a directory" >&2
+    exit 2
+fi
+if ! command -v "$harness" >/dev/null 2>&1; then
+    echo "$label: '$harness' not found on PATH" >&2
+    exit 127
+fi
+
+# Log hygiene (review finding, GH-497 round 1): the log carries the whole brief plus the
+# child's transcript, so it must not be world-readable, and on a shared host another
+# account must not be able to pre-plant the directory or a symlink at the log path.
+umask 077
+log_dir="${RIG_AGENT_LOG_DIR:-/tmp/agent-logs}"
+mkdir -p "$log_dir"
+# Absolute BEFORE the cd below: a relative RIG_AGENT_LOG_DIR would be checked here and
+# opened somewhere else after `cd "$workdir"` (review finding, GH-497 round 2).
+log_dir="$(cd "$log_dir" && pwd -P)"
+if [ ! -O "$log_dir" ]; then
+    echo "$label: log dir '$log_dir' is not owned by you — refusing (set RIG_AGENT_LOG_DIR)" >&2
+    exit 2
+fi
+chmod 700 "$log_dir"
+log="$log_dir/$name.log"
+if [ -L "$log" ] || { [ -e "$log" ] && [ ! -f "$log" ]; }; then
+    echo "$label: log path '$log' is a symlink or not a regular file — refusing" >&2
+    exit 2
+fi
+# An EXISTING log (a re-launched agent name) may carry a looser mode from before; tighten it
+# rather than appending the brief into a world-readable file.
+touch "$log" && chmod 600 "$log"
+
+# Read the brief BEFORE changing directory: a RELATIVE <brief-file> is validated
+# against the caller's cwd above, and `cd "$workdir"` would make the same path
+# resolve somewhere else. Reading it inside the backgrounded command substitution
+# below would then fail silently (set -e does not reach into `$(...)` on a
+# `nohup ... &` line) and launch the child with an EMPTY prompt while still
+# exiting 0 (codex P1, PR #497).
+brief_text="$(cat -- "$brief")"
+
+cd "$workdir"
+export RIG_AGENT_ID="$name"
+export RIG_DETACHED_AGENT=1
+
+{
+    echo "--- $(date -u '+%Y-%m-%dT%H:%M:%SZ') launching detached agent '$name' ($harness) in '$workdir'"
+} >>"$log"
+
+# The child argv, per harness (see the header). The brief is always the LAST argument,
+# after `--`.
+case "$harness" in
+    opencode) set -- opencode run --title "$name" -- "$brief_text" ;;
+    codex)    set -- codex exec --dangerously-bypass-hook-trust --skip-git-repo-check -- "$brief_text" ;;
+    omp)      set -- omp -p --auto-approve -- "$brief_text" ;;
+esac
+
+# Detach for real (review finding, GH-497 round 2), three parts:
+#   * `--` ends option parsing (see above);
+#   * `</dev/null` — nohup only redirects stdin when it is a TTY; under a harness bash
+#     tool stdin is a pipe, and every one of these CLIs reads a non-TTY stdin (`omp -p`
+#     sits in "readPipedInput" forever, `codex exec` appends it to the prompt), so the
+#     child would block on the caller's pipe;
+#   * a NEW SESSION (setsid) — nohup only masks SIGHUP; the child stayed in the caller's
+#     process group and a harness that tree-/group-kills its tool call on completion or
+#     timeout would kill the "detached" agent with it. macOS ships no `setsid(1)`, so
+#     fall back to python3 (a hard dependency of the hook family anyway): os.setsid()
+#     then exec. The forked `&` child is never a group leader, so setsid cannot fail.
+_new_session() {
+    if command -v setsid >/dev/null 2>&1; then
+        exec setsid "$@"
+    fi
+    exec python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
+}
+export -f _new_session
+nohup bash -c '_new_session "$@"' _ "$@" \
+    </dev/null >>"$log" 2>&1 &
+pid=$!
+
+echo "detached agent '$name' launched (pid $pid, log $log, workdir $workdir)"
+exit 0

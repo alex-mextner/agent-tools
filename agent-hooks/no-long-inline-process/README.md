@@ -27,6 +27,12 @@ process is still caught — `timeout 600 npm test`, `env CI=1 pytest`, `timeout 
 own args (`timeout`'s duration, `env`'s `KEY=VALUE` assignments, `-k`/`-n`/`--signal` flags) are
 skipped; only the *wrapped* command's long-running-ness decides (`timeout 5 ls` stays allowed).
 
+**Every harness is governed identically (agent-tools#573):** the refusal names the delegation
+recipe of the event's top-level `harness` tag (`agenttools_hatch_escalation.delegation_recipe`)
+— `collaboration.spawn_agent` / `rig-detached-codex` for codex, `rig-detached-opencode` for
+opencode, the `task` tool / `rig-detached-omp` for omp, the Agent tool for Claude Code; an
+untagged event gets every recipe.
+
 **Subagent-exempt:** a dispatched subagent (`agent_id` present) is *expected* to run these in
 the background, so it is always allowed. This gate governs the orchestrator only. `args.agent_id`
 must originate from a **trusted, transport-level** signal — never from model-controlled

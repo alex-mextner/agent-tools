@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# rig-detached-opencode — the canonical rig-owned detached-agent launcher for opencode.
-# Usage: rig-detached-opencode <name> <brief-file> [workdir]
+# rig-detached-codex — the canonical rig-owned detached-agent launcher for codex.
+# Usage: rig-detached-codex <name> <brief-file> [workdir]
 #
 # A thin wrapper over the shared core in the sibling `rig-detached-agent` universal skill
 # (agent-tools#573: one launcher, three harnesses — the child argv is the only difference).
 # rig provisions both skills side by side under ~/.agents/skills/ (default skills_target,
 # default-on via skills.universal.all), and the core is resolved relative to THIS file's real
-# path, so the provisioned copy — ~/.agents/skills/rig-detached-opencode/rig-detached-opencode, the
+# path, so the provisioned copy — ~/.agents/skills/rig-detached-codex/rig-detached-codex, the
 # path every gate REMINDER names — works whether it is reached directly or through a harness
 # skill-dir symlink (~/.codex/skills). See the core for the full contract and trust reasoning.
 
@@ -18,7 +18,7 @@ if command -v readlink >/dev/null 2>&1; then
 fi
 core="$(dirname -- "$self")/../rig-detached-agent/rig-detached-agent"
 if [ ! -x "$core" ]; then
-    echo "rig-detached-opencode: launcher core '$core' is missing — provision the rig-detached-agent skill (rig apply commit)" >&2
+    echo "rig-detached-codex: launcher core '$core' is missing — provision the rig-detached-agent skill (rig apply commit)" >&2
     exit 127
 fi
-exec "$core" opencode "$@"
+exec "$core" codex "$@"

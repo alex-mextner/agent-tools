@@ -50,18 +50,39 @@ blocking return contract in docs/hooks.md — this bridge does not map any of th
 For a multi-section `edit` call or a multi-file `apply_patch` call, the dispatcher fans out
 one v1 event per file path, mirroring `opencode_hook_bridge`'s `_v1_events_for_dispatch`.
 
+## Identity contract (subagent exemption, agent-tools#573)
+
 The bridge strips all omp tool-argument fields that look like agent identity (`agent_id`,
 `agent_type`, camelCase variants, and `agent`) before forwarding args — the same
-`_FORGED_AGENT_KEYS` treatment as the codex/opencode bridges, because omp exposes no
-TRUSTED per-tool-call subagent identity in the extension event either (confirmed absent
-from the documented `tool_call`/`tool_result` shape). Every translated v1 event also
-carries a top-level `harness: "omp"` — a hardcoded module constant (`dispatch.HARNESS`),
-never derived from the omp event, so it can't be forged the way the identity fields above
-must be actively stripped. `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES`
-reads this tag to exempt omp from that gate (agent-tools#533) for the same reason it
-already exempts codex and opencode: none of the three expose a trusted per-call subagent
-identity, so the gate's "main thread must delegate to a CC subagent" premise does not
-transplant cleanly onto any of them.
+`_FORGED_AGENT_KEYS` treatment as the codex/opencode bridges — and repopulates
+`args.agent_id` / `args.agent_type` from three trusted sources, in order
+(`_apply_subagent_identity`):
+
+1. **The extension-set top-level `agentId` / `agentType`** of the dispatcher payload. omp runs
+   a `task` subagent IN THE SAME PROCESS: it creates a child agent session and invokes every
+   extension's default export once more for it, with a fresh `pi` (captured on omp 18.0.11:
+   the module loads once, the export runs twice, the child's `tool_call`s arrive on the second
+   registration's handler). `extension.ts` tags a registration's tool calls as a subagent's
+   ONLY when BOTH hold: it is not the first registration in the process AND its
+   `sessionManager.getSessionFile()` is child-shaped — nested under the parent session's stem
+   directory, or under an `omp-task-*` temp dir in `--no-session` mode — whereas a root
+   session's file is a top-level sibling (or absent). The conjunction keeps the root immune to
+   an interactive `/new`. Everything read is omp's own bookkeeping; the model cannot reach it
+   from a tool call's arguments, and the dispatcher never reads identity from `input`.
+2. **Launcher env markers** `RIG_AGENT_ID` / `RIG_DETACHED_AGENT` — an `omp -p` child started
+   by the `rig-detached-omp` launcher skill (the extension spawns the dispatcher with
+   `{...process.env}`).
+3. **Process ancestry** — an `omp` process above the one that dispatched this hook (a child
+   `omp -p` run from a parent session's bash tool without the launcher).
+
+Sources 2 and 3 live in the shared `lib/agent_hooks_v1/subagent_identity.py`; its docstring
+carries the trust reasoning. No source → no key at all (fail closed in the relax direction).
+
+Every translated v1 event also carries a top-level `harness: "omp"` — a hardcoded module
+constant (`dispatch.HARNESS`), never derived from the omp event, so it can't be forged the
+way the identity fields above must be actively stripped. Hooks read it to name THIS
+harness's delegation recipe in their refusal text (the `task` tool / `rig-detached-omp`),
+never to exempt the harness — the #533/#544 `EXEMPT_HARNESSES` shortcut is gone.
 
 ## Hashline content extraction is an approximation
 

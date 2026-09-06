@@ -65,10 +65,13 @@ The bridge strips all opencode tool-argument fields that look like agent identit
 can never self-exempt a call, so a forged `agent_id` inside `tool_input` is dropped
 before anything else runs.
 
-The one authoritative identity source is the opencode PROCESS ENVIRONMENT, read at
-launch by `_detached_agent_id()`: `RIG_AGENT_ID=<name>` (identity) or
-`RIG_DETACHED_AGENT=1` (anonymous marker). When a marker is present the dispatcher
-injects `args.agent_id`, so every subagent-exempt hook
+The authoritative identity sources are the ones the shared
+`lib/agent_hooks_v1/subagent_identity.py` reads (`_apply_subagent_identity`, agent-tools#573):
+the opencode PROCESS ENVIRONMENT — `RIG_AGENT_ID=<name>` (identity) or `RIG_DETACHED_AGENT=1`
+(anonymous marker) — and, failing that, PROCESS ANCESTRY (an `opencode` process above the one
+that dispatched this hook: a child `opencode run` started from a parent session's bash tool
+without the launcher). When either applies the dispatcher injects `args.agent_id`
+(`args.agent_type` `detached` / `ancestor`), so every subagent-exempt hook
 (`orchestrator-stays-thin`, `background-subagent-gate`, `no-long-inline-process`,
 `subagent-no-bg-longproc`) treats the session's tool calls as a dispatched subagent's
 instead of the orchestrator's. The markers are set by the canonical detached launcher
