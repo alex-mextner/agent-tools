@@ -758,3 +758,86 @@ def test_magic_close_env_off_switch(repo, tmp_path):
     assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
     assert "magic-close gate disabled (SHIP_MAGIC_CLOSE_GATE=0)" in r.stdout
     assert _merged(tmp_path)
+
+
+# ── the derived code must actually be a task-cli TICKET id (agent-tools#565) ─────────────────
+# The acceptance gate is a MERGE gate, so what it asks `task gate` about has to be a ticket.
+# The old shape check was "contains a digit", which every one of these passes:
+#   * review-cli CHECK codes — `rig-cli-341`, `OC476-OPENCODE-BACKGROUND-TRUTH` — a different
+#     entity entirely (a recorded review run, not a tracked ticket). `task gate` 404s on them,
+#     exits 2, and the gate SKIPS: the merge proceeds with NOTHING verified (four real merges
+#     shipped this way on 2026-09-06: PRs 349, 556, 352, 497).
+#   * the PULL REQUEST's own number — `GH-<PR>` / `#<PR>`. PR #499's real ticket was #495 (in
+#     both its branch and its title), but the gate asked about `#499`, an unrelated issue with
+#     no criteria, and refused; the merge was only unblocked by recording a false
+#     post-merge-acceptance opt-out on #499.
+# task-cli's id grammar (tasklib/cli.py::_route_id_to_project) is exactly: `#<n>`, a bare `<n>`
+# (GitHub issues), or ONE alphanumeric team prefix + `-` + digits (`HYP-931`, Linear). A
+# candidate that does not fit falls through to the NEXT source, same as any other rejection.
+
+_FELL_THROUGH_BODY = "Refs HYP-931"
+
+
+def test_acceptance_gate_rejects_a_review_check_code_and_falls_through(repo, tmp_path):
+    """`rig-cli-341` is a review-cli check code, not a ticket: two hyphens, no team-prefix
+    shape. It must be rejected and the PR body's real ticket used instead."""
+    r = _run(repo, tmp_path, branch="feat", env={
+        "TASK_CODE": "rig-cli-341",
+        "SHIP_TEST_PR_TITLE": "feat: the thing",
+        "SHIP_TEST_PR_BODY": _FELL_THROUGH_BODY,
+        "SHIP_TEST_TASK_GATE_JSON": _NOT_ACCEPTED, "SHIP_TEST_TASK_GATE_EXIT": "1",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert _task_calls(tmp_path) == ["gate HYP-931 --json"], _task_calls(tmp_path)
+
+
+def test_acceptance_gate_rejects_a_descriptive_review_code_carrying_digits(repo, tmp_path):
+    """`OC476-OPENCODE-BACKGROUND-TRUTH` has digits (so the old check passed it) but its
+    trailing segment is not numeric — it is review-cli's descriptive arm, never a ticket."""
+    r = _run(repo, tmp_path, branch="feat", env={
+        "TASK_CODE": "OC476-OPENCODE-BACKGROUND-TRUTH",
+        "SHIP_TEST_PR_TITLE": "feat: the thing",
+        "SHIP_TEST_PR_BODY": _FELL_THROUGH_BODY,
+        "SHIP_TEST_TASK_GATE_JSON": _NOT_ACCEPTED, "SHIP_TEST_TASK_GATE_EXIT": "1",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert _task_calls(tmp_path) == ["gate HYP-931 --json"], _task_calls(tmp_path)
+
+
+def test_acceptance_gate_rejects_the_pull_request_number_as_a_ticket_code(repo, tmp_path):
+    """`GH-1` under PR #1 names the pull request, not a ticket (the PR #499/#495 incident).
+    It must fall through to the body's real ticket."""
+    r = _run(repo, tmp_path, branch="feat", env={
+        "TASK_CODE": "GH-1",
+        "SHIP_TEST_PR_TITLE": "feat: the thing",
+        "SHIP_TEST_PR_BODY": _FELL_THROUGH_BODY,
+        "SHIP_TEST_TASK_GATE_JSON": _NOT_ACCEPTED, "SHIP_TEST_TASK_GATE_EXIT": "1",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert _task_calls(tmp_path) == ["gate HYP-931 --json"], _task_calls(tmp_path)
+
+
+def test_acceptance_gate_skips_when_only_the_pull_request_number_is_derivable(repo, tmp_path):
+    """With nothing but the PR's own number anywhere, the gate must report an honest "no task
+    code" skip — never gate the PR against itself."""
+    r = _run(repo, tmp_path, branch="feat", env={
+        "TASK_CODE": "#1",
+        "SHIP_TEST_PR_TITLE": "feat: the thing",
+        "SHIP_TEST_PR_BODY": "no ticket here",
+    })
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "could not derive a task code for #1 — skipping" in r.stderr
+    assert _task_calls(tmp_path) == []
+    assert _audit(tmp_path, "acceptance")[0]["detail"] == "no task code"
+
+
+def test_acceptance_gate_still_accepts_a_bare_issue_number(repo, tmp_path):
+    """A bare `382` IS a task-cli id (GitHub issue) — the real shape must not over-reject it
+    (the audit shows ship gating on exactly this form)."""
+    r = _run(repo, tmp_path, branch="feat", env={
+        "TASK_CODE": "382",
+        "SHIP_TEST_PR_TITLE": "feat: the thing", "SHIP_TEST_PR_BODY": _FELL_THROUGH_BODY,
+        "SHIP_TEST_TASK_GATE_JSON": _NOT_ACCEPTED, "SHIP_TEST_TASK_GATE_EXIT": "1",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert _task_calls(tmp_path) == ["gate 382 --json"], _task_calls(tmp_path)
