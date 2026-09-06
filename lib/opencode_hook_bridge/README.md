@@ -83,6 +83,13 @@ cooperative-orchestrator threat model (`on_error: open` discipline gates, not se
 boundaries). A bare/whitespace `RIG_AGENT_ID` is not a marker; `RIG_DETACHED_AGENT=1`
 alone yields the anonymous id `detached`.
 
+Every translated v1 event also carries a top-level `harness: "opencode"` — a hardcoded
+module constant (`dispatch.HARNESS`), never derived from the opencode event, so it can't be
+forged via tool args the way the identity fields above must be actively stripped. A hook
+that needs to scope a policy to (or exempt) one harness reads `event["harness"]` directly
+(see `agent-hooks/orchestrator-stays-thin`'s harness-exempt list for the first consumer,
+agent-tools#533) instead of trying to reconstruct a trusted subagent identity.
+
 ## Descriptor directory
 
 By default the bridge reads:

@@ -2,13 +2,19 @@
 """agents-hooks/v1 pre-bash hook — send-time escalation-format gate.
 
 When the agent escalates to the human's out-of-band channel — a ``tg --tag decision`` /
-``--tag problem`` / ``--tag question`` invocation — this inspects the message body for the
-structural markers the `decision-request-discipline` skill requires (Context, Options / pros-cons
-table, Recommendation). All three tags are the same escalation shape, so the check applies to
-each — an agent picking ``problem`` or ``question`` instead of ``decision`` no longer skips it
-(agent-tools#213/#12).
+``--tag problem`` invocation — this inspects the message body for the structural markers the
+`decision-request-discipline` skill requires (Context, Options / pros-cons table,
+Recommendation). Both tags are the same escalation shape, so the check applies to each — an
+agent picking ``problem`` instead of ``decision`` no longer skips it (agent-tools#213/#12).
 
-Graduated, deliberately lenient verdict (Alex: hard-block a bare question, but a false positive
+There is NO ``question`` tag any more (agent-tools#524, tg-cli#301, Alex 2026-09-05): an open
+question for the human IS a decision request and goes out as ``--tag decision`` in the
+decision-request format. ``tg`` itself refuses the ``question`` tag; this hook BLOCKS the command
+one step earlier (exit 10) with the same one-line hint, so the agent is redirected before a
+doomed send ever runs. That block is unconditional — no hatch applies, because there is nothing
+to force through: the tag does not exist.
+
+Graduated, deliberately lenient verdict (Alex: hard-block a bare decision request, but a false positive
 would wedge his ONLY comms channel to his agents, so err HARD toward passing):
 
   - COMPLETE body (all three markers)                 → silent allow (exit 0)
@@ -38,10 +44,13 @@ approval to the human via Telegram (deny-by-default; a bare ``1`` is rejected).
 
 Contract (agents-hooks/v1):
   stdin  : JSON event; the shell command is in args.command
-  stdout : protocol JSON only       exit 0 : allow   exit 10 : BLOCK (bare body only)
+  stdout : protocol JSON only       exit 0 : allow
+                                    exit 10 : BLOCK (a bare body — hatchable; or the removed
+                                              ``question`` tag — unconditional, no hatch)
 
 on_error is "open": a crash here must never wedge the ability to send a message. EVERY error
-path allows; the only hard stop is the deliberate, narrow bare-body block.
+path allows; the only hard stops are the deliberate, narrow bare-body block and the removed-tag
+block.
 """
 
 from __future__ import annotations
@@ -132,13 +141,33 @@ _MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("Recommendation", re.compile(r"\brecommend|\bi suggest\b|\bi'd (?:go|pick)\b|\bproposal\b", re.I)),
 )
 
-# The escalation-shaped `tg` tags this hook inspects. All three route a message to the human's
+# The escalation-shaped `tg` tags this hook inspects. Both route a message to the human's
 # out-of-band channel expecting a structured escalation (context + pros/cons + a recommendation),
 # per the decision-request-discipline skill — so the same self-check applies to each. `decision`
-# was the original tag; `problem` and `question` are the same escalation shape and were added so
-# the self-check is not silently skipped just because the agent picked a different tag word.
-# (agent-tools#213/#12.)
-_ESCALATION_TAGS = frozenset({"decision", "problem", "question"})
+# was the original tag; `problem` is the same escalation shape and was added so the self-check is
+# not silently skipped just because the agent picked a different tag word. (agent-tools#213/#12.)
+# `question` USED to be a third member; it was removed (agent-tools#524) — see _REMOVED_TAG.
+_ESCALATION_TAGS = frozenset({"decision", "problem"})
+
+# The tag word REMOVED from `tg` (tg-cli#301): an open question is a decision request. It is
+# still recognized here — not as an escalation to grade, but to BLOCK the command outright with
+# the redirect below, so an agent with stale habits is corrected before `tg` refuses the send.
+_REMOVED_TAG = "question"
+_REMOVED_TAG_HINT = (
+    "BLOCKED: the `question` tag was removed from tg — an open question is a decision request. "
+    "Re-send it as `tg --tag decision` in the decision-request format (Context, a pros/cons "
+    "table of the options, a Recommendation; read the decision-request-discipline skill)."
+)
+
+
+def _inspected_tag(word: str) -> str | None:
+    """The lowercase tag this hook acts on for a ``--tag`` value — an escalation tag to grade, or
+    the removed ``question`` tag to block — else None. Case-insensitive, like `tg` itself."""
+    lowered = word.lower()
+    if lowered in _ESCALATION_TAGS or lowered == _REMOVED_TAG:
+        return lowered
+    return None
+
 
 # A pros/cons TABLE — markdown or HTML — is the strongest signal of a real, structured escalation
 # and must ALWAYS let the message through (a false block of the human's only comms channel is far
@@ -220,9 +249,9 @@ def _unwrap_segment(segment: str) -> list[str]:
 def _split_top_level_segments(command: str) -> list[str]:
     """Split a command line on the shell separators ``&&`` / ``||`` / ``;`` / ``|`` / ``&`` /
     newline, QUOTE-AWARELY so a separator INSIDE a quoted argument does not tear the command
-    apart. A naive ``re.split`` on ``|`` split ``tg --tag question "A | B?"`` mid-quote into an
-    unbalanced ``tg --tag question "A `` segment that failed to shlex-tokenize, so the escalation
-    went unseen and the bare-question block was bypassed for the common "A vs B" wording. The
+    apart. A naive ``re.split`` on ``|`` split ``tg --tag decision "A | B?"`` mid-quote into an
+    unbalanced ``tg --tag decision "A `` segment that failed to shlex-tokenize, so the escalation
+    went unseen and the bare-body block was bypassed for the common "A vs B" wording. The
     char-scan tolerates an unbalanced quote gracefully (it keeps the quote open to end-of-line)
     rather than raising, so a malformed command still fails toward the same lenient allow.
 
@@ -268,8 +297,8 @@ def _split_top_level_segments(command: str) -> list[str]:
 
 def _escalation_request_body(command: str) -> tuple[str, str] | None:
     """If the command is a `tg` invocation carrying an escalation tag (``--tag decision`` /
-    ``problem`` / ``question``), return ``(tag, body)`` — the matched tag and the message body it
-    would send (positional text + any ``--title``); else None.
+    ``problem``) or the removed ``question`` tag, return ``(tag, body)`` — the matched tag and
+    the message body it would send (positional text + any ``--title``); else None.
 
     Walks each ``&&``/``||``/``;``/``|``/``&``-separated segment (split QUOTE-AWARELY so a
     separator inside the quoted message body never tears it apart) so a `tg` later in a pipeline
@@ -289,8 +318,9 @@ def _escalation_request_body(command: str) -> tuple[str, str] | None:
 
 def _body_if_escalation_tag(args: list[str]) -> tuple[str, str] | None:
     """Given a `tg` invocation's args, return ``(tag, body)`` iff a ``--tag`` from
-    ``_ESCALATION_TAGS`` (decision/problem/question) is present; else None. Collects positional
-    (non-flag) text and the ``--title`` value, which together are what the human reads.
+    ``_ESCALATION_TAGS`` (decision/problem) — or the removed ``question`` tag — is present; else
+    None. Collects positional (non-flag) text and the ``--title`` value, which together are what
+    the human reads.
     Value-taking flags consume their next token so a flag value is never mistaken for the
     positional message."""
     matched_tag: str | None = None
@@ -307,14 +337,13 @@ def _body_if_escalation_tag(args: list[str]) -> tuple[str, str] | None:
     while i < len(args):
         tok = args[i]
         if tok == "--tag":
-            if i + 1 < len(args) and args[i + 1].lower() in _ESCALATION_TAGS:
-                matched_tag = args[i + 1].lower()
+            # `--tag <word>` consumes the next token; a trailing bare `--tag` has none.
+            candidate = args[i + 1] if i + 1 < len(args) else ""
+            matched_tag = _inspected_tag(candidate) or matched_tag
             i += 2
             continue
         if tok.startswith("--tag="):
-            candidate = tok.split("=", 1)[1].lower()
-            if candidate in _ESCALATION_TAGS:
-                matched_tag = candidate
+            matched_tag = _inspected_tag(tok.partition("=")[2]) or matched_tag
             i += 1
             continue
         if tok == "--title":
@@ -412,6 +441,8 @@ def _is_bare(body: str, missing: list[str]) -> bool:
 def _decide(command: str, cwd: str) -> tuple[str, str | None, int]:
     """Grade an escalation-tagged `tg` send. Returns (decision, message, exit_code):
 
+      - the REMOVED `question` tag                    → BLOCK + the --tag decision redirect
+                                                        (exit 10, no hatch — the tag is gone)
       - not an escalation send / a COMPLETE body      → allow, no message         (exit 0)
       - a PARTIAL body (some structure, some missing)  → allow + advisory nudge    (exit 0)
       - a genuinely BARE body (no structure at all)    → BLOCK + how-to skeleton   (exit 10),
@@ -423,6 +454,8 @@ def _decide(command: str, cwd: str) -> tuple[str, str | None, int]:
     if matched is None:
         return "allow", None, 0
     tag, body = matched
+    if tag == _REMOVED_TAG:
+        return "block", _REMOVED_TAG_HINT, BLOCK_EXIT_CODE
     missing = _missing_markers(body)
     if not missing:
         return "allow", None, 0
@@ -445,8 +478,9 @@ def _decide(command: str, cwd: str) -> tuple[str, str | None, int]:
 def main() -> int:
     # Fail-OPEN: ANY unexpected error (a malformed event, an input shlex can't tokenize despite
     # the guards) returns `allow`, never a block. This hook gates the human's ONLY comms channel
-    # to the agent, so a crash must NEVER wedge a send — the only hard stop is a deliberate,
-    # narrow BARE-body block; everything else, including every error path, allows.
+    # to the agent, so a crash must NEVER wedge a send — the only hard stops are the deliberate,
+    # narrow BARE-body block and the removed-`question`-tag block; everything else, including
+    # every error path, allows.
     try:
         event = json.load(sys.stdin)
         args = event.get("args") or {}

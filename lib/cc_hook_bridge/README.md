@@ -18,7 +18,7 @@ contracts. This package is that bridge.
 A single dispatcher CC calls once per event:
 
 ```
-python3 -m cc_hook_bridge PreToolUse   # for the Bash, Edit|Write, Agent|Task, Skill matchers
+python3 -m cc_hook_bridge PreToolUse   # for the Bash, Edit|Write, Agent|Task, Skill, Monitor matchers
 python3 -m cc_hook_bridge PostToolUse  # for the Edit|Write matcher (post-write)
 python3 -m cc_hook_bridge Stop
 ```
@@ -28,12 +28,13 @@ On each call it:
 1. reads the CC tool-call JSON from stdin (`tool_name`, `tool_input`, `cwd`, …);
 2. maps the `(event, tool)` to a logical `agents-hooks/v1` **point**
    (PreToolUse: `Bash`→`pre-bash`, `Write|Edit|MultiEdit|NotebookEdit`→`pre-write`,
-   `Agent|Task`→`pre-agent`, `Skill`→`pre-skill`;
+   `Agent|Task`→`pre-agent`, `Skill`→`pre-skill`, `Monitor`→`pre-monitor`;
    PostToolUse: `Write|Edit|MultiEdit|NotebookEdit`→`post-write`; `Stop`→`stop`);
 3. enumerates the installed descriptors in `~/.claude/hooks/*.json` for that point
    (sorted by `priority`, then `id`);
 4. translates the CC event into the v1 event each hook script reads
-   (`{hook_api, event_id, tool, point, command, cwd, args}`) and runs each script;
+   (`{hook_api, event_id, tool, point, harness, command, cwd, args}` — `harness` is always
+   `"claude-code"` here, a module constant, not derived from the CC event) and runs each script;
 5. translates the v1 **exit-10 BLOCK** into CC's own block signal — **first block wins**,
    its reason is surfaced to the model.
 
@@ -95,6 +96,9 @@ dispatcher rig points at. Manual equivalent (what rig writes):
           "command": "python3 -m cc_hook_bridge PreToolUse" }] },
       { "matcher": "Skill",
         "hooks": [{ "type": "command",
+          "command": "python3 -m cc_hook_bridge PreToolUse" }] },
+      { "matcher": "Monitor",
+        "hooks": [{ "type": "command",
           "command": "python3 -m cc_hook_bridge PreToolUse" }] }
     ],
     "PostToolUse": [
@@ -130,9 +134,10 @@ updating all of them together:
   file-edit tool also needs adding to `_WRITE_TOOLS` *and* its payload field taught to
   **`_proposed_write_text`** (else its content is never scanned by the pre-write guards),
   *and* added to the rig-cli matcher `Edit|Write|MultiEdit|NotebookEdit`. A whole new logical
-  point (like `pre-agent` for `Agent|Task`, `pre-skill` for `Skill`) needs its own rig-cli
-  matcher registered in `hook_bridge_entries` too — the mapping here is inert on its own
-  until rig-cli's matcher change ships (a two-repo change, same split those two points used).
+  point (like `pre-agent` for `Agent|Task`, `pre-skill` for `Skill`, `pre-monitor` for
+  `Monitor`) needs its own rig-cli matcher registered in `hook_bridge_entries` too — the
+  mapping here is inert on its own until rig-cli's matcher change ships (a two-repo change,
+  same split those points used).
 - **`cc_block_output`** — the per-event block JSON. A new blocking event (beyond
   PreToolUse / PostToolUse / Stop) needs its block shape added here.
 - **`_KNOWN_EVENTS`** — the typo guard in `main`.

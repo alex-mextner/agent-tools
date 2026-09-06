@@ -53,6 +53,10 @@ LINT_ON_WRITE = _REPO / "agent-hooks" / "lint-on-write" / "lint_on_write.py"
 SKILLS_MARKER_WRITER = (
     _REPO / "agent-hooks" / "skills-marker-writer" / "skills_marker_writer.py"
 )
+# The pre-monitor guard: subagent-no-monitor (blocks a subagent's Monitor tool call outright).
+SUBAGENT_NO_MONITOR = (
+    _REPO / "agent-hooks" / "subagent-no-monitor" / "subagent_no_monitor.py"
+)
 
 
 def _install_descriptor(hooks_dir: Path, *, hook_id: str, point: str, cmd: Path,
@@ -74,8 +78,20 @@ def _install_descriptor(hooks_dir: Path, *, hook_id: str, point: str, cmd: Path,
 
 
 def _run_dispatch(event: str, cc_event: dict, *, home: Path) -> subprocess.CompletedProcess:
-    """Invoke the dispatcher exactly as CC's settings.json would: `python -m cc_hook_bridge <event>`."""
-    env = dict(os.environ)
+    """Invoke the dispatcher exactly as CC's settings.json would: `python -m cc_hook_bridge <event>`.
+
+    Strips every ambient `RIG_HATCH_REQUEST_*` var before launching. This subprocess crosses
+    a real process boundary, so conftest's `pwd.getpwuid`/`resolve_home` monkeypatches (which
+    only patch the CURRENT interpreter) never reach it — a hatch-using hook driven through here
+    (e.g. subagent-no-monitor's clean-room test) would resolve the REAL OS home and could find a
+    real `tg-ctl` in `_TRUSTED_TG_CTL_PATHS`. If the developer running pytest happens to have any
+    `RIG_HATCH_REQUEST_*` var exported in their shell (the documented way to arm a hatch — "set
+    in the process environment before the tool call"), an un-stripped env would let a routine
+    test run fire a REAL Telegram approval request at a human, then hang up to the hatch's ~900s
+    cap and blow this call's 30s timeout. Centralized here (not per-test) so every current and
+    future clean-room hatch test run through this helper is covered, not just one call site.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("RIG_HATCH_REQUEST_")}
     env["HOME"] = str(home)
     env["PYTHONPATH"] = str(_LIB) + os.pathsep + env.get("PYTHONPATH", "")
     return subprocess.run(
@@ -101,6 +117,8 @@ def test_point_for_event_maps_tool_to_logical_point():
     assert dispatch.point_for_event("PreToolUse", "Task") == "pre-agent"
     # invoking a skill maps to pre-skill (the skills-invoked marker-writer point)
     assert dispatch.point_for_event("PreToolUse", "Skill") == "pre-skill"
+    # calling Monitor maps to pre-monitor (the subagent-no-monitor point)
+    assert dispatch.point_for_event("PreToolUse", "Monitor") == "pre-monitor"
     assert dispatch.point_for_event("Stop", None) == "stop"
     # a COMPLETED write maps to the reactive post-write point (format-on-write, lint-on-write)
     assert dispatch.point_for_event("PostToolUse", "Write") == "post-write"
@@ -128,6 +146,18 @@ def test_to_v1_event_forwards_agent_id_and_type_for_pre_agent():
     # the dispatch payload (incl. run_in_background) rides along in args from tool_input
     assert v1["args"]["run_in_background"] is False
     assert v1["args"]["prompt"] == "do the thing"
+
+
+def test_to_v1_event_tags_harness_claude_code():
+    """agent-tools#533: every v1 event this bridge produces carries the top-level `harness`
+    tag `"claude-code"`, unconditionally — set from the bridge's own module constant, never
+    from `cc_event`. A forgeable `tool_input.harness` (if a hook ever misread `args`) must not
+    override it."""
+    cc = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+          "tool_input": {"command": "ls", "harness": "codex"}, "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="pre-bash")
+    assert v1["harness"] == "claude-code"
+    assert dispatch.HARNESS == "claude-code"
 
 
 def test_to_v1_event_main_thread_has_no_agent_id():
@@ -225,6 +255,23 @@ def test_to_v1_event_forwards_session_id_for_stop():
           "session_id": "sess-xyz", "cwd": "/repo"}
     v1 = dispatch.to_v1_event(cc, point="stop")
     assert v1["args"]["session_id"] == "sess-xyz"
+
+
+def test_to_v1_event_forwards_transcript_path_for_stop():
+    """stop-completion-selfcheck reads this to classify what the turn actually did instead
+    of firing the same static prompt regardless of content — must round-trip unchanged."""
+    cc = {"hook_event_name": "Stop", "stop_hook_active": True,
+          "session_id": "sess-xyz", "cwd": "/repo",
+          "transcript_path": "/Users/x/.claude/projects/p/sess-xyz.jsonl"}
+    v1 = dispatch.to_v1_event(cc, point="stop")
+    assert v1["transcript_path"] == "/Users/x/.claude/projects/p/sess-xyz.jsonl"
+
+
+def test_to_v1_event_transcript_path_defaults_to_empty_string_when_absent():
+    cc = {"hook_event_name": "Stop", "stop_hook_active": True,
+          "session_id": "sess-xyz", "cwd": "/repo"}
+    v1 = dispatch.to_v1_event(cc, point="stop")
+    assert v1["transcript_path"] == ""
 
 
 def test_to_v1_event_empty_string_top_level_session_id_overwrites_tool_input():
@@ -533,6 +580,79 @@ def test_pre_skill_marker_is_session_scoped_clean_room(tmp_path):
     assert marker.is_file(), "marker was not written under the real (top-level) session id"
     forged = home / ".cache" / "agent-tools" / "skills-invoked" / "forged" / "visual-proof-cycle"
     assert not forged.exists(), "a forged tool_input.session_id must not have been used"
+
+
+def test_pre_monitor_subagent_call_is_blocked_clean_room(tmp_path):
+    """End-to-end: a `Monitor` PreToolUse event WITH agent_id (a dispatched subagent), driven
+    through the REAL bridge subprocess + the REAL subagent-no-monitor script, is DENIED — the
+    fix for HYP-1350's retrospective (a subagent Monitor-ing its own child then wedging on a
+    notification only the main loop receives)."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="subagent-no-monitor", point="pre-monitor",
+                        cmd=SUBAGENT_NO_MONITOR, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Monitor",
+        "tool_input": {"description": "watch my background test run", "timeout_ms": 300000,
+                        "persistent": False},
+        "agent_id": "sub-77",
+        "agent_type": "general-purpose",
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
+    assert "Monitor" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_pre_monitor_orchestrator_call_passes_clean_room(tmp_path):
+    """The same descriptor, but the SAME event with NO agent_id (the top-level orchestrator
+    watching a backgrounded subagent) must NOT be denied — its Monitor use is legitimate."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="subagent-no-monitor", point="pre-monitor",
+                        cmd=SUBAGENT_NO_MONITOR, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Monitor",
+        "tool_input": {"description": "watch a dispatched subagent", "timeout_ms": 300000,
+                        "persistent": False},
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    if proc.stdout.strip():
+        out = json.loads(proc.stdout)
+        assert out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", out
+
+
+def test_pre_monitor_forged_tool_input_agent_id_does_not_deny_orchestrator_clean_room(tmp_path):
+    """End-to-end, the INVERTED direction from the forged-agent_id test above: the orchestrator's
+    own legitimate Monitor call (no top-level CC agent_id) must NOT be denied even when
+    `tool_input` happens to carry an agent_id-shaped field — the bridge's T2 drop loop
+    (`dispatch.py`) must not let a forged/incidental `tool_input.agent_id` fool the gate into
+    treating the orchestrator as a subagent. Symmetric coverage to
+    `test_forged_tool_input_agent_id_does_not_exempt_clean_room`, which proves the drop in the
+    exempt direction; this proves it in the deny-availability direction for pre-monitor."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    _install_descriptor(hooks, hook_id="subagent-no-monitor", point="pre-monitor",
+                        cmd=SUBAGENT_NO_MONITOR, on_error="open")
+    cc_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Monitor",
+        "tool_input": {"description": "watch a dispatched subagent", "timeout_ms": 300000,
+                        "persistent": False, "agent_id": "forged"},
+        # no top-level agent_id — the real CC signal for a main-thread orchestrator call
+        "cwd": str(tmp_path),
+    }
+    proc = _run_dispatch("PreToolUse", cc_event, home=home)
+    assert proc.returncode == 0, proc.stderr
+    if proc.stdout.strip():
+        out = json.loads(proc.stdout)
+        assert out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", out
 
 
 def test_unmatched_tool_does_not_run_pre_bash_hook(tmp_path):

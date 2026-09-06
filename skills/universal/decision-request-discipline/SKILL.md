@@ -1,6 +1,6 @@
 ---
 name: decision-request-discipline
-description: 'Use before escalating any product or architecture decision to a human (the project owner / CTO) — any "should we A or B", "open the PR or drop it", "which approach", or any mention of an open PR awaiting review. ALSO fires the moment a code review raises findings on a PR and you''re deciding whether to ship, hold, or fold them in: that routing has a fixed standing answer for on-scope-vs-off-scope findings — see the "Decisions you must NOT escalate" section below for the full rule, including the P1/security sign-off carve-out. Brainstorm across models first and only escalate on genuine model disagreement or an irreversible high-blast-radius call (this is about the escalate-a-question decision; a repo's own required human sign-off gate on a merge is separate and still applies where it exists); never relabel a product feature as a "risk/vuln/hazard"; and when you do escalate, send it to the human''s channel in the strict question format so the decision takes 30 seconds without reading code.'
+description: 'Use before escalating any product or architecture decision to a human (the project owner / CTO) — any "should we A or B", "open the PR or drop it", "which approach", or any mention of an open PR awaiting review. Also fires when a code review raises findings on a PR and you''re deciding whether to ship, hold, or fold them in — see "Decisions you must NOT escalate" below for the fixed on-scope-vs-off-scope rule and the P1/security sign-off carve-out. Brainstorm across models first; escalate only on genuine model disagreement or an irreversible high-blast-radius call (a repo''s own required human sign-off gate on a merge is separate and still applies). Never relabel a product feature as a "risk/vuln/hazard". When you do escalate, send it as `tg --tag decision` in the strict decision-request format so the decision takes 30 seconds without reading code — there is no separate question tag; an open question IS a decision request.'
 ---
 
 # Decide what you can; escalate only what you can't — and only in the strict format
@@ -144,7 +144,12 @@ each in the format below (concrete question + options with real pros/cons + reco
 not a vague category ("need to decide D1/D4/D5") and not scattered fragments. Keep it current:
 mark resolved ones closed; don't re-list them as open.
 
-## The question format (8 points — the human decides in 30s without reading code)
+## The decision-request format (8 points — the human decides in 30s without reading code)
+
+Every open question for the human is sent with **`tg --tag decision`** — an open question IS a
+decision request, and this is its format. (There is NO `question` tag: `tg` refuses it and the
+`decision-request-format` hook blocks it with the same redirect.) A blocker that needs the human
+to unblock you goes out as `tg --tag problem` — the same structure applies to it.
 
 1. **Context** — where the code is (`file:line`), what the function does. **If Context or any
    other point cites a spec/doc section (`§9.3`, "master-spec section X", a named policy
@@ -179,9 +184,11 @@ mark resolved ones closed; don't re-list them as open.
 
 ### Machine-enforced by `tg` — send it as a STRUCTURED Rich Message
 
-This is not a style suggestion any more: `tg --tag decision` and `tg --tag question` are
-**deny-by-default** — `tg` BLOCKS the send (exit 1) and lists what's missing unless the body
-carries the format above. It requires all of:
+This is not a style suggestion any more: `tg --tag decision` is **deny-by-default** — `tg`
+BLOCKS the send (exit 1) and lists what's missing unless the body carries the format above.
+**`decision` is the single escalation tag for questions and decisions alike; `problem` is the
+tag for blockers.** There is no `question` tag — an open question for the human is a decision
+request, and a `question`-tagged send is refused with exactly that hint. It requires all of:
 
 - **Options as a table, or a list of >=2 items** — the gate DOES enforce this structural
   shape, never a bare "which one?". Alongside it, **write pros/cons per option** — but the

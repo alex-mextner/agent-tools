@@ -40,9 +40,18 @@ Hosts must execute hook scripts as separate subprocesses. Importing hook scripts
 a long-lived or multi-threaded host process is not part of the contract unless that host provides
 its own equivalent process/module isolation.
 
-- **stdin**: a JSON event — `{ hook_api, event_id, tool, point, command, cwd, args }`.
+- **stdin**: a JSON event — `{ hook_api, event_id, tool, point, harness, command, cwd, args }`.
   `args` carries the action-specific payload (e.g. the Bash command string, the file path
-  + content for a write).
+  + content for a write). `harness` is a bridge-set constant (`"claude-code"` / `"codex"` /
+  `"opencode"`) identifying which product's hook system dispatched the event — set from a
+  hardcoded module literal in each bridge, never derived from `args`/`tool_input`, so it cannot
+  be forged the way a same-named key sitting in `args` could be (agent-tools#533). A hook that
+  needs to scope itself to, or exempt, an entire harness reads `event["harness"]` directly; see
+  `agent-hooks/orchestrator-stays-thin`'s `EXEMPT_HARNESSES` for the first consumer. **A hook
+  that RELAXES on `harness` must use a fail-closed allowlist** (`harness in {known-safe values}`),
+  never a `!=` exclusion: the field may be absent on an event from a bridge that predates it, or
+  from any future bridge that doesn't set one, and an absent/unrecognized value must stay
+  GOVERNED by default, exactly like this repo's `agent_id` subagent-exemption convention.
 - **stdout**: protocol JSON only — `{ "hook_api": "agents-hooks/v1", "decision": "allow"
   | "block", "message": "..." }`. Empty stdout = allow.
 - **stderr**: human logs (never parsed).
@@ -93,9 +102,14 @@ These are the *logical* points; map them to your harness's actual tool-use event
 > **Claude Code:** CC does NOT run these descriptors directly — it only runs hooks declared
 > in `settings.json`. The `lib/cc_hook_bridge` dispatcher is the carrier that makes them
 > fire: rig wires it into `settings.json` (PreToolUse for `pre-bash`/`pre-write`/`pre-agent`/
-> `pre-skill`, PostToolUse for `post-write`, Stop for `stop`) and translates the exit-10
-> BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`. Without that bridge
-> these hooks are inert in CC (agent-tools#18).
+> `pre-skill`/`pre-monitor`, PostToolUse for `post-write`, Stop for `stop`) and translates
+> the exit-10 BLOCK into CC's `permissionDecision: "deny"` / `decision: "block"`. Without
+> that bridge these hooks are inert in CC (agent-tools#18). `pre-monitor` is the newest of
+> these, following the same two-repo staging `pre-agent`/`pre-skill` went through — its
+> rig-cli-side `Monitor` matcher (rig-cli#296) has now shipped, so `pre-monitor` is live once
+> rig has provisioned the bridge (same prerequisites as `pre-agent`/`pre-skill` below: a
+> `claude-code` harness block, `agent_hooks` enabled, `harness.hook_bridge` not opted out)
+> and `rig apply` has run on a given machine.
 
 > **Codex:** Codex also needs a carrier bridge. `lib/codex_hook_bridge` is the first
 > dispatcher for the confirmed Codex hooks contract: TOML hooks call it for `PreToolUse`
@@ -118,9 +132,10 @@ These are the *logical* points; map them to your harness's actual tool-use event
 | point          | fires when…                                  | hooks                                   |
 | -------------- | -------------------------------------------- | --------------------------------------- |
 | `pre-agent` **(live in Claude Code and opencode when rig provisions their bridges; NOT mapped in Codex yet)** | before a subagent dispatch (Agent/Task/opencode task tool) | background-subagent-gate                 |
-| `pre-bash`     | before a shell command runs                  | block-devserver-primary, block-no-verify, block-raw-pr-merge, block-reset-hard, pin-primary-worktree, pkill-guard, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash, orchestrator-stays-thin, no-long-inline-process, subagent-no-bg-longproc, no-shell-file-edit, skills-read-gate, visual-proof-gate, decision-request-format |
+| `pre-bash`     | before a shell command runs                  | block-devserver-primary, block-no-verify, block-raw-pr-merge, block-reset-hard, pin-primary-worktree, pkill-guard, require-review-before-commit, require-ticket-before-commit, enforce-timeout-on-bash, orchestrator-stays-thin, no-long-inline-process, subagent-no-bg-longproc, no-shell-file-edit, skills-read-gate, visual-proof-gate, decision-request-format, heavy-op-memory-gate |
 | `pre-write`    | before a file write/edit                     | block-secrets-write, block-raw-process-env, orchestrator-stays-thin, worktree-only-writes |
 | `pre-skill` **(live in Claude Code when rig provisions the bridge; NOT mapped in Codex/opencode yet)** | before a Skill-tool invocation | skills-marker-writer |
+| `pre-monitor` **(live in Claude Code when rig provisions the bridge; Codex/opencode have no Monitor-equivalent tool)** | before a Monitor-tool call | subagent-no-monitor |
 | `post-write`   | after a file write/edit has landed on disk   | format-on-write, lint-on-write          |
 | `stop`         | when the agent is about to end its turn      | stop-completion-selfcheck               |
 
@@ -144,6 +159,24 @@ session id, so one session invoking a skill can't satisfy another concurrent ses
 so `skills-read-gate`'s freshness check (on `pre-bash`) has something real to read. A
 `pre-skill` hook should never block — the point is a recording tap, not a gate — so hooks
 here should be `on_error: open` and always emit `allow`.
+
+### `pre-monitor` — block a subagent's Monitor call
+
+`pre-monitor` fires before CC's `Monitor` tool call runs (the fire-and-forget background
+event-stream watch — start it, keep working, get notified per line/event later). Its one
+consumer, `subagent-no-monitor`, blocks it **unconditionally** whenever `agent_id` is present
+(a dispatched subagent), because a subagent is never re-invoked by a Monitor-event notification
+— only the main loop is (Monitor has no harness-tracked child at all, unlike an ordinary
+backgrounded Bash `run_in_background: true` command; see `agent-hooks/subagent-no-monitor/`'s
+own README for the empirically-verified distinction, tracked against `subagent-no-bg-longproc`'s
+broader stated rationale as agent-tools#546). The orchestrator's own Monitor use is unaffected.
+**Registration:** the point mapping lives in `lib/cc_hook_bridge/dispatch.py`; the
+`settings.json` `Monitor` matcher that makes CC actually fire it (written by rig-cli's
+`hook_bridge_entries`, same split `pre-agent`/`pre-skill` went through) has shipped
+(rig-cli#296) — `rig apply` on a given machine wires it in. A machine hasn't picked this up
+yet if its `~/.claude/settings.json` predates the last `rig apply` run after both halves
+merged, or if the harness process was started before that apply ran (CC reads its hook
+config at session start, not live) — re-run `rig apply` and start a fresh session to confirm.
 
 ### `post-write` — react to a *completed* write
 

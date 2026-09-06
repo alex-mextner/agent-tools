@@ -6,13 +6,19 @@ Run from the repo root::
 
 Every test runs under a tmp HOME (``XDG_STATE_HOME`` / ``XDG_CACHE_HOME`` /
 ``XDG_CONFIG_HOME`` pointed inside ``tmp_path``) and injects a fake autostart runner + a fake
-detached spawner, so the suite installs NO real launchd/systemd autostart, spawns no real
-process, and leaks nothing onto the developer's machine. The launchd/systemd UNIT GENERATION
-is asserted directly against the rendered text.
+detached spawner, so the suite installs NO real launchd/systemd autostart and leaks nothing
+onto the developer's machine. The launchd/systemd UNIT GENERATION is asserted directly
+against the rendered text. ONE deliberate exception:
+``test_default_port_prober_detects_a_real_ad_hoc_listener`` spawns a real child process and
+binds a real loopback socket (and shells out to ``lsof`` if present) to end-to-end-reproduce
+the review-cli#377 incident with the actual, unmocked port prober — every other test stays
+fully hermetic via the ``home`` fixture's fake ``port_probe``.
 """
 
 from __future__ import annotations
 
+import shutil
+import socket
 import sys
 from pathlib import Path
 
@@ -31,6 +37,7 @@ from agenttools_service import (  # noqa: E402
     MACOS,
     LaunchdBackend,
     NoopAutostartBackend,
+    PortProbe,
     Service,
     ServiceManager,
     SystemdUserBackend,
@@ -42,6 +49,7 @@ from agenttools_service import (  # noqa: E402
     run_action,
     select_autostart_backend,
 )
+from agenttools_service.core import _default_port_prober as _real_default_port_prober  # noqa: E402
 
 
 # --- fakes ------------------------------------------------------------------------------
@@ -94,13 +102,25 @@ class SpawnerSpy:
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    """A tmp HOME with XDG dirs pointed inside it; returns the home Path."""
+    """A tmp HOME with XDG dirs pointed inside it; returns the home Path.
+
+    Also defaults every ``ServiceManager``'s port probe to "nothing is listening" — the real
+    prober dials a real socket, and most tests use the same fixed port (7878, the review
+    dashboard's default); on a dev machine that actually happens to be running the real
+    dashboard, an unpatched real probe would flip `stop`/`disable` test expectations non-
+    deterministically. Tests that specifically exercise the port-liveness warning override
+    `port_probe=` explicitly (or use `_real_default_port_prober` directly).
+    """
     h = tmp_path / "home"
     h.mkdir()
     monkeypatch.setenv("HOME", str(h))
     monkeypatch.setenv("XDG_STATE_HOME", str(h / ".local" / "state"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(h / ".cache"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(h / ".config"))
+    monkeypatch.setattr(
+        "agenttools_service.core._default_port_prober",
+        lambda host, port: PortProbe(occupied=False, pid=None),
+    )
     return h
 
 
@@ -1236,23 +1256,6 @@ def test_run_action_run_handles_missing_binary(home, capsys):
     assert "review" in err
 
 
-def test_stop_action_warns_when_os_autostart_enabled(home, capsys):
-    # An enabled (launchd) service with no pidfile: `stop` finds nothing to stop, but a bare
-    # "was not running" is misleading because the OS owns a live process. Expect a stderr hint.
-    svc = make_service(home)
-    runner = RunnerSpy()
-    backend = LaunchdBackend(home=home, runner=runner)
-    backend.install(svc)  # autostart on disk, OS owns the process
-    mgr = ServiceManager(
-        svc, platform=MACOS, autostart=backend, spawner=SpawnerSpy(), alive=lambda pid: False
-    )
-    rc = run_action(mgr, "stop")
-    captured = capsys.readouterr()
-    assert rc == 3
-    assert "was not running" not in captured.out
-    assert "autostart" in captured.err and "disable" in captured.err
-
-
 def test_disable_on_os_managed_only_service_no_pidfile(home):
     # The expected post-`enable` state on a managed backend: autostart unit installed, NO
     # pidfile. `disable` must uninstall (the real work) while `stop` is a clean no-op.
@@ -1283,3 +1286,449 @@ def test_manager_uses_supervisor_defaults_when_alive_and_signaller_none(home):
     assert st.running is False
     assert st.state == "stopped"
     assert mgr.stop() is False  # nothing to signal; clean no-op through real defaults
+
+
+# --- port-liveness after stop/disable (review-cli#377) ----------------------------------
+#
+# The incident: `review dashboard run --port 7878` (ad-hoc, no pidfile) stayed alive after
+# `review dashboard disable` reported success. `stop`/`disable` only ever see the pidfile-
+# tracked MANAGER-spawned instance; a foreign/unmanaged listener on the same port is
+# invisible to them. `ServiceManager.probe_port` + `run_action`'s `_foreign_listener_fragment`
+# close that gap by checking the port itself after acting.
+
+
+def test_probe_port_returns_none_when_service_has_no_port(home):
+    svc = make_service(home, port=None)
+    mgr = ServiceManager(svc, platform=MACOS, spawner=SpawnerSpy(), alive=lambda pid: False)
+    assert mgr.probe_port() is None
+
+
+def test_stop_warns_and_exits_4_when_managed_instance_stopped_but_port_still_occupied(
+    home, capsys
+):
+    # The managed instance WAS running and IS stopped — but a foreign process also holds the
+    # port (e.g. it raced an ad-hoc `run` into existence on the same port).
+    svc = make_service(home)
+    svc.pidfile.parent.mkdir(parents=True, exist_ok=True)
+    svc.pidfile.write_text(PidRecord(pid=4242, started_at=1.0, cmd=list(svc.argv)).to_json())
+    states = {"alive": True}
+    mgr = ServiceManager(
+        svc,
+        platform=MACOS,
+        spawner=SpawnerSpy(),
+        alive=lambda pid: states["alive"],
+        signaller=lambda pid, sig: states.update(alive=False),
+        port_probe=lambda host, port: PortProbe(occupied=True, pid=9999),
+    )
+    rc = run_action(mgr, "stop")
+    captured = capsys.readouterr()
+    assert rc == 4
+    assert "stopped" not in captured.out  # no bare success line on stdout
+    assert f"{svc.host}:{svc.port}" in captured.err
+    assert "9999" in captured.err
+
+
+def test_stop_warning_brackets_an_ipv6_probed_address(home, capsys):
+    # When the probe reports it actually connected on the IPv6 loopback (`PortProbe.addr`),
+    # the warning must bracket it (`[::1]:7878`) rather than the unparseable `::1:7878`.
+    svc = make_service(home)
+    mgr = ServiceManager(
+        svc,
+        platform=MACOS,
+        spawner=SpawnerSpy(),
+        alive=lambda pid: False,
+        port_probe=lambda host, port: PortProbe(occupied=True, pid=555, addr="::1"),
+    )
+    rc = run_action(mgr, "stop")
+    captured = capsys.readouterr()
+    assert rc == 4
+    assert f"[::1]:{svc.port}" in captured.err
+    # The bracketed form does not contain the bare "::1:<port>" substring (there's a "]"
+    # between the address and the port), so this also proves the address wasn't left bare.
+    assert f"::1:{svc.port}" not in captured.err
+
+
+def test_stop_warns_and_exits_4_when_no_managed_instance_but_port_occupied(home, capsys):
+    # THE incident path: no pidfile at all (an ad-hoc `run` never writes one), so `stop` has
+    # nothing of its own to stop -> must not report a bare "was not running".
+    svc = make_service(home)
+    mgr = ServiceManager(
+        svc,
+        platform=MACOS,
+        spawner=SpawnerSpy(),
+        alive=lambda pid: False,
+        port_probe=lambda host, port: PortProbe(occupied=True, pid=None),
+    )
+    rc = run_action(mgr, "stop")
+    captured = capsys.readouterr()
+    assert rc == 4
+    assert "was not running" not in captured.out
+    assert "was not running" not in captured.err
+    assert f"{mgr.service.host}:{mgr.service.port}" in captured.err
+    assert "pid unknown" in captured.err  # no lsof answer -> named as unknown, not omitted
+
+
+def test_disable_warns_and_exits_4_when_stopped_but_port_still_occupied(home, capsys):
+    # Still occupied through the settle-and-re-probe (both calls report occupied): a genuine
+    # finding, not a drain-window flake. Inject a fake sleeper so the test pays zero
+    # wall-clock time while still proving the retry actually happened.
+    svc = make_service(home)
+    sleeps: list[float] = []
+    mgr = ServiceManager(
+        svc,
+        platform=MACOS,
+        spawner=SpawnerSpy(),
+        alive=lambda pid: False,
+        port_probe=lambda host, port: PortProbe(occupied=True, pid=31337),
+        sleeper=sleeps.append,
+    )
+    rc = run_action(mgr, "disable")
+    captured = capsys.readouterr()
+    assert rc == 4
+    assert "autostart disabled and stopped" not in captured.out
+    assert f"{svc.host}:{svc.port}" in captured.err
+    assert "31337" in captured.err
+    assert sleeps == [0.5]  # exactly one settle wait, no busy-loop
+
+
+def test_disable_settle_retry_clears_a_transient_launchd_drain_window(home, capsys):
+    # THE launchd-drain scenario the settle window exists for: `launchctl unload` returns
+    # while the OS-managed process is still finishing its exit, so the FIRST probe (right
+    # after `manager.disable()`) reads occupied — but the port is actually free by the time
+    # the settled re-probe runs. Must report a clean success, not a false failure.
+    svc = make_service(home)
+    calls = {"n": 0}
+
+    def draining_then_free(host, port):
+        calls["n"] += 1
+        return PortProbe(occupied=(calls["n"] == 1), pid=4242 if calls["n"] == 1 else None)
+
+    sleeps: list[float] = []
+    mgr = ServiceManager(
+        svc,
+        platform=MACOS,
+        spawner=SpawnerSpy(),
+        alive=lambda pid: False,
+        port_probe=draining_then_free,
+        sleeper=sleeps.append,
+    )
+    rc = run_action(mgr, "disable")
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.out.strip() == f"{svc.name}: autostart disabled and stopped"
+    assert "still listening" not in captured.err
+    assert sleeps == [0.5]
+    assert calls["n"] == 2  # probed once, settled once, re-probed once — no more
+
+
+def test_disable_does_not_settle_retry_when_port_is_free_on_the_first_probe(home, capsys):
+    # The common case (nothing occupying the port at all) must not pay the settle wait.
+    svc = make_service(home)
+    calls = {"n": 0}
+
+    def always_free(host, port):
+        calls["n"] += 1
+        return PortProbe(occupied=False, pid=None)
+
+    sleeps: list[float] = []
+    mgr = ServiceManager(
+        svc,
+        platform=MACOS,
+        spawner=SpawnerSpy(),
+        alive=lambda pid: False,
+        port_probe=always_free,
+        sleeper=sleeps.append,
+    )
+    rc = run_action(mgr, "disable")
+    assert rc == 0
+    assert sleeps == []
+    assert calls["n"] == 1
+
+
+def test_stop_and_disable_unaffected_when_port_genuinely_free(home, capsys):
+    # Regression guard: the new check must not fire when nothing is listening — the common
+    # case, and the one every pre-existing test above already exercises via the `home`
+    # fixture's default (not-occupied) probe. Pin it explicitly here too.
+    svc = make_service(home)
+    svc.pidfile.parent.mkdir(parents=True, exist_ok=True)
+    svc.pidfile.write_text(PidRecord(pid=4242, started_at=1.0, cmd=list(svc.argv)).to_json())
+    states = {"alive": True}
+    mgr = ServiceManager(
+        svc,
+        platform=MACOS,
+        spawner=SpawnerSpy(),
+        alive=lambda pid: states["alive"],
+        signaller=lambda pid, sig: states.update(alive=False),
+        port_probe=lambda host, port: PortProbe(occupied=False, pid=None),
+    )
+    rc = run_action(mgr, "stop")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out.strip() == f"{svc.name}: stopped"
+
+    mgr2 = ServiceManager(
+        svc, platform=MACOS, spawner=SpawnerSpy(), alive=lambda pid: False,
+        port_probe=lambda host, port: PortProbe(occupied=False, pid=None),
+    )
+    rc2 = run_action(mgr2, "disable")
+    out2 = capsys.readouterr().out
+    assert rc2 == 0
+    assert out2.strip() == f"{svc.name}: autostart disabled and stopped"
+
+
+def test_default_port_prober_detects_a_real_ad_hoc_listener(home, capsys):
+    """End-to-end reproduction of the actual incident, using the REAL (unmocked) prober: bind
+    a real socket on an ephemeral port from a separate process (standing in for an ad-hoc,
+    unmanaged `review dashboard run`, which also has no pidfile), then run `stop` against
+    that exact port and assert the output names it instead of claiming success. (`disable`
+    shares the same `_foreign_listener_fragment` helper and is covered against a FAKE probe
+    by `test_disable_warns_and_exits_4_when_stopped_but_port_still_occupied` — this test's
+    job is proving the REAL prober end to end, not re-covering every action.)
+    """
+    import socket as _socket
+    import subprocess as _subprocess
+    import sys as _sys
+    import time as _time
+
+    # Bind an ephemeral port up front so we know a free one, then hand it to the child so the
+    # child (not us) is the one actually listening — a distinct PID, like a real foreign process.
+    probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    child = _subprocess.Popen(
+        [
+            _sys.executable,
+            "-c",
+            (
+                "import socket,time;"
+                f"s=socket.socket();s.bind(('127.0.0.1',{port}));"
+                "s.listen();time.sleep(30)"
+            ),
+        ]
+    )
+    try:
+        # Wait for the child to actually be listening before probing it.
+        deadline = _time.monotonic() + 5
+        while _time.monotonic() < deadline:
+            try:
+                with _socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    break
+            except OSError:
+                _time.sleep(0.05)
+        else:
+            pytest.fail("child never started listening")
+
+        svc = make_service(home, port=port)
+        mgr = ServiceManager(
+            svc,
+            platform=MACOS,
+            spawner=SpawnerSpy(),
+            alive=lambda pid: False,
+            port_probe=_real_default_port_prober,  # bypass the home fixture's fake default
+        )
+        rc = run_action(mgr, "stop")
+        captured = capsys.readouterr()
+        assert rc == 4
+        assert "was not running" not in captured.out
+        assert f"127.0.0.1:{port}" in captured.err
+        # A resolved PID is a bonus, not a guarantee: lsof might be permission-walled, time
+        # out, or (per test_lsof_listener_pid_returns_none_on_multiple_pids) see more than one
+        # matching listener and correctly refuse to guess. Assert the pid slot is present and
+        # well-formed (either the real child pid or the explicit "unknown" fallback) rather
+        # than requiring the exact pid, so this doesn't flake on a machine where lsof behaves
+        # exactly as designed but can't uniquely resolve the listener.
+        assert (f"(pid {child.pid})" in captured.err) or ("(pid unknown)" in captured.err)
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
+# --- port-liveness helpers: unit coverage (glm-5.2 review findings, GH-377 follow-up) -----
+
+
+def test_loopback_for_always_returns_a_loopback_address_never_the_input_host():
+    # `host` is display-only; probing must NEVER dial it verbatim — dialing a real
+    # non-loopback `host` would be an SSRF-shaped outbound probe of a config-/env-sourced
+    # value (see `_loopback_for`'s docstring). Every input maps to a loopback address; only
+    # the IPv4-vs-IPv6 family is taken from the input's shape.
+    from agenttools_service.core import _loopback_for
+
+    assert _loopback_for("0.0.0.0") == "127.0.0.1"
+    assert _loopback_for("") == "127.0.0.1"
+    assert _loopback_for("127.0.0.1") == "127.0.0.1"
+    # A real-looking, non-loopback display host still maps to loopback — never dialed as-is.
+    assert _loopback_for("10.0.0.5") == "127.0.0.1"
+    assert _loopback_for("example.internal") == "127.0.0.1"
+    assert _loopback_for("169.254.169.254") == "127.0.0.1"  # the cloud metadata address
+    # IPv6-shaped input (incl. the "::" wildcard) picks the IPv6 loopback family.
+    assert _loopback_for("::") == "::1"
+    assert _loopback_for("2001:db8::1") == "::1"
+
+
+class _FakeCompletedProcess:
+    def __init__(self, stdout: str, returncode: int = 0) -> None:
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+def test_lsof_listener_pid_returns_none_when_lsof_missing(monkeypatch):
+    from agenttools_service.core import _lsof_listener_pid
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert _lsof_listener_pid(7878) is None
+
+
+def test_lsof_listener_pid_returns_pid_on_single_line(monkeypatch):
+    from agenttools_service.core import _lsof_listener_pid
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/sbin/lsof")
+    assert _lsof_listener_pid(7878, runner=lambda cmd: _FakeCompletedProcess("4242\n")) == 4242
+
+
+def test_lsof_listener_pid_returns_none_on_multiple_pids(monkeypatch):
+    # SO_REUSEPORT / separate IPv4+IPv6 listeners can make `lsof -t` print more than one PID.
+    # Guessing "the first one" could name the WRONG process; refuse to guess instead.
+    from agenttools_service.core import _lsof_listener_pid
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/sbin/lsof")
+    assert _lsof_listener_pid(7878, runner=lambda cmd: _FakeCompletedProcess("4242\n5555\n")) is None
+
+
+def test_lsof_listener_pid_returns_none_on_empty_output(monkeypatch):
+    from agenttools_service.core import _lsof_listener_pid
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/sbin/lsof")
+    assert _lsof_listener_pid(7878, runner=lambda cmd: _FakeCompletedProcess("")) is None
+
+
+def test_lsof_listener_pid_returns_none_on_malformed_output(monkeypatch):
+    from agenttools_service.core import _lsof_listener_pid
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/sbin/lsof")
+    assert _lsof_listener_pid(7878, runner=lambda cmd: _FakeCompletedProcess("not-a-pid\n")) is None
+
+
+def test_lsof_listener_pid_returns_none_on_nonzero_returncode_even_with_a_pid_line(monkeypatch):
+    # A partial/permission-walled lsof run can exit nonzero while still printing a PID line on
+    # stdout; that does not meet the "clean answer" bar the docstring promises — don't attribute
+    # a listener to output lsof itself flagged as unreliable.
+    from agenttools_service.core import _lsof_listener_pid
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/sbin/lsof")
+    fake = _FakeCompletedProcess("4242\n", returncode=1)
+    assert _lsof_listener_pid(7878, runner=lambda cmd: fake) is None
+
+
+def test_lsof_listener_pid_returns_none_on_runner_error(monkeypatch):
+    from agenttools_service.core import _lsof_listener_pid
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/sbin/lsof")
+
+    def boom(cmd):
+        raise OSError("no such process")
+
+    assert _lsof_listener_pid(7878, runner=boom) is None
+
+
+def test_default_port_prober_survives_unicode_host(monkeypatch):
+    # `Service` permits non-ASCII hosts (only whitespace/control chars are rejected), and
+    # socket.create_connection can raise UnicodeError (an IDNA-encoding failure — a ValueError
+    # subclass, NOT an OSError) for a host like "héllo". The prober must not let that escape as
+    # a raw traceback; it should report "not occupied" like any other unreachable host.
+    #
+    # Deliberately calls `_real_default_port_prober` (the module-qualified alias captured at
+    # import time, BEFORE any `home`-fixture monkeypatch can run) rather than a fresh `from
+    # agenttools_service.core import _default_port_prober` inside the function body: this test
+    # takes no `home` fixture today, but a local import re-resolves the module attribute at
+    # CALL time — if a future edit added `home` as a parameter, that import would silently
+    # rebind to the fixture's fake (which never touches `socket.create_connection` at all),
+    # and this test would keep passing even if the UnicodeError handling it exists to check
+    # were deleted. The module-level alias can't be shadowed that way.
+    def raise_unicode_error(*args, **kwargs):
+        raise UnicodeError("encoding failed")
+
+    monkeypatch.setattr(socket, "create_connection", raise_unicode_error)
+    probe = _real_default_port_prober("héllo", 7878)
+    assert probe.occupied is False
+
+
+def test_default_port_prober_tries_ipv4_then_ipv6_and_reports_the_family_that_answered(
+    monkeypatch,
+):
+    # THE round-3 regression fix: probing only ONE loopback family (chosen from the
+    # display-only `Service.host`) missed a real listener bound to the OTHER family — a
+    # foreign IPv6-only listener with a default (IPv4) `host` read as "port free". The prober
+    # must try both, in order, and report which one actually answered via `PortProbe.addr`.
+    attempted: list[tuple[str, int]] = []
+
+    def fake_create_connection(addr_port, timeout):
+        addr, port = addr_port
+        attempted.append((addr, port))
+        if addr == "127.0.0.1":
+            raise OSError("refused")  # nothing on the IPv4 loopback
+
+        class _Ctx:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Ctx()  # IPv6 loopback "accepts"
+
+    monkeypatch.setattr(socket, "create_connection", fake_create_connection)
+    monkeypatch.setattr(
+        "agenttools_service.core._lsof_listener_pid", lambda port: 9090
+    )
+    probe = _real_default_port_prober("127.0.0.1", 7878)
+    assert probe.occupied is True
+    assert probe.addr == "::1"
+    assert probe.pid == 9090
+    assert attempted == [("127.0.0.1", 7878), ("::1", 7878)]  # IPv4 tried first, then IPv6
+
+
+def test_default_port_prober_reports_free_when_neither_family_answers(monkeypatch):
+    def always_refuse(addr_port, timeout):
+        raise OSError("refused")
+
+    monkeypatch.setattr(socket, "create_connection", always_refuse)
+    probe = _real_default_port_prober("127.0.0.1", 7878)
+    assert probe.occupied is False
+    assert probe.addr is None
+    assert probe.pid is None
+
+
+def test_stop_action_on_healthy_os_autostart_service_does_not_probe_the_port(home, capsys):
+    # THE regression an earlier revision of this fix introduced (caught by review-cli#377's
+    # review round 2, both GLM and codex independently): an `enable`d launchd/systemd service
+    # is, BY DESIGN, listening with no pidfile — that is the expected healthy state, not a
+    # foreign listener. `stop` must keep exiting 3 with the plain "run 'disable'" hint and
+    # must NOT call the port probe at all on this branch (proven here by a probe that raises
+    # if invoked, not merely one that returns occupied=True) — surfacing a foreign-listener
+    # warning would (a) be factually wrong (the very port disable is told to fix is this
+    # service's own healthy process) and (b) break any script that branches on exit 3 meaning
+    # "nothing of mine to stop".
+    svc = make_service(home)
+    runner = RunnerSpy()
+    backend = LaunchdBackend(home=home, runner=runner)
+    backend.install(svc)  # autostart on disk, OS owns the process
+
+    def must_not_be_called(host, port):
+        raise AssertionError("stop must not probe the port when OS autostart is enabled")
+
+    mgr = ServiceManager(
+        svc,
+        platform=MACOS,
+        autostart=backend,
+        spawner=SpawnerSpy(),
+        alive=lambda pid: False,
+        port_probe=must_not_be_called,
+    )
+    rc = run_action(mgr, "stop")
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert "was not running" not in captured.out
+    assert "autostart" in captured.err and "disable" in captured.err
+    assert "still listening" not in captured.err
