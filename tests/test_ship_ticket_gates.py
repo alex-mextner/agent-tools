@@ -352,11 +352,51 @@ def test_acceptance_gate_refuses_when_task_gate_cannot_resolve_a_derived_code(re
     assert "Refusing: acceptance gate — task-cli could not resolve ticket HYP-931 (task gate HYP-931 exit 2)" in r.stderr, r.stderr
     assert "unknown ticket HYP-931" in r.stderr
     assert "REVIEW_TASK_CODE=" in r.stderr and "SHIP_ACCEPTANCE_GATE=0" in r.stderr, r.stderr
-    assert "from the branch name" in r.stderr, r.stderr   # where the bad code came from
+    assert "The code came from the branch name." in r.stderr, r.stderr   # where the bad code came from
     assert not _merged(tmp_path)
     (line,) = _audit(tmp_path, "acceptance")
     assert line["decision"] == "refused:unresolvable" and line["task_code"] == "HYP-931"
     assert line["detail"] == "task gate exit 2: error: unknown ticket HYP-931"
+
+
+def test_acceptance_gate_exit_2_error_line_on_stdout_is_task_cli_too(repo, tmp_path):
+    """A shim that prints task-cli's `error: …` line on STDOUT (the real binary uses stderr)
+    is still task-cli's answer: the line is found on either stream, first occurrence, and a
+    mid-line "error:" mention elsewhere is not what identifies it."""
+    r = _run(repo, tmp_path, env={
+        "SHIP_TEST_TASK_GATE_JSON": "warning: cache miss (no error: yet)\nerror: unknown ticket HYP-931",
+        "SHIP_TEST_TASK_GATE_EXIT": "2",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    (line,) = _audit(tmp_path, "acceptance")
+    assert line["detail"] == "task gate exit 2: error: unknown ticket HYP-931", line
+    assert not _merged(tmp_path)
+
+
+def test_acceptance_gate_exit_2_prefers_the_stderr_error_line_over_stdout(repo, tmp_path):
+    """Both streams carry a `^error: ` line: stderr's wins (where the real binary prints it)."""
+    r = _run(repo, tmp_path, env={
+        "SHIP_TEST_TASK_GATE_JSON": "error: stdout chatter", "SHIP_TEST_TASK_GATE_ERR": "error: unknown ticket HYP-931",
+        "SHIP_TEST_TASK_GATE_EXIT": "2",
+    })
+    assert r.returncode == 1, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    (line,) = _audit(tmp_path, "acceptance")
+    assert line["detail"] == "task gate exit 2: error: unknown ticket HYP-931", line
+
+
+def test_acceptance_gate_exit_2_with_only_a_mid_line_error_mention_still_skips(repo, tmp_path):
+    """The dropped substring match, pinned: "error:" MID-line (a foreign binary's usage text,
+    a wrapper's chatter) on exit 2 is not task-cli's `error: …` line — the PATH-collision skip
+    applies, not a refusal of every merge on that machine."""
+    r = _run(repo, tmp_path, env={
+        "SHIP_TEST_TASK_GATE_JSON": "usage: task <command> (see 'task help'; an unknown command is an error: it exits 2)",
+        "SHIP_TEST_TASK_GATE_ERR": "task: no such command 'gate' — error: unknown", "SHIP_TEST_TASK_GATE_EXIT": "2",
+    })
+    assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    assert "did not return task-cli's expected" in r.stderr, r.stderr
+    assert _merged(tmp_path)
+    (line,) = _audit(tmp_path, "acceptance")
+    assert line["decision"] == "skipped" and line["detail"] == "'task' on PATH does not look like task-cli"
 
 
 def test_acceptance_gate_exit_2_refusal_is_the_same_under_dry_run_without_audit(repo, tmp_path):

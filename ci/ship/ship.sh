@@ -2573,7 +2573,8 @@ _skip_ci_hatch_gate() {
 #     candidate's (possibly already-shipped) record — the twin spelling is still tried first,
 #     since the reviews may all live under it;
 #   - a candidate with NO record under either spelling (review-cli answers `total_iterations: 0`
-#     plus `error: no recorded review iterations for …` — JSON on stdout, exit 1) is not this
+#     plus `error: no recorded review iterations for …` — JSON on stdout, exit 1; BOTH the zero
+#     counts and the error line are required, zero counts alone are a short record) is not this
 #     PR's review record: the scan moves to the next candidate, then to the next source (env →
 #     branch → body; the body is fetched only when no branch candidate has a record). Precedence
 #     is preserved because a record-less candidate could never have authorized anyway, and every
@@ -2662,6 +2663,9 @@ _review_quorum_read_payload() {
   QPASSED=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed // false' 2>/dev/null || echo false)
   QITER=$(printf '%s' "$QUORUM_JSON" | jq -r '.passed_iterations // 0' 2>/dev/null || echo 0)
   QTOTAL=$(printf '%s' "$QUORUM_JSON" | jq -r '.total_iterations // 0' 2>/dev/null || echo 0)
+  # Whether the payload carries `total_iterations` AT ALL — a build that does not cannot make
+  # the "no record" claim (codex review finding, round 3): an absent key reads as 0 above.
+  QUORUM_HAS_TOTAL_KEY=$(printf '%s' "$QUORUM_JSON" | jq -r 'has("total_iterations")' 2>/dev/null || echo false)
   QMODELS_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_models_passed // 0' 2>/dev/null || echo 0)
   QMODELS=$(printf '%s' "$QUORUM_JSON" | jq -r '(.models // []) | join(", ")' 2>/dev/null || echo "")
   QROLES_N=$(printf '%s' "$QUORUM_JSON" | jq -r '.distinct_roles_passed // 0' 2>/dev/null || echo 0)
@@ -2716,6 +2720,21 @@ _review_quorum_read_payload() {
   return 0
 }
 
+# Whether the Q* vars (read from $QUORUM_JSON) are review-cli's OWN "no record" answer: zero
+# counts (with the `total_iterations` key PRESENT — an absent key is not a zero) AND its
+# specific `error` line ("no recorded review iterations for <code>", from reviewlib/stats.py).
+# Only THAT answer lets the candidate scan move on. Zero counts WITHOUT it (a build that lacks
+# `total_iterations`, unparseable stdout, a shim emitting `{"passed":false}`)
+# or with ANY OTHER error (a stats-read failure that still emits JSON) are a record that falls
+# short — refuse on it, never scan past it to a later candidate's passing record (Opus review
+# findings, rounds 1 and 2). The security-critical decision of the scan, kept in one place.
+_review_quorum_payload_is_no_record() {
+  [ "$QUORUM_HAS_TOTAL_KEY" = "true" ] || return 1
+  [ "$QTOTAL" -eq 0 ] && [ "$QITER" -eq 0 ] || return 1
+  case "$QERR" in 'no recorded review iterations'*) return 0 ;; esac
+  return 1
+}
+
 # Looks ONE candidate up under its spellings (the code, then its twin if it has one).
 # Exit 0: a spelling met the bar — TASK_CODE/QUORUM_JSON are that spelling's.
 # Exit 1: a spelling has a record that falls short — TASK_CODE/QUORUM_JSON are the FIRST such
@@ -2725,14 +2744,21 @@ _review_quorum_read_payload() {
 #         ever found) and every spelling is appended to QUORUM_TRIED.
 # Exit 3: review-cli could not be queried for a spelling (TASK_CODE = that spelling).
 _review_quorum_lookup_candidate() {  # $1 = candidate code
-  local spelling anchor_code="" anchor_json="" anchor_roles=1 twin
+  # anchor_roles is always set together with anchor_code and never read before anchor_code is
+  # non-empty — so it needs no default of its own.
+  local spelling anchor_code="" anchor_json="" anchor_roles twin
   twin=$(_review_quorum_twin_code "$1")
   for spelling in "$1" $twin; do
     _review_quorum_query "$spelling"
-    if [ -z "$QUORUM_JSON" ]; then TASK_CODE="$spelling"; return 3; fi
+    if [ -z "$QUORUM_JSON" ]; then
+      # Could not query this spelling. With a short record already in hand that record is the
+      # verdict (refuse on it, below) — a twin lookup that fails must not hide a real 1/3.
+      [ -n "$anchor_code" ] && break
+      TASK_CODE="$spelling"; return 3
+    fi
     _review_quorum_read_payload
     if [ "$QUORUM_BAR_MET" = "1" ]; then TASK_CODE="$spelling"; return 0; fi
-    if [ "$QTOTAL" -gt 0 ] || [ "$QITER" -gt 0 ]; then
+    if ! _review_quorum_payload_is_no_record; then
       if [ -z "$anchor_code" ]; then
         anchor_code="$spelling"; anchor_json="$QUORUM_JSON"; anchor_roles="$QUORUM_ROLES_REQUESTED"
       else
@@ -2742,7 +2768,7 @@ _review_quorum_lookup_candidate() {  # $1 = candidate code
     fi
     # No record under this spelling.
     if [ -n "$anchor_code" ]; then
-      QUORUM_NOTES="${QUORUM_NOTES}; also tried ${spelling} (${QERR:-no recorded review iterations})"
+      QUORUM_NOTES="${QUORUM_NOTES}; also tried ${spelling} (${QERR})"
     else
       if [ -z "$QUORUM_NORECORD_CODE" ]; then
         QUORUM_NORECORD_CODE="$spelling"; QUORUM_NORECORD_JSON="$QUORUM_JSON"
@@ -2849,6 +2875,7 @@ else
   QITER=0; QMODELS_N=0; QMODELS=""; QROLES_N=0; QROLES=""; QERR=""; QPASSED=false
 
   TASK_CODE=""; QTOTAL=0; QUORUM_JSON=""; QUORUM_ROLES_REQUESTED=1; QUORUM_HAS_ROLE_KEY=false
+  QUORUM_HAS_TOTAL_KEY=false
   QUORUM_BAR_MET=0; QUORUM_NOTES=""; QUORUM_TRIED=""
   QUORUM_NORECORD_CODE=""; QUORUM_NORECORD_JSON=""; QUORUM_NORECORD_ROLES_REQUESTED=1
   REVIEW_CHECK_ARGS_NOROLES=(--min-iter "$MIN_ITER")
@@ -3144,7 +3171,12 @@ _ship_task_code_candidate_ok() {  # $1 = candidate code  $2 = source label (for 
 # The source label of the code `_ship_derive_task_code_for_notify` last accepted (empty when it
 # derived nothing) — read by the acceptance gate's refusals so the shipper is told WHICH text
 # named the ticket task-cli then could not resolve (agent-tools#569).
+# Both are set by a DIRECT call (never inside `$(…)` — a command substitution runs in a subshell
+# and its assignments never reach the caller; codex review finding, round 1): the acceptance gate
+# calls the derivation directly and reads _SHIP_TASK_CODE / _SHIP_TASK_CODE_SOURCE, the notify
+# step only needs the printed code.
 _SHIP_TASK_CODE_SOURCE=""
+_SHIP_TASK_CODE=""
 # $1 = newline-separated candidates from ONE source, $2 = its label -> prints the first candidate
 # that passes `_ship_task_code_candidate_ok` (exit 0), or nothing (exit 1) when none does.
 _ship_first_admissible_task_code() {
@@ -3154,6 +3186,7 @@ _ship_first_admissible_task_code() {
     if _ship_task_code_candidate_ok "$candidate" "$2"; then
       echo "[ship] task-code: using '${candidate}' from $2." >&2
       _SHIP_TASK_CODE_SOURCE="$2"
+      _SHIP_TASK_CODE="$candidate"
       printf '%s' "$candidate"
       return 0
     fi
@@ -3161,7 +3194,7 @@ _ship_first_admissible_task_code() {
   return 1
 }
 _ship_derive_task_code_for_notify() {
-  _SHIP_TASK_CODE_SOURCE=""
+  _SHIP_TASK_CODE_SOURCE=""; _SHIP_TASK_CODE=""
   _ship_first_admissible_task_code "${TASK_CODE:-}" '$TASK_CODE' && return 0
   _ship_first_admissible_task_code "$(_review_quorum_extract_ticket_candidates "$BRANCH")" "the branch name" && return 0
 
@@ -3547,7 +3580,10 @@ _acceptance_gate() {
     echo "[ship] acceptance gate: --repo targets a foreign remote — skipping (a local 'task' here reads the wrong project)." >&2
     _ticket_gate_audit_log acceptance skipped "" "foreign --repo"; return 0
   fi
-  local code; code=$(_ship_derive_task_code_for_notify)
+  # Direct call, not `$(…)`: the refusal below reports WHICH source named the code, and that
+  # label only survives outside a subshell.
+  _ship_derive_task_code_for_notify >/dev/null
+  local code="$_SHIP_TASK_CODE"
   if [ -z "$code" ]; then
     echo "[ship] acceptance gate: could not derive a task code for #$PR — skipping (not every PR is tied to a tracked ticket)." >&2
     _ticket_gate_audit_log acceptance skipped "" "no task code"; return 0
@@ -3568,10 +3604,10 @@ _acceptance_gate() {
   errfile=$(mktemp 2>/dev/null) || errfile=/dev/null
   # From "$ROOT", not via -C: task-cli's -C is a per-subcommand flag (see the notify step).
   out=$(cd "$ROOT" && task gate "$code" --json 2>"$errfile") || rc=$?
-  local err=""
+  local err_raw=""
   if [ "$errfile" != "/dev/null" ] && [ -s "$errfile" ]; then
-    err=$(LC_ALL=C tr '\n' ' ' < "$errfile" | LC_ALL=C sed 's/ $//')
-    echo "[ship] acceptance gate: task-cli stderr: ${err}" >&2
+    err_raw=$(cat "$errfile")
+    echo "[ship] acceptance gate: task-cli stderr: $(printf '%s' "$err_raw" | LC_ALL=C tr '\n' ' ' | LC_ALL=C sed 's/ *$//')" >&2
   fi
   [ "$errfile" != "/dev/null" ] && rm -f "$errfile"  # always, not only when -s (review finding: the file leaked on the common empty-stderr path)
   # `task` is a famously ambiguous command name (Taskwarrior, go-task also install as `task`)
@@ -3594,7 +3630,9 @@ _acceptance_gate() {
   # cannot find is a BROKEN PR, not an unguarded one. Only when the answer does not even look
   # like task-cli's (no `error:` line — task-cli always prints one on exit 2) does the
   # PATH-collision guard above still apply: a foreign `task` must not refuse every merge.
-  if [ "$rc" = "2" ] && ! _acceptance_gate_looks_like_task_cli_error "$out" "$err"; then
+  local task_err=""
+  [ "$rc" = "2" ] && task_err=$(_acceptance_gate_task_cli_error_line "$out" "$err_raw")
+  if [ "$rc" = "2" ] && [ -z "$task_err" ]; then
     echo "[ship] WARNING: acceptance gate could not evaluate ${code} — '$(command -v task)' on PATH did not return task-cli's expected \`error:\` line on exit 2 (a DIFFERENT 'task' binary — e.g. Taskwarrior or go-task — may be shadowing task-cli). Skipping: $(printf '%s' "$out" | LC_ALL=C tr '\n' ' ')" >&2
     _ticket_gate_audit_log acceptance skipped "$code" "'task' on PATH does not look like task-cli"
     return 0
@@ -3602,7 +3640,7 @@ _acceptance_gate() {
   case "$rc" in
     0) _acceptance_gate_pass "$code" "$out" ;;
     1) _acceptance_gate_refuse "$code" "$out" ;;
-    2) _acceptance_gate_refuse_unresolvable "$code" "$(_acceptance_gate_task_cli_error "$out" "$err")" ;;
+    2) _acceptance_gate_refuse_unresolvable "$code" "$task_err" ;;
     *)
       # Outside task-cli's 0/1/2 contract entirely (a crash, a signal, a foreign binary's own
       # convention) — not a verdict on the ticket; logged and skipped, as before.
@@ -3610,20 +3648,23 @@ _acceptance_gate() {
       _ticket_gate_audit_log acceptance skipped "$code" "could not evaluate: exit ${rc}" ;;
   esac
 }
-# task-cli's exit-2 contract is one `error: …` line (its `_UserError` handler prints it, on
-# stderr for the real binary). $1 = stdout, $2 = stderr (newlines already flattened) -> true iff
-# either carries that line.
-_acceptance_gate_looks_like_task_cli_error() {
-  case "$1" in *'error: '*|'error:'*) return 0 ;; esac
-  case "$2" in *'error: '*|'error:'*) return 0 ;; esac
-  return 1
-}
-# $1 = stdout, $2 = stderr -> the `error: …` text task-cli printed (stderr first — that is where
-# the real binary puts it; stdout for a shim that prints it there), flattened to one line.
-_acceptance_gate_task_cli_error() {
-  local from="$2"
-  case "$2" in *error:*) ;; *) from="$1" ;; esac
-  printf '%s' "$from" | LC_ALL=C tr '\n' ' ' | LC_ALL=C sed -E 's/^.*(error: )/\1/; s/ $//'
+# task-cli's exit-2 contract is ONE line starting `error: …` (its `_UserError` handler prints
+# exactly that, on stderr; probed live 2026-09-07: `error: github: HTTP 404 for GET …/issues/<n>`
+# for an unknown ticket). $1 = stdout, $2 = raw stderr -> prints the FIRST such line (stderr
+# first — where the real binary puts it; stdout for a shim that prints it there), or nothing.
+# One predicate for both "is this task-cli's answer?" (non-empty) and "what did it say?", so the
+# two can never drift apart. Anchored at LINE START, not a substring (the earlier substring
+# match was dropped deliberately): a foreign `task` that merely mentions "error:" mid-line does
+# not turn every merge into a refusal. Two residuals, both accepted and both documented in the
+# README: a foreign binary that prints a line starting `error: ` AND exits 2 is refused too —
+# loud, never silent (the refusal names the binary path and the ops off-switch); and should
+# task-cli ever PREFIX its line (`task: error: …`, a timestamp), exit 2 would read as
+# "not task-cli" and skip again — the contract is pinned on task-cli's side (its README's gate
+# section is kept byte-identical with this one), so that is a two-repo change, not a drift.
+_acceptance_gate_task_cli_error_line() {
+  local line
+  line=$(printf '%s\n%s\n' "$2" "$1" | LC_ALL=C grep -m1 -E '^error: ' || true)
+  printf '%s' "$line"
 }
 # The fail-closed refusal for a derived-but-unresolvable code (agent-tools#569). $1 = code
 # $2 = task-cli's own error line; exits 1 (under --dry-run too — same refusal, audit only printed).

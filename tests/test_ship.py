@@ -5433,17 +5433,30 @@ fi
 [ -n "${SHIP_TEST_REVIEW_LOG:-}" ] && printf '%s\\n' "$flag" >> "${SHIP_TEST_REVIEW_LOG}"
 [ -n "${SHIP_TEST_REVIEW_CODE_LOG:-}" ] && printf '%s\\n' "$code" >> "${SHIP_TEST_REVIEW_CODE_LOG}"
 # SHIP_TEST_REVIEW_KNOWN_CODES (space-separated): when set, any OTHER code answers exactly what
-# the real review-cli answers for a code it has no iterations for (probed live 2026-09-06):
-# zero counts plus an `error` key — JSON, exit 0, never an empty stdout.
+# the real review-cli answers for a code it has no iterations for (probed live 2026-09-07):
+# zero counts plus an `error` key — JSON on stdout, exit 1, never an empty stdout.
 if [ -n "${SHIP_TEST_REVIEW_KNOWN_CODES:-}" ]; then
   known=0
   for k in ${SHIP_TEST_REVIEW_KNOWN_CODES}; do [ "$k" = "$code" ] && known=1; done
   if [ "$known" = "0" ]; then
-    printf '{"task_code":"%s","passed_iterations":0,"total_iterations":0,"distinct_models_passed":0,"models":[],"min_iter":%s,"passed":false,"distinct_roles_passed":0,"roles":[],"min_roles":%s,"error":"no recorded review iterations for %s"}\\n' \\
-      "$code" "$minit" "$minroles" "$code"
-    exit 0
+    total='"total_iterations":0,'
+    # SHIP_TEST_REVIEW_NO_RECORD_OMIT_TOTAL=1 simulates a build that never emits the key.
+    [ "${SHIP_TEST_REVIEW_NO_RECORD_OMIT_TOTAL:-0}" = "1" ] && total=""
+    printf '{"task_code":"%s","passed_iterations":0,%s"distinct_models_passed":0,"models":[],"min_iter":%s,"passed":false,"distinct_roles_passed":0,"roles":[],"min_roles":%s,"error":"no recorded review iterations for %s"}\\n' \\
+      "$code" "$total" "$minit" "$minroles" "$code"
+    exit 1
   fi
 fi
+# SHIP_TEST_REVIEW_UNQUERYABLE_CODES (space-separated): review-cli cannot answer for these at
+# all — empty stdout on every tier (an argparse failure, an unreadable store), exit 2.
+for k in ${SHIP_TEST_REVIEW_UNQUERYABLE_CODES:-}; do
+  [ "$k" = "$code" ] && { echo "review task: error: store unreadable" >&2; exit 2; }
+done
+# SHIP_TEST_REVIEW_SHORT_CODES (space-separated): these codes have a record of exactly ONE
+# passed iteration / one role — a bar that falls short — whatever the global counts say.
+for k in ${SHIP_TEST_REVIEW_SHORT_CODES:-}; do
+  [ "$k" = "$code" ] && { SHIP_TEST_REVIEW_ITER=1; SHIP_TEST_REVIEW_ROLES=1; SHIP_TEST_REVIEW_MODELS=1; }
+done
 if [ "${SHIP_TEST_REVIEW_BROKEN:-0}" = "1" ]; then
   echo "internal error: stats store unreadable" >&2
   exit 1
@@ -8381,6 +8394,80 @@ def test_review_quorum_finds_a_record_keyed_hash_when_the_branch_says_gh(tmp_pat
     assert line["task_code"] == "#565", line
 
 
+def test_review_quorum_authorizes_under_the_twin_when_the_primary_record_falls_short(tmp_path):
+    """`#565` HAS a record (one iteration — say, one agent quoted it) and GH-565 carries the
+    real three: the bar is met under the twin, so authorize under GH-565 — a short primary is
+    not the last word while its other spelling is unread."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    code_log = tmp_path / "codes.log"
+    r = _run_ship_quorum(main, gh, rv, env_extra={
+        "SHIP_TEST_PR_BODY": "Refs #565", "SHIP_TEST_REVIEW_SHORT_CODES": "#565",
+        "SHIP_TEST_REVIEW_CODE_LOG": str(code_log), "SHIP_AUDIT_FILE": str(tmp_path / "audit.jsonl"),
+    })
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "AUTHORITY CONFIRMED" in r.stdout and "for GH-565" in r.stdout, r.stdout
+    assert code_log.read_text().split() == ["#565", "GH-565"]
+    (line,) = [l for l in _quorum_audit(tmp_path) if l.get("decision") == "authorized" and "gate" not in l]
+    assert line["task_code"] == "GH-565" and line["iterations"] == 3, line
+
+
+def test_review_quorum_short_primary_is_the_verdict_when_the_twin_cannot_be_queried(tmp_path):
+    """`#565` has a real 1/3 record; the GH-565 lookup returns nothing at all. The short record
+    already in hand is the verdict — refuse on it with ITS counts, not "could not query GH-565"
+    and not the twin's empty numbers (Opus review, round 3: the anchor's payload is re-read)."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    code_log = tmp_path / "codes.log"
+    r = _run_ship_quorum(main, gh, rv, env_extra={
+        "SHIP_TEST_PR_BODY": "Refs #565", "SHIP_TEST_REVIEW_SHORT_CODES": "#565",
+        "SHIP_TEST_REVIEW_UNQUERYABLE_CODES": "GH-565", "SHIP_TEST_REVIEW_CODE_LOG": str(code_log),
+    })
+    assert r.returncode != 0, f"{r.stdout}\n{r.stderr}"
+    assert "bar NOT met for #565 — 1/3 iterations, 1/3 distinct roles" in r.stderr, r.stderr
+    assert "could not query" not in r.stderr
+    log = code_log.read_text().split()   # the twin is retried on every query tier (3), as designed
+    assert log[0] == "#565" and set(log[1:]) == {"GH-565"}, log
+    assert "[fake gh] merged" not in r.stdout
+
+
+def test_review_quorum_no_record_claim_needs_the_total_iterations_key(tmp_path):
+    """A payload WITHOUT `total_iterations` (an old build, a shim) cannot claim "no record"
+    even with the error line: it is a short record — refuse, never scan on to #77."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    code_log = tmp_path / "codes.log"
+    r = _run_ship_quorum(main, gh, rv, env_extra={
+        "SHIP_TEST_PR_BODY": "HYP-100 follow-up. Refs #77", "SHIP_TEST_REVIEW_KNOWN_CODES": "#77",
+        "SHIP_TEST_REVIEW_NO_RECORD_OMIT_TOTAL": "1", "SHIP_TEST_REVIEW_CODE_LOG": str(code_log),
+    })
+    assert r.returncode != 0, f"{r.stdout}\n{r.stderr}"
+    assert "bar NOT met for HYP-100 — 0/3 iterations" in r.stderr, r.stderr
+    assert code_log.read_text().split() == ["HYP-100"], code_log.read_text()
+
+
+def test_review_quorum_zero_counts_without_the_no_record_error_are_a_short_record(tmp_path):
+    """Only review-cli's own no-record answer (zero counts AND the error line) lets the scan
+    move on. A 0/0 payload WITHOUT it (an old build lacking `total_iterations`, a shim) is a
+    record that falls short: refuse on THAT candidate, never borrow the later #77's record."""
+    main, _wt = _make_repo_with_branch(tmp_path, "feat")
+    gh = _fake_gh_quorum_dir(tmp_path)
+    rv = _fake_review_dir(tmp_path)
+    code_log = tmp_path / "codes.log"
+    r = _run_ship_quorum(main, gh, rv, env_extra={
+        "SHIP_TEST_PR_BODY": "HYP-100 follow-up. Refs #77", "SHIP_TEST_REVIEW_ITER": "0",
+        "SHIP_TEST_REVIEW_ROLES": "0", "SHIP_TEST_REVIEW_MODELS": "0",
+        "SHIP_TEST_REVIEW_CODE_LOG": str(code_log),
+    })
+    assert r.returncode != 0, f"{r.stdout}\n{r.stderr}"
+    assert "bar NOT met for HYP-100 — 0/3 iterations" in r.stderr, r.stderr
+    assert code_log.read_text().split() == ["HYP-100"], code_log.read_text()
+    assert "[fake gh] merged" not in r.stdout
+
+
 def test_review_quorum_explicit_env_code_is_looked_up_under_both_spellings_too(tmp_path):
     main, _wt = _make_repo_with_branch(tmp_path, "feat")
     gh = _fake_gh_quorum_dir(tmp_path)
@@ -8421,7 +8508,8 @@ def test_review_quorum_scans_past_a_candidate_with_no_record_in_the_same_body(tm
     })
     assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
     assert "AUTHORITY CONFIRMED" in r.stdout and "#77" in r.stdout, r.stdout
-    assert code_log.read_text().split() == ["UTF-8", "#77", "GH-77"] or code_log.read_text().split() == ["UTF-8", "#77"], code_log.read_text()
+    # The twin (GH-77) is never queried once #77 itself meets the bar.
+    assert code_log.read_text().split() == ["UTF-8", "#77"], code_log.read_text()
     assert "no recorded review iterations for UTF-8" in r.stderr and "trying the next candidate" in r.stderr, r.stderr
 
 
