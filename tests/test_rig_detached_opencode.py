@@ -37,7 +37,11 @@ _LAUNCHER = (
 _ISOLATED_LOG_DIR = Path(tempfile.mkdtemp(prefix="rig-detached-opencode-test-logs-"))
 _LOG_DIR = _ISOLATED_LOG_DIR
 
-_STUB_SLEEP_S = 2.0
+# The detach assertion is `launcher elapsed < _STUB_SLEEP_S - 0.5`. The launcher now
+# spawns bash -> nohup -> bash -c -> python3 (setsid shim) -> stub, which under a loaded
+# machine (a full suite running next to it) can take >1.5s; a 4.5s budget separates "the
+# launcher returned before the child finished" from scheduler noise (flaked once at 2.0).
+_STUB_SLEEP_S = 5.0
 
 
 @pytest.fixture(scope="module", autouse=True)
