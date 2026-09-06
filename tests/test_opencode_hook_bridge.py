@@ -106,7 +106,7 @@ def _run_gate_ungoverned(v1_event: dict) -> subprocess.CompletedProcess:
     with the bridge's normalization / injected identity under a future explicit "opencode is the
     orchestrator" knob (the knob would re-govern by tag; the args must already be right)."""
     ungoverned = dict(v1_event)
-    ungoverned.pop("harness")
+    ungoverned.pop("harness", None)
     child = dict(os.environ)
     child.pop("RIG_HATCH_REQUEST_BACKGROUND_SUBAGENT_GATE", None)
     return subprocess.run(

@@ -684,8 +684,9 @@ def _is_read_only_sed(segment: str) -> bool:
     the segment to the pre-existing rules — the `sed -i` `BUILD_EDIT` signal, the >=3-segment
     fallback — exactly as before this predicate existed): an unbalanced-quote segment (shlex
     raises), a `-l` cluster (GNU/BSD operand mismatch), a script file. Script scanning is a small
-    hand-rolled walk over sed's grammar (addresses, `s`/`y` delimiters, `a`/`i`/`c` text, `#`
-    comments, labels/filenames to end-of-line) — a discipline heuristic like the rest of this file,
+    hand-rolled walk over sed's grammar (addresses, `s`/`y` delimiters, bracket expressions in a
+    regex, `a`/`i`/`c` text, `#` comments, labels/filenames to end-of-line) — a discipline
+    heuristic like the rest of this file,
     not a sed parser; where it cannot tell, it errs toward "writes". Basename-exact head match
     (`sed`, `/usr/bin/sed`), never `\b`, so `sed-foo` is not `sed`."""
     try:
@@ -750,9 +751,67 @@ def _sed_scripts(argv: list[str]) -> list[str] | None:
     return scripts
 
 
-def _skip_sed_address(script: str, i: int) -> int:
+def _skip_bracket_expression(script: str, i: int) -> int:
+    """From ``script[i] == "["`` inside a REGEX, advance past the whole POSIX bracket expression:
+    an optional `^`, an optional leading literal `]`, and `[:class:]` / `[=equiv=]` / `[.coll.]`
+    members. Returns the index just after the closing `]`, or -1 when it never closes (sed
+    rejects the script: "unterminated address regex")."""
+    n = len(script)
+    i += 1
+    if i < n and script[i] == "^":
+        i += 1
+    if i < n and script[i] == "]":
+        i += 1
+    while i < n:
+        if script[i] == "[" and i + 1 < n and script[i + 1] in ":=.":
+            close = script.find(script[i + 1] + "]", i + 2)
+            if close < 0:
+                return -1
+            i = close + 2
+            continue
+        if script[i] == "]":
+            return i + 1
+        i += 1
+    return -1
+
+
+def _skip_regex(script: str, i: int, delim: str) -> int:
+    """From ``script[i]`` (the first char INSIDE a regex closed by ``delim``), advance past the
+    closing delimiter, honouring backslash escapes and bracket expressions — GNU and BSD sed
+    both accept the bare delimiter inside `[...]` (`/[/]/w out` is ONE address then a write,
+    review round 2). Returns the index just after the delimiter, or -1 when the regex never
+    closes."""
+    n = len(script)
+    while i < n:
+        c = script[i]
+        if c == delim:
+            return i + 1
+        if c == "\\":
+            i += 2
+        elif c == "[":
+            i = _skip_bracket_expression(script, i)
+            if i < 0:
+                return -1
+        else:
+            i += 1
+    return -1
+
+
+def _skip_plain_delimited(script: str, i: int, delim: str) -> int:
+    """From ``script[i]``, advance past the next unescaped ``delim`` — the `s` REPLACEMENT and
+    both `y` operands, where `[` has no meaning (`s/a/[/w out` and `y/[/]/;w out.txt` both
+    write, verified on GNU + BSD). Returns the index just after it, or -1 when absent."""
+    n = len(script)
+    while i < n:
+        if script[i] == delim:
+            return i + 1
+        i += 2 if script[i] == "\\" else 1
+    return -1
+
+
+def _skip_one_sed_address(script: str, i: int) -> int:
     r"""Advance past ONE address at ``script[i]``: `N`, `$`, `/re/`, `\cREc` (with `I`/`M` flags),
-    plus GNU's `first~step` / `addr,+N` / `addr,~N` numeric forms."""
+    plus GNU's `first~step` / `addr,+N` / `addr,~N` numeric forms. -1 for an unterminated regex."""
     n = len(script)
     if i < n and (script[i].isdigit() or script[i] in "+~"):
         while i < n and (script[i].isdigit() or script[i] in "+~"):
@@ -763,46 +822,32 @@ def _skip_sed_address(script: str, i: int) -> int:
     if i < n and script[i] in "/\\":
         if script[i] == "\\":
             if i + 1 >= n:
-                return n
+                return -1
             delim, i = script[i + 1], i + 2
         else:
             delim, i = "/", i + 1
-        while i < n and script[i] != delim:
-            i += 2 if script[i] == "\\" else 1
-        i += 1  # the closing delimiter
-        while i < n and script[i] in "IM":
+        i = _skip_regex(script, i, delim)
+        while 0 <= i < n and script[i] in "IM":
             i += 1
     return i
 
 
-def _skip_sed_addresses(script: str, i: int) -> int:
-    """Advance past the optional `addr1[,addr2]` + optional `!` in front of a sed command."""
+def _skip_sed_address_clause(script: str, i: int) -> int:
+    """Advance past the optional `addr1[,addr2]` + optional `!` in front of a sed command.
+    -1 when an address regex is unterminated."""
     n = len(script)
-    i = _skip_sed_address(script, i)
+    i = _skip_one_sed_address(script, i)
+    if i < 0:
+        return -1
     while i < n and script[i] in " \t":
         i += 1
     if i < n and script[i] == ",":
-        i = _skip_sed_address(script, i + 1)
+        i = _skip_one_sed_address(script, i + 1)
+        if i < 0:
+            return -1
         while i < n and script[i] in " \t":
             i += 1
     while i < n and script[i] in "! \t":
-        i += 1
-    return i
-
-
-def _skip_delimited(script: str, i: int, count: int) -> int:
-    """From ``script[i]`` (the delimiter char of an `s`/`y` command), advance past ``count`` more
-    unescaped occurrences of that delimiter; returns the index just after the last one."""
-    n = len(script)
-    if i >= n:
-        return n
-    delim, i, seen = script[i], i + 1, 0
-    while i < n and seen < count:
-        if script[i] == "\\":
-            i += 2
-            continue
-        if script[i] == delim:
-            seen += 1
         i += 1
     return i
 
@@ -812,23 +857,37 @@ def _sed_script_mutates(script: str) -> bool:
     at a command position, or a `w`/`e` flag on an `s` command. Walks the grammar just enough to
     tell a command position from pattern/replacement/address text — `/w/p` (an address) and
     `s/w/x/` (a pattern) are NOT writes; `1,3w out`, `s/a/b/w out`, `2{w out`, `5q;w out`,
-    `:a;w out` are. Only a/i/c text, r/R filenames and `#` comments run to end of line; a
-    label/optional-operand command (`: b t T l q Q`) ends at `;`/newline/`}`."""
+    `:a;w out`, `/[/]/w out` are. Only a/i/c text, r/R filenames and `#` comments run to end of
+    line; a label/optional-operand command (`: b t T l q Q`) ends at `;`/newline/`}`. A regex
+    (address, `s` pattern) honours bracket expressions, so a delimiter inside `[...]` does not
+    end it; anything sed itself rejects (unterminated regex/bracket/`s`, an address without a
+    command) counts as a write — the grant-direction default."""
     n, i = len(script), 0
     while i < n:
         c = script[i]
         if c in " \t\n;{}":
             i += 1
             continue
-        i = _skip_sed_addresses(script, i)
-        if i >= n:
-            return False
+        i = _skip_sed_address_clause(script, i)
+        if i < 0 or i >= n:
+            # An unterminated address regex, or an address with no command: sed rejects both
+            # ("unterminated address regex" / "missing command"). Grant-direction: not read-only.
+            return True
         c = script[i]
         if c in _SED_MUTATING_CMDS:
             return True
         if c in "sy":
             # `s<d>pat<d>rep<d>flags` / `y<d>src<d>dst<d>`: the opening delimiter, then TWO more.
-            i = _skip_delimited(script, i + 1, 2)
+            # Only the `s` PATTERN is a regex (bracket expressions honoured); the replacement and
+            # both `y` operands are plain text.
+            if i + 1 >= n:
+                return True
+            delim = script[i + 1]
+            i = (_skip_regex if c == "s" else _skip_plain_delimited)(script, i + 2, delim)
+            if i >= 0:
+                i = _skip_plain_delimited(script, i, delim)
+            if i < 0:
+                return True  # unterminated `s`/`y` — a sed error; grant-direction
             if c == "s":
                 while i < n and script[i] not in ";\n}":
                     if script[i] in _SED_MUTATING_S_FLAGS:

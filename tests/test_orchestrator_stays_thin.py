@@ -2564,6 +2564,15 @@ def test_literal_repro_chain_with_sed_n_is_read_only_on_first_offense(tmp_path, 
     "sed -n 'a\\' f.txt",                                    # `a` text to end of line, no write
     "sed 's/x/y/g;s/w/z/' f.txt",                           # a `w` in an s PATTERN is not the flag
     "sed -n 'p' -- f.txt",
+    # review round 2 (Opus): a POSIX bracket expression may carry the bare delimiter — both GNU
+    # and BSD sed accept `/[/]/` as ONE address (and `s/[/]/X/` as one pattern) — so the scan
+    # must not end the regex at a `/` inside `[...]`.
+    "sed -n '/[/]/p' f.txt",
+    "sed -n '/[^/]/p' f.txt",                                # negated set
+    "sed -n '/[]/]/p' f.txt",                                # a leading `]` is a literal member
+    "sed -n '/[[:alpha:]/]/p' f.txt",                        # a `[:class:]` member
+    "sed 's/[/]/X/' f.txt",                                  # bracket in the `s` PATTERN
+    "sed -n '\\,[,],p' f.txt",                               # custom delimiter inside a bracket
 ])
 def test_read_only_sed_is_inspection(command, tmp_path, monkeypatch):
     """A `sed` that only prints (no in-place flag, no `w`/`W`/`e` script command, no script file)
@@ -2622,6 +2631,21 @@ def test_read_only_sed_is_inspection(command, tmp_path, monkeypatch):
     "sed --fi script.sed f.txt",
     "sed --qui '1p' f.txt",                   # even a harmless abbreviation is refused
     "sed --some-future-option -n '1p' f.txt",
+    # review round 2 (Opus): a bracket expression containing the delimiter used to END the address
+    # scan early, leaving the real `w` invisible — `sed -n '/[/]/w out.txt' f.txt` WRITES out.txt
+    # on both GNU and BSD sed (verified live). Brackets are honoured in a regex address and in the
+    # `s` PATTERN only: the `s` REPLACEMENT and `y` have no bracket semantics (also verified live —
+    # `s/a/[/w out` and `y/[/]/;w out.txt` both write), and an unterminated regex/bracket is a sed
+    # error, which the grant-direction predicate reads as "not read-only".
+    "sed -n '/[/]/w out.txt' f.txt",
+    "sed -n '/[[:alpha:]/]/w out.txt' f.txt",
+    "sed -n 's/[/]/X/w out.txt' f.txt",
+    "sed -n 's/[[:alpha:]]/X/w out.txt' f.txt",
+    "sed -n 's/a/[/w out' f.txt",                # the REPLACEMENT is not a regex: `w out` is the flag
+    "sed -n 'y/[/]/;w out.txt' f.txt",            # `y` is not a regex: `[`→`]`, then the write
+    "sed -n '/[/w out.txt' f.txt",                # unterminated bracket = unterminated address regex
+    "sed -n '/abc' f.txt",                        # unterminated address regex
+    "sed -n '1' f.txt",                           # an address with no command (sed: missing command)
 ])
 def test_sed_that_edits_or_writes_is_not_read_only(command, tmp_path, monkeypatch):
     """The guard: an in-place edit, a `w`/`W`/`e` script command (or `s///w` / `s///e` flag), or
