@@ -64,7 +64,10 @@ def _stub_opencode(bin_dir: Path, marker: Path) -> None:
         f'  echo "ARGS=$*"\n'
         f'  echo "PID=$$ PGID=$(ps -o pgid= -p $$ | tr -d \' \')"\n'
         f'  echo "STDIN_EOF=$(head -c1 </dev/stdin | wc -c | tr -d \' \')"\n'
-        f'}} > "{marker}"\n'
+        # Write the record to a temp file and rename it into place: `_poll_for(marker)`
+        # returns the moment the path EXISTS, and the `$(ps ...)`/`$(head ...)` lines
+        # above take real time under load — a reader saw a half-written record once.
+        f'}} > "{marker}.tmp" && mv "{marker}.tmp" "{marker}"\n'
         'echo "stub-opencode-started"\n'
         f"sleep {_STUB_SLEEP_S}\n"
         'echo "stub-opencode-done"\n',
